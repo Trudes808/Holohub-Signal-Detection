@@ -1,0 +1,40 @@
+{
+    "application": {
+        "name": "USRP Frequency Detection",
+        "authors": [
+            {
+                "name": "Andrew Lynch <andrew.lynch@emerson.com>",
+                "affiliation": "National Instruments Corporation."
+            }
+        ],
+        "language": "C++",
+        "version": "1.0.0",
+        "changelog": {
+            "1.0": "Initial Release"
+        },
+        "holoscan_sdk": {
+            "minimum_required_version": "3.1.0",
+            "tested_versions": [
+                "3.1.0",
+                "3.2.0"
+            ]
+        },
+        "platforms": ["x86_64"],
+        "tags": ["USRP", "SDR"],
+        "ranking": 4,
+        "dependencies": {
+            "operators": [
+                "fft"
+            ],
+            "libraries": [{
+              "name": "MatX",
+              "version": "0.9.0",
+              "url": "https://github.com/NVIDIA/MatX.git"
+            }]
+        },
+        "run": {
+            "command": "<holohub_app_bin>/usrp_freq_detection",
+            "workdir": "holohub_bin"
+        }
+    }
+}
