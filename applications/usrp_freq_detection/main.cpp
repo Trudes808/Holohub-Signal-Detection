@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
     auto app = holoscan::make_application<UsrpFreqDetectPipeline>();
 
     // Get the configuration file
-    if (argc < 1) {
+    if (argc < 2) {
         HOLOSCAN_LOG_ERROR("Usage: {} [config.yaml]", argv[0]);
         return -1;
     }

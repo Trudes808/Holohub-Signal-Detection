@@ -33,7 +33,7 @@
             }]
         },
         "run": {
-            "command": "<holohub_app_bin>/usrp_freq_detection",
+            "command": "<holohub_app_bin>/usrp_freq_detection config.yaml",
             "workdir": "holohub_bin"
         }
     }

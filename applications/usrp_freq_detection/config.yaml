@@ -69,8 +69,7 @@ advanced_network:
       - name: sdr_data
         # Set to the PCIe address of your ingest NIC.
         #  - See list with: sudo lshw -c network -businfo
-        # address: 0000:51:00.1  # A4500
-        address: 0000:02:00.0  # A4500E
+        address: 0000:41:00.0
         rx:
           flow_isolation: true
           queues:
