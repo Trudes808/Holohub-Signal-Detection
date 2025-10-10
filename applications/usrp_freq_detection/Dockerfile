@@ -103,7 +103,7 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
     && echo "deb [signed-by=${LOCAL_GPG_KEY_PATH}] ${DOCA_REPO_LINK} ./" | tee /etc/apt/sources.list.d/mellanox.list
 
 # APT installs
-# - cublas, cufft, cusolver, curand dev libs: for matx
+# - cublas, cufft, cusolver, curand, cusparse dev libs: for matx
 # - ninja-build: for cmake build
 # - pkgconf: to import dpdk and doca in CMake
 # - mlnx-dpdk-dev: for dpdk and gpunetio backends
@@ -120,6 +120,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libcufft-dev-12-6 \
         libcusolver-dev-12-6 \
         libcurand-dev-12-6 \
+        libcusparse-dev-12-6 \
         ninja-build \
         pkgconf \
         mlnx-dpdk-dev \
@@ -226,18 +227,16 @@ RUN sed -i 's/\"apps\"//' rmax_apps_lib/CMakeLists.txt
 # ==============================
 FROM common-deps
 
-# =============================
-# matx: Install MatX from source with patches
 # ==============================
-ARG MATX_VERSION=0.9.0
+# matx: Install MatX from source
+# ==============================
+ARG MATX_VERSION=0.9.2
 
-COPY applications/psd_pipeline/matx_patches /tmp/matx_patches/
 RUN mkdir /tmp/matx && \
     cd /tmp/matx && \
     curl -OL "https://github.com/NVIDIA/MatX/archive/refs/tags/v${MATX_VERSION}.tar.gz" && \
     tar -xzf "v${MATX_VERSION}.tar.gz" && \
     cd "./MatX-${MATX_VERSION}" && \
-    for p in /tmp/matx_patches/*.patch; do patch -p1 < "$p"; done && \
     mkdir -p build && \
     cd build && \
     cmake .. && \
