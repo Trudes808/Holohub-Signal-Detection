@@ -25,7 +25,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 51200
+        num_bufs: 10000
         # Size of the Ethernet header + IP header + UDP header
         buf_size: 42
       # Memory pool for channel 1 CHDR signal data packets
@@ -34,7 +34,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 51200
+        num_bufs: 10000
         # Size of the CHDR signal data packet
         buf_size: 8192
       # Memory pool for channel 1 CHDR packet headers
@@ -43,7 +43,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 51200
+        num_bufs: 10000
         # Size of the CHDR header
         buf_size: 8
       # Memory pool for channel 2 CHDR signal data packets
@@ -52,7 +52,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 51200
+        num_bufs: 10000
         # Size of the CHDR signal data packet
         buf_size: 8192
       # Memory pool for channel 2 CHDR packet headers
@@ -61,7 +61,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 51200
+        num_bufs: 10000
         # Size of the CHDR header
         buf_size: 8
 
@@ -77,10 +77,10 @@ advanced_network:
               id: 0
               cpu_core: 5
               # How many data packets do you want before
-              # invoking the VRT connector operator?
+              # invoking the CHDR converter operator?
               # 20 data packets is 20480 samples and
               # we want 625 of them, so 12,500
-              batch_size: 12500
+              batch_size: 2500
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
@@ -89,10 +89,10 @@ advanced_network:
               id: 1
               cpu_core: 6
               # How many data packets do you want before
-              # invoking the VRT connector operator?
+              # invoking the CHDR converter operator?
               # 20 data packets is 20480 samples and
               # we want 625 of them, so 12,500
-              batch_size: 12500
+              batch_size: 2500
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH2_CHDR_Headers_RX_CPU"
@@ -108,7 +108,7 @@ advanced_network:
                 # Match with the port your SDR is sending to and the
                 # length of the signal data packets
                 udp_dst: 1234
-                ipv4_len: 4148
+                # ipv4_len: 4148
             - name: "Channel 2 data packets"
               id: 1
               action:
@@ -118,20 +118,20 @@ advanced_network:
                 # Match with the port your SDR is sending to and the
                 # length of the signal data packets
                 udp_dst: 1235
-                ipv4_len: 4148
+                # ipv4_len: 4148
 
 
 chdr_converter:
   interface_name: sdr_data
   num_complex_samples_per_packet: 2048
   num_packets_per_fft: 10
-  num_ffts_per_batch: 625
+  num_ffts_per_batch: 125
   num_simul_batches: 2
   num_channels: 2
 
 fft:
   burst_size: 20480
-  num_bursts: 625
+  num_bursts: 125
   num_channels: 4
   spectrum_type: 1
   averaging_type: 1
@@ -139,7 +139,7 @@ fft:
   window_type: 0
   transform_points: 20480
   window_points: 20480
-  resolution: 6250
+  resolution: 1250
   span: 128000000
   weighting_factor: 0
   f1_index: -10240
