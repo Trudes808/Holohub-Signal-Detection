@@ -19,7 +19,7 @@ advanced_network:
     log_level: "info"
 
     memory_regions:
-      # Memory pool for channel 1 frame headers
+      # Memory pool for frame headers
       - name: "Headers_RX_CPU"
         kind: "huge"
         affinity: 0
@@ -28,15 +28,6 @@ advanced_network:
         num_bufs: 10000
         # Size of the Ethernet header + IP header + UDP header
         buf_size: 42
-      # Memory pool for channel 1 CHDR signal data packets
-      - name: "CH1_Data_RX_GPU"
-        kind: "device"
-        affinity: 0
-        access:
-          - local
-        num_bufs: 10000
-        # Size of the CHDR signal data packet
-        buf_size: 8192
       # Memory pool for channel 1 CHDR packet headers
       - name: "CH1_CHDR_Headers_RX_CPU"
         kind: "huge"
@@ -45,9 +36,9 @@ advanced_network:
           - local
         num_bufs: 10000
         # Size of the CHDR header
-        buf_size: 8
-      # Memory pool for channel 2 CHDR signal data packets
-      - name: "CH2_Data_RX_GPU"
+        buf_size: 16
+      # Memory pool for channel 1 CHDR signal data packets
+      - name: "CH1_Data_RX_GPU"
         kind: "device"
         affinity: 0
         access:
@@ -63,7 +54,16 @@ advanced_network:
           - local
         num_bufs: 10000
         # Size of the CHDR header
-        buf_size: 8
+        buf_size: 16
+      # Memory pool for channel 2 CHDR signal data packets
+      - name: "CH2_Data_RX_GPU"
+        kind: "device"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 10000
+        # Size of the CHDR signal data packet
+        buf_size: 8192
 
     interfaces:
       - name: sdr_data
@@ -79,7 +79,7 @@ advanced_network:
               # How many data packets do you want before
               # invoking the CHDR converter operator?
               # 20 data packets is 20480 samples and
-              # we want 625 of them, so 12,500
+              # we want 125 of them, so 2,500
               batch_size: 2500
               memory_regions:
                 - "Headers_RX_CPU"
@@ -91,7 +91,7 @@ advanced_network:
               # How many data packets do you want before
               # invoking the CHDR converter operator?
               # 20 data packets is 20480 samples and
-              # we want 625 of them, so 12,500
+              # we want 125 of them, so 2,500
               batch_size: 2500
               memory_regions:
                 - "Headers_RX_CPU"
@@ -107,8 +107,9 @@ advanced_network:
               match:
                 # Match with the port your SDR is sending to and the
                 # length of the signal data packets
+                udp_src: 49153
                 udp_dst: 1234
-                # ipv4_len: 4148
+                ipv4_len: 8000
             - name: "Channel 2 data packets"
               id: 1
               action:
@@ -117,8 +118,9 @@ advanced_network:
               match:
                 # Match with the port your SDR is sending to and the
                 # length of the signal data packets
+                udp_src: 49153
                 udp_dst: 1235
-                # ipv4_len: 4148
+                ipv4_len: 8000
 
 
 chdr_converter:
