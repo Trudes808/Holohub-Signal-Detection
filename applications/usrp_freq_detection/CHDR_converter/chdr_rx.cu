@@ -63,8 +63,11 @@ __global__ void place_packet_data_kernel(complex* out,
 
   // Copy data while performing an endian flip and casting to complex float
   for (size_t i = 0; i < num_complex_samples_per_packet; ++i) {
-    out[offset + i] = complex(static_cast<float>(bswap_16(samples[i * 2])) * scalar,
-                      static_cast<float>(bswap_16(samples[(i * 2) + 1])) * scalar);
+    // Byte swap not needed on LE systems as already covered by reinterpret_cast above
+    // out[offset + i] = complex(static_cast<float>(bswap_16(samples[i * 2])) * scalar,
+    //                   static_cast<float>(bswap_16(samples[(i * 2) + 1])) * scalar);
+    out[offset + i] = complex(static_cast<float>(samples[i * 2]) * scalar,
+                      static_cast<float>(samples[(i * 2) + 1]) * scalar);
   }
 }
 
@@ -83,7 +86,7 @@ void place_packet_data(complex* out,
   //     the statically allocated memory
   //  S: associated CUDA stream
   // At this point, we're processing num_ffts_per_batch * num_packets_per_fft packets
-  // (e.g. 625 * 20 = 12,500).
+  // (e.g. 125 * 20 = 2,500).
   // So, let's launch a grid for every num_packets_per_fft and a thread for every packet.
   // This would make blockIdx.x the packet row and threadIdx.x the packet.
   place_packet_data_kernel<<<
