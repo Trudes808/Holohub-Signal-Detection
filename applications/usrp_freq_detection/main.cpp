@@ -1,10 +1,69 @@
-// SPDX-FileCopyrightText: 2024 Valley Tech Systems, Inc.
+// SPDX-FileCopyrightText: 2025 National Instruments Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
 #include "CHDR_converter/chdr_rx.h"
 #include <fft.hpp>
 
-// #define WRITE_DATA
+// operator that logs information about the processed data
+class LogOp: public holoscan::Operator {
+ public:
+    HOLOSCAN_OPERATOR_FORWARD_ARGS(LogOp)
+
+    using in_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
+
+    LogOp() = default;
+
+    void setup(holoscan::OperatorSpec& spec) override {
+        spec.input<in_t>("in");
+    }
+
+    void initialize() {
+        holoscan::Operator::initialize();
+        start = std::chrono::steady_clock::now();
+    }
+
+    void compute(holoscan::InputContext& op_input,
+                 holoscan::OutputContext& op_output,
+                 holoscan::ExecutionContext& context) override {
+        // Receive input tensor and CUDA stream
+        auto input = op_input.receive<in_t>("in").value();
+        // auto cuda_stream = op_input.receive_cuda_stream("in", true, false);
+        auto tensor = std::get<0>(input);
+        auto stream = std::get<1>(input);
+
+        // Access metadata
+        auto meta = metadata();
+        auto channel_num = meta->get<uint16_t>("channel_number", 0);
+
+        // Get timing information
+        auto now =  std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration<double>(now - start).count();
+        start = now;
+
+        // Get tensor dimensions
+        auto num_samples = tensor.Size(0) * tensor.Size(1);
+        auto num_bits = num_samples * sizeof(int16_t) * 2 * 8;
+
+        // Log statistics
+        HOLOSCAN_LOG_INFO("Received {} samples from channel {} at {:.2f} MSps ({:.2f} Gbps)",
+                         num_samples,
+                         channel_num,
+                         num_samples / elapsed / 1e6,
+                         num_bits / elapsed / 1e9);
+
+        // Debugging
+        if (false) {
+            // print first 1024 samples
+            // HOLOSCAN_LOG_INFO("Received tensor from channel {} with rank {} and shape: ({}, {})",
+            //     channel_num, tensor.Rank(), tensor.Size(0), tensor.Size(1));
+            // set_print_format_type(MATX_PRINT_FORMAT_PYTHON);
+            // print(slice<1>(tensor, {0, 0}, {matxDropDim, 1024}));
+        }
+        // Debugging end
+    }
+ private:
+    std::chrono::steady_clock::time_point start;
+};
 
 class UsrpFreqDetectPipeline : public holoscan::Application {
  public:
@@ -22,44 +81,59 @@ class UsrpFreqDetectPipeline : public holoscan::Application {
             "chdrConverterOp",
             from_config("chdr_converter"));
 
-        auto fftOp = make_operator<ops::FFT>(
-            "fftOp",
-            from_config("fft"));
+        // auto fftOp = make_operator<ops::FFT>(
+        //     "fftOp",
+        //     from_config("fft"));
+
+        auto logOp = make_operator<LogOp>(
+            "logOp",
+            make_condition<CountCondition>(from_config("num_runs").as<int64_t>())
+            // make_condition<CudaStreamCondition>("stream_sync", Arg("receiver", "in"))
+        );
 
         add_operator(chdrConverterOp);
-        add_operator(fftOp);
-        add_flow(chdrConverterOp, fftOp);
-
+        // add_operator(fftOp);
+        add_operator(logOp);
+        // add_flow(chdrConverterOp, fftOp);
+        add_flow(chdrConverterOp, logOp);
     }
 };
 
 int main(int argc, char** argv) {
-    holoscan::set_log_pattern("FULL");
+    // Create the application
     auto app = holoscan::make_application<UsrpFreqDetectPipeline>();
+    
+    // Enable metadata for all operators
+    app->enable_metadata(true);
 
-    // Get the configuration file
+    // Check for required configuration file argument
     if (argc < 2) {
         HOLOSCAN_LOG_ERROR("Usage: {} [config.yaml]", argv[0]);
         return -1;
     }
 
+    // Get the full path to the configuration file
     auto config_path = std::filesystem::canonical(argv[0]).parent_path();
     config_path += "/" + std::string(argv[1]);
 
-    // Check if the file exists
+    // Check if the configuration file exists
     if (!std::filesystem::exists(config_path)) {
         HOLOSCAN_LOG_ERROR("Configuration file '{}' does not exist",
                 static_cast<std::string>(config_path));
         return -1;
     }
 
-    // Run
-    app->enable_metadata(true);
+    // Apply configuration from file
     app->config(config_path);
+
+    // Configure the event-based scheduler
     app->scheduler(app->make_scheduler<holoscan::EventBasedScheduler>(
           "event-based-scheduler", app->from_config("scheduler")));
+
+    // Run the application
     app->run();
 
+    // Shutdown
     shutdown();
     return 0;
 }

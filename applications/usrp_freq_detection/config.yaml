@@ -1,9 +1,7 @@
 # SPDX-FileCopyrightText: 2025 National Instruments Corporation
 # SPDX-License-Identifier: Apache-2.0
 ---
-# Number of PSDs to produce before exiting
-# -1: run indefinitely
-num_psds: -1
+num_runs: -1  # Number of iterations the application will run, -1 is infinite
 
 scheduler:
   worker_thread_number: 4
