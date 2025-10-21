@@ -259,6 +259,50 @@ void ChdrConverterOpRx::process_channel_data(
           + get_segment_packet_length(burst, 2, p);
   }
 
+  // Debugging
+  if (false) {
+    HOLOSCAN_LOG_INFO("Processing burst on channel {} (stream {}) with {} packets",
+                    channel->channel_num, channel->cur_idx, get_num_packets(burst));
+    int p = 0;
+    uint16_t length0 = get_segment_packet_length(burst, 0, p);
+    uint16_t length1 = get_segment_packet_length(burst, 1, p);
+    uint16_t length2 = get_segment_packet_length(burst, 2, p);
+    HOLOSCAN_LOG_INFO("Segment 0 length: {}, Segment 1 length: {}, Segment 2 length: {}",
+                      length0, length1, length2);
+    auto ptr0 = get_segment_packet_ptr(burst, 0, p);
+    auto ptr1 = get_segment_packet_ptr(burst, 1, p);
+    auto ptr2 = get_segment_packet_ptr(burst, 2, p);
+    HOLOSCAN_LOG_INFO("Segment 0 ptr: {}, Segment 1 ptr: {}, Segment 2 ptr: {}",
+                      (void*)ptr0, (void*)ptr1, (void*)ptr2);
+    // print bytes for each segment
+    std::ostringstream oss;
+    oss << "Segment '0' bytes: ";
+    for (int i = 0; i < length0; ++i) {
+      oss << std::hex << std::setw(2) << std::setfill('0')
+          << static_cast<int>(((uint8_t*)ptr0)[i]) << ' ';
+    }
+    HOLOSCAN_LOG_INFO("{}", oss.str());
+    oss.str("");
+    oss << "Segment '1' bytes: ";
+    for (int i = 0; i < length1; ++i) {
+      oss << std::hex << std::setw(2) << std::setfill('0')
+          << static_cast<int>(((uint8_t*)ptr1)[i]) << ' ';
+    }
+    HOLOSCAN_LOG_INFO("{}", oss.str());
+    // copy from device to host memory
+    uint8_t* host_buf = nullptr;
+    cudaMallocHost((void**)&host_buf, length2);
+    cudaMemcpy(host_buf, ptr2, length2, cudaMemcpyDeviceToHost);
+    oss.str("");
+    oss << "Segment '2' bytes: ";
+    for (int i = 0; i < length2; ++i) {
+      oss << std::hex << std::setw(2) << std::setfill('0')
+          << static_cast<int>(host_buf[i]) << ' ';
+    }
+    HOLOSCAN_LOG_INFO("{}", oss.str());
+  }
+  // Debugging end
+
   channel->ttl_bytes_recv += ttl_bytes_in_cur_batch;
   channel->aggr_pkts_recv += get_num_packets(burst);
   channel->cur_msg.msg[channel->cur_msg.num_batches++] = burst;
@@ -276,6 +320,16 @@ void ChdrConverterOpRx::process_channel_data(
                       num_packets_per_fft_.get(),
                       num_complex_samples_per_packet_.get(),
                       channel->streams[channel->cur_idx]);
+
+    // Debugging
+    if (false) {
+      HOLOSCAN_LOG_INFO("Inspecting RF channel {} data from thread {} with shape: ({}, {}, {})",
+        channel->channel_num, channel->cur_idx,
+        channel->rf_data.Size(0), channel->rf_data.Size(1), channel->rf_data.Size(2));
+      set_print_format_type(MATX_PRINT_FORMAT_PYTHON);
+      print(slice<1>(channel->rf_data, {static_cast<index_t>(channel->cur_idx), 0, 0}, {matxDropDim, matxDropDim, 1024}));
+    }
+    // End debugging
 
     cudaEventRecord(channel->events[channel->cur_idx], channel->streams[channel->cur_idx]);
     channel->cur_msg.stream = channel->streams[channel->cur_idx];
