@@ -106,9 +106,9 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
   // We want to batch up 20 packets for an FFT calculation, so
   // we want 20x1024.
   // We want to perform 625 FFT calculations at once, so we want
-  // to batch up 625x20x1024 samples.
+  // to batch up 125x20x1024 samples.
   // We want to have 2 data buffers ping-ponging between processing
-  // and accumulation, so we want to hold 2x625x20x1024 samples.
+  // and accumulation, so we want to hold 2x125x20x1024 samples.
   // rf_data is a tensor_t which represents this data. The last
   // dimension (20x1024 in this example) is collapsed into one as
   // downstream operators don't care about how many packets were
@@ -116,7 +116,7 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
   spec.param<uint16_t>(num_complex_samples_per_packet_,
       "num_complex_samples_per_packet",
       "Number of complex samples per packet",
-      "Number of complex samples per VRT packet", 1024);
+      "Number of complex samples per CHDR packet", 1024);
   spec.param<uint16_t>(num_packets_per_fft_,
       "num_packets_per_fft",
       "Number of packets per FFT",
@@ -124,7 +124,7 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
   spec.param<uint16_t>(num_ffts_per_batch_,
       "num_ffts_per_batch",
       "Number of ffts per batch",
-      "Number of fft data batches batches to send for processing at once", 625);
+      "Number of fft data batches batches to send for processing at once", 125);
   spec.param<uint16_t>(num_simul_batches_,
       "num_simul_batches",
       "Number of simultaneous batches",

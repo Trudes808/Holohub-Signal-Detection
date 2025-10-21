@@ -109,7 +109,7 @@ advanced_network:
                 # length of the signal data packets
                 udp_src: 49153
                 udp_dst: 1234
-                ipv4_len: 8000
+                # ipv4_len: 4112
             - name: "Channel 2 data packets"
               id: 1
               action:
@@ -120,15 +120,15 @@ advanced_network:
                 # length of the signal data packets
                 udp_src: 49153
                 udp_dst: 1235
-                ipv4_len: 8000
+                # ipv4_len: 4112
 
 
 chdr_converter:
   interface_name: sdr_data
-  num_complex_samples_per_packet: 2048
-  num_packets_per_fft: 10
+  num_complex_samples_per_packet: 1024
+  num_packets_per_fft: 20
   num_ffts_per_batch: 125
-  num_simul_batches: 2
+  num_simul_batches: 1
   num_channels: 2
 
 fft:
