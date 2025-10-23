@@ -15,8 +15,6 @@
  * limitations under the License.
  */
 #include "chdr_rx.h"
-#include "swap.h"
-#include "swap.cuh"
 
 using out_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
 
@@ -63,9 +61,7 @@ __global__ void place_packet_data_kernel(complex* out,
 
   // Copy data while performing an endian flip and casting to complex float
   for (size_t i = 0; i < num_complex_samples_per_packet; ++i) {
-    // Byte swap not needed on LE systems as already covered by reinterpret_cast above
-    // out[offset + i] = complex(static_cast<float>(bswap_16(samples[i * 2])) * scalar,
-    //                   static_cast<float>(bswap_16(samples[(i * 2) + 1])) * scalar);
+    // Casting includes conversion from network order on little-endian systems
     out[offset + i] = complex(static_cast<float>(samples[i * 2]) * scalar,
                       static_cast<float>(samples[(i * 2) + 1]) * scalar);
   }
