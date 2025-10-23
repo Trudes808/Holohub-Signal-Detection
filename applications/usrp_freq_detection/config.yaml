@@ -128,11 +128,13 @@ chdr_converter:
   num_ffts_per_batch: 125
   num_simul_batches: 1
   num_channels: 2
+  log_packets: false
+  log_data: false
 
 fft:
   burst_size: 20480
   num_bursts: 125
-  num_channels: 4
+  num_channels: 2
   spectrum_type: 1
   averaging_type: 1
   window_time: 0
@@ -146,3 +148,7 @@ fft:
   f2_index: 10239
   window_time_delta: 0
 
+logger:
+  num_channels: 2
+  log_interval: 1
+  log_data: false

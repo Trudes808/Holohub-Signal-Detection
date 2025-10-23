@@ -141,6 +141,14 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
       "Name of the RX port",
       "Name of the RX port from the advanced_network config",
       "sdr_data");
+  spec.param<bool>(log_data_,
+      "log_data",
+      "Log Data",
+      "If true, log detailed data information for debugging.", false);
+  spec.param<bool>(log_packets_,
+      "log_packets",
+      "Log Packets",
+      "If true, log detailed packet information for debugging.", false);
 }
 
 void ChdrConverterOpRx::initialize() {
@@ -259,8 +267,8 @@ void ChdrConverterOpRx::process_channel_data(
           + get_segment_packet_length(burst, 2, p);
   }
 
-  // Debugging
-  if (false) {
+  // Log packet details for debugging
+  if (log_packets_) {
     HOLOSCAN_LOG_INFO("Processing burst on channel {} (stream {}) with {} packets",
                     channel->channel_num, channel->cur_idx, get_num_packets(burst));
     int p = 0;
@@ -301,7 +309,7 @@ void ChdrConverterOpRx::process_channel_data(
     }
     HOLOSCAN_LOG_INFO("{}", oss.str());
   }
-  // Debugging end
+  // End packet logging 
 
   channel->ttl_bytes_recv += ttl_bytes_in_cur_batch;
   channel->aggr_pkts_recv += get_num_packets(burst);
@@ -321,15 +329,15 @@ void ChdrConverterOpRx::process_channel_data(
                       num_complex_samples_per_packet_.get(),
                       channel->streams[channel->cur_idx]);
 
-    // Debugging
-    if (false) {
+    // Log data for debugging
+    if (log_data_) {
       HOLOSCAN_LOG_INFO("Inspecting RF channel {} data from thread {} with shape: ({}, {}, {})",
         channel->channel_num, channel->cur_idx,
         channel->rf_data.Size(0), channel->rf_data.Size(1), channel->rf_data.Size(2));
       set_print_format_type(MATX_PRINT_FORMAT_PYTHON);
       print(slice<1>(channel->rf_data, {static_cast<index_t>(channel->cur_idx), 0, 0}, {matxDropDim, matxDropDim, 1024}));
     }
-    // End debugging
+    // End data logging
 
     cudaEventRecord(channel->events[channel->cur_idx], channel->streams[channel->cur_idx]);
     channel->cur_msg.stream = channel->streams[channel->cur_idx];

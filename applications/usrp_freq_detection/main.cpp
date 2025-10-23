@@ -15,13 +15,22 @@ class LogOp: public holoscan::Operator {
 
     void setup(holoscan::OperatorSpec& spec) override {
         spec.input<in_t>("in");
+        spec.param(num_channels_, "num_channels",
+            "Number of Channels",
+            "The number of RF channels being processed.", 1);
+        spec.param(log_interval_, "log_interval",
+            "Log Interval",
+            "Interval in seconds to log the data rate statistics.", 5);
+        spec.param(log_data_, "log_data",
+            "Log Data",
+            "If true, log detailed data information for debugging.", false);
     }
 
     void initialize() {
         holoscan::Operator::initialize();
-        total_samples_ = 0;
-        start_ = std::chrono::steady_clock::now();
-        elapsed_ = std::chrono::steady_clock::duration::zero();
+        total_samples_.resize(num_channels_, 0);
+        start_.resize(num_channels_, std::chrono::steady_clock::now());
+        elapsed_.resize(num_channels_, std::chrono::steady_clock::duration::zero());
     }
 
     void compute(holoscan::InputContext& op_input,
@@ -39,32 +48,32 @@ class LogOp: public holoscan::Operator {
 
         // Get timing information
         auto now =  std::chrono::steady_clock::now();
-        auto interval = now - start_;
-        start_ = now;
+        auto interval = now - start_[channel_num];
+        start_[channel_num] = now;
 
         // Get tensor dimensions
         auto num_samples = tensor.Size(0) * tensor.Size(1);
         auto num_bits = num_samples * sizeof(int16_t) * 2 * 8;  // sc16 = complex int16_t
 
         // Update statisitics
-        total_samples_ += num_samples;
-        elapsed_ += interval;
+        total_samples_[channel_num] += num_samples;
+        elapsed_[channel_num] += interval;
 
         // Log statistics
-        auto seconds = std::chrono::duration<double>(elapsed_).count();
-        if (total_samples_ > 0 && seconds >= LOG_INTERVAL) {
+        auto seconds = std::chrono::duration<double>(elapsed_[channel_num]).count();
+        if (total_samples_[channel_num] > 0 && seconds >= log_interval_) {
             auto duration = std::chrono::duration<double>(interval).count();
             HOLOSCAN_LOG_INFO("Processed {} samples from channel {} at {:.2f} MSps ({:.2f} Gbps)",
-                            total_samples_,
+                            total_samples_[channel_num],
                             channel_num,
                             num_samples / duration / 1e6,
                             num_bits / duration / 1e9);
-            total_samples_ = 0;
-            elapsed_ = std::chrono::steady_clock::duration::zero();
+            total_samples_[channel_num] = 0;
+            elapsed_[channel_num] = std::chrono::steady_clock::duration::zero();
         }
 
-        // Debugging
-        if (false) {
+        // Log data for debugging
+        if (log_data_) {
             HOLOSCAN_LOG_INFO("Received tensor from channel {} with rank {} and shape: ({}, {})",
                 channel_num, tensor.Rank(), tensor.Size(0), tensor.Size(1));
             make_tensor(samples_, tensor.Shape(), MATX_HOST_MEMORY);
@@ -87,13 +96,14 @@ class LogOp: public holoscan::Operator {
             // set_print_format_type(MATX_PRINT_FORMAT_PYTHON);
             // print(slice<1>(tensor, {0, 0}, {matxDropDim, 1024}));
         }
-        // Debugging end
     }
  private:
-    static constexpr int LOG_INTERVAL = 1;  // log interval in seconds
-    int64_t total_samples_;
-    std::chrono::steady_clock::time_point start_;
-    std::chrono::steady_clock::duration elapsed_;
+    holoscan::Parameter<int> num_channels_;
+    holoscan::Parameter<int> log_interval_;
+    holoscan::Parameter<bool> log_data_;
+    std::vector<int64_t> total_samples_;
+    std::vector<std::chrono::steady_clock::time_point> start_;
+    std::vector<std::chrono::steady_clock::duration> elapsed_;
     tensor_t<complex, 2> samples_;
 };
 
@@ -119,6 +129,7 @@ class UsrpFreqDetectPipeline : public holoscan::Application {
 
         auto logOp = make_operator<LogOp>(
             "logOp",
+            from_config("logger"),
             make_condition<CountCondition>(from_config("num_runs").as<int64_t>())
             // make_condition<CudaStreamCondition>("stream_sync", Arg("receiver", "in"))
         );

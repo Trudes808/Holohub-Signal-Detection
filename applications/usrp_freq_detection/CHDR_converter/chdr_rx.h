@@ -56,6 +56,8 @@ class ChdrConverterOpRx : public Operator {
   Parameter<uint16_t> num_simul_batches_;
   Parameter<uint16_t> num_channels_;
   Parameter<std::string> interface_name_;
+  Parameter<bool> log_data_;
+  Parameter<bool> log_packets_;
   int port_id_;
   uint32_t num_packets_per_batch;
 
