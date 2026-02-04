@@ -12,7 +12,7 @@ advanced_network:
   cfg:
     version: 1
     manager: "dpdk"
-    master_core: 0  # Master CPU core
+    master_core: 9  # Master CPU core
     debug: false
     log_level: "info"
 
@@ -23,7 +23,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 10000
+        num_bufs: 12500
         # Size of the Ethernet header + IP header + UDP header
         buf_size: 42
       # Memory pool for channel 1 CHDR packet headers
@@ -32,7 +32,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 10000
+        num_bufs: 12500
         # Size of the CHDR header (depends on CHDR_W size)
         buf_size: 64
       # Memory pool for channel 1 CHDR signal data packets
@@ -41,16 +41,16 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 10000
+        num_bufs: 12500
         # Size of the CHDR signal data packet (depends on number of samples transmitted)
-        buf_size: 8192
+        buf_size: 4096
       # Memory pool for channel 2 CHDR packet headers
       - name: "CH2_CHDR_Headers_RX_CPU"
         kind: "huge"
         affinity: 0
         access:
           - local
-        num_bufs: 10000
+        num_bufs: 12500
         # Size of the CHDR header (depends on CHDR_W size)
         buf_size: 64
       # Memory pool for channel 2 CHDR signal data packets
@@ -59,9 +59,9 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 10000
+        num_bufs: 12500
         # Size of the CHDR signal data packet (depends on number of samples transmitted)
-        buf_size: 8192
+        buf_size: 4096
 
     interfaces:
       - name: sdr_data
@@ -73,7 +73,7 @@ advanced_network:
           queues:
             - name: "Channel 1 data"
               id: 0
-              cpu_core: 5
+              cpu_core: 10
               # How many data packets do you want before
               # invoking the CHDR converter operator?
               # 20 data packets is 20480 samples and
@@ -85,7 +85,7 @@ advanced_network:
                 - "CH1_Data_RX_GPU"
             - name: "Channel 2 data"
               id: 1
-              cpu_core: 6
+              cpu_core: 11
               # How many data packets do you want before
               # invoking the CHDR converter operator?
               # 20 data packets is 20480 samples and
