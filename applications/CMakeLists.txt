@@ -118,7 +118,8 @@ add_holohub_application(ultrasound_segmentation DEPENDS OPERATORS aja_source)
 
 add_holohub_application(usrp_freq_detection DEPENDS
                         OPERATORS advanced_network
-                                  fft)
+                                  fft
+                                  spectrogram)
 
 add_holohub_application(velodyne_lidar_app DEPENDS
                         OPERATORS velodyne_lidar

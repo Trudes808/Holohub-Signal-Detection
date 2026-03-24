@@ -152,3 +152,12 @@ logger:
   num_channels: 2
   log_interval: 1
   log_data: false
+
+spectrogram:
+  num_channels: 2
+  enable_save: true
+  save_every_n_frames: 100
+  max_images_per_channel: 20
+  output_height: 256
+  output_width: 512
+  output_dir: "/workspace/spectrograms"

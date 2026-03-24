@@ -22,6 +22,13 @@ If everything is working, start Holoscan from the top level of this repo:
 
     ./holohub run usrp_freq_detection --docker-opts "-u root --privileged -v /mnt/huge:/mnt/huge"
 
+  To save spectrogram debug images to the host, also mount an output directory and
+  make sure it matches `spectrogram.output_dir` in
+  `applications/usrp_freq_detection/config.yaml` (default: `/workspace/spectrograms`):
+
+    mkdir -p /tmp/usrp_spectrograms
+    ./holohub run usrp_freq_detection --docker-opts "-u root --privileged -v /mnt/huge:/mnt/huge -v /tmp/usrp_spectrograms:/workspace/spectrograms"
+
 
 Then, start the raw UDP stream using the patched version of rx_to_remote_udp.py
 that is inside the `applications/usrp_freq_detection` directory. You need to

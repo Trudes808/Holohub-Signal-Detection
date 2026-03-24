@@ -35,6 +35,7 @@ target_link_libraries(usrp_freq_detection
   holoscan::core
   holoscan::advanced_network
   holoscan::ops::fft
+  holoscan::ops::spectrogram
   CHDR_converter
 )
 target_include_directories(usrp_freq_detection

@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 #include "CHDR_converter/chdr_rx.h"
+#include <spectrogram.hpp>
 #include <fft.hpp>
 
 // operator that logs information about the processed data
@@ -127,6 +128,10 @@ class UsrpFreqDetectPipeline : public holoscan::Application {
             "fftOp",
             from_config("fft"));
 
+        auto spectrogramOp = make_operator<ops::Spectrogram>(
+            "spectrogramOp",
+            from_config("spectrogram"));
+
         auto logOp = make_operator<LogOp>(
             "logOp",
             from_config("logger"),
@@ -136,8 +141,10 @@ class UsrpFreqDetectPipeline : public holoscan::Application {
 
         add_operator(chdrConverterOp);
         add_operator(fftOp);
+        add_operator(spectrogramOp);
         add_operator(logOp);
         add_flow(chdrConverterOp, fftOp);
+        add_flow(fftOp, spectrogramOp);
         add_flow(fftOp, logOp);
     }
 };
