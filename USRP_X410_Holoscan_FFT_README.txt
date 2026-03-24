@@ -42,21 +42,7 @@ STEP 3B -- REBUILD + RESTART THE CONTAINER (after code changes)
 ================================================================================
 
 cd ~/holohub-dev
-sudo ./holohub build-container usrp_freq_detection
-sudo docker rm -f holohub_usrp_freq_detection 2>/dev/null || true
-
-# Launch fresh container
-sudo docker run --name holohub_usrp_freq_detection --privileged --net host --interactive --tty \
-  -u 0:0 \
-  -v ~/holohub-dev:/workspace/holohub \
-  -v /dev/hugepages:/dev/hugepages \
-  -w /workspace/holohub \
-  --runtime nvidia \
-  --gpus all \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  --ipc=host \
-  holohub:usrp_freq_detection
+./applications/usrp_freq_detection/restart_usrp_container.sh
 
 ================================================================================
 STEP 4 -- LAUNCH THE CONTAINER
@@ -185,6 +171,7 @@ Streaming script : ~/holohub-dev/applications/usrp_freq_detection/rx_to_remote_u
 Dockerfile       : ~/holohub-dev/applications/usrp_freq_detection/Dockerfile
 Main source      : ~/holohub-dev/applications/usrp_freq_detection/main.cpp
 Build helper     : ~/holohub-dev/applications/usrp_freq_detection/bootstrap_build.sh
+Restart helper   : ~/holohub-dev/applications/usrp_freq_detection/restart_usrp_container.sh
 
 
 ================================================================================
