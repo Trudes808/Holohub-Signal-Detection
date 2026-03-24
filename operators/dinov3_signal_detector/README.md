@@ -11,7 +11,8 @@ Provides a C++/CUDA baseline signal-detection stage for the wideband USRP pipeli
 
 This initial implementation is a high-throughput scaffold that:
 - consumes FFT-domain tensors (`tensor_t<complex, 2>`),
-- performs GPU-side power-threshold masking,
+- supports an optional GPU PyTorch tensor path (when built with Torch),
+- performs baseline GPU-side power-threshold masking,
 - emits a fixed-size detector mask tensor (`tensor_t<float, 2>`),
 - propagates metadata for downstream consumers.
 
@@ -27,6 +28,10 @@ dinov3_signal_detector:
   emit_stride: 1
   mask_threshold_db: -20.0
   log_detections: false
+  use_pytorch_backend: true
+  model_name: "dinov3_vitb16"
+  model_repo_path: "/workspace/models/dinov3"
+  weights_path: "/workspace/models/dinov3/weights/dinov3_vitb16_placeholder.pth"
 ```
 
 ## I/O Contract
@@ -39,3 +44,12 @@ Metadata keys written:
 - `dino_mask_height`
 - `dino_mask_width`
 - `dino_mask_threshold_db`
+- `dino_backend`
+- `dino_model_name`
+- `dino_weights_path`
+
+## Current ML status
+
+- `use_pytorch_backend=true` activates a PyTorch GPU tensor-processing path if Torch is available at build/runtime.
+- This path currently performs tensor-domain preprocessing and mask generation while preserving CUDA stream handoff.
+- The configured `weights_path` is a placeholder for upcoming full DINOv3 model-forward integration.

@@ -141,3 +141,7 @@ dinov3_signal_detector:
   emit_stride: 1
   mask_threshold_db: -20.0
   log_detections: false
+  use_pytorch_backend: true
+  model_name: "dinov3_vitb16"
+  model_repo_path: "/workspace/models/dinov3"
+  weights_path: "/workspace/models/dinov3/weights/dinov3_vitb16_placeholder.pth"

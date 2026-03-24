@@ -5,6 +5,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+
+#ifdef HOLOHUB_HAS_TORCH
+#include <torch/torch.h>
+#include <torch/nn/functional.h>
+#include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#endif
 
 namespace {
 
@@ -70,6 +79,26 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
              "Log detections",
              "If true, logs detector execution details.",
              false);
+  spec.param(use_pytorch_backend_,
+             "use_pytorch_backend",
+             "Use PyTorch backend",
+             "If true, uses PyTorch tensor operations on GPU as detector path when available.",
+             true);
+  spec.param(model_name_,
+             "model_name",
+             "Model name",
+             "DINOv3 model name placeholder for future integration.",
+             std::string("dinov3_vitb16"));
+  spec.param(model_repo_path_,
+             "model_repo_path",
+             "Model repo path",
+             "Path to local DINOv3 repository (placeholder for future integration).",
+             std::string("/workspace/models/dinov3"));
+  spec.param(weights_path_,
+             "weights_path",
+             "Weights path",
+             "Path to model weights placeholder while downloads complete.",
+             std::string("/workspace/models/dinov3/weights/dinov3_vitb16_placeholder.pth"));
 }
 
 void DinoV3SignalDetector::initialize() {
@@ -80,6 +109,30 @@ void DinoV3SignalDetector::initialize() {
   make_tensor(detection_masks_,
               {num_channels_.get(), input_height_.get(), input_width_.get()},
               MATX_DEVICE_MEMORY);
+
+  pytorch_runtime_ready_ = false;
+
+#ifdef HOLOHUB_HAS_TORCH
+  if (use_pytorch_backend_.get()) {
+    if (!torch::cuda::is_available()) {
+      HOLOSCAN_LOG_WARN("PyTorch backend requested, but torch CUDA is not available. Falling back to CUDA kernel path.");
+    } else {
+      pytorch_runtime_ready_ = true;
+      HOLOSCAN_LOG_INFO("PyTorch backend enabled for DINOv3 detector. model_name='{}' repo='{}' weights='{}'",
+                        model_name_.get(),
+                        model_repo_path_.get(),
+                        weights_path_.get());
+
+      if (!std::filesystem::exists(weights_path_.get())) {
+        HOLOSCAN_LOG_WARN("weights path does not exist: {}", weights_path_.get());
+      }
+    }
+  }
+#else
+  if (use_pytorch_backend_.get()) {
+    HOLOSCAN_LOG_WARN("PyTorch backend requested, but operator was built without Torch. Falling back to CUDA kernel path.");
+  }
+#endif
 }
 
 void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
@@ -126,6 +179,68 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
 
   const int dst_rows = std::max(1, input_height_.get());
   const int dst_cols = std::max(1, input_width_.get());
+
+#ifdef HOLOHUB_HAS_TORCH
+  if (use_pytorch_backend_.get() && pytorch_runtime_ready_) {
+    const int64_t output_elements = static_cast<int64_t>(dst_rows) * static_cast<int64_t>(dst_cols);
+    auto output_bytes = static_cast<size_t>(output_elements) * sizeof(float);
+
+    c10::cuda::CUDAStream external_stream = c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device());
+    c10::cuda::CUDAStreamGuard stream_guard(external_stream);
+
+    auto complex_options = torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA);
+    auto complex_input = torch::from_blob(fft_tensor.Data(),
+                                          {static_cast<int64_t>(src_rows), static_cast<int64_t>(src_cols)},
+                                          complex_options);
+
+    auto power = torch::pow(torch::abs(complex_input), 2).add(1e-12);
+    auto power_db = 10.0 * torch::log10(power);
+
+    auto resized = torch::nn::functional::interpolate(
+        power_db.unsqueeze(0).unsqueeze(0),
+        torch::nn::functional::InterpolateFuncOptions()
+            .size(std::vector<int64_t>{static_cast<int64_t>(dst_rows), static_cast<int64_t>(dst_cols)})
+            .mode(torch::kBilinear)
+            .align_corners(false));
+
+    auto mask = resized.squeeze(0).squeeze(0).ge(mask_threshold_db_.get()).to(torch::kFloat32).contiguous();
+
+    auto copy_result = cudaMemcpyAsync(out.Data(),
+                                       mask.data_ptr<float>(),
+                                       output_bytes,
+                                       cudaMemcpyDeviceToDevice,
+                                       stream);
+    if (copy_result != cudaSuccess) {
+      HOLOSCAN_LOG_ERROR("DINOv3 detector torch-path memcpy failed: {}", cudaGetErrorString(copy_result));
+      return;
+    }
+
+    meta->set("dino_frame_number", frame_number);
+    meta->set("dino_mask_height", static_cast<uint32_t>(dst_rows));
+    meta->set("dino_mask_width", static_cast<uint32_t>(dst_cols));
+    meta->set("dino_mask_threshold_db", mask_threshold_db_.get());
+    meta->set("dino_backend", std::string("pytorch_placeholder"));
+    meta->set("dino_model_name", model_name_.get());
+    meta->set("dino_weights_path", weights_path_.get());
+
+    if (log_detections_.get()) {
+      HOLOSCAN_LOG_INFO("DINOv3 detector (PyTorch path) emitted mask for channel {} frame {} shape {}x{}",
+                        channel_number,
+                        frame_number,
+                        dst_rows,
+                        dst_cols);
+    }
+
+    op_output.emit(dino_out_t {out, stream}, "out");
+    return;
+  }
+#else
+  if (use_pytorch_backend_.get() && !pytorch_warning_emitted_) {
+    HOLOSCAN_LOG_WARN("DINOv3 detector use_pytorch_backend=true but Torch is unavailable at build time; using CUDA fallback path.");
+    pytorch_warning_emitted_ = true;
+  }
+#endif
+
   const int total = dst_rows * dst_cols;
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
@@ -148,6 +263,9 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
   meta->set("dino_mask_height", static_cast<uint32_t>(dst_rows));
   meta->set("dino_mask_width", static_cast<uint32_t>(dst_cols));
   meta->set("dino_mask_threshold_db", mask_threshold_db_.get());
+  meta->set("dino_backend", std::string("cuda_threshold_fallback"));
+  meta->set("dino_model_name", model_name_.get());
+  meta->set("dino_weights_path", weights_path_.get());
 
   if (log_detections_.get()) {
     HOLOSCAN_LOG_INFO("DINOv3 detector emitted mask for channel {} frame {} with shape {}x{}",

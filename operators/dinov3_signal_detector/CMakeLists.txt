@@ -10,6 +10,7 @@ enable_language(CUDA)
 find_package(holoscan 2.5.0 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
 find_package(matx CONFIG REQUIRED)
+find_package(Torch QUIET)
 
 add_library(dinov3_signal_detector
   dinov3_signal_detector.cu
@@ -23,5 +24,14 @@ target_link_libraries(dinov3_signal_detector
     holoscan::core
     matx::matx
 )
+
+if(Torch_FOUND)
+  target_link_libraries(dinov3_signal_detector PRIVATE ${TORCH_LIBRARIES})
+  target_compile_definitions(dinov3_signal_detector PRIVATE HOLOHUB_HAS_TORCH=1)
+  target_compile_features(dinov3_signal_detector PRIVATE cxx_std_17)
+  message(STATUS "dinov3_signal_detector: Torch found, enabling PyTorch backend path")
+else()
+  message(STATUS "dinov3_signal_detector: Torch not found, building CUDA fallback path only")
+endif()
 
 install(TARGETS dinov3_signal_detector)
