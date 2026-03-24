@@ -121,6 +121,12 @@ add_holohub_application(usrp_freq_detection DEPENDS
                                   fft
                                   spectrogram)
 
+add_holohub_application(usrp_wideband_signal_detection DEPENDS
+                        OPERATORS advanced_network
+                                  fft
+                                  spectrogram
+                                  dinov3_signal_detector)
+
 add_holohub_application(velodyne_lidar_app DEPENDS
                         OPERATORS velodyne_lidar
                                   basic_network

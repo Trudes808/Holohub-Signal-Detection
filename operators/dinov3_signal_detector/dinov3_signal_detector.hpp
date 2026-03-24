@@ -9,15 +9,15 @@
 
 namespace holoscan::ops {
 
-using complex = cuda::std::complex<float>;
-using in_t = std::tuple<matx::tensor_t<complex, 2>, cudaStream_t>;
-using out_t = in_t;
+using dino_complex = cuda::std::complex<float>;
+using dino_in_t = std::tuple<matx::tensor_t<dino_complex, 2>, cudaStream_t>;
+using dino_out_t = std::tuple<matx::tensor_t<float, 2>, cudaStream_t>;
 
-class Spectrogram : public holoscan::Operator {
+class DinoV3SignalDetector : public holoscan::Operator {
  public:
-  HOLOSCAN_OPERATOR_FORWARD_ARGS(Spectrogram)
+  HOLOSCAN_OPERATOR_FORWARD_ARGS(DinoV3SignalDetector)
 
-  Spectrogram() = default;
+  DinoV3SignalDetector() = default;
 
   void setup(holoscan::OperatorSpec& spec) override;
   void initialize() override;
@@ -27,15 +27,14 @@ class Spectrogram : public holoscan::Operator {
 
  private:
   holoscan::Parameter<int> num_channels_;
-  holoscan::Parameter<bool> enable_save_;
-  holoscan::Parameter<int> save_every_n_frames_;
-  holoscan::Parameter<int> max_images_per_channel_;
-  holoscan::Parameter<int> output_height_;
-  holoscan::Parameter<int> output_width_;
-  holoscan::Parameter<std::string> output_dir_;
+  holoscan::Parameter<int> input_height_;
+  holoscan::Parameter<int> input_width_;
+  holoscan::Parameter<int> emit_stride_;
+  holoscan::Parameter<float> mask_threshold_db_;
+  holoscan::Parameter<bool> log_detections_;
 
   std::vector<uint64_t> frame_count_;
-  std::vector<int> images_saved_;
+  matx::tensor_t<float, 3> detection_masks_;
 };
 
 }  // namespace holoscan::ops

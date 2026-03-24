@@ -52,6 +52,7 @@ namespace holoscan::ops {
 
 void Spectrogram::setup(holoscan::OperatorSpec& spec) {
   spec.input<in_t>("in");
+  spec.output<out_t>("out");
 
   spec.param(num_channels_, "num_channels", "Number of channels", "Number of channels in the stream.", 1);
   spec.param(enable_save_, "enable_save", "Enable save", "Enable writing spectrogram images to disk.", true);
@@ -96,7 +97,7 @@ void Spectrogram::initialize() {
 }
 
 void Spectrogram::compute(holoscan::InputContext& op_input,
-                          holoscan::OutputContext&,
+                          holoscan::OutputContext& op_output,
                           holoscan::ExecutionContext&) {
   auto input = op_input.receive<in_t>("in").value();
   auto& tensor = std::get<0>(input);
@@ -113,6 +114,8 @@ void Spectrogram::compute(holoscan::InputContext& op_input,
   }
 
   const uint64_t frame_number = ++frame_count_[channel_number];
+
+  op_output.emit(out_t {tensor, stream}, "out");
 
   if (!enable_save_.get()) {
     return;

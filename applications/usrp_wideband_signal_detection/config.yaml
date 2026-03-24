@@ -1,0 +1,143 @@
+# SPDX-FileCopyrightText: 2026 National Instruments Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+num_runs: -1
+
+scheduler:
+  worker_thread_number: 4
+  stop_on_deadlock: true
+  stop_on_deadlock_timeout: 500
+
+advanced_network:
+  cfg:
+    version: 1
+    manager: "dpdk"
+    master_core: 9
+    debug: false
+    log_level: "info"
+
+    memory_regions:
+      - name: "Headers_RX_CPU"
+        kind: "huge"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 51200
+        buf_size: 42
+      - name: "CH1_CHDR_Headers_RX_CPU"
+        kind: "huge"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 51200
+        buf_size: 64
+      - name: "CH1_Data_RX_GPU"
+        kind: "device"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 25000
+        buf_size: 4096
+      - name: "CH2_CHDR_Headers_RX_CPU"
+        kind: "huge"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 51200
+        buf_size: 64
+      - name: "CH2_Data_RX_GPU"
+        kind: "device"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 25000
+        buf_size: 4096
+
+    interfaces:
+      - name: sdr_data
+        address: 0000:a2:00.0
+        rx:
+          flow_isolation: true
+          queues:
+            - name: "Channel 1 data"
+              id: 0
+              cpu_core: 10
+              batch_size: 5000
+              memory_regions:
+                - "Headers_RX_CPU"
+                - "CH1_CHDR_Headers_RX_CPU"
+                - "CH1_Data_RX_GPU"
+            - name: "Channel 2 data"
+              id: 1
+              cpu_core: 11
+              batch_size: 5000
+              memory_regions:
+                - "Headers_RX_CPU"
+                - "CH2_CHDR_Headers_RX_CPU"
+                - "CH2_Data_RX_GPU"
+
+          flows:
+            - name: "Channel 1 data packets"
+              id: 0
+              action:
+                type: queue
+                id: 0
+              match:
+                udp_src: 49153
+                udp_dst: 1234
+            - name: "Channel 2 data packets"
+              id: 1
+              action:
+                type: queue
+                id: 1
+              match:
+                udp_src: 49153
+                udp_dst: 1235
+
+chdr_converter:
+  interface_name: sdr_data
+  num_complex_samples_per_packet: 1024
+  num_packets_per_fft: 20
+  num_ffts_per_batch: 250
+  num_simul_batches: 1
+  num_channels: 2
+  log_packets: false
+  log_data: false
+
+fft:
+  burst_size: 20480
+  num_bursts: 250
+  num_channels: 2
+  spectrum_type: 1
+  averaging_type: 1
+  window_time: 0
+  window_type: 0
+  transform_points: 20480
+  window_points: 20480
+  resolution: 1250
+  span: 128000000
+  weighting_factor: 0
+  f1_index: -10240
+  f2_index: 10239
+  window_time_delta: 0
+
+logger:
+  num_channels: 2
+  log_interval: 1
+
+spectrogram:
+  num_channels: 2
+  enable_save: true
+  save_every_n_frames: 100
+  max_images_per_channel: 20
+  output_height: 256
+  output_width: 512
+  output_dir: "/workspace/spectrograms"
+
+dinov3_signal_detector:
+  num_channels: 2
+  input_height: 256
+  input_width: 512
+  emit_stride: 1
+  mask_threshold_db: -20.0
+  log_detections: false

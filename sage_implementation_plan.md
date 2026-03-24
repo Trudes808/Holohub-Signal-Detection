@@ -1,6 +1,6 @@
 # Sage Step-by-Step Implementation Plan
 
-Last updated: 2026-03-19
+Last updated: 2026-03-24
 
 ## 1) Purpose and Scope
 
@@ -204,12 +204,31 @@ Wire spectrogram branch into app graph while preserving legacy PSD branch.
 
 Attach DINOv3 inference to spectrogram outputs using the most maintainable path.
 
+### Notebook reference for algorithm flow
+
+- Reference implementation notebook:
+   - `../Dinov3-RF-Signal-Detection/rf_spectrogram_segmentation.ipynb`
+- This notebook defines the current algorithmic flow to preserve during operatorization:
+   1. Spectrogram slice/window selection (`H x W`, patch-size aligned).
+   2. Input normalization to image-like tensor (ImageNet mean/std style in the Python prototype).
+   3. DINOv3 feature extraction (patch embeddings).
+   4. Patch-space postprocess for detection mask candidates (prototype uses PCA + clustering and mask scoring).
+   5. Visualization/debug outputs (prototype only; not in hot path).
+
 ### Decision gate
 
 Choose one:
 
 - **Path A (preferred first):** Holoscan `InferenceOp` backend=TRT with CUDA tensors.
 - **Path B:** custom DINOv3 operator if preprocessing/postprocessing requirements exceed InferenceOp flexibility.
+
+### Implementation decision for this project stage
+
+- **Primary execution target:** C++/CUDA operator path for production throughput.
+- **Role of Python notebook:** algorithm prototyping and regression reference only.
+- **Recommended staging:**
+   1. Use `InferenceOp` as bring-up path for engine/runtime validation.
+   2. Implement `dinov3_signal_detector` custom C++ operator for fused preprocess + inference glue + postprocess once contracts are stable.
 
 ### Tasks (common)
 
@@ -225,21 +244,72 @@ Choose one:
    - engine cache behavior
    - device assignment
 
+### Tasks (C++ operator track: required for performance)
+
+1. Define `dinov3_signal_detector` operator contract:
+   - input: spectrogram tensor + metadata (`channel_number`, timing/frame index)
+   - output: detection mask(s), confidence/score summary, passthrough metadata
+2. Implement GPU preprocess in operator (no host copy):
+   - patch-size alignment/cropping policy (e.g., multiple of 16)
+   - dtype/layout conversion to model input layout
+   - normalization policy equivalent to notebook baseline
+3. Integrate TRT inference execution path:
+   - engine load/init in `initialize()`
+   - async enqueue on provided CUDA stream in `compute()`
+4. Implement GPU postprocess (minimum viable):
+   - produce deterministic binary/score mask from model outputs
+   - include threshold parameters and deterministic tie-break rules
+5. Add debug parity hooks (off by default):
+   - optional sampled host export for parity checks vs notebook outputs
+6. Add cadence/backpressure controls in operator config:
+   - `emit_stride`, queue cap, frame-drop policy
+
 ### File touchpoints
 
 - If Path A:
   - `applications/psd_pipeline/main.cpp`
   - `applications/psd_pipeline/config.yaml` (or dedicated app config)
 - If Path B:
-  - new `operators/dinov3_signal_detector/*`
+   - new `operators/dinov3_signal_detector/dinov3_signal_detector.hpp`
+   - new `operators/dinov3_signal_detector/dinov3_signal_detector.cu`
+   - new `operators/dinov3_signal_detector/CMakeLists.txt`
+   - new `operators/dinov3_signal_detector/README.md`
+   - new `operators/dinov3_signal_detector/metadata.json`
   - `operators/CMakeLists.txt`
   - app wiring/config files above
+
+### Initial operator parameters (proposed)
+
+- `num_channels`
+- `input_height`, `input_width`
+- `patch_size` (default 16)
+- `input_layout` (`NCHW` default)
+- `input_dtype` (`fp16` default, `fp32` fallback)
+- `normalize_mode` (`imagenet`, `none`, or custom constants)
+- `engine_path` / `onnx_path` / `engine_cache_dir`
+- `infer_batch_size`
+- `mask_threshold`
+- `postprocess_mode` (`argmax`, `threshold`, future `cluster`)
+- `emit_stride`
+- `max_inflight`
+- `debug_dump_enable`
+- `debug_dump_every_n`
 
 ### Validation
 
 - Inference receives expected tensor shape and dtype.
 - Output message schema is stable.
 - End-to-end branch runs at controlled cadence.
+
+### Validation additions for notebook parity
+
+1. Fixed-input parity test:
+   - run one captured spectrogram slice through notebook reference and C++ operator path
+   - compare output mask overlap metric (IoU) and summary statistics
+2. Throughput validation:
+   - verify no GPU->CPU transfer in hot path (except optional debug mode)
+3. Determinism check:
+   - same input + config yields identical mask output over repeated runs
 
 ### Exit criteria
 
@@ -349,6 +419,8 @@ These should be decided before Phase 2 completion:
 3. **Inference cadence policy** (every frame vs stride/window)
 4. **DINOv3 deployment path** (InferenceOp TensorRT vs custom operator)
 5. **Per-channel model policy** (shared model instance vs channel-specific handling)
+6. **Postprocess definition** (model-native mask head vs patch-feature clustering fallback)
+7. **Parity metric** (e.g., IoU threshold against notebook reference outputs)
 
 
 ## 7) Risks and Mitigations
