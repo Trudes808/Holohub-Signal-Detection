@@ -23,7 +23,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 12500
+        num_bufs: 51200
         # Size of the Ethernet header + IP header + UDP header
         buf_size: 42
       # Memory pool for channel 1 CHDR packet headers
@@ -32,7 +32,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 12500
+        num_bufs: 51200
         # Size of the CHDR header (depends on CHDR_W size)
         buf_size: 64
       # Memory pool for channel 1 CHDR signal data packets
@@ -41,7 +41,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 12500
+        num_bufs: 25000
         # Size of the CHDR signal data packet (depends on number of samples transmitted)
         buf_size: 4096
       # Memory pool for channel 2 CHDR packet headers
@@ -50,7 +50,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 12500
+        num_bufs: 51200
         # Size of the CHDR header (depends on CHDR_W size)
         buf_size: 64
       # Memory pool for channel 2 CHDR signal data packets
@@ -59,7 +59,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 12500
+        num_bufs: 25000
         # Size of the CHDR signal data packet (depends on number of samples transmitted)
         buf_size: 4096
 
@@ -67,7 +67,7 @@ advanced_network:
       - name: sdr_data
         # Set to the PCIe address of your ingest NIC.
         #  - See list with: sudo lshw -c network -businfo
-        address: 0000:41:00.0
+        address: 0000:a2:00.0
         rx:
           flow_isolation: true
           queues:
@@ -78,7 +78,7 @@ advanced_network:
               # invoking the CHDR converter operator?
               # 20 data packets is 20480 samples and
               # we want 125 of them, so 2,500
-              batch_size: 2500
+              batch_size: 5000
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
@@ -90,7 +90,7 @@ advanced_network:
               # invoking the CHDR converter operator?
               # 20 data packets is 20480 samples and
               # we want 125 of them, so 2,500
-              batch_size: 2500
+              batch_size: 5000
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH2_CHDR_Headers_RX_CPU"
@@ -125,7 +125,7 @@ chdr_converter:
   interface_name: sdr_data
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 125
+  num_ffts_per_batch: 250
   num_simul_batches: 1
   num_channels: 2
   log_packets: false
@@ -133,7 +133,7 @@ chdr_converter:
 
 fft:
   burst_size: 20480
-  num_bursts: 125
+  num_bursts: 250
   num_channels: 2
   spectrum_type: 1
   averaging_type: 1
