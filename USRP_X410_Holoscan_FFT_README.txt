@@ -112,7 +112,7 @@ cd ~/holohub-dev/applications/usrp_freq_detection
 
 python3 rx_to_remote_udp.py \
   --args "addr=192.168.10.2" \
-  --freq 1e9 \
+  --freq 2400e6 \
   --rate 491.52e6 \
   --gain 30 \
   --channels 0 \
