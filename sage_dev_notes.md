@@ -1,6 +1,58 @@
 # Sage Development Notes
 
-Last updated: 2026-03-19
+Last updated: 2026-03-24
+
+## Important Recent Changes (2026-03-24)
+
+### New Application: `usrp_wideband_signal_detection`
+
+- Added a new application parallel to `usrp_freq_detection`:
+  - `applications/usrp_wideband_signal_detection/main.cpp`
+  - `applications/usrp_wideband_signal_detection/config.yaml`
+  - `applications/usrp_wideband_signal_detection/CMakeLists.txt`
+  - `applications/usrp_wideband_signal_detection/README.md`
+  - `applications/usrp_wideband_signal_detection/metadata.json`
+- Graph flow in new app:
+  - `chdrConverterOp -> fftOp -> spectrogramOp -> dinoV3SignalDetectorOp`
+  - plus side branch `fftOp -> logOp`
+
+### New Operator: `dinov3_signal_detector`
+
+- Added operator scaffold and registration:
+  - `operators/dinov3_signal_detector/dinov3_signal_detector.hpp`
+  - `operators/dinov3_signal_detector/dinov3_signal_detector.cu`
+  - `operators/dinov3_signal_detector/CMakeLists.txt`
+  - `operators/dinov3_signal_detector/README.md`
+  - `operators/dinov3_signal_detector/metadata.json`
+  - `operators/CMakeLists.txt` updated to include `dinov3_signal_detector`
+
+### Spectrogram Handoff Update
+
+- Updated `spectrogram` operator to emit passthrough output (`out`) so downstream detector stages can consume the same GPU tensor stream without extra host copies.
+- Files updated:
+  - `operators/spectrogram/spectrogram.hpp`
+  - `operators/spectrogram/spectrogram.cu`
+
+### DINO Detector Backend Modes (Current)
+
+- `dinov3_signal_detector` now supports configurable backend behavior:
+  - `torchscript`: attempts TorchScript model forward on GPU.
+  - `pytorch_placeholder`: runs GPU PyTorch tensor preprocessing and placeholder mask generation.
+  - `cuda_threshold_fallback`: runs CUDA-only threshold masking path.
+- New config knobs include:
+  - `use_pytorch_backend`
+  - `inference_backend`
+  - `model_name`
+  - `model_repo_path`
+  - `weights_path` (placeholder while download completes)
+  - `model_script_path` (placeholder TorchScript path)
+  - `strict_model_forward`
+
+### Model Artifacts Status
+
+- Full DINOv3 model-forward integration is in progress.
+- Current implementation includes a TorchScript hook with safe fallback behavior if model artifacts are missing or forward fails.
+- Placeholder paths are intentionally configured until downloads complete on this machine.
 
 ## FFT Operator Flow
 

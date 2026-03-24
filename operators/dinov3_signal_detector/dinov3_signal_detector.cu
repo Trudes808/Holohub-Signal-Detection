@@ -6,9 +6,12 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <stdexcept>
+#include <vector>
 
 #ifdef HOLOHUB_HAS_TORCH
 #include <torch/torch.h>
+#include <torch/script.h>
 #include <torch/nn/functional.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -84,6 +87,11 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
              "Use PyTorch backend",
              "If true, uses PyTorch tensor operations on GPU as detector path when available.",
              true);
+  spec.param(inference_backend_,
+             "inference_backend",
+             "Inference backend",
+             "Backend mode: torchscript, pytorch_placeholder, or cuda_threshold_fallback.",
+             std::string("torchscript"));
   spec.param(model_name_,
              "model_name",
              "Model name",
@@ -99,6 +107,16 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
              "Weights path",
              "Path to model weights placeholder while downloads complete.",
              std::string("/workspace/models/dinov3/weights/dinov3_vitb16_placeholder.pth"));
+  spec.param(model_script_path_,
+             "model_script_path",
+             "Model script path",
+             "Path to TorchScript model for model-forward backend.",
+             std::string("/workspace/models/dinov3/weights/dinov3_vitb16_placeholder.ts"));
+  spec.param(strict_model_forward_,
+             "strict_model_forward",
+             "Strict model forward",
+             "If true, drop frames when torchscript forward fails instead of falling back.",
+             false);
 }
 
 void DinoV3SignalDetector::initialize() {
@@ -111,6 +129,7 @@ void DinoV3SignalDetector::initialize() {
               MATX_DEVICE_MEMORY);
 
   pytorch_runtime_ready_ = false;
+  torchscript_model_loaded_ = false;
 
 #ifdef HOLOHUB_HAS_TORCH
   if (use_pytorch_backend_.get()) {
@@ -125,6 +144,25 @@ void DinoV3SignalDetector::initialize() {
 
       if (!std::filesystem::exists(weights_path_.get())) {
         HOLOSCAN_LOG_WARN("weights path does not exist: {}", weights_path_.get());
+      }
+
+      if (inference_backend_.get() == "torchscript") {
+        if (!std::filesystem::exists(model_script_path_.get())) {
+          HOLOSCAN_LOG_WARN("TorchScript model path not found (placeholder expected while downloading): {}",
+                            model_script_path_.get());
+        } else {
+          try {
+            torchscript_module_ = torch::jit::load(model_script_path_.get());
+            torchscript_module_.to(torch::kCUDA);
+            torchscript_module_.eval();
+            torchscript_model_loaded_ = true;
+            HOLOSCAN_LOG_INFO("Loaded TorchScript model from {}", model_script_path_.get());
+          } catch (const c10::Error& error) {
+            HOLOSCAN_LOG_WARN("Failed to load TorchScript model '{}': {}",
+                              model_script_path_.get(),
+                              error.what());
+          }
+        }
       }
     }
   }
@@ -203,7 +241,63 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
             .mode(torch::kBilinear)
             .align_corners(false));
 
-    auto mask = resized.squeeze(0).squeeze(0).ge(mask_threshold_db_.get()).to(torch::kFloat32).contiguous();
+    auto backend = inference_backend_.get();
+    torch::Tensor mask;
+
+    if (backend == "torchscript" && torchscript_model_loaded_) {
+      try {
+        std::vector<torch::jit::IValue> model_inputs;
+        model_inputs.emplace_back(resized.to(torch::kFloat32));
+
+        auto model_output = torchscript_module_.forward(model_inputs);
+        torch::Tensor logits;
+
+        if (model_output.isTensor()) {
+          logits = model_output.toTensor();
+        } else if (model_output.isTuple()) {
+          auto tuple_ptr = model_output.toTuple();
+          if (tuple_ptr && !tuple_ptr->elements().empty() && tuple_ptr->elements()[0].isTensor()) {
+            logits = tuple_ptr->elements()[0].toTensor();
+          }
+        }
+
+        if (!logits.defined()) {
+          throw std::runtime_error("TorchScript forward returned non-tensor output");
+        }
+
+        if (logits.dim() == 4) {
+          logits = logits.squeeze(0).squeeze(0);
+        } else if (logits.dim() == 3) {
+          logits = logits.squeeze(0);
+        }
+
+        if (logits.sizes().size() != 2 ||
+            logits.size(0) != static_cast<int64_t>(dst_rows) ||
+            logits.size(1) != static_cast<int64_t>(dst_cols)) {
+          logits = torch::nn::functional::interpolate(
+                       logits.unsqueeze(0).unsqueeze(0),
+                       torch::nn::functional::InterpolateFuncOptions()
+                           .size(std::vector<int64_t>{static_cast<int64_t>(dst_rows), static_cast<int64_t>(dst_cols)})
+                           .mode(torch::kBilinear)
+                           .align_corners(false))
+                       .squeeze(0)
+                       .squeeze(0);
+        }
+
+        mask = logits.ge(mask_threshold_db_.get()).to(torch::kFloat32).contiguous();
+        backend = "torchscript";
+      } catch (const std::exception& error) {
+        HOLOSCAN_LOG_WARN("TorchScript forward failed; {}. Falling back to pytorch_placeholder path.", error.what());
+        if (strict_model_forward_.get()) {
+          return;
+        }
+        mask = resized.squeeze(0).squeeze(0).ge(mask_threshold_db_.get()).to(torch::kFloat32).contiguous();
+        backend = "pytorch_placeholder";
+      }
+    } else {
+      mask = resized.squeeze(0).squeeze(0).ge(mask_threshold_db_.get()).to(torch::kFloat32).contiguous();
+      backend = "pytorch_placeholder";
+    }
 
     auto copy_result = cudaMemcpyAsync(out.Data(),
                                        mask.data_ptr<float>(),
@@ -219,12 +313,14 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     meta->set("dino_mask_height", static_cast<uint32_t>(dst_rows));
     meta->set("dino_mask_width", static_cast<uint32_t>(dst_cols));
     meta->set("dino_mask_threshold_db", mask_threshold_db_.get());
-    meta->set("dino_backend", std::string("pytorch_placeholder"));
+    meta->set("dino_backend", backend);
     meta->set("dino_model_name", model_name_.get());
     meta->set("dino_weights_path", weights_path_.get());
+    meta->set("dino_model_script_path", model_script_path_.get());
 
     if (log_detections_.get()) {
-      HOLOSCAN_LOG_INFO("DINOv3 detector (PyTorch path) emitted mask for channel {} frame {} shape {}x{}",
+      HOLOSCAN_LOG_INFO("DINOv3 detector ({} path) emitted mask for channel {} frame {} shape {}x{}",
+                        backend,
                         channel_number,
                         frame_number,
                         dst_rows,
@@ -266,6 +362,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
   meta->set("dino_backend", std::string("cuda_threshold_fallback"));
   meta->set("dino_model_name", model_name_.get());
   meta->set("dino_weights_path", weights_path_.get());
+  meta->set("dino_model_script_path", model_script_path_.get());
 
   if (log_detections_.get()) {
     HOLOSCAN_LOG_INFO("DINOv3 detector emitted mask for channel {} frame {} with shape {}x{}",

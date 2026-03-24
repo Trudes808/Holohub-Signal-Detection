@@ -7,6 +7,10 @@
 #include <holoscan/holoscan.hpp>
 #include <matx.h>
 
+#ifdef HOLOHUB_HAS_TORCH
+#include <torch/script.h>
+#endif
+
 namespace holoscan::ops {
 
 using dino_complex = cuda::std::complex<float>;
@@ -33,14 +37,22 @@ class DinoV3SignalDetector : public holoscan::Operator {
   holoscan::Parameter<float> mask_threshold_db_;
   holoscan::Parameter<bool> log_detections_;
     holoscan::Parameter<bool> use_pytorch_backend_;
+    holoscan::Parameter<std::string> inference_backend_;
     holoscan::Parameter<std::string> model_name_;
     holoscan::Parameter<std::string> model_repo_path_;
     holoscan::Parameter<std::string> weights_path_;
+    holoscan::Parameter<std::string> model_script_path_;
+    holoscan::Parameter<bool> strict_model_forward_;
 
   std::vector<uint64_t> frame_count_;
   matx::tensor_t<float, 3> detection_masks_;
     bool pytorch_runtime_ready_ = false;
     bool pytorch_warning_emitted_ = false;
+    bool torchscript_model_loaded_ = false;
+
+  #ifdef HOLOHUB_HAS_TORCH
+    torch::jit::script::Module torchscript_module_;
+  #endif
 };
 
 }  // namespace holoscan::ops

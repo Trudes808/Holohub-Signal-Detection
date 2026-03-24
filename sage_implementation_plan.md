@@ -460,3 +460,142 @@ Start with **Phase 0** and produce a short baseline report including:
 2. observed packet/FFT cadence,
 3. current latency and memory stats,
 4. issues to resolve before Phase 1.
+
+
+## 10) Resume Plan After DINO Download Completes
+
+Use this section as the **exact re-entry checklist** once model artifacts are present on disk.
+
+### 10.1 Prerequisite artifact check
+
+Confirm all required artifacts exist before code changes:
+
+1. DINO repo path exists and is readable.
+2. Model weights file exists (`weights_path`).
+3. TorchScript export file exists (`model_script_path`) **or** ONNX file is ready if switching to TRT path.
+4. Target app config points to real artifact paths (not placeholders).
+
+If any artifact is missing, stop and resolve artifact generation/download first.
+
+### 10.2 Config finalize step
+
+Update app config in `applications/usrp_wideband_signal_detection/config.yaml`:
+
+1. Set `dinov3_signal_detector.inference_backend`:
+   - `torchscript` for immediate model-forward bring-up.
+   - `cuda_threshold_fallback` only for temporary non-ML runs.
+2. Replace placeholder values for:
+   - `model_repo_path`
+   - `weights_path`
+   - `model_script_path`
+3. Set `strict_model_forward: true` for validation runs.
+
+### 10.3 Operator bring-up sequence
+
+Perform bring-up in this order:
+
+1. Start with **single channel** and reduced load profile.
+2. Verify operator logs show TorchScript loaded successfully.
+3. Verify metadata reports `dino_backend=torchscript`.
+4. Confirm no fallback warnings are emitted.
+
+Exit criteria for this step:
+- Model-forward path runs without fallback for at least a short sustained run.
+
+### 10.4 Input contract alignment (must pass)
+
+Validate model input assumptions against actual tensors:
+
+1. Confirm detector input shape from spectrogram path is as expected.
+2. Confirm model expected layout and dtype (e.g., NCHW FP32/FP16).
+3. If mismatched, implement explicit preprocessing in operator:
+   - channel expansion / replication,
+   - normalization constants,
+   - resize/crop policy,
+   - dtype cast.
+
+Exit criteria:
+- Input tensor contract is documented and deterministic.
+
+### 10.5 Parity validation against notebook reference
+
+Run one fixed spectrogram slice through both paths:
+
+1. Notebook reference (`rf_spectrogram_segmentation.ipynb`).
+2. C++ operator path (`usrp_wideband_signal_detection`).
+
+Compare:
+- mask overlap (IoU),
+- foreground area fraction,
+- basic localization consistency.
+
+Exit criteria:
+- Parity metrics meet agreed threshold and are recorded.
+
+### 10.6 Throughput restoration and scale-up
+
+After parity passes:
+
+1. Enable 2-channel profile.
+2. Re-enable target FFT/spectrogram sizes.
+3. Tune `emit_stride`, queue depth, and scheduler settings.
+4. Capture latency and stability metrics under sustained load.
+
+Exit criteria:
+- Stable sustained run with bounded memory and controlled inference cadence.
+
+### 10.7 Immediate follow-on tasks (post-download)
+
+1. Add postprocess stage after detector (connected components / boxes / confidence summary).
+2. Promote debug metadata into formal output schema.
+3. Add explicit troubleshooting notes for model-load and fallback modes.
+4. Update docs with final artifact placement conventions.
+
+### 10.8 Session Restart Quick Commands
+
+Use these commands as a minimal restart sequence.
+
+```bash
+# 1) Artifact presence checks
+ls -lh /workspace/models/dinov3
+ls -lh /workspace/models/dinov3/weights
+
+# 2) Confirm config keys and current values
+grep -n "inference_backend\|model_repo_path\|weights_path\|model_script_path\|strict_model_forward" \
+   /workspace/holohub/applications/usrp_wideband_signal_detection/config.yaml
+
+# 3) (Optional) update placeholders with real paths
+# Example edits (use your real file names)
+sed -i 's|inference_backend: ".*"|inference_backend: "torchscript"|g' \
+   /workspace/holohub/applications/usrp_wideband_signal_detection/config.yaml
+sed -i 's|strict_model_forward: .*|strict_model_forward: true|g' \
+   /workspace/holohub/applications/usrp_wideband_signal_detection/config.yaml
+
+# 4) Rebuild app target
+cd /workspace/holohub
+cmake --build build -j --target usrp_wideband_signal_detection
+
+# 5) Run pipeline (Terminal 1)
+cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection
+./usrp_wideband_signal_detection config.yaml
+
+# 6) Start USRP stream (Terminal 2, host)
+cd ~/holohub-dev/applications/usrp_wideband_signal_detection
+python3 ../usrp_freq_detection/rx_to_remote_udp.py \
+   --args "addr=192.168.10.2" \
+   --freq 2400e6 \
+   --rate 491.52e6 \
+   --gain 30 \
+   --channels 0 \
+   --dest-addr 192.168.100.51 \
+   --dest-port 1234 \
+   --keep-hdr \
+   --adapter sfp1 \
+   --dest-mac-addr E0:9D:73:E0:5B:E6
+
+# 7) Verify backend behavior from logs
+grep -E "DINOv3 detector|TorchScript|fallback|dino_backend" -n \
+   /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection/*.log 2>/dev/null || true
+```
+
+If step 7 shows fallback while artifacts are present, run with `strict_model_forward: true` and resolve load/forward errors before continuing throughput tuning.
