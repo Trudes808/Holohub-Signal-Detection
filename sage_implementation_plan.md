@@ -1,17 +1,25 @@
 # Sage Step-by-Step Implementation Plan
 
-Last updated: 2026-03-24
+Last updated: 2026-04-01
 
 ## 1) Purpose and Scope
 
-This document defines a **careful, executable implementation plan** for adding:
+This document defines a careful, executable implementation plan for the current Holohub signal-detection integration path.
 
-1. A new **Spectrogram Operator**
-2. A new **DINOv3 Signal Detection stage** (operator or InferenceOp integration)
+The active implementation target is the dedicated wideband detection application:
 
-for a high-throughput SDR workload targeting **2 channels at 500 Msps each**.
+- `applications/usrp_wideband_signal_detection`
 
-This is a delivery plan (not code), designed to be followed incrementally in future sessions.
+This plan covers:
+
+1. hardening the existing Spectrogram and DinoV3 signal-detector operator path,
+2. packaging the local DINOv3 repository and weights for use inside the Holohub container,
+3. exporting and validating a TorchScript model-forward path, and
+4. restoring sustained multi-channel testing after strict single-channel validation.
+
+The earlier phase structure in this document remains useful as implementation history, but the current re-entry point for active development is the dedicated wideband application and the step-10 resume checklist below.
+
+This is a delivery plan, not code, designed to be followed incrementally in future sessions.
 
 
 ## 2) Success Criteria
@@ -45,6 +53,16 @@ The project is considered successful when all of the following are true:
 ## 4) Project Phases
 
 Each phase includes: objective, tasks, file touchpoints, validation, and exit criteria.
+
+### Current implementation status
+
+The original phases below describe the intended build-out order. In the current repository state, the major scaffolding work has already moved into a dedicated application and custom operators:
+
+- `applications/usrp_wideband_signal_detection`
+- `operators/spectrogram`
+- `operators/dinov3_signal_detector`
+
+Because of that, active development should resume from the step-10 re-entry checklist rather than restarting at Phase 0 unless baseline re-validation is specifically needed.
 
 ---
 
@@ -454,148 +472,192 @@ The project is complete when:
 
 ## 9) Immediate Next Session Starter (Recommended)
 
-Start with **Phase 0** and produce a short baseline report including:
+Resume from section 10 using the dedicated wideband detection application and the packaged DINOv3 runtime path.
 
-1. config profile used,
-2. observed packet/FFT cadence,
-3. current latency and memory stats,
-4. issues to resolve before Phase 1.
+The first session back should produce a short packaging and runtime-readiness report including:
+
+1. confirmation that the local DINOv3 repo exists at `/home/sat3737/holoscan_demo_workspace/dinov3`,
+2. confirmation that the selected weight file exists at `/home/sat3737/holoscan_demo_workspace/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`,
+3. confirmation that those assets have been staged into the Holohub container under `/workspace/models/dinov3`,
+4. confirmation that a TorchScript export exists at the final container runtime path,
+5. confirmation that the app config points to real staged artifacts rather than placeholders,
+6. confirmation that spectrogram debug image saving is disabled for model-forward validation runs, and
+7. any build or runtime issues that must be resolved before strict single-channel bring-up.
 
 
-## 10) Resume Plan After DINO Download Completes
+## 10) Resume Plan For Holohub Re-Entry
 
-Use this section as the **exact re-entry checklist** once model artifacts are present on disk.
+Use this section as the exact re-entry checklist for returning to Holohub development on the current wideband signal-detection path.
 
-### 10.1 Prerequisite artifact check
+### 10.0 Package DINOv3 assets into the Holohub container
 
-Confirm all required artifacts exist before code changes:
+Treat the host workspace as the source of truth and the container path as the runtime source of truth.
 
-1. DINO repo path exists and is readable.
-2. Model weights file exists (`weights_path`).
-3. TorchScript export file exists (`model_script_path`) **or** ONNX file is ready if switching to TRT path.
-4. Target app config points to real artifact paths (not placeholders).
+Host-side source of truth:
 
-If any artifact is missing, stop and resolve artifact generation/download first.
+1. Local DINOv3 repository:
+   - `/home/sat3737/holoscan_demo_workspace/dinov3`
+2. Selected weight artifact:
+   - `/home/sat3737/holoscan_demo_workspace/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`
 
-### 10.2 Config finalize step
+Container-side runtime target:
+
+1. Repository root:
+   - `/workspace/models/dinov3`
+2. Weights directory:
+   - `/workspace/models/dinov3/weights`
+
+Packaging requirements:
+
+1. Stage the local DINOv3 repository into `/workspace/models/dinov3` as container-managed content.
+2. Stage the exact selected weight file into `/workspace/models/dinov3/weights`.
+3. Include the repository files required by the current notebook-based local load flow, especially:
+   - `hubconf.py`
+   - Python package sources under `dinov3/`
+   - any repo metadata needed by local `torch.hub` loading
+4. Record the final canonical container paths that runtime config and export tooling will use.
+
+If packaging is incomplete, stop here and resolve container asset staging first.
+
+### 10.1 Export the runtime model artifact inside the container
+
+Before app bring-up, export a TorchScript artifact from the packaged container-side repo and weight set.
+
+Requirements:
+
+1. Run export from inside the target Holohub container environment.
+2. Use the packaged repository under `/workspace/models/dinov3`.
+3. Use the staged weight file `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`.
+4. Write the exported TorchScript model into the canonical runtime tree, preferably under `/workspace/models/dinov3/weights`.
+5. Record the exact exported filename that will be referenced by config.
+
+Rationale:
+
+- this avoids host-versus-container mismatches in PyTorch, CUDA, and dependency behavior.
+
+Exit criteria:
+
+- a real TorchScript artifact exists on disk inside the container runtime layout.
+
+### 10.2 Prerequisite runtime gate
+
+Confirm all required runtime artifacts exist before code or config validation:
+
+1. The container repo path exists and is readable:
+   - `/workspace/models/dinov3`
+2. The exact staged weight file exists.
+3. The exported TorchScript file exists.
+4. The target app config points to those exact staged artifact paths.
+5. No placeholder filenames remain in active config or detector documentation.
+
+If any artifact is missing or any placeholder remains, stop and resolve that before bring-up.
+
+### 10.3 Config finalize step
 
 Update app config in `applications/usrp_wideband_signal_detection/config.yaml`:
 
-1. Set `dinov3_signal_detector.inference_backend`:
-   - `torchscript` for immediate model-forward bring-up.
-   - `cuda_threshold_fallback` only for temporary non-ML runs.
-2. Replace placeholder values for:
+1. Set `dinov3_signal_detector.inference_backend` to `torchscript`.
+2. Keep `use_pytorch_backend` enabled.
+3. Replace placeholder values for:
    - `model_repo_path`
    - `weights_path`
    - `model_script_path`
-3. Set `strict_model_forward: true` for validation runs.
+4. Set `strict_model_forward: true` for validation runs.
+5. Disable `spectrogram.enable_save` for bring-up and performance runs.
 
-### 10.3 Operator bring-up sequence
+Reason for disabling spectrogram save during validation:
+
+- the current spectrogram operator still performs device-to-host copies and stream synchronization when writing debug images, so it should be treated as a debug-only path during model-forward validation.
+
+### 10.4 Build validation
+
+Before runtime testing:
+
+1. Reconfigure and rebuild the app inside the Holohub container.
+2. Confirm the detector builds through the Torch-enabled branch in `operators/dinov3_signal_detector/CMakeLists.txt`.
+3. Verify the detector is compiled with Torch support enabled before any runtime inference testing begins.
+
+Exit criteria:
+
+- build output confirms Torch support is active for `dinov3_signal_detector`.
+
+### 10.5 Operator bring-up sequence
 
 Perform bring-up in this order:
 
-1. Start with **single channel** and reduced load profile.
-2. Verify operator logs show TorchScript loaded successfully.
+1. Start with single channel and reduced load.
+2. Verify operator logs show TorchScript loaded successfully from the staged container path.
 3. Verify metadata reports `dino_backend=torchscript`.
 4. Confirm no fallback warnings are emitted.
-
-Exit criteria for this step:
-- Model-forward path runs without fallback for at least a short sustained run.
-
-### 10.4 Input contract alignment (must pass)
-
-Validate model input assumptions against actual tensors:
-
-1. Confirm detector input shape from spectrogram path is as expected.
-2. Confirm model expected layout and dtype (e.g., NCHW FP32/FP16).
-3. If mismatched, implement explicit preprocessing in operator:
-   - channel expansion / replication,
-   - normalization constants,
-   - resize/crop policy,
-   - dtype cast.
+5. Confirm the detector emits masks without dropping into `pytorch_placeholder` or `cuda_threshold_fallback`.
 
 Exit criteria:
-- Input tensor contract is documented and deterministic.
 
-### 10.5 Parity validation against notebook reference
+- model-forward path runs without fallback for at least a short sustained single-channel run.
 
-Run one fixed spectrogram slice through both paths:
+### 10.6 Input contract audit
 
-1. Notebook reference (`rf_spectrogram_segmentation.ipynb`).
-2. C++ operator path (`usrp_wideband_signal_detection`).
+Validate and document the current detector input contract before broader optimization:
 
-Compare:
-- mask overlap (IoU),
-- foreground area fraction,
-- basic localization consistency.
+1. Confirm the current spectrogram operator contract is still passthrough-oriented rather than a final image-tensor producer.
+2. Confirm the detector currently derives power, resize behavior, and thresholding directly from FFT-domain input.
+3. Record this as the accepted short-term contract for bring-up.
+4. Defer any true spectrogram-tensor refactor until after stable TorchScript model-forward validation.
 
 Exit criteria:
-- Parity metrics meet agreed threshold and are recorded.
 
-### 10.6 Throughput restoration and scale-up
+- the temporary input contract is documented and acknowledged as intentional.
 
-After parity passes:
+### 10.7 Parity validation against notebook references
 
-1. Enable 2-channel profile.
-2. Re-enable target FFT/spectrogram sizes.
-3. Tune `emit_stride`, queue depth, and scheduler settings.
-4. Capture latency and stability metrics under sustained load.
+Run one fixed captured input through both the notebook and C++ paths.
+
+Notebook references:
+
+1. `noise_detection_dino_experiments2.ipynb`
+   - source of truth for local repo loading assumptions, weight selection, and patch-size assumptions
+2. `rf_spectrogram_segmentation.ipynb`
+   - preprocessing and mask-parity reference
+
+Validation layers:
+
+1. Preprocessing parity:
+   - compare the power-domain and resized model input used by the detector path against the notebook reference
+2. Output parity:
+   - compare final masks using IoU, foreground area fraction, and basic localization consistency
 
 Exit criteria:
-- Stable sustained run with bounded memory and controlled inference cadence.
 
-### 10.7 Immediate follow-on tasks (post-download)
+- parity metrics meet the agreed threshold and are recorded.
 
-1. Add postprocess stage after detector (connected components / boxes / confidence summary).
-2. Promote debug metadata into formal output schema.
-3. Add explicit troubleshooting notes for model-load and fallback modes.
-4. Update docs with final artifact placement conventions.
+### 10.8 Throughput restoration and scale-up
 
-### 10.8 Session Restart Quick Commands
+After strict bring-up and parity pass:
 
-Use these commands as a minimal restart sequence.
+1. Restore the target 2-channel profile.
+2. Re-enable representative FFT and detector settings.
+3. Tune `emit_stride`, logging, and scheduler settings.
+4. Keep spectrogram saving disabled unless it is explicitly needed for sampled debug output.
+5. Capture latency, bounded-memory behavior, and sustained-run stability metrics.
 
-```bash
-# 1) Artifact presence checks
-ls -lh /workspace/models/dinov3
-ls -lh /workspace/models/dinov3/weights
+Exit criteria:
 
-# 2) Confirm config keys and current values
-grep -n "inference_backend\|model_repo_path\|weights_path\|model_script_path\|strict_model_forward" \
-   /workspace/holohub/applications/usrp_wideband_signal_detection/config.yaml
+- stable sustained run with bounded memory, controlled inference cadence, and no unintended backend regressions.
 
-# 3) (Optional) update placeholders with real paths
-# Example edits (use your real file names)
-sed -i 's|inference_backend: ".*"|inference_backend: "torchscript"|g' \
-   /workspace/holohub/applications/usrp_wideband_signal_detection/config.yaml
-sed -i 's|strict_model_forward: .*|strict_model_forward: true|g' \
-   /workspace/holohub/applications/usrp_wideband_signal_detection/config.yaml
+### 10.9 Immediate follow-on tasks
 
-# 4) Rebuild app target
-cd /workspace/holohub
-cmake --build build -j --target usrp_wideband_signal_detection
+1. Add a postprocess or sink stage after the detector so outputs are validated by more than logs and metadata.
+2. Promote debug metadata into a formal downstream output schema.
+3. Add explicit troubleshooting notes for model-load, export, packaging, and fallback modes.
+4. Decide whether the spectrogram operator remains a debug saver or becomes the true tensor-producing preprocessing stage.
 
-# 5) Run pipeline (Terminal 1)
-cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection
-./usrp_wideband_signal_detection config.yaml
+### 10.10 Session restart quick checks
 
-# 6) Start USRP stream (Terminal 2, host)
-cd ~/holohub-dev/applications/usrp_wideband_signal_detection
-python3 ../usrp_freq_detection/rx_to_remote_udp.py \
-   --args "addr=192.168.10.2" \
-   --freq 2400e6 \
-   --rate 491.52e6 \
-   --gain 30 \
-   --channels 0 \
-   --dest-addr 192.168.100.51 \
-   --dest-port 1234 \
-   --keep-hdr \
-   --adapter sfp1 \
-   --dest-mac-addr E0:9D:73:E0:5B:E6
+Use the following session checklist after any pause in work:
 
-# 7) Verify backend behavior from logs
-grep -E "DINOv3 detector|TorchScript|fallback|dino_backend" -n \
-   /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection/*.log 2>/dev/null || true
-```
-
-If step 7 shows fallback while artifacts are present, run with `strict_model_forward: true` and resolve load/forward errors before continuing throughput tuning.
+1. Confirm host-side repo and selected weight still exist.
+2. Confirm packaged container-side repo and weight staging still exist.
+3. Confirm the exported TorchScript artifact still exists at the configured path.
+4. Confirm `applications/usrp_wideband_signal_detection/config.yaml` still points to the staged runtime paths and not placeholders.
+5. Rebuild and confirm Torch support is still enabled.
+6. Re-run strict single-channel validation before returning to 2-channel throughput tuning.
