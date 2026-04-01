@@ -119,8 +119,11 @@ python3 rx_to_remote_udp.py \
   --dest-addr 192.168.100.51 \
   --dest-port 1234 \
   --keep-hdr \
-  --adapter sfp1 \
+  --adapter sfp0 \
   --dest-mac-addr E0:9D:73:E0:5B:E6
+
+# Note: if `uhd_usrp_probe` reports `fpga=X4_200`, the X410 will only grant
+# 245.76 Msps here. Flash a `CG_400` image before expecting 491.52 Msps.
 
 # To change center frequency, modify --freq (in Hz)
 # Example: 2.4 GHz = --freq 2.4e9

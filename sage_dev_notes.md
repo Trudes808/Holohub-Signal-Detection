@@ -1,6 +1,6 @@
 # Sage Development Notes
 
-Last updated: 2026-03-24
+Last updated: 2026-04-01
 
 ## Important Recent Changes (2026-03-24)
 
@@ -50,9 +50,15 @@ Last updated: 2026-03-24
 
 ### Model Artifacts Status
 
-- Full DINOv3 model-forward integration is in progress.
-- Current implementation includes a TorchScript hook with safe fallback behavior if model artifacts are missing or forward fails.
-- Placeholder paths are intentionally configured until downloads complete on this machine.
+- Full DINOv3 model-forward integration is still in progress.
+- The local host-side DINOv3 repo is now known:
+  - `/home/sat3737/holoscan_demo_workspace/dinov3`
+- The selected host-side weight file is now known:
+  - `/home/sat3737/holoscan_demo_workspace/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`
+- The runtime source of truth remains the Holohub container path:
+  - `/workspace/models/dinov3`
+- Current implementation includes a TorchScript hook with strict validation available via `strict_model_forward=true`.
+- Remaining work is container staging plus TorchScript export under `/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts`.
 
 ## FFT Operator Flow
 

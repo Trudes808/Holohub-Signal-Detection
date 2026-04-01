@@ -2,6 +2,23 @@
 
 Last updated: 2026-04-01
 
+## Current re-entry status (2026-04-01)
+
+Completed since the original step-10 resume:
+
+- container helper scripts were added for build, run, setup, and shell entry,
+- the local DINOv3 repo and weights are staged into the Holohub container and exported to TorchScript in-container,
+- the application builds successfully in local container mode with Torch enabled,
+- a strict TorchScript runtime attempt still segfaults in the C++ operator initialization path,
+- the active default config was intentionally moved to a stable debug-artifact mode,
+- separate TorchScript validation and load-only diagnostic configs are now part of the application build output.
+
+Immediate next steps:
+
+1. run `config.yaml` to verify the first 5 spectrograms and first 5 detector masks are written as expected,
+2. run `config_torchscript_load_only.yaml` to confirm whether `torch::jit::load(...)` remains stable in the live application process,
+3. run `config_torchscript_validation.yaml` to identify whether the crash happens before or after the new `to_cuda` and `eval` stage logs.
+
 ## 1) Purpose and Scope
 
 This document defines a careful, executable implementation plan for the current Holohub signal-detection integration path.
@@ -489,6 +506,31 @@ The first session back should produce a short packaging and runtime-readiness re
 
 Use this section as the exact re-entry checklist for returning to Holohub development on the current wideband signal-detection path.
 
+### Current re-entry status (2026-04-01)
+
+Completed in the current session:
+
+1. Step 10.0 is complete.
+   - The local DINOv3 repo and selected weight were staged into `/workspace/models/dinov3` and `/workspace/models/dinov3/weights`.
+2. Step 10.1 is complete.
+   - TorchScript export now succeeds on GPU and writes:
+   - `/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts`
+3. Step 10.2 is complete.
+   - Runtime artifact paths exist in-container and active config points at the staged `.pth` and `.ts` artifacts.
+4. Step 10.3 is complete.
+   - `applications/usrp_wideband_signal_detection/config.yaml` is aligned to the staged artifacts, strict model-forward validation, and spectrogram save disabled.
+5. Step 10.4 is complete.
+   - `usrp_wideband_signal_detection` now configures and builds successfully in the Holohub container, including the Torch-enabled `dinov3_signal_detector` path.
+
+Next active step:
+
+1. Start at step 10.5.
+2. Perform first runtime bring-up with reduced load and verify:
+   - TorchScript loads from the staged container path
+   - detector metadata reports `dino_backend=torchscript`
+   - no fallback warnings are emitted
+   - mask output is produced on the strict model-forward path
+
 ### 10.0 Package DINOv3 assets into the Holohub container
 
 Treat the host workspace as the source of truth and the container path as the runtime source of truth.
@@ -538,6 +580,7 @@ Rationale:
 Exit criteria:
 
 - a real TorchScript artifact exists on disk inside the container runtime layout.
+- status: complete on 2026-04-01 with export path `/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts`.
 
 ### 10.2 Prerequisite runtime gate
 
@@ -580,6 +623,7 @@ Before runtime testing:
 Exit criteria:
 
 - build output confirms Torch support is active for `dinov3_signal_detector`.
+- status: complete on 2026-04-01; app binary produced at `build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection/usrp_wideband_signal_detection`.
 
 ### 10.5 Operator bring-up sequence
 
@@ -594,6 +638,12 @@ Perform bring-up in this order:
 Exit criteria:
 
 - model-forward path runs without fallback for at least a short sustained single-channel run.
+
+Immediate next action:
+
+1. Launch the built app inside the refreshed container using the strict TorchScript configuration already in `applications/usrp_wideband_signal_detection/config.yaml`.
+2. Keep channel count and load reduced for first runtime confirmation.
+3. Capture operator logs and metadata for the first successful `torchscript` inference pass before any throughput tuning.
 
 ### 10.6 Input contract audit
 
