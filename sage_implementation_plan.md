@@ -17,7 +17,9 @@ Immediate next steps:
 
 1. run `config.yaml` to verify the first 5 spectrograms and first 5 detector masks are written as expected,
 2. run `config_torchscript_load_only.yaml` to confirm whether `torch::jit::load(...)` remains stable in the live application process,
-3. run `config_torchscript_validation.yaml` to identify whether the crash happens before or after the new `to_cuda` and `eval` stage logs.
+3. run `config_torchscript_cpu_eval.yaml` to verify whether `eval()` is stable while staying on CPU,
+4. run `config_torchscript_cuda_no_eval.yaml` to determine whether the failure appears when the module moves to CUDA,
+5. run `config_torchscript_validation.yaml` only after the staged diagnostics above, so the final crash boundary is already known.
 
 ## 1) Purpose and Scope
 

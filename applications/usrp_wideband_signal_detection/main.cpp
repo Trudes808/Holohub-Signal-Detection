@@ -6,6 +6,35 @@
 #include <fft.hpp>
 #include <spectrogram.hpp>
 
+namespace {
+
+std::filesystem::path resolve_config_path(const char* argv0, const char* config_arg) {
+  const std::filesystem::path requested(config_arg);
+  const auto binary_dir = std::filesystem::canonical(argv0).parent_path();
+
+  if (requested.is_absolute() && std::filesystem::exists(requested)) {
+    return requested;
+  }
+
+  if (std::filesystem::exists(requested)) {
+    return std::filesystem::absolute(requested);
+  }
+
+  const auto from_binary_dir = binary_dir / requested;
+  if (std::filesystem::exists(from_binary_dir)) {
+    return from_binary_dir;
+  }
+
+  const auto from_source_dir = std::filesystem::path(USRP_WIDEBAND_APP_SOURCE_DIR) / requested;
+  if (std::filesystem::exists(from_source_dir)) {
+    return from_source_dir;
+  }
+
+  return from_binary_dir;
+}
+
+}  // namespace
+
 class LogOp: public holoscan::Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(LogOp)
@@ -125,8 +154,7 @@ int main(int argc, char** argv) {
     return -1;
   }
 
-  auto config_path = std::filesystem::canonical(argv[0]).parent_path();
-  config_path += "/" + std::string(argv[1]);
+  auto config_path = resolve_config_path(argv[0], argv[1]);
 
   if (!std::filesystem::exists(config_path)) {
     HOLOSCAN_LOG_ERROR("Configuration file '{}' does not exist", static_cast<std::string>(config_path));

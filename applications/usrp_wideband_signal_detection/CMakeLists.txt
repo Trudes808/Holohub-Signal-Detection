@@ -85,6 +85,11 @@ target_include_directories(usrp_wideband_signal_detection
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+target_compile_definitions(usrp_wideband_signal_detection
+  PRIVATE
+  USRP_WIDEBAND_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
 if(NOT DEFINED ANO_MGR)
     set(ANO_MGR "dpdk gpunetio" CACHE STRING "Manager type(s) list")
 endif()
@@ -96,6 +101,8 @@ endforeach()
 
   set(USRP_WIDEBAND_CONFIG_FILES
     config.yaml
+    config_torchscript_cpu_eval.yaml
+    config_torchscript_cuda_no_eval.yaml
     config_torchscript_validation.yaml
     config_torchscript_load_only.yaml
   )

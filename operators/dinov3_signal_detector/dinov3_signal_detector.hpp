@@ -59,6 +59,7 @@ class DinoV3SignalDetector : public holoscan::Operator {
   bool torchscript_model_loaded_ = false;
   bool torchscript_forward_ready_ = false;
   bool torchscript_forward_warning_emitted_ = false;
+  bool torchscript_forward_trace_emitted_ = false;
 
 #ifdef HOLOHUB_HAS_TORCH
   std::unique_ptr<torch::jit::script::Module> torchscript_module_;

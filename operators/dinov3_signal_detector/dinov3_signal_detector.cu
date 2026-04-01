@@ -217,6 +217,7 @@ void DinoV3SignalDetector::initialize() {
   torchscript_model_loaded_ = false;
   torchscript_forward_ready_ = false;
   torchscript_forward_warning_emitted_ = false;
+  torchscript_forward_trace_emitted_ = false;
 
 #ifdef HOLOHUB_HAS_TORCH
   if (use_pytorch_backend_.get()) {
@@ -426,10 +427,29 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
 
     if (backend == "torchscript" && torchscript_model_loaded_ && torchscript_forward_ready_) {
       try {
+        if (!torchscript_forward_trace_emitted_) {
+          HOLOSCAN_LOG_INFO(
+              "TorchScript forward trace: channel={} frame={} input={}x{} resized={}x{} backend={} init_mode={}",
+              channel_number,
+              frame_number,
+              src_rows,
+              src_cols,
+              dst_rows,
+              dst_cols,
+              backend,
+              torchscript_init_mode_.get());
+          HOLOSCAN_LOG_INFO("TorchScript forward trace: invoking torchscript_module_->forward(...) on CUDA tensor");
+        }
+
         std::vector<torch::jit::IValue> model_inputs;
         model_inputs.emplace_back(resized.to(torch::kFloat32));
 
         auto model_output = torchscript_module_->forward(model_inputs);
+
+        if (!torchscript_forward_trace_emitted_) {
+          HOLOSCAN_LOG_INFO("TorchScript forward trace: forward(...) returned successfully");
+        }
+
         torch::Tensor logits;
 
         if (model_output.isTensor()) {
@@ -466,6 +486,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
 
         mask = logits.ge(mask_threshold_db_.get()).to(torch::kFloat32).contiguous();
         backend = "torchscript";
+        torchscript_forward_trace_emitted_ = true;
       } catch (const std::exception& error) {
         HOLOSCAN_LOG_WARN("TorchScript forward failed; {}. Falling back to pytorch_placeholder path.", error.what());
         if (strict_model_forward_.get()) {

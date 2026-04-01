@@ -31,6 +31,12 @@ Available configs copied into the build directory:
 	- stable debug-artifact mode
 	- saves the first 5 spectrograms and first 5 detector masks per channel
 	- keeps `inference_backend: "pytorch_placeholder"` so the known C++ TorchScript init crash does not block runtime checks
+- `config_torchscript_cpu_eval.yaml`
+	- isolates whether `eval()` is safe while the module is still on CPU
+	- uses `inference_backend: "torchscript"`, `torchscript_init_mode: "load_cpu_eval"`, and `strict_model_forward: false`
+- `config_torchscript_cuda_no_eval.yaml`
+	- isolates whether the CUDA transfer itself is safe before `eval()` runs
+	- uses `inference_backend: "torchscript"`, `torchscript_init_mode: "load_cuda_no_eval"`, and `strict_model_forward: false`
 - `config_torchscript_validation.yaml`
 	- strict crash-repro and validation mode
 	- uses `inference_backend: "torchscript"`, `strict_model_forward: true`, and `torchscript_init_mode: "load_cuda_eval"`
@@ -55,6 +61,9 @@ The application directory now includes three host-side helper scripts for the co
 	- stages the local DINOv3 repo and selected weight into the running container, verifies `nvidia-smi` works inside the container, installs a pinned CUDA 12.6 PyTorch stack plus the DINOv3 Python requirements when needed, exports the TorchScript artifact on GPU, and by default builds the application inside the container
 	- bootstraps MatX inside the running container if `/usr/local/lib/cmake/matx/matx-config.cmake` is missing, so an older image can still complete the build without a full rebuild
 	- verifies DPDK build dependencies are present before the application configure step and stops early if the container must be rebuilt from the MatX/USRP-enabled image
+- `rebuild_demo_container_app.sh`
+	- rebuilds only `usrp_wideband_signal_detection` inside the existing container and lists the generated app build directory
+	- use this after source edits when the container already has staged models and dependencies
 - `enter_demo_container.sh`
 	- opens an interactive bash shell in the named container and auto-starts it if needed
 
@@ -86,11 +95,20 @@ If you want setup to skip dependency installation or app build:
 INSTALL_PYTHON_DEPS=0 BUILD_APP_IN_CONTAINER=0 ./setup_demo_container.sh
 ```
 
+If the running container has a stale binary after source changes, rebuild just this app:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+./rebuild_demo_container_app.sh
+```
+
 ## Validation Notes
 
 - `config.yaml` is now the stable debug run configuration. It intentionally keeps `inference_backend: "pytorch_placeholder"` while saving the first 5 spectrograms and detector masks per channel.
 - `config_torchscript_validation.yaml` is the strict TorchScript bring-up configuration. Use it when you want the C++ TorchScript path to fail loudly.
 - `config_torchscript_load_only.yaml` is the first diagnostic step for the C++ TorchScript path. It confirms whether `torch::jit::load(...)` itself is safe before the operator attempts CUDA transfer.
+- `config_torchscript_cpu_eval.yaml` is the second diagnostic step. It tests whether `eval()` is safe while staying entirely on CPU.
+- `config_torchscript_cuda_no_eval.yaml` is the third diagnostic step. It tests whether `to(torch::kCUDA)` is safe before `eval()` runs.
 - The selected runtime weight is `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`.
 - The recommended export helper for container-side TorchScript generation is `applications/usrp_wideband_signal_detection/export_dinov3_torchscript.py`.
 - The setup flow is GPU-only. It verifies `nvidia-smi`, checks `torch.cuda.is_available()`, and fails instead of silently exporting on CPU.
