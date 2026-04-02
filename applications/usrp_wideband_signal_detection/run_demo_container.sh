@@ -7,9 +7,13 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 CONTAINER_NAME=${CONTAINER_NAME:-usrp_x410_signal_detection_demo}
 IMAGE_NAME=${IMAGE_NAME:-usrp_x410_signal_detection_demo:latest}
 HUGEPAGES_DIR=${HUGEPAGES_DIR:-/dev/hugepages}
+SPECTROGRAM_HOST_DIR=${SPECTROGRAM_HOST_DIR:-/tmp/usrp_spectrograms}
+DINO_MASK_HOST_DIR=${DINO_MASK_HOST_DIR:-/tmp/usrp_dino_masks}
 DETACH=${DETACH:-1}
 
 cd "${REPO_ROOT}"
+
+mkdir -p "${SPECTROGRAM_HOST_DIR}" "${DINO_MASK_HOST_DIR}"
 
 sudo docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 
@@ -22,6 +26,8 @@ DOCKER_RUN_CMD=(
   -e HOLOHUB_BUILD_LOCAL=1 \
   -e NVIDIA_DRIVER_CAPABILITIES=graphics,video,compute,utility,display \
   -v "${REPO_ROOT}:/workspace/holohub" \
+  -v "${SPECTROGRAM_HOST_DIR}:/workspace/spectrograms" \
+  -v "${DINO_MASK_HOST_DIR}:/workspace/dino_masks" \
   -v /dev:/dev \
   -v "${HUGEPAGES_DIR}:/dev/hugepages" \
   -w /workspace/holohub \
@@ -42,6 +48,8 @@ if [[ "${DETACH}" == "1" ]]; then
   )
   "${DOCKER_RUN_CMD[@]}" >/dev/null
   echo "Started container ${CONTAINER_NAME} from image ${IMAGE_NAME}."
+  echo "Host spectrogram output: ${SPECTROGRAM_HOST_DIR}"
+  echo "Host DINO mask output: ${DINO_MASK_HOST_DIR}"
   echo "Attach with: sudo docker exec -it ${CONTAINER_NAME} bash"
   exit 0
 fi

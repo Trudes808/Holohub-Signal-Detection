@@ -55,7 +55,7 @@ advanced_network:
 
     interfaces:
       - name: sdr_data
-        address: 0000:a2:00.0
+        address: 0000:a2:00.1
         rx:
           flow_isolation: true
           queues:

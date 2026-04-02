@@ -31,6 +31,10 @@ Available configs copied into the build directory:
 	- stable debug-artifact mode
 	- saves the first 5 spectrograms and first 5 detector masks per channel
 	- keeps `inference_backend: "pytorch_placeholder"` so the known C++ TorchScript init crash does not block runtime checks
+- `config_cuda_fallback.yaml`
+	- C++/CUDA fallback debug mode
+	- saves the first 5 spectrograms and first 5 detector masks per channel
+	- forces `use_pytorch_backend: false` and `inference_backend: "cuda_threshold_fallback"` so detector behavior stays on the non-Torch path
 - `config_torchscript_cpu_eval.yaml`
 	- isolates whether `eval()` is safe while the module is still on CPU
 	- uses `inference_backend: "torchscript"`, `torchscript_init_mode: "load_cpu_eval"`, and `strict_model_forward: false`
@@ -57,6 +61,9 @@ The application directory now includes three host-side helper scripts for the co
 	- starts a fresh privileged container with `CONTAINER_NAME` defaulting to `usrp_x410_signal_detection_demo`
 	- by default it starts the container detached with a keepalive command so setup can target it reliably
 	- exports `HOLOHUB_BUILD_LOCAL=1` so build commands executed inside the container stay in local mode
+	- mounts `/tmp/usrp_spectrograms` on the host to `/workspace/spectrograms` in the container so the viewer notebook can read generated debug spectrograms after the run
+	- mounts `/tmp/usrp_dino_masks` on the host to `/workspace/dino_masks` in the container for detector mask artifacts
+	- host output paths can be overridden with `SPECTROGRAM_HOST_DIR=...` and `DINO_MASK_HOST_DIR=...`
 - `setup_demo_container.sh`
 	- stages the local DINOv3 repo and selected weight into the running container, verifies `nvidia-smi` works inside the container, installs a pinned CUDA 12.6 PyTorch stack plus the DINOv3 Python requirements when needed, exports the TorchScript artifact on GPU, and by default builds the application inside the container
 	- bootstraps MatX inside the running container if `/usr/local/lib/cmake/matx/matx-config.cmake` is missing, so an older image can still complete the build without a full rebuild
@@ -74,6 +81,11 @@ cd applications/usrp_wideband_signal_detection
 ./build_demo_container.sh
 ./run_demo_container.sh
 ```
+
+Default host-side debug outputs after container startup:
+
+- spectrograms: `/tmp/usrp_spectrograms`
+- DINO masks: `/tmp/usrp_dino_masks`
 
 In a second terminal:
 
@@ -105,10 +117,12 @@ cd applications/usrp_wideband_signal_detection
 ## Validation Notes
 
 - `config.yaml` is now the stable debug run configuration. It intentionally keeps `inference_backend: "pytorch_placeholder"` while saving the first 5 spectrograms and detector masks per channel.
+- `config_cuda_fallback.yaml` is the debug configuration for the pure C++/CUDA detector path. It disables the PyTorch backend in operator logic and uses `cuda_threshold_fallback` while keeping artifact saves enabled.
 - `config_torchscript_validation.yaml` is the strict TorchScript bring-up configuration. Use it when you want the C++ TorchScript path to fail loudly.
 - `config_torchscript_load_only.yaml` is the first diagnostic step for the C++ TorchScript path. It confirms whether `torch::jit::load(...)` itself is safe before the operator attempts CUDA transfer.
 - `config_torchscript_cpu_eval.yaml` is the second diagnostic step. It tests whether `eval()` is safe while staying entirely on CPU.
 - `config_torchscript_cuda_no_eval.yaml` is the third diagnostic step. It tests whether `to(torch::kCUDA)` is safe before `eval()` runs.
+- Because the current executable is linked against libtorch when Torch is available at build time, the Torch runtime libraries still need to be present in the container even when you launch `config_cuda_fallback.yaml`.
 - The selected runtime weight is `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`.
 - The recommended export helper for container-side TorchScript generation is `applications/usrp_wideband_signal_detection/export_dinov3_torchscript.py`.
 - The setup flow is GPU-only. It verifies `nvidia-smi`, checks `torch.cuda.is_available()`, and fails instead of silently exporting on CPU.

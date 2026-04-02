@@ -1,25 +1,24 @@
 # Sage Step-by-Step Implementation Plan
 
-Last updated: 2026-04-01
+Last updated: 2026-04-02
 
-## Current re-entry status (2026-04-01)
+## Current re-entry status (2026-04-02)
 
 Completed since the original step-10 resume:
 
 - container helper scripts were added for build, run, setup, and shell entry,
 - the local DINOv3 repo and weights are staged into the Holohub container and exported to TorchScript in-container,
 - the application builds successfully in local container mode with Torch enabled,
-- a strict TorchScript runtime attempt still segfaults in the C++ operator initialization path,
-- the active default config was intentionally moved to a stable debug-artifact mode,
-- separate TorchScript validation and load-only diagnostic configs are now part of the application build output.
+- the wideband signal detection application now runs against the live USRP hardware,
+- RF receive and spectrogram plotting were validated independently in `notebooks/test_radio.ipynb`, and
+- the active resume point is now signal-detector operator validation on real over-the-air input.
 
 Immediate next steps:
 
-1. run `config.yaml` to verify the first 5 spectrograms and first 5 detector masks are written as expected,
-2. run `config_torchscript_load_only.yaml` to confirm whether `torch::jit::load(...)` remains stable in the live application process,
-3. run `config_torchscript_cpu_eval.yaml` to verify whether `eval()` is stable while staying on CPU,
-4. run `config_torchscript_cuda_no_eval.yaml` to determine whether the failure appears when the module moves to CUDA,
-5. run `config_torchscript_validation.yaml` only after the staged diagnostics above, so the final crash boundary is already known.
+1. run the strict TorchScript detector path on live USRP input and verify `dinov3_signal_detector` emits masks or equivalent downstream outputs,
+2. confirm operator logs and metadata report `dino_backend=torchscript` with no fallback warnings,
+3. record the first successful single-channel detection pass against known 2.4 GHz activity, and
+4. only then restore broader load, additional channels, or saved debug artifacts.
 
 ## 1) Purpose and Scope
 
@@ -508,7 +507,7 @@ The first session back should produce a short packaging and runtime-readiness re
 
 Use this section as the exact re-entry checklist for returning to Holohub development on the current wideband signal-detection path.
 
-### Current re-entry status (2026-04-01)
+### Current re-entry status (2026-04-02)
 
 Completed in the current session:
 
@@ -523,15 +522,20 @@ Completed in the current session:
    - `applications/usrp_wideband_signal_detection/config.yaml` is aligned to the staged artifacts, strict model-forward validation, and spectrogram save disabled.
 5. Step 10.4 is complete.
    - `usrp_wideband_signal_detection` now configures and builds successfully in the Holohub container, including the Torch-enabled `dinov3_signal_detector` path.
+6. RF hardware validation is complete.
+   - The app can now run against the live USRP without blocking on basic device bring-up.
+7. Spectrogram validation is complete.
+   - `notebooks/test_radio.ipynb` confirmed short IQ capture, receive power plotting, and spectrogram rendering on the target radio path.
 
 Next active step:
 
 1. Start at step 10.5.
-2. Perform first runtime bring-up with reduced load and verify:
+2. Perform first signal-detector validation run with reduced load and verify:
    - TorchScript loads from the staged container path
    - detector metadata reports `dino_backend=torchscript`
    - no fallback warnings are emitted
-   - mask output is produced on the strict model-forward path
+   - mask or detector output is produced on the strict model-forward path
+3. If detector output is absent, use `notebooks/test_radio.ipynb` first as the RF sanity check before changing detector thresholds or operator logic.
 
 ### 10.0 Package DINOv3 assets into the Holohub container
 
@@ -646,6 +650,7 @@ Immediate next action:
 1. Launch the built app inside the refreshed container using the strict TorchScript configuration already in `applications/usrp_wideband_signal_detection/config.yaml`.
 2. Keep channel count and load reduced for first runtime confirmation.
 3. Capture operator logs and metadata for the first successful `torchscript` inference pass before any throughput tuning.
+4. If masks are not emitted, confirm live RF activity again with `notebooks/test_radio.ipynb` on the same antenna, channel, center frequency, and gain settings before debugging the detector.
 
 ### 10.6 Input contract audit
 
@@ -712,4 +717,5 @@ Use the following session checklist after any pause in work:
 3. Confirm the exported TorchScript artifact still exists at the configured path.
 4. Confirm `applications/usrp_wideband_signal_detection/config.yaml` still points to the staged runtime paths and not placeholders.
 5. Rebuild and confirm Torch support is still enabled.
-6. Re-run strict single-channel validation before returning to 2-channel throughput tuning.
+6. Re-run `notebooks/test_radio.ipynb` if basic RF visibility is in doubt.
+7. Re-run strict single-channel detector validation before returning to 2-channel throughput tuning.

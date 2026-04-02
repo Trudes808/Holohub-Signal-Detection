@@ -28,18 +28,29 @@ execute_process(
   ERROR_QUIET
 )
 
-if(PY_NVJITLINK_DIR)
+if(PY_NVJITLINK_DIR AND EXISTS "${PY_NVJITLINK_DIR}/libnvJitLink.so.12")
   list(APPEND CUDA_LINK_DIRS ${PY_NVJITLINK_DIR})
 endif()
 
-find_library(NVJITLINK_LINK_ITEM
-  NAMES libnvJitLink.so.12 nvJitLink
-  PATHS ${CUDA_LINK_DIRS}
-  NO_DEFAULT_PATH
-)
+set(APP_NVJITLINK_LINK_ITEM "")
+if(TARGET CUDA::nvJitLink)
+  set(APP_NVJITLINK_LINK_ITEM CUDA::nvJitLink)
+else()
+  unset(APP_NVJITLINK_LINK_ITEM CACHE)
+  find_library(APP_NVJITLINK_LINK_ITEM
+    NAMES libnvJitLink.so.12 nvJitLink
+    PATHS ${CUDA_LINK_DIRS}
+    NO_DEFAULT_PATH
+  )
 
-if(NOT NVJITLINK_LINK_ITEM)
-  message(FATAL_ERROR "usrp_wideband_signal_detection: libnvJitLink.so.12 not found")
+  if(APP_NVJITLINK_LINK_ITEM)
+    get_filename_component(APP_NVJITLINK_LINK_DIR "${APP_NVJITLINK_LINK_ITEM}" DIRECTORY)
+    if(EXISTS "${APP_NVJITLINK_LINK_DIR}")
+      list(APPEND CUDA_LINK_DIRS ${APP_NVJITLINK_LINK_DIR})
+    endif()
+  else()
+    message(WARNING "usrp_wideband_signal_detection: libnvJitLink.so.12 not found for direct app linkage; relying on transitive linkage if required")
+  endif()
 endif()
 
 set(CHDR_CONVERTER_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../usrp_freq_detection/CHDR_converter)
@@ -70,8 +81,11 @@ target_link_libraries(usrp_wideband_signal_detection
   holoscan::ops::spectrogram
   holoscan::ops::dinov3_signal_detector
   CHDR_converter_wideband
-  ${NVJITLINK_LINK_ITEM}
 )
+
+if(APP_NVJITLINK_LINK_ITEM)
+  target_link_libraries(usrp_wideband_signal_detection PRIVATE ${APP_NVJITLINK_LINK_ITEM})
+endif()
 
 target_link_directories(usrp_wideband_signal_detection PRIVATE ${CUDA_LINK_DIRS})
 foreach(CUDA_LINK_DIR IN LISTS CUDA_LINK_DIRS)
@@ -101,6 +115,7 @@ endforeach()
 
   set(USRP_WIDEBAND_CONFIG_FILES
     config.yaml
+    config_cuda_fallback.yaml
     config_torchscript_cpu_eval.yaml
     config_torchscript_cuda_no_eval.yaml
     config_torchscript_validation.yaml
