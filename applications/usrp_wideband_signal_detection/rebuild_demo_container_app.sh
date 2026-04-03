@@ -16,6 +16,23 @@ if [[ "$(sudo docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}")" != "t
   sudo docker start "${CONTAINER_NAME}" >/dev/null
 fi
 
+if ! sudo docker exec "${CONTAINER_NAME}" bash -lc 'python3 - <<"PY"
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.find_spec("torch")
+if spec is None or spec.origin is None:
+    raise SystemExit(1)
+
+torch_dir = Path(spec.origin).resolve().parent
+torch_config = torch_dir / "share" / "cmake" / "Torch" / "TorchConfig.cmake"
+if not torch_config.exists():
+    raise SystemExit(2)
+PY'; then
+  echo "Warning: container PyTorch CMake files are missing; the rebuild will compile dinov3_signal_detector without Torch support." >&2
+  echo "Run applications/usrp_wideband_signal_detection/setup_demo_container.sh to install the pinned CUDA PyTorch stack and export the TorchScript artifact before rebuilding." >&2
+fi
+
 sudo docker exec "${CONTAINER_NAME}" bash -lc "set -euo pipefail && \
   cd /workspace/holohub && \
   export HOLOHUB_BUILD_LOCAL=1 && \

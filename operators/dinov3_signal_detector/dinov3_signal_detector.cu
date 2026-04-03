@@ -8,20 +8,50 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <stdexcept>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 
 #ifdef HOLOHUB_HAS_TORCH
-#include <torch/torch.h>
-#include <torch/script.h>
-#include <torch/nn/functional.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <torch/nn/functional.h>
+#include <torch/script.h>
+#include <torch/torch.h>
 #endif
 
 namespace {
+
+enum TimingStageIndex : size_t {
+  kInputStage = 0,
+  kFrontendCorrectionStage,
+  kCropAlignStage,
+  kResizeStage,
+  kModelPrepStage,
+  kTorchForwardStage,
+  kDinoScoreStage,
+  kPowerScoreStage,
+  kFusionStage,
+  kDeviceCopyStage,
+  kMaskSaveStage,
+  kTotalStage,
+};
+
+constexpr std::array<const char*, holoscan::ops::DinoV3SignalDetector::kTimingStageCount> kTimingStageNames = {
+    "input_ms",
+    "frontend_correction_ms",
+    "crop_align_ms",
+    "resize_ms",
+    "model_prep_ms",
+    "torch_forward_ms",
+    "dino_score_ms",
+    "power_score_ms",
+    "fusion_ms",
+    "device_copy_ms",
+    "mask_save_ms",
+    "total_ms",
+};
 
 std::string make_mask_output_path(const std::string& output_dir,
                                   uint16_t channel,
@@ -103,6 +133,136 @@ __global__ void power_db_mask_kernel(const cuda::std::complex<float>* input,
   output[idx] = (power_db >= threshold_db) ? 1.0f : 0.0f;
 }
 
+__global__ void complex_to_power_db_kernel(const cuda::std::complex<float>* input,
+                                           float* output,
+                                           int src_rows,
+                                           int src_cols) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = src_rows * src_cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const auto v = input[idx];
+  const float re = v.real();
+  const float im = v.imag();
+  const float power = re * re + im * im + 1e-12f;
+  output[idx] = 10.0f * log10f(power);
+}
+
+#ifdef HOLOHUB_HAS_TORCH
+
+double resolve_stat_value(const std::vector<double>& values, size_t index, double fallback) {
+  if (index < values.size() && std::isfinite(values[index])) {
+    return values[index];
+  }
+  return fallback;
+}
+
+int64_t quantile_index(int64_t size, double q) {
+  if (size <= 1) {
+    return 0;
+  }
+  const double clamped = std::clamp(q, 0.0, 1.0);
+  return static_cast<int64_t>(std::llround(clamped * static_cast<double>(size - 1)));
+}
+
+torch::Tensor select_quantile_along_dim(const torch::Tensor& input, double q, int64_t dim) {
+  auto sorted = std::get<0>(torch::sort(input, dim));
+  return sorted.select(dim, quantile_index(input.size(dim), q));
+}
+
+double scalar_quantile(const torch::Tensor& input, double q) {
+  auto flat = input.reshape({-1});
+  auto sorted = std::get<0>(torch::sort(flat, 0));
+  return sorted[quantile_index(sorted.size(0), q)].item<double>();
+}
+
+torch::Tensor gaussian_filter1d(const torch::Tensor& input, double sigma) {
+  if (sigma <= 0.0) {
+    return input.clone();
+  }
+
+  const auto radius = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(3.0 * sigma)));
+  const auto kernel_size = 2 * radius + 1;
+  auto options = torch::TensorOptions().dtype(input.dtype()).device(input.device());
+  auto x = torch::arange(-radius, radius + 1, options);
+  auto kernel = torch::exp(-(x * x) / (2.0 * sigma * sigma));
+  kernel = kernel / kernel.sum();
+
+  auto padded = torch::constant_pad_nd(input.view({1, 1, -1}), {radius, radius}, 0.0);
+  auto filtered = torch::conv1d(padded, kernel.view({1, 1, kernel_size}));
+  return filtered.view({-1});
+}
+
+torch::Tensor normalize_map01(const torch::Tensor& input, double low_q, double high_q) {
+  const double lo = scalar_quantile(input, low_q);
+  const double hi = scalar_quantile(input, high_q);
+  const double scale = std::max(hi - lo, 1e-6);
+  return torch::clamp((input - lo) / scale, 0.0, 1.0);
+}
+
+torch::Tensor derive_dino_score_map(torch::Tensor model_output,
+                                    int aligned_rows,
+                                    int aligned_cols,
+                                    int patch_size,
+                                    int dst_rows,
+                                    int dst_cols) {
+  using torch::indexing::Slice;
+
+  if (model_output.dim() == 4 && model_output.size(0) == 1) {
+    model_output = model_output.squeeze(0);
+  }
+
+  torch::Tensor base_map;
+
+  if (model_output.dim() == 3) {
+    if (model_output.size(0) > 1 && model_output.size(1) > 1 && model_output.size(2) > 1) {
+      base_map = torch::sqrt(torch::mean(model_output * model_output, 0) + 1e-6);
+    } else if (model_output.size(0) == 1) {
+      base_map = model_output.squeeze(0);
+    }
+  } else if (model_output.dim() == 2) {
+    const int patch_rows = std::max(1, aligned_rows / std::max(1, patch_size));
+    const int patch_cols = std::max(1, aligned_cols / std::max(1, patch_size));
+    const int64_t patch_count = static_cast<int64_t>(patch_rows) * static_cast<int64_t>(patch_cols);
+
+    if (model_output.size(0) == patch_count) {
+      base_map = torch::sqrt(torch::mean(model_output * model_output, 1) + 1e-6)
+                     .view({patch_rows, patch_cols});
+    } else if (model_output.size(1) == patch_count) {
+      base_map = torch::sqrt(torch::mean(model_output.transpose(0, 1) * model_output.transpose(0, 1), 1) + 1e-6)
+                     .view({patch_rows, patch_cols});
+    } else {
+      base_map = model_output;
+    }
+  } else if (model_output.dim() == 1) {
+    base_map = model_output.view({1, -1});
+  }
+
+  if (!base_map.defined()) {
+    throw std::runtime_error("TorchScript forward returned an unsupported tensor shape for DINO scoring");
+  }
+
+  if (base_map.dim() == 1) {
+    base_map = base_map.view({1, -1});
+  }
+  if (base_map.dim() != 2) {
+    throw std::runtime_error("Derived DINO score map is not 2D");
+  }
+
+  auto normalized = normalize_map01(base_map.to(torch::kFloat32), 0.05, 0.95);
+  auto resized = torch::nn::functional::interpolate(
+      normalized.unsqueeze(0).unsqueeze(0),
+      torch::nn::functional::InterpolateFuncOptions()
+          .size(std::vector<int64_t>{static_cast<int64_t>(dst_rows), static_cast<int64_t>(dst_cols)})
+          .mode(torch::kBilinear)
+          .align_corners(false));
+  return resized.squeeze(0).squeeze(0).contiguous();
+}
+
+#endif
+
 }  // namespace
 
 namespace holoscan::ops {
@@ -114,13 +274,18 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(input_height_,
              "input_height",
              "Input height",
-             "Detector input height (time bins).",
+             "Detector output height.",
              256);
   spec.param(input_width_,
              "input_width",
              "Input width",
-             "Detector input width (frequency bins).",
+             "Detector output width.",
              512);
+  spec.param(patch_size_,
+             "patch_size",
+             "Patch size",
+             "Patch size used for DINO-aligned input shaping.",
+             16);
   spec.param(emit_stride_,
              "emit_stride",
              "Emit stride",
@@ -129,7 +294,7 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(mask_threshold_db_,
              "mask_threshold_db",
              "Mask threshold (dB)",
-             "Power threshold in dB used for baseline signal mask generation.",
+             "Legacy fallback threshold in dB used for baseline signal mask generation.",
              -20.0f);
   spec.param(log_detections_,
              "log_detections",
@@ -159,7 +324,7 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(use_pytorch_backend_,
              "use_pytorch_backend",
              "Use PyTorch backend",
-             "If true, uses PyTorch tensor operations on GPU as detector path when available.",
+             "If true, uses the LibTorch-based notebook reproduction path when available.",
              true);
   spec.param(inference_backend_,
              "inference_backend",
@@ -169,23 +334,23 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(model_name_,
              "model_name",
              "Model name",
-             "DINOv3 model name placeholder for future integration.",
+             "DINOv3 model name.",
              std::string("dinov3_vitb16"));
   spec.param(model_repo_path_,
              "model_repo_path",
              "Model repo path",
-             "Path to local DINOv3 repository (placeholder for future integration).",
+             "Path to local DINOv3 repository.",
              std::string("/workspace/models/dinov3"));
   spec.param(weights_path_,
              "weights_path",
              "Weights path",
-             "Path to model weights placeholder while downloads complete.",
-             std::string("/workspace/models/dinov3/weights/dinov3_vitb16_placeholder.pth"));
+             "Path to model weights.",
+             std::string("/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"));
   spec.param(model_script_path_,
              "model_script_path",
              "Model script path",
              "Path to TorchScript model for model-forward backend.",
-             std::string("/workspace/models/dinov3/weights/dinov3_vitb16_placeholder.ts"));
+             std::string("/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"));
   spec.param(torchscript_init_mode_,
              "torchscript_init_mode",
              "TorchScript init mode",
@@ -196,6 +361,69 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
              "Strict model forward",
              "If true, drop frames when torchscript forward fails instead of falling back.",
              false);
+  spec.param(imagenet_mean_,
+             "imagenet_mean",
+             "ImageNet mean",
+             "Mean used for notebook-aligned model normalization.",
+             std::vector<double>{0.485, 0.456, 0.406});
+  spec.param(imagenet_std_,
+             "imagenet_std",
+             "ImageNet std",
+             "Standard deviation used for notebook-aligned model normalization.",
+             std::vector<double>{0.229, 0.224, 0.225});
+  spec.param(fft_size_, "fft_size", "FFT size", "Notebook-derived FFT size constant for metadata and parity tracking.", 1024);
+  spec.param(noverlap_, "noverlap", "FFT overlap", "Notebook-derived overlap constant for parity tracking.", 256);
+  spec.param(ignore_sideband_hz_,
+             "ignore_sideband_hz",
+             "Ignore sideband Hz",
+             "Frequency span to ignore on each side of the spectrum before DINO preprocessing.",
+             7.0e6);
+  spec.param(frontend_correction_enable_,
+             "frontend_correction_enable",
+             "Frontend correction enable",
+             "Enable notebook-inspired frontend correction before DINO preprocessing.",
+             true);
+  spec.param(frontend_correction_row_q_, "frontend_correction_row_q", "Frontend correction row quantile", "Notebook-derived frontend correction row quantile.", 25.0);
+  spec.param(frontend_correction_smooth_sigma_, "frontend_correction_smooth_sigma", "Frontend correction smoothing sigma", "Notebook-derived frontend correction smoothing sigma.", 12.0);
+  spec.param(frontend_correction_reference_q_, "frontend_correction_reference_q", "Frontend correction reference quantile", "Notebook-derived frontend correction reference quantile.", 75.0);
+  spec.param(frontend_correction_max_boost_db_, "frontend_correction_max_boost_db", "Frontend correction max boost", "Notebook-derived max frontend correction boost in dB.", 12.0);
+  spec.param(frontend_correction_soft_knee_db_, "frontend_correction_soft_knee_db", "Frontend correction soft knee", "Notebook-derived frontend correction soft knee in dB.", 4.0);
+  spec.param(frontend_correction_edge_taper_fraction_, "frontend_correction_edge_taper_fraction", "Frontend correction edge taper fraction", "Notebook-derived edge taper fraction.", 0.10);
+  spec.param(frontend_correction_edge_taper_sigma_, "frontend_correction_edge_taper_sigma", "Frontend correction edge taper sigma", "Notebook-derived edge taper sigma.", 6.0);
+  spec.param(frontend_correction_edge_target_drop_db_, "frontend_correction_edge_target_drop_db", "Frontend correction edge target drop", "Notebook-derived edge target drop in dB.", 2.5);
+  spec.param(frontend_edge_guard_floor_, "frontend_edge_guard_floor", "Frontend edge guard floor", "Notebook-derived frontend edge guard floor.", 0.35);
+  spec.param(dino_coherence_gate_floor_, "dino_coherence_gate_floor", "DINO coherence gate floor", "Notebook-derived DINO coherence gate floor.", 0.25);
+  spec.param(texture_q_, "texture_q", "Texture quantile", "Notebook-derived texture quantile constant.", 0.90);
+  spec.param(texture_k_, "texture_k", "Texture K", "Notebook-derived texture neighborhood size.", 6);
+  spec.param(power_q_, "power_q", "Power quantile", "Notebook-derived power quantile constant.", 0.90);
+  spec.param(dino_group_k_, "dino_group_k", "DINO grouping K", "Notebook-derived DINO grouping neighborhood size.", 8);
+  spec.param(dino_group_spatial_weight_, "dino_group_spatial_weight", "DINO grouping spatial weight", "Notebook-derived DINO grouping spatial weight.", 0.35);
+  spec.param(dino_group_score_q_, "dino_group_score_q", "DINO grouping score quantile", "Notebook-derived DINO grouping score quantile.", 0.60);
+  spec.param(pipeline_final_threshold_, "pipeline_final_threshold", "Pipeline final threshold", "Notebook-derived final threshold when speckle cleanup is active.", 0.20);
+  spec.param(pipeline_final_threshold_no_speckle_, "pipeline_final_threshold_no_speckle", "Pipeline final threshold without speckle", "Notebook-derived final threshold when speckle cleanup is inactive.", 0.10);
+  spec.param(pipeline_gap_floor_, "pipeline_gap_floor", "Pipeline gap floor", "Notebook-derived gap floor constant.", 0.10);
+  spec.param(pipeline_component_min_size_, "pipeline_component_min_size", "Pipeline minimum component size", "Notebook-derived minimum component size.", 5);
+  spec.param(pipeline_component_min_size_no_speckle_, "pipeline_component_min_size_no_speckle", "Pipeline minimum component size without speckle", "Notebook-derived minimum component size without speckle cleanup.", 2);
+  spec.param(pipeline_power_rescue_floor_, "pipeline_power_rescue_floor", "Pipeline power rescue floor", "Notebook-derived power rescue floor.", 0.10);
+  spec.param(pipeline_power_rescue_gain_, "pipeline_power_rescue_gain", "Pipeline power rescue gain", "Notebook-derived power rescue gain.", 2.0);
+  spec.param(pipeline_strong_speckle_min_component_, "pipeline_strong_speckle_min_component", "Pipeline strong speckle minimum component", "Notebook-derived strong speckle minimum component size.", 10);
+  spec.param(pipeline_texture_speckle_clean_threshold_, "pipeline_texture_speckle_clean_threshold", "Pipeline texture speckle clean threshold", "Notebook-derived texture cleanup threshold.", 0.85);
+  spec.param(pipeline_texture_speckle_strong_threshold_, "pipeline_texture_speckle_strong_threshold", "Pipeline texture strong threshold", "Notebook-derived texture strong threshold.", 0.20);
+  spec.param(timing_summary_enable_,
+             "timing_summary_enable",
+             "Timing summary enable",
+             "Enable per-stage detector timing summaries.",
+             true);
+  spec.param(timing_summary_every_n_,
+             "timing_summary_every_n",
+             "Timing summary every N",
+             "Emit timing summaries every N emitted detector frames per channel.",
+             16);
+  spec.param(timing_summary_window_,
+             "timing_summary_window",
+             "Timing summary window",
+             "Maximum number of emitted detector frames to accumulate before a timing summary reset.",
+             16);
 }
 
 void DinoV3SignalDetector::initialize() {
@@ -203,6 +431,7 @@ void DinoV3SignalDetector::initialize() {
 
   frame_count_.assign(num_channels_.get(), 0);
   masks_saved_.assign(num_channels_.get(), 0);
+  timing_stats_.assign(num_channels_.get(), ChannelTimingStats {});
 
   make_tensor(detection_masks_,
               {num_channels_.get(), input_height_.get(), input_width_.get()},
@@ -214,10 +443,14 @@ void DinoV3SignalDetector::initialize() {
   }
 
   pytorch_runtime_ready_ = false;
+  pytorch_warning_emitted_ = false;
   torchscript_model_loaded_ = false;
+  torchscript_load_attempted_ = false;
+  torchscript_load_failed_ = false;
   torchscript_forward_ready_ = false;
   torchscript_forward_warning_emitted_ = false;
   torchscript_forward_trace_emitted_ = false;
+  torchscript_module_on_cuda_ = false;
 
 #ifdef HOLOHUB_HAS_TORCH
   if (use_pytorch_backend_.get()) {
@@ -225,19 +458,15 @@ void DinoV3SignalDetector::initialize() {
       HOLOSCAN_LOG_WARN("PyTorch backend requested, but torch CUDA is not available. Falling back to CUDA kernel path.");
     } else {
       pytorch_runtime_ready_ = true;
-      HOLOSCAN_LOG_INFO("PyTorch backend enabled for DINOv3 detector. model_name='{}' repo='{}' weights='{}'",
+      HOLOSCAN_LOG_INFO("PyTorch backend enabled for DINOv3 detector. model_name='{}' repo='{}' weights='{}' script='{}'",
                         model_name_.get(),
                         model_repo_path_.get(),
-                        weights_path_.get());
-
-      if (!std::filesystem::exists(weights_path_.get())) {
-        HOLOSCAN_LOG_WARN("weights path does not exist: {}", weights_path_.get());
-      }
+                        weights_path_.get(),
+                        model_script_path_.get());
 
       if (inference_backend_.get() == "torchscript") {
         if (!std::filesystem::exists(model_script_path_.get())) {
-          HOLOSCAN_LOG_WARN("TorchScript model path not found (placeholder expected while downloading): {}",
-                            model_script_path_.get());
+          HOLOSCAN_LOG_WARN("TorchScript model path not found: {}", model_script_path_.get());
         } else {
           const auto requested_init_mode = torchscript_init_mode_.get();
           const auto init_mode = normalize_torchscript_init_mode(requested_init_mode);
@@ -246,47 +475,9 @@ void DinoV3SignalDetector::initialize() {
                               requested_init_mode,
                               init_mode);
           }
-
-          try {
-            HOLOSCAN_LOG_INFO("TorchScript init start: script='{}' mode='{}'",
-                              model_script_path_.get(),
-                              init_mode);
-            HOLOSCAN_LOG_INFO("TorchScript init stage: load");
-            auto loaded_module = std::make_unique<torch::jit::script::Module>(torch::jit::load(model_script_path_.get()));
-            HOLOSCAN_LOG_INFO("TorchScript init stage complete: load");
-
-            if (torchscript_init_moves_to_cuda(init_mode)) {
-              HOLOSCAN_LOG_INFO("TorchScript init stage: to_cuda");
-              loaded_module->to(torch::kCUDA);
-              HOLOSCAN_LOG_INFO("TorchScript init stage complete: to_cuda");
-            } else {
-              HOLOSCAN_LOG_INFO("TorchScript init skipping CUDA transfer for mode '{}'", init_mode);
-            }
-
-            if (torchscript_init_runs_eval(init_mode)) {
-              HOLOSCAN_LOG_INFO("TorchScript init stage: eval");
-              loaded_module->eval();
-              HOLOSCAN_LOG_INFO("TorchScript init stage complete: eval");
-            } else {
-              HOLOSCAN_LOG_INFO("TorchScript init skipping eval for mode '{}'", init_mode);
-            }
-
-            torchscript_module_ = std::move(loaded_module);
-            torchscript_model_loaded_ = true;
-            torchscript_forward_ready_ = torchscript_init_moves_to_cuda(init_mode);
-            HOLOSCAN_LOG_INFO("Loaded TorchScript model from {} (mode='{}', forward_ready={})",
-                              model_script_path_.get(),
-                              init_mode,
-                              torchscript_forward_ready_ ? "true" : "false");
-          } catch (const c10::Error& error) {
-            HOLOSCAN_LOG_WARN("Failed to load TorchScript model '{}': {}",
-                              model_script_path_.get(),
-                              error.what());
-          } catch (const std::exception& error) {
-            HOLOSCAN_LOG_WARN("TorchScript init failed for '{}': {}",
-                              model_script_path_.get(),
-                              error.what());
-          }
+          HOLOSCAN_LOG_INFO("TorchScript load deferred until first compute: script='{}' mode='{}'",
+                            model_script_path_.get(),
+                            init_mode);
         }
       }
     }
@@ -323,25 +514,52 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
 
   const int src_rows = static_cast<int>(fft_tensor.Size(0));
   const int src_cols = static_cast<int>(fft_tensor.Size(1));
+  const int dst_rows = std::max(1, input_height_.get());
+  const int dst_cols = std::max(1, input_width_.get());
+  const int patch_size = std::max(1, patch_size_.get());
+  const bool timing_enabled = timing_summary_enable_.get();
+  const auto total_start = std::chrono::steady_clock::now();
+  std::array<double, kTimingStageCount> stage_ms {};
 
   if (src_rows <= 0 || src_cols <= 0) {
     HOLOSCAN_LOG_WARN("DINOv3 detector received empty tensor on channel {}", channel_number);
     return;
   }
 
+  auto time_step_ms = [&](size_t stage_index, auto&& fn) {
+    if (!timing_enabled) {
+      fn();
+      return;
+    }
+
+    const auto stage_start = std::chrono::steady_clock::now();
+    fn();
+    auto sync_result = cudaStreamSynchronize(stream);
+    if (sync_result != cudaSuccess) {
+      HOLOSCAN_LOG_ERROR("DINOv3 detector timing sync failed at {}: {}",
+                         kTimingStageNames[stage_index],
+                         cudaGetErrorString(sync_result));
+      return;
+    }
+
+    stage_ms[stage_index] = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - stage_start)
+                                .count();
+  };
+
   auto out = matx::slice<2>(detection_masks_,
                             {static_cast<matx::index_t>(channel_number), 0, 0},
                             {matxDropDim, matxEnd, matxEnd});
 
-  auto clear_result = cudaMemsetAsync(
-      out.Data(), 0, static_cast<size_t>(input_height_.get()) * static_cast<size_t>(input_width_.get()) * sizeof(float), stream);
-  if (clear_result != cudaSuccess) {
-    HOLOSCAN_LOG_ERROR("DINOv3 detector cudaMemsetAsync failed: {}", cudaGetErrorString(clear_result));
-    return;
-  }
-
-  const int dst_rows = std::max(1, input_height_.get());
-  const int dst_cols = std::max(1, input_width_.get());
+  time_step_ms(kInputStage, [&] {
+    auto clear_result = cudaMemsetAsync(out.Data(),
+                                        0,
+                                        static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols) * sizeof(float),
+                                        stream);
+    if (clear_result != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemsetAsync failed: ") + cudaGetErrorString(clear_result));
+    }
+  });
 
   auto maybe_save_mask = [&](const std::string& backend_name) {
     if (!enable_mask_save_.get()) {
@@ -390,194 +608,551 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
                       path);
   };
 
-#ifdef HOLOHUB_HAS_TORCH
-  if (use_pytorch_backend_.get() && pytorch_runtime_ready_) {
-    const int64_t output_elements = static_cast<int64_t>(dst_rows) * static_cast<int64_t>(dst_cols);
-    auto output_bytes = static_cast<size_t>(output_elements) * sizeof(float);
+  std::string backend_used = "cuda_threshold_fallback";
+  int ignore_bins_per_side = 0;
+  double freq_bin_hz = 0.0;
+  int aligned_rows = dst_rows;
+  int aligned_cols = dst_cols;
+  double dino_threshold = 0.0;
+  double power_threshold = 0.0;
+  double final_threshold = pipeline_final_threshold_.get();
 
-    c10::cuda::CUDAStream external_stream = c10::cuda::getStreamFromExternal(stream, c10::cuda::current_device());
-    c10::cuda::CUDAStreamGuard stream_guard(external_stream);
+  auto run_cuda_fallback = [&](const std::string& pipeline_variant) -> bool {
+    const int total = dst_rows * dst_cols;
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
 
-    auto complex_options = torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA);
-    auto complex_input = torch::from_blob(fft_tensor.Data(),
-                                          {static_cast<int64_t>(src_rows), static_cast<int64_t>(src_cols)},
-                                          complex_options);
-
-    auto power = torch::pow(torch::abs(complex_input), 2).add(1e-12);
-    auto power_db = 10.0 * torch::log10(power);
-
-    auto resized = torch::nn::functional::interpolate(
-        power_db.unsqueeze(0).unsqueeze(0),
-        torch::nn::functional::InterpolateFuncOptions()
-            .size(std::vector<int64_t>{static_cast<int64_t>(dst_rows), static_cast<int64_t>(dst_cols)})
-            .mode(torch::kBilinear)
-            .align_corners(false));
-
-    auto backend = inference_backend_.get();
-    torch::Tensor mask;
-
-    if (backend == "torchscript" && torchscript_model_loaded_ && !torchscript_forward_ready_) {
-      if (!torchscript_forward_warning_emitted_) {
-        HOLOSCAN_LOG_WARN("TorchScript model loaded with init mode '{}' but not marked forward-ready. Falling back to pytorch_placeholder path.",
-                          torchscript_init_mode_.get());
-        torchscript_forward_warning_emitted_ = true;
+    time_step_ms(kTorchForwardStage, [&] {});
+    time_step_ms(kDinoScoreStage, [&] {});
+    time_step_ms(kPowerScoreStage, [&] {});
+    time_step_ms(kFusionStage, [&] {
+      power_db_mask_kernel<<<blocks, threads, 0, stream>>>(fft_tensor.Data(),
+                                                            out.Data(),
+                                                            src_rows,
+                                                            src_cols,
+                                                            dst_rows,
+                                                            dst_cols,
+                                                            mask_threshold_db_.get());
+      auto kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("kernel launch failed: ") + cudaGetErrorString(kernel_result));
       }
-      backend = "pytorch_placeholder";
-    }
-
-    if (backend == "torchscript" && torchscript_model_loaded_ && torchscript_forward_ready_) {
-      try {
-        if (!torchscript_forward_trace_emitted_) {
-          HOLOSCAN_LOG_INFO(
-              "TorchScript forward trace: channel={} frame={} input={}x{} resized={}x{} backend={} init_mode={}",
-              channel_number,
-              frame_number,
-              src_rows,
-              src_cols,
-              dst_rows,
-              dst_cols,
-              backend,
-              torchscript_init_mode_.get());
-          HOLOSCAN_LOG_INFO("TorchScript forward trace: invoking torchscript_module_->forward(...) on CUDA tensor");
-        }
-
-        std::vector<torch::jit::IValue> model_inputs;
-        model_inputs.emplace_back(resized.to(torch::kFloat32));
-
-        auto model_output = torchscript_module_->forward(model_inputs);
-
-        if (!torchscript_forward_trace_emitted_) {
-          HOLOSCAN_LOG_INFO("TorchScript forward trace: forward(...) returned successfully");
-        }
-
-        torch::Tensor logits;
-
-        if (model_output.isTensor()) {
-          logits = model_output.toTensor();
-        } else if (model_output.isTuple()) {
-          auto tuple_ptr = model_output.toTuple();
-          if (tuple_ptr && !tuple_ptr->elements().empty() && tuple_ptr->elements()[0].isTensor()) {
-            logits = tuple_ptr->elements()[0].toTensor();
-          }
-        }
-
-        if (!logits.defined()) {
-          throw std::runtime_error("TorchScript forward returned non-tensor output");
-        }
-
-        if (logits.dim() == 4) {
-          logits = logits.squeeze(0).squeeze(0);
-        } else if (logits.dim() == 3) {
-          logits = logits.squeeze(0);
-        }
-
-        if (logits.sizes().size() != 2 ||
-            logits.size(0) != static_cast<int64_t>(dst_rows) ||
-            logits.size(1) != static_cast<int64_t>(dst_cols)) {
-          logits = torch::nn::functional::interpolate(
-                       logits.unsqueeze(0).unsqueeze(0),
-                       torch::nn::functional::InterpolateFuncOptions()
-                           .size(std::vector<int64_t>{static_cast<int64_t>(dst_rows), static_cast<int64_t>(dst_cols)})
-                           .mode(torch::kBilinear)
-                           .align_corners(false))
-                       .squeeze(0)
-                       .squeeze(0);
-        }
-
-        mask = logits.ge(mask_threshold_db_.get()).to(torch::kFloat32).contiguous();
-        backend = "torchscript";
-        torchscript_forward_trace_emitted_ = true;
-      } catch (const std::exception& error) {
-        HOLOSCAN_LOG_WARN("TorchScript forward failed; {}. Falling back to pytorch_placeholder path.", error.what());
-        if (strict_model_forward_.get()) {
-          return;
-        }
-        mask = resized.squeeze(0).squeeze(0).ge(mask_threshold_db_.get()).to(torch::kFloat32).contiguous();
-        backend = "pytorch_placeholder";
-      }
-    } else {
-      mask = resized.squeeze(0).squeeze(0).ge(mask_threshold_db_.get()).to(torch::kFloat32).contiguous();
-      backend = "pytorch_placeholder";
-    }
-
-    auto copy_result = cudaMemcpyAsync(out.Data(),
-                                       mask.data_ptr<float>(),
-                                       output_bytes,
-                                       cudaMemcpyDeviceToDevice,
-                                       stream);
-    if (copy_result != cudaSuccess) {
-      HOLOSCAN_LOG_ERROR("DINOv3 detector torch-path memcpy failed: {}", cudaGetErrorString(copy_result));
-      return;
-    }
+    });
+    time_step_ms(kDeviceCopyStage, [&] {});
+    time_step_ms(kMaskSaveStage, [&] { maybe_save_mask("cuda_threshold_fallback"); });
 
     meta->set("dino_frame_number", frame_number);
     meta->set("dino_mask_height", static_cast<uint32_t>(dst_rows));
     meta->set("dino_mask_width", static_cast<uint32_t>(dst_cols));
     meta->set("dino_mask_threshold_db", mask_threshold_db_.get());
-    meta->set("dino_backend", backend);
+    meta->set("dino_backend", std::string("cuda_threshold_fallback"));
     meta->set("dino_model_name", model_name_.get());
     meta->set("dino_weights_path", weights_path_.get());
     meta->set("dino_model_script_path", model_script_path_.get());
-    meta->set("dino_torchscript_init_mode", torchscript_init_mode_.get());
-    meta->set("dino_torchscript_forward_ready", torchscript_forward_ready_);
+    meta->set("dino_pipeline_variant", pipeline_variant);
 
-    if (log_detections_.get()) {
-      HOLOSCAN_LOG_INFO("DINOv3 detector ({} path) emitted mask for channel {} frame {} shape {}x{}",
-                        backend,
+    backend_used = "cuda_threshold_fallback";
+    return true;
+  };
+
+#ifdef HOLOHUB_HAS_TORCH
+  if (use_pytorch_backend_.get() && pytorch_runtime_ready_) {
+    std::string failure_stage = "stream_setup";
+    std::string failure_detail;
+    try {
+      int active_device = 0;
+      auto get_device_result = cudaGetDevice(&active_device);
+      if (get_device_result != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaGetDevice failed: ") + cudaGetErrorString(get_device_result));
+      }
+      auto set_device_result = cudaSetDevice(active_device);
+      if (set_device_result != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaSetDevice failed: ") + cudaGetErrorString(set_device_result));
+      }
+      c10::cuda::CUDAGuard device_guard(c10::Device(c10::kCUDA, active_device));
+      auto torch_stream = c10::cuda::getDefaultCUDAStream(active_device);
+      c10::cuda::CUDAStreamGuard torch_stream_guard(torch_stream);
+      using torch::indexing::Slice;
+
+      {
+        std::ostringstream oss;
+        oss << "active_device=" << active_device
+            << " src_rows=" << src_rows
+            << " src_cols=" << src_cols
+            << " fft_ptr=" << static_cast<const void*>(fft_tensor.Data());
+        failure_detail = oss.str();
+      }
+
+      auto stream_sync_result = cudaStreamSynchronize(stream);
+      if (stream_sync_result != cudaSuccess) {
+        throw std::runtime_error(std::string("input stream synchronize failed: ") + cudaGetErrorString(stream_sync_result));
+      }
+
+      failure_stage = "input_wrap";
+      const auto requested_init_mode = normalize_torchscript_init_mode(torchscript_init_mode_.get());
+      const bool use_cuda_torch = (inference_backend_.get() != "torchscript") || torchscript_init_moves_to_cuda(requested_init_mode);
+      auto compute_device = use_cuda_torch ? c10::Device(torch::kCUDA, active_device)
+                   : c10::Device(torch::kCPU);
+      auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(compute_device);
+      const int total_bins = src_rows * src_cols;
+      std::vector<dino_complex> host_fft(static_cast<size_t>(total_bins));
+      failure_stage = "input_copy_to_host";
+      auto host_copy_result = cudaMemcpyAsync(host_fft.data(),
+                                              fft_tensor.Data(),
+                                              host_fft.size() * sizeof(dino_complex),
+                                              cudaMemcpyDeviceToHost,
+                                              stream);
+      if (host_copy_result != cudaSuccess) {
+        throw std::runtime_error(std::string("input host copy failed: ") + cudaGetErrorString(host_copy_result));
+      }
+      auto host_copy_sync_result = cudaStreamSynchronize(stream);
+      if (host_copy_sync_result != cudaSuccess) {
+        throw std::runtime_error(std::string("input host copy synchronize failed: ") + cudaGetErrorString(host_copy_sync_result));
+      }
+
+      failure_stage = "power_db_host_compute";
+      std::vector<float> host_power_db(static_cast<size_t>(total_bins));
+      for (int idx = 0; idx < total_bins; ++idx) {
+        const auto v = host_fft[static_cast<size_t>(idx)];
+        const float re = v.real();
+        const float im = v.imag();
+        const float power = re * re + im * im + 1e-12f;
+        host_power_db[static_cast<size_t>(idx)] = 10.0f * std::log10(power);
+      }
+
+      failure_stage = "power_db_to_cuda";
+      auto cpu_float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+      auto power_db = torch::from_blob(host_power_db.data(),
+                                       {static_cast<int64_t>(src_rows), static_cast<int64_t>(src_cols)},
+                                       cpu_float_options)
+                          .clone()
+                          .to(compute_device);
+
+      auto backend = inference_backend_.get();
+      if (backend == "torchscript" && !torchscript_model_loaded_ && !torchscript_load_failed_) {
+        std::lock_guard<std::mutex> lock(torchscript_load_mutex_);
+        if (!torchscript_model_loaded_ && !torchscript_load_failed_) {
+          const auto requested_init_mode = torchscript_init_mode_.get();
+          const auto init_mode = normalize_torchscript_init_mode(requested_init_mode);
+          torchscript_load_attempted_ = true;
+
+          try {
+            failure_stage = "torchscript_load";
+            HOLOSCAN_LOG_INFO("TorchScript init start: script='{}' mode='{}'", model_script_path_.get(), init_mode);
+            const bool load_on_cuda = torchscript_init_moves_to_cuda(init_mode);
+            const auto load_device = load_on_cuda ? c10::Device(torch::kCUDA, active_device)
+                                                  : c10::Device(torch::kCPU);
+            HOLOSCAN_LOG_INFO("TorchScript init stage: load_begin device='{}'",
+                              load_on_cuda ? "cuda" : "cpu");
+            torchscript_module_.reset(
+                new torch::jit::script::Module(torch::jit::load(model_script_path_.get(), load_device)));
+            HOLOSCAN_LOG_INFO("TorchScript init stage complete: load_begin device='{}'",
+                              load_on_cuda ? "cuda" : "cpu");
+
+            if (torchscript_init_runs_eval(init_mode)) {
+              HOLOSCAN_LOG_INFO("TorchScript init stage: eval_begin");
+              torchscript_module_->eval();
+              HOLOSCAN_LOG_INFO("TorchScript init stage complete: eval_begin");
+            }
+
+            torchscript_model_loaded_ = true;
+            torchscript_module_on_cuda_ = load_on_cuda;
+            torchscript_forward_ready_ = true;
+            HOLOSCAN_LOG_INFO("Loaded TorchScript model from {} (mode='{}', device='{}', forward_ready={})",
+                              model_script_path_.get(),
+                              init_mode,
+                              load_on_cuda ? "cuda" : "cpu",
+                              torchscript_forward_ready_ ? "true" : "false");
+          } catch (const c10::Error& error) {
+            torchscript_load_failed_ = true;
+            HOLOSCAN_LOG_WARN("Failed to load TorchScript model '{}': {}",
+                              model_script_path_.get(),
+                              error.what());
+          } catch (const std::exception& error) {
+            torchscript_load_failed_ = true;
+            HOLOSCAN_LOG_WARN("TorchScript init failed for '{}': {}",
+                              model_script_path_.get(),
+                              error.what());
+          }
+        }
+      }
+
+      if (backend == "torchscript" && torchscript_load_failed_) {
+        if (strict_model_forward_.get()) {
+          HOLOSCAN_LOG_WARN("TorchScript load previously failed and strict_model_forward=true; dropping frame {} on channel {}.",
+                            frame_number,
+                            channel_number);
+          return;
+        }
+        backend = "pytorch_placeholder";
+      }
+
+      if (backend == "torchscript" && torchscript_model_loaded_ && !torchscript_forward_ready_) {
+        if (!torchscript_forward_warning_emitted_) {
+          HOLOSCAN_LOG_WARN("TorchScript model loaded with init mode '{}' but not marked forward-ready. Falling back to pytorch_placeholder path.",
+                            torchscript_init_mode_.get());
+          torchscript_forward_warning_emitted_ = true;
+        }
+        backend = "pytorch_placeholder";
+      }
+
+      failure_stage = "power_db";
+      auto corrected_db = power_db.contiguous();
+
+      failure_stage = "frontend_correction";
+      time_step_ms(kFrontendCorrectionStage, [&] {
+        if (!frontend_correction_enable_.get()) {
+          return;
+        }
+
+        auto col_activity = select_quantile_along_dim(corrected_db, 0.85, 0);
+        const double quiet_threshold = scalar_quantile(col_activity, 0.70);
+        auto quiet_mask = col_activity.le(quiet_threshold);
+        auto quiet_indices = torch::nonzero(quiet_mask).reshape({-1});
+        const auto min_quiet_cols = std::max<int64_t>(16, corrected_db.size(1) / 8);
+        torch::Tensor quiet_view = corrected_db;
+        if (quiet_indices.numel() >= min_quiet_cols) {
+          quiet_view = corrected_db.index({Slice(), quiet_indices});
+        }
+
+        auto row_floor = select_quantile_along_dim(quiet_view, frontend_correction_row_q_.get() / 100.0, 1);
+        auto response = gaussian_filter1d(row_floor, frontend_correction_smooth_sigma_.get());
+
+        const int64_t num_rows = response.size(0);
+        const int64_t inner_span = std::min<int64_t>(num_rows, std::max<int64_t>(8, static_cast<int64_t>(std::llround(0.65 * static_cast<double>(num_rows)))));
+        const int64_t inner_start = std::max<int64_t>(0, (num_rows - inner_span) / 2);
+        const int64_t inner_stop = std::min<int64_t>(num_rows, inner_start + inner_span);
+        auto inner_response = response.index({Slice(inner_start, inner_stop)});
+        if (inner_response.numel() == 0) {
+          inner_response = response;
+        }
+
+        const double reference_level = scalar_quantile(inner_response, frontend_correction_reference_q_.get() / 100.0);
+        auto edge_profile = torch::zeros({num_rows}, float_options);
+        const int64_t edge_rows = std::min<int64_t>(std::max<int64_t>(1, num_rows / 2),
+                                                    std::max<int64_t>(8, static_cast<int64_t>(std::llround(frontend_correction_edge_taper_fraction_.get() * static_cast<double>(num_rows)))));
+
+        if (edge_rows > 0) {
+          auto ramp = torch::linspace(1.0, 0.0, edge_rows, float_options);
+          edge_profile.index_put_({Slice(0, edge_rows)}, ramp);
+          edge_profile.index_put_({Slice(num_rows - edge_rows, num_rows)}, torch::maximum(edge_profile.index({Slice(num_rows - edge_rows, num_rows)}), torch::linspace(0.0, 1.0, edge_rows, float_options)));
+        }
+
+        edge_profile = gaussian_filter1d(edge_profile, frontend_correction_edge_taper_sigma_.get());
+        edge_profile = edge_profile / torch::clamp(edge_profile.max(), 1e-6);
+
+        auto target_response = reference_level - frontend_correction_edge_target_drop_db_.get() * edge_profile;
+        auto target_deficit = torch::clamp_min(target_response - response, 0.0);
+        const double soft_knee = std::max(frontend_correction_soft_knee_db_.get(), 1e-3);
+        auto soft_boost = frontend_correction_max_boost_db_.get() * (1.0 - torch::exp(-target_deficit / soft_knee));
+        soft_boost = torch::minimum(soft_boost, target_deficit);
+        auto boost_db = gaussian_filter1d(soft_boost, std::max(1.0, frontend_correction_smooth_sigma_.get() / 2.0));
+        boost_db = torch::minimum(boost_db, target_deficit);
+        corrected_db = corrected_db + boost_db.unsqueeze(1);
+      });
+
+      failure_stage = "crop_align";
+      time_step_ms(kCropAlignStage, [&] {
+        const double resolution_hz = meta->get<double>("resolution", 0.0);
+        const double span_hz = meta->get<double>("span", 0.0);
+        freq_bin_hz = resolution_hz > 0.0 ? resolution_hz : (span_hz > 0.0 ? span_hz / static_cast<double>(src_cols) : 0.0);
+
+        if (ignore_sideband_hz_.get() > 0.0 && freq_bin_hz > 0.0) {
+          const int requested_bins = static_cast<int>(std::ceil(ignore_sideband_hz_.get() / freq_bin_hz));
+          const int max_ignore_bins = std::max(0, (src_cols - patch_size) / 2);
+          ignore_bins_per_side = std::min(requested_bins, max_ignore_bins);
+        }
+
+        if (ignore_bins_per_side > 0 && (2 * ignore_bins_per_side) < src_cols) {
+          corrected_db = corrected_db.index({Slice(), Slice(ignore_bins_per_side, src_cols - ignore_bins_per_side)});
+        }
+
+        aligned_rows = std::max(1, (dst_rows / patch_size) * patch_size);
+        aligned_cols = std::max(1, (dst_cols / patch_size) * patch_size);
+        if (aligned_rows == 0) {
+          aligned_rows = dst_rows;
+        }
+        if (aligned_cols == 0) {
+          aligned_cols = dst_cols;
+        }
+      });
+
+      torch::Tensor resized_db;
+      failure_stage = "resize";
+      time_step_ms(kResizeStage, [&] {
+        resized_db = torch::nn::functional::interpolate(
+                         corrected_db.unsqueeze(0).unsqueeze(0),
+                         torch::nn::functional::InterpolateFuncOptions()
+                             .size(std::vector<int64_t>{static_cast<int64_t>(aligned_rows), static_cast<int64_t>(aligned_cols)})
+                             .mode(torch::kBilinear)
+                             .align_corners(false))
+                         .squeeze(0)
+                         .squeeze(0)
+                         .contiguous();
+      });
+
+      torch::Tensor model_input;
+      failure_stage = "model_prep";
+      time_step_ms(kModelPrepStage, [&] {
+        auto grayscale = normalize_map01(resized_db, 0.01, 0.99).to(torch::kFloat32);
+        auto rgb = torch::stack({grayscale, grayscale, grayscale}, 0).unsqueeze(0).contiguous();
+
+        auto mean = torch::tensor(
+                          std::vector<float>{static_cast<float>(resolve_stat_value(imagenet_mean_.get(), 0, 0.485)),
+                                             static_cast<float>(resolve_stat_value(imagenet_mean_.get(), 1, 0.456)),
+                                             static_cast<float>(resolve_stat_value(imagenet_mean_.get(), 2, 0.406))},
+                          float_options)
+                        .view({1, 3, 1, 1});
+        auto std = torch::tensor(
+                         std::vector<float>{static_cast<float>(resolve_stat_value(imagenet_std_.get(), 0, 0.229)),
+                                            static_cast<float>(resolve_stat_value(imagenet_std_.get(), 1, 0.224)),
+                                            static_cast<float>(resolve_stat_value(imagenet_std_.get(), 2, 0.225))},
+                         float_options)
+                       .view({1, 3, 1, 1});
+
+        model_input = (rgb - mean) / std;
+      });
+
+      {
+        std::ostringstream oss;
+        oss << "input=" << src_rows << "x" << src_cols
+            << " aligned=" << aligned_rows << "x" << aligned_cols
+            << " model_input_shape=[" << model_input.size(0)
+            << ", " << model_input.size(1)
+            << ", " << model_input.size(2)
+            << ", " << model_input.size(3) << "]"
+            << " model_input_device=" << model_input.device().str()
+            << " model_input_dtype=" << c10::toString(model_input.scalar_type())
+            << " backend=" << backend
+            << " init_mode=" << torchscript_init_mode_.get()
+            << " model_loaded=" << (torchscript_model_loaded_ ? "true" : "false")
+            << " forward_ready=" << (torchscript_forward_ready_ ? "true" : "false");
+        failure_detail = oss.str();
+      }
+
+      torch::Tensor dino_score;
+      if (backend == "torchscript" && torchscript_model_loaded_ && torchscript_forward_ready_) {
+        torch::Tensor model_output;
+
+        failure_stage = "torch_forward";
+        time_step_ms(kTorchForwardStage, [&] {
+          if (!torchscript_forward_trace_emitted_) {
+            HOLOSCAN_LOG_INFO("TorchScript forward trace: channel={} frame={} input={}x{} aligned={}x{} backend={} init_mode={}",
+                              channel_number,
+                              frame_number,
+                              src_rows,
+                              src_cols,
+                              aligned_rows,
+                              aligned_cols,
+                              backend,
+                              torchscript_init_mode_.get());
+          }
+
+          std::vector<torch::jit::IValue> model_inputs;
+          model_inputs.emplace_back(model_input);
+          auto raw_output = torchscript_module_->forward(model_inputs);
+          if (raw_output.isTensor()) {
+            model_output = raw_output.toTensor();
+          } else if (raw_output.isTuple()) {
+            auto tuple_ptr = raw_output.toTuple();
+            if (tuple_ptr && !tuple_ptr->elements().empty() && tuple_ptr->elements()[0].isTensor()) {
+              model_output = tuple_ptr->elements()[0].toTensor();
+            }
+          }
+
+          if (!model_output.defined()) {
+            throw std::runtime_error("TorchScript forward returned non-tensor output");
+          }
+        });
+
+        time_step_ms(kDinoScoreStage, [&] {
+          failure_stage = "dino_score";
+          dino_score = derive_dino_score_map(model_output, aligned_rows, aligned_cols, patch_size, dst_rows, dst_cols);
+        });
+
+        backend_used = "torchscript";
+        torchscript_forward_trace_emitted_ = true;
+      } else {
+        time_step_ms(kTorchForwardStage, [&] {});
+        time_step_ms(kDinoScoreStage, [&] {
+          auto resized_placeholder = torch::nn::functional::interpolate(
+                                       resized_db.unsqueeze(0).unsqueeze(0),
+                                       torch::nn::functional::InterpolateFuncOptions()
+                                           .size(std::vector<int64_t>{static_cast<int64_t>(dst_rows), static_cast<int64_t>(dst_cols)})
+                                           .mode(torch::kBilinear)
+                                           .align_corners(false))
+                                       .squeeze(0)
+                                       .squeeze(0);
+          dino_score = normalize_map01(resized_placeholder, 0.05, 0.95).contiguous();
+        });
+        backend_used = "pytorch_placeholder";
+      }
+
+      torch::Tensor power_score;
+      failure_stage = "power_score";
+      time_step_ms(kPowerScoreStage, [&] {
+        auto resized_power = torch::nn::functional::interpolate(
+                                 corrected_db.unsqueeze(0).unsqueeze(0),
+                                 torch::nn::functional::InterpolateFuncOptions()
+                                     .size(std::vector<int64_t>{static_cast<int64_t>(dst_rows), static_cast<int64_t>(dst_cols)})
+                                     .mode(torch::kBilinear)
+                                     .align_corners(false))
+                                 .squeeze(0)
+                                 .squeeze(0)
+                                 .contiguous();
+        power_score = normalize_map01(resized_power, 0.05, 0.95).contiguous();
+        power_threshold = scalar_quantile(power_score, std::clamp(power_q_.get(), 0.0, 1.0));
+      });
+
+      torch::Tensor final_mask;
+      failure_stage = "fusion";
+      time_step_ms(kFusionStage, [&] {
+        dino_threshold = scalar_quantile(dino_score, std::clamp(dino_group_score_q_.get(), 0.0, 1.0));
+        auto dino_mask = dino_score.ge(dino_threshold).to(torch::kFloat32);
+        auto power_mask = power_score.ge(power_threshold).to(torch::kFloat32);
+        auto agreement_map = 0.5f * (dino_mask + power_mask);
+        auto rescue = torch::clamp((power_score - pipeline_power_rescue_floor_.get()) /
+                                       std::max(1.0 - pipeline_power_rescue_floor_.get(), 1e-6),
+                                   0.0,
+                                   1.0) * pipeline_power_rescue_gain_.get();
+        auto gap_weight = torch::clamp(dino_score - pipeline_gap_floor_.get(), 0.0, 1.0);
+        auto final_score = torch::maximum(agreement_map, rescue * gap_weight);
+        final_threshold = pipeline_final_threshold_.get();
+        final_mask = final_score.ge(final_threshold).to(torch::kFloat32).contiguous();
+      });
+
+      failure_stage = "device_copy";
+      time_step_ms(kDeviceCopyStage, [&] {
+        cudaError_t copy_result = cudaSuccess;
+        const size_t output_bytes = static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols) * sizeof(float);
+        if (final_mask.device().is_cuda()) {
+          auto torch_sync_result = cudaDeviceSynchronize();
+          if (torch_sync_result != cudaSuccess) {
+            throw std::runtime_error(std::string("torch path synchronize failed: ") + cudaGetErrorString(torch_sync_result));
+          }
+          copy_result = cudaMemcpy(out.Data(), final_mask.data_ptr<float>(), output_bytes, cudaMemcpyDeviceToDevice);
+        } else {
+          copy_result = cudaMemcpyAsync(out.Data(), final_mask.data_ptr<float>(), output_bytes, cudaMemcpyHostToDevice, stream);
+        }
+        if (copy_result != cudaSuccess) {
+          throw std::runtime_error(std::string("torch-path memcpy failed: ") + cudaGetErrorString(copy_result));
+        }
+      });
+
+      meta->set("dino_frame_number", frame_number);
+      meta->set("dino_mask_height", static_cast<uint32_t>(dst_rows));
+      meta->set("dino_mask_width", static_cast<uint32_t>(dst_cols));
+      meta->set("dino_mask_threshold_db", mask_threshold_db_.get());
+      meta->set("dino_backend", backend_used);
+      meta->set("dino_model_name", model_name_.get());
+      meta->set("dino_weights_path", weights_path_.get());
+      meta->set("dino_model_script_path", model_script_path_.get());
+      meta->set("dino_torchscript_init_mode", torchscript_init_mode_.get());
+      meta->set("dino_torchscript_forward_ready", torchscript_forward_ready_);
+      meta->set("dino_patch_size", patch_size);
+      meta->set("dino_fft_size", fft_size_.get());
+      meta->set("dino_noverlap", noverlap_.get());
+      meta->set("dino_ignore_bins_per_side", ignore_bins_per_side);
+      meta->set("dino_freq_bin_hz", freq_bin_hz);
+      meta->set("dino_frontend_correction_enabled", frontend_correction_enable_.get());
+      meta->set("dino_input_aligned_height", aligned_rows);
+      meta->set("dino_input_aligned_width", aligned_cols);
+      meta->set("dino_group_score_threshold", dino_threshold);
+      meta->set("dino_power_score_threshold", power_threshold);
+      meta->set("dino_pipeline_final_threshold", final_threshold);
+      meta->set("dino_pipeline_variant", std::string("notebook_preprocess_feature_fusion_v1"));
+      meta->set("dino_preprocess_color_mode", std::string("grayscale_triplicate"));
+
+      if (log_detections_.get()) {
+        HOLOSCAN_LOG_INFO("DINOv3 detector ({}) emitted notebook-aligned debug mask for channel {} frame {} shape {}x{}",
+                          backend_used,
+                          channel_number,
+                          frame_number,
+                          dst_rows,
+                          dst_cols);
+      }
+
+      failure_stage = "mask_save";
+      time_step_ms(kMaskSaveStage, [&] { maybe_save_mask(backend_used); });
+    } catch (const std::exception& error) {
+      HOLOSCAN_LOG_WARN("DINOv3 detector failed on channel {} frame {} during {}: {} [{}]",
                         channel_number,
                         frame_number,
-                        dst_rows,
-                        dst_cols);
+                        failure_stage,
+                        error.what(),
+                        failure_detail);
+      if (strict_model_forward_.get()) {
+        return;
+      }
+      try {
+        run_cuda_fallback("cuda_threshold_fallback_after_error");
+      } catch (const std::exception& fallback_error) {
+        HOLOSCAN_LOG_ERROR("DINOv3 detector fallback failed on channel {} frame {}: {}",
+                           channel_number,
+                           frame_number,
+                           fallback_error.what());
+        return;
+      }
     }
-
-    maybe_save_mask(backend);
-
-    return;
+  } else {
+    try {
+      run_cuda_fallback("cuda_threshold_fallback");
+    } catch (const std::exception& error) {
+      HOLOSCAN_LOG_ERROR("DINOv3 detector fallback failed on channel {} frame {}: {}",
+                         channel_number,
+                         frame_number,
+                         error.what());
+      return;
+    }
   }
 #else
   if (use_pytorch_backend_.get() && !pytorch_warning_emitted_) {
     HOLOSCAN_LOG_WARN("DINOv3 detector use_pytorch_backend=true but Torch is unavailable at build time; using CUDA fallback path.");
     pytorch_warning_emitted_ = true;
   }
-#endif
 
-  const int total = dst_rows * dst_cols;
-  const int threads = 256;
-  const int blocks = (total + threads - 1) / threads;
-
-  power_db_mask_kernel<<<blocks, threads, 0, stream>>>(fft_tensor.Data(),
-                                                        out.Data(),
-                                                        src_rows,
-                                                        src_cols,
-                                                        dst_rows,
-                                                        dst_cols,
-                                                        mask_threshold_db_.get());
-
-  auto kernel_result = cudaGetLastError();
-  if (kernel_result != cudaSuccess) {
-    HOLOSCAN_LOG_ERROR("DINOv3 detector kernel launch failed: {}", cudaGetErrorString(kernel_result));
+  try {
+    run_cuda_fallback("cuda_threshold_fallback");
+  } catch (const std::exception& error) {
+    HOLOSCAN_LOG_ERROR("DINOv3 detector fallback failed on channel {} frame {}: {}",
+                       channel_number,
+                       frame_number,
+                       error.what());
     return;
   }
+#endif
 
-  meta->set("dino_frame_number", frame_number);
-  meta->set("dino_mask_height", static_cast<uint32_t>(dst_rows));
-  meta->set("dino_mask_width", static_cast<uint32_t>(dst_cols));
-  meta->set("dino_mask_threshold_db", mask_threshold_db_.get());
-  meta->set("dino_backend", std::string("cuda_threshold_fallback"));
-  meta->set("dino_model_name", model_name_.get());
-  meta->set("dino_weights_path", weights_path_.get());
-  meta->set("dino_model_script_path", model_script_path_.get());
+  stage_ms[kTotalStage] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - total_start).count();
+  meta->set("dino_timing_total_ms", stage_ms[kTotalStage]);
+  meta->set("dino_timing_summary_enabled", timing_enabled);
 
-  if (log_detections_.get()) {
-    HOLOSCAN_LOG_INFO("DINOv3 detector emitted mask for channel {} frame {} with shape {}x{}",
-                      channel_number,
-                      frame_number,
-                      dst_rows,
-                      dst_cols);
+  if (timing_enabled) {
+    auto& stats = timing_stats_[channel_number];
+    ++stats.window_frames;
+    for (size_t stage_index = 0; stage_index < kTimingStageCount; ++stage_index) {
+      stats.total_ms[stage_index] += stage_ms[stage_index];
+      stats.max_ms[stage_index] = std::max(stats.max_ms[stage_index], stage_ms[stage_index]);
+    }
+
+    const int summary_every = std::max(1, timing_summary_every_n_.get());
+    const int summary_window = std::max(1, timing_summary_window_.get());
+    const bool emit_summary = (frame_number % static_cast<uint64_t>(summary_every) == 0) ||
+                              (stats.window_frames >= static_cast<uint64_t>(summary_window));
+    if (emit_summary) {
+      const double inv_frames = 1.0 / static_cast<double>(std::max<uint64_t>(1, stats.window_frames));
+      std::ostringstream oss;
+      oss << "DINO timing summary ch=" << channel_number
+          << " backend=" << backend_used
+          << " frames=" << stats.window_frames;
+      for (size_t stage_index = 0; stage_index < kTimingStageCount; ++stage_index) {
+        const double mean_ms = stats.total_ms[stage_index] * inv_frames;
+        oss << ' ' << kTimingStageNames[stage_index] << "_mean=" << mean_ms
+            << ' ' << kTimingStageNames[stage_index] << "_max=" << stats.max_ms[stage_index];
+      }
+      HOLOSCAN_LOG_INFO("{}", oss.str());
+      stats = ChannelTimingStats {};
+    }
   }
-
-  maybe_save_mask("cuda_threshold_fallback");
-
 }
 
 }  // namespace holoscan::ops

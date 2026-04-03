@@ -14,17 +14,37 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 execute_process(
-  COMMAND ${Python3_EXECUTABLE} -c "import torch.utils; print(torch.utils.cmake_prefix_path)"
-  OUTPUT_VARIABLE PYTORCH_CMAKE_PREFIX_PATH
+  COMMAND ${Python3_EXECUTABLE} -c "from pathlib import Path; import sys; hints=[];\ntry:\n import torch, torch.utils\n cmake_prefix=getattr(torch.utils, 'cmake_prefix_path', '')\n torch_file=Path(torch.__file__).resolve()\n torch_dir=torch_file.parent\n candidates=[cmake_prefix, str(torch_dir), str(torch_dir / 'share' / 'cmake'), str(torch_dir / 'share' / 'cmake' / 'Torch'), str(torch_dir.parent), str(torch_dir.parent / 'share' / 'cmake'), str(torch_dir.parent / 'share' / 'cmake' / 'Torch')]\n for item in candidates:\n  if item and item not in hints:\n   hints.append(item)\n print(';'.join(hints))\nexcept Exception:\n print('')"
+  OUTPUT_VARIABLE PYTORCH_CMAKE_HINTS
   OUTPUT_STRIP_TRAILING_WHITESPACE
   ERROR_QUIET
 )
 
-if(PYTORCH_CMAKE_PREFIX_PATH)
-  list(PREPEND CMAKE_PREFIX_PATH ${PYTORCH_CMAKE_PREFIX_PATH})
+set(TORCH_SEARCH_HINTS "")
+
+if(PYTORCH_CMAKE_HINTS)
+  string(REPLACE ";" ";" PYTORCH_CMAKE_HINTS_LIST "${PYTORCH_CMAKE_HINTS}")
+  foreach(TORCH_HINT IN LISTS PYTORCH_CMAKE_HINTS_LIST)
+    if(TORCH_HINT AND EXISTS "${TORCH_HINT}")
+      list(APPEND TORCH_SEARCH_HINTS "${TORCH_HINT}")
+    endif()
+  endforeach()
 endif()
 
-find_package(Torch QUIET)
+list(REMOVE_DUPLICATES TORCH_SEARCH_HINTS)
+
+if(TORCH_SEARCH_HINTS)
+  list(PREPEND CMAKE_PREFIX_PATH ${TORCH_SEARCH_HINTS})
+  message(STATUS "dinov3_signal_detector: Torch search hints=${TORCH_SEARCH_HINTS}")
+else()
+  message(STATUS "dinov3_signal_detector: No Python Torch CMake hints detected from ${Python3_EXECUTABLE}")
+endif()
+
+find_package(Torch QUIET PATHS ${TORCH_SEARCH_HINTS})
+
+if(NOT Torch_FOUND)
+  find_package(Torch QUIET)
+endif()
 
 add_library(dinov3_signal_detector
   dinov3_signal_detector.cu

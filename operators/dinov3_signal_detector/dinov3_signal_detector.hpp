@@ -3,10 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <array>
+#include <chrono>
 #include <cuda/std/complex>
 #include <holoscan/holoscan.hpp>
 #include <matx.h>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #ifdef HOLOHUB_HAS_TORCH
 #include <torch/script.h>
@@ -23,6 +28,8 @@ class DinoV3SignalDetector : public holoscan::Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(DinoV3SignalDetector)
 
+  static constexpr size_t kTimingStageCount = 12;
+
   DinoV3SignalDetector() = default;
 
   void setup(holoscan::OperatorSpec& spec) override;
@@ -32,9 +39,16 @@ class DinoV3SignalDetector : public holoscan::Operator {
                holoscan::ExecutionContext& context) override;
 
  private:
+  struct ChannelTimingStats {
+    uint64_t window_frames = 0;
+    std::array<double, kTimingStageCount> total_ms {};
+    std::array<double, kTimingStageCount> max_ms {};
+  };
+
   holoscan::Parameter<int> num_channels_;
   holoscan::Parameter<int> input_height_;
   holoscan::Parameter<int> input_width_;
+  holoscan::Parameter<int> patch_size_;
   holoscan::Parameter<int> emit_stride_;
   holoscan::Parameter<float> mask_threshold_db_;
   holoscan::Parameter<bool> log_detections_;
@@ -50,18 +64,58 @@ class DinoV3SignalDetector : public holoscan::Operator {
   holoscan::Parameter<std::string> model_script_path_;
   holoscan::Parameter<std::string> torchscript_init_mode_;
   holoscan::Parameter<bool> strict_model_forward_;
+  holoscan::Parameter<std::vector<double>> imagenet_mean_;
+  holoscan::Parameter<std::vector<double>> imagenet_std_;
+  holoscan::Parameter<int> fft_size_;
+  holoscan::Parameter<int> noverlap_;
+  holoscan::Parameter<double> ignore_sideband_hz_;
+  holoscan::Parameter<bool> frontend_correction_enable_;
+  holoscan::Parameter<double> frontend_correction_row_q_;
+  holoscan::Parameter<double> frontend_correction_smooth_sigma_;
+  holoscan::Parameter<double> frontend_correction_reference_q_;
+  holoscan::Parameter<double> frontend_correction_max_boost_db_;
+  holoscan::Parameter<double> frontend_correction_soft_knee_db_;
+  holoscan::Parameter<double> frontend_correction_edge_taper_fraction_;
+  holoscan::Parameter<double> frontend_correction_edge_taper_sigma_;
+  holoscan::Parameter<double> frontend_correction_edge_target_drop_db_;
+  holoscan::Parameter<double> frontend_edge_guard_floor_;
+  holoscan::Parameter<double> dino_coherence_gate_floor_;
+  holoscan::Parameter<double> texture_q_;
+  holoscan::Parameter<int> texture_k_;
+  holoscan::Parameter<double> power_q_;
+  holoscan::Parameter<int> dino_group_k_;
+  holoscan::Parameter<double> dino_group_spatial_weight_;
+  holoscan::Parameter<double> dino_group_score_q_;
+  holoscan::Parameter<double> pipeline_final_threshold_;
+  holoscan::Parameter<double> pipeline_final_threshold_no_speckle_;
+  holoscan::Parameter<double> pipeline_gap_floor_;
+  holoscan::Parameter<int> pipeline_component_min_size_;
+  holoscan::Parameter<int> pipeline_component_min_size_no_speckle_;
+  holoscan::Parameter<double> pipeline_power_rescue_floor_;
+  holoscan::Parameter<double> pipeline_power_rescue_gain_;
+  holoscan::Parameter<int> pipeline_strong_speckle_min_component_;
+  holoscan::Parameter<double> pipeline_texture_speckle_clean_threshold_;
+  holoscan::Parameter<double> pipeline_texture_speckle_strong_threshold_;
+  holoscan::Parameter<bool> timing_summary_enable_;
+  holoscan::Parameter<int> timing_summary_every_n_;
+  holoscan::Parameter<int> timing_summary_window_;
 
   std::vector<uint64_t> frame_count_;
   std::vector<int> masks_saved_;
+  std::vector<ChannelTimingStats> timing_stats_;
   matx::tensor_t<float, 3> detection_masks_;
   bool pytorch_runtime_ready_ = false;
   bool pytorch_warning_emitted_ = false;
   bool torchscript_model_loaded_ = false;
+  bool torchscript_load_attempted_ = false;
+  bool torchscript_load_failed_ = false;
   bool torchscript_forward_ready_ = false;
   bool torchscript_forward_warning_emitted_ = false;
   bool torchscript_forward_trace_emitted_ = false;
+  bool torchscript_module_on_cuda_ = false;
 
 #ifdef HOLOHUB_HAS_TORCH
+  std::mutex torchscript_load_mutex_;
   std::unique_ptr<torch::jit::script::Module> torchscript_module_;
 #endif
 };
