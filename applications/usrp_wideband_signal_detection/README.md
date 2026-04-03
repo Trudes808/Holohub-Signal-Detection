@@ -128,15 +128,16 @@ Set `visualization.enable: true` in `config.yaml` to turn on the live spectrogra
 The current live renderer:
 
 - branches directly from `spectrogramOp`
-- converts the spectrogram tensor into a HoloViz color image
+- converts the spectrogram tensor into a classic spectrum-analyzer style HoloViz image
 - keeps detector overlay work separate so the render path stays reusable
+- includes a top PSD strip, max-hold trace, analyzer-style spectrogram panel, side readouts, and color-limit slider visuals shared with offline replay
 
 ### Offline Replay
 
 Example usage from the build directory:
 
 ```bash
-./offline_spectrogram_visualizer --offline-dir /tmp/usrp_spectrograms --fps 8
+./offline_spectrogram_visualizer --offline-dir /tmp/usrp_spectrograms --mask-dir /tmp/usrp_dino_masks --fps 8
 ```
 
 Headless screenshot export:
@@ -153,8 +154,23 @@ Useful flags:
 	- directory containing saved `.pgm` spectrogram frames
 - `--fps <FPS>`
 	- playback rate for offline replay
+- `--mask-dir <DIR>`
+	- directory containing `dino_mask_ch*_f*_*.pgm` files; when a frame match exists, the mask is blended into the spectrogram panel and reflected in the sidebar metrics
 - `--screenshot <FILE>`
-	- export the first replayed `.pgm` frame directly to PNG without starting HoloViz; relative paths are saved under `/workspace/spectrograms`, which maps back to the host spectrogram directory
+	- export the first replayed frame as the full composed dashboard preview without starting HoloViz; relative paths are saved under `/workspace/spectrograms`, which maps back to the host spectrogram directory
+
+Renderer tuning fields in the replay and live configs:
+
+- `blue_limit`
+	- lower heatmap clamp shown by the blue slider and applied to spectrogram color scaling
+- `red_limit`
+	- upper heatmap clamp shown by the red slider and applied to spectrogram color scaling
+- `center_frequency_hz`
+	- display-only center frequency readout until the live pipeline forwards that metadata directly
+- `fft_size`
+	- FFT size shown in the analyzer info panel
+- `dino_chunk_rows`, `dino_chunk_cols`
+	- DINO chunk dimensions shown in the analyzer info panel
 - `--no-loop`
 	- stop after the final frame instead of looping
 
@@ -164,7 +180,7 @@ Remote usage note:
 - this works in a local desktop session, a remote desktop session, or a correctly configured display-forwarded container
 - this is not expected to render in a plain headless SSH session with no display server
 
-The `--screenshot` path is the current no-desktop fallback. It writes a PNG directly from the first replayed frame and does not depend on HoloViz, GLFW, or Vulkan. If you pass a simple filename such as `offline_preview.png`, it will be written to `/workspace/spectrograms/offline_preview.png` in the container and show up in the mapped host directory, typically `/tmp/usrp_spectrograms/offline_preview.png`.
+The `--screenshot` path is the current no-desktop fallback. It writes the same composed dashboard frame used by offline replay and does not depend on HoloViz, GLFW, or Vulkan. If a matching detector mask exists in `/workspace/dino_masks` or the directory passed to `--mask-dir`, the preview includes the overlay and sidebar overlay metrics. If you pass a simple filename such as `offline_preview.png`, it will be written to `/workspace/spectrograms/offline_preview.png` in the container and show up in the mapped host directory, typically `/tmp/usrp_spectrograms/offline_preview.png`.
 
 If you run inside the demo container and see `Failed to initialize glfw` or `Failed to detect any supported platform`, the container was started without host display forwarding. Relaunch it from a desktop-capable session with `DISPLAY` set so `run_demo_container.sh` can forward `/tmp/.X11-unix` and `XAUTHORITY` into the container.
 

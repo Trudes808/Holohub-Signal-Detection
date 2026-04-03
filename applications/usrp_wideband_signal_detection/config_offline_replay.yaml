@@ -7,11 +7,21 @@ scheduler:
   stop_on_deadlock_timeout: 500
 
 offline_replay:
+  num_channels: 2
+  history_frames: 5
   directory: "/workspace/spectrograms"
+  mask_directory: "/workspace/dino_masks"
   frame_rate: 6.0
   repeat: true
   channel_filter: -1
   tensor_name: "spectrogram"
+  blue_limit: 0.10
+  red_limit: 0.92
+  overlay_alpha: 0.38
+  center_frequency_hz: 0.0
+  fft_size: 20480
+  dino_chunk_rows: 256
+  dino_chunk_cols: 512
 
 visualization:
   holoviz:

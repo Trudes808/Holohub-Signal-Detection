@@ -12,10 +12,12 @@
 namespace {
 
 constexpr const char* kHostMountedSpectrogramDir = "/workspace/spectrograms";
+constexpr const char* kHostMountedMaskDir = "/workspace/dino_masks";
 
 struct OfflineReplayOverrides {
   std::string config_path = "config_offline_replay.yaml";
   std::string offline_dir;
+  std::string mask_dir = kHostMountedMaskDir;
   std::string screenshot_path;
   double frame_rate = -1.0;
   bool repeat = true;
@@ -59,37 +61,99 @@ std::string resolve_screenshot_path(const std::string& requested_path) {
   return (std::filesystem::path(kHostMountedSpectrogramDir) / screenshot_path).string();
 }
 
-int export_first_frame_png(const std::string& directory, const std::string& output_path) {
+int export_first_frame_png(const std::string& directory,
+                           const std::string& mask_directory,
+                           const std::string& output_path) {
   const auto frames = holoscan::ops::list_offline_pgm_frames(directory, -1);
   if (frames.empty()) {
     HOLOSCAN_LOG_ERROR("No .pgm spectrogram frames found in '{}'", directory);
     return -1;
   }
 
-  holoscan::ops::OfflinePgmFrame frame;
-  if (!holoscan::ops::load_offline_pgm_frame(frames.front(), frame)) {
-    HOLOSCAN_LOG_ERROR("Failed to load spectrogram frame '{}'", frames.front().string());
-    return -1;
+  constexpr int kNumChannels = 2;
+  constexpr int kHistoryFrames = 5;
+  constexpr float kBlueLimit = 0.10f;
+  constexpr float kRedLimit = 0.92f;
+  std::vector<holoscan::ops::ChannelVisualizationState> channel_states(static_cast<size_t>(kNumChannels));
+  for (const auto& frame_path : frames) {
+    holoscan::ops::OfflinePgmFrame frame;
+    if (!holoscan::ops::load_offline_pgm_frame(frame_path, frame)) {
+      HOLOSCAN_LOG_WARN("Skipping unreadable spectrogram frame '{}'", frame_path.string());
+      continue;
+    }
+
+    int channel = -1;
+    uint64_t frame_number = 0;
+    int rows = 0;
+    int cols = 0;
+    if (!holoscan::ops::parse_recorded_pgm_name(frame_path.filename().string(),
+                                                "spectrogram",
+                                                channel,
+                                                frame_number,
+                                                rows,
+                                                cols)) {
+      continue;
+    }
+    if (channel < 0 || channel >= kNumChannels) {
+      continue;
+    }
+
+    auto& state = channel_states[static_cast<size_t>(channel)];
+    holoscan::ops::append_spectrogram_history(state, frame.pixels, frame.width, frame.height, kHistoryFrames);
+    state.current_psd_trace = holoscan::ops::compute_psd_trace(frame.pixels, frame.width, frame.height);
+    holoscan::ops::update_max_hold_trace(state.current_psd_trace, state.max_hold_trace);
+
+    holoscan::ops::OfflinePgmFrame mask_frame;
+    const auto mask_path = holoscan::ops::find_matching_recorded_pgm(mask_directory,
+                                                                     "dino_mask",
+                                                                     channel,
+                                                                     frame_number);
+    const bool has_mask = !mask_path.empty() && holoscan::ops::load_offline_pgm_frame(mask_path, mask_frame);
+    const auto density_trace = has_mask ? holoscan::ops::compute_density_trace(&mask_frame)
+                                        : holoscan::ops::compute_density_trace_from_grayscale(frame.pixels,
+                                                                                              frame.width,
+                                                                                              frame.height,
+                                                                                              kRedLimit);
+    holoscan::ops::update_density_history(density_trace, state.density_trace, state.density_frames_seen);
+    state.latest_mask = has_mask ? mask_frame : holoscan::ops::OfflinePgmFrame{};
+    state.overlay_available = has_mask;
+    state.active = true;
+    state.info.channel = channel;
+    state.info.frame_number = static_cast<int64_t>(frame_number);
+    state.info.center_frequency_hz = 0.0;
+    state.info.fft_size = 20480;
+    state.info.dino_chunk_rows = frame.height;
+    state.info.dino_chunk_cols = frame.width;
+    state.info.overlay_available = has_mask;
+    state.info.title = "USRP WIDEBAND";
+    state.info.subtitle = "OFFLINE REPLAY";
   }
 
-  auto rgb = holoscan::ops::colorize_grayscale_spectrogram(frame.pixels);
+  int composed_width = 0;
+  int composed_height = 0;
+  auto composed = holoscan::ops::compose_visualization_rgb(channel_states,
+                                                           kBlueLimit,
+                                                           kRedLimit,
+                                                           0.38f,
+                                                           composed_width,
+                                                           composed_height);
 
   const std::filesystem::path png_path(output_path);
   if (!png_path.parent_path().empty()) {
     std::filesystem::create_directories(png_path.parent_path());
   }
 
-  const int stride = frame.width * 3;
-  if (!stbi_write_png(png_path.string().c_str(), frame.width, frame.height, 3, rgb.data(), stride)) {
+  const int stride = composed_width * 3;
+  if (!stbi_write_png(png_path.string().c_str(), composed_width, composed_height, 3, composed.data(), stride)) {
     throw std::runtime_error("Failed to write PNG screenshot to " + png_path.string());
   }
 
-  HOLOSCAN_LOG_INFO("Saved offline spectrogram screenshot '{}' from '{}'", png_path.string(), frames.front().string());
+  HOLOSCAN_LOG_INFO("Saved offline analyzer screenshot '{}' from {} replayed frames", png_path.string(), frames.size());
   return 0;
 }
 
 void usage(const char* argv0) {
-  HOLOSCAN_LOG_INFO("Usage: {} [--config FILE] [--offline-dir DIR] [--fps FPS] [--no-loop] [--screenshot FILE.png]", argv0);
+  HOLOSCAN_LOG_INFO("Usage: {} [--config FILE] [--offline-dir DIR] [--mask-dir DIR] [--fps FPS] [--no-loop] [--screenshot FILE.png]", argv0);
 }
 
 OfflineReplayOverrides parse_arguments(int argc, char** argv) {
@@ -97,6 +161,7 @@ OfflineReplayOverrides parse_arguments(int argc, char** argv) {
 
   static option long_options[] = {{"config", required_argument, nullptr, 'c'},
                                   {"offline-dir", required_argument, nullptr, 'd'},
+                                  {"mask-dir", required_argument, nullptr, 'm'},
                                   {"fps", required_argument, nullptr, 'f'},
                                   {"screenshot", required_argument, nullptr, 's'},
                                   {"no-loop", no_argument, nullptr, 'n'},
@@ -104,7 +169,7 @@ OfflineReplayOverrides parse_arguments(int argc, char** argv) {
                                   {0, 0, 0, 0}};
 
   while (true) {
-    const int opt = getopt_long(argc, argv, "c:d:f:s:nh", long_options, nullptr);
+    const int opt = getopt_long(argc, argv, "c:d:m:f:s:nh", long_options, nullptr);
     if (opt == -1) {
       break;
     }
@@ -115,6 +180,9 @@ OfflineReplayOverrides parse_arguments(int argc, char** argv) {
         break;
       case 'd':
         options.offline_dir = optarg;
+        break;
+      case 'm':
+        options.mask_dir = optarg;
         break;
       case 'f':
         options.frame_rate = std::stod(optarg);
@@ -158,6 +226,7 @@ class OfflineSpectrogramReplayApp : public holoscan::Application {
                                                          from_config("offline_replay"),
                                                          make_condition<BooleanCondition>("replay_active", true),
                                                          Arg("directory") = directory,
+                                                         Arg("mask_directory") = overrides_.mask_dir,
                                                          Arg("repeat") = overrides_.repeat,
                                                          Arg("frame_rate") = frame_rate);
 
@@ -180,7 +249,7 @@ int main(int argc, char** argv) {
 
   if (!overrides.screenshot_path.empty()) {
     const auto directory = overrides.offline_dir.empty() ? kHostMountedSpectrogramDir : overrides.offline_dir;
-    return export_first_frame_png(directory, overrides.screenshot_path);
+    return export_first_frame_png(directory, overrides.mask_dir, overrides.screenshot_path);
   }
 
   auto app = holoscan::make_application<OfflineSpectrogramReplayApp>();

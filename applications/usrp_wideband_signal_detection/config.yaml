@@ -128,10 +128,19 @@ logger:
 visualization:
   enable: false
   renderer:
+    num_channels: 2
+    history_frames: 5
     output_height: 256
     output_width: 512
-    channel_filter: 0
+    channel_filter: -1
     tensor_name: "spectrogram"
+    blue_limit: 0.10
+    red_limit: 0.92
+    overlay_alpha: 0.38
+    center_frequency_hz: 0.0
+    fft_size: 20480
+    dino_chunk_rows: 256
+    dino_chunk_cols: 512
   holoviz:
     width: 1280
     height: 720

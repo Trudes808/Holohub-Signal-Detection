@@ -86,9 +86,10 @@ Preferred overlay contract:
 Recommended sequence:
 
 1. finish spectrogram-only rendering in the live and offline paths
-2. add a detector postprocessor that emits HoloViz `InputSpec` data plus overlay tensors
-3. map RF coordinates into normalized screen coordinates in that postprocessor
-4. keep the renderer itself agnostic to detector internals
+2. add an offline composite preview path that overlays saved detector masks on top of the framed spectrogram dashboard so layout can be reviewed before live detector wiring is complete
+3. add a detector postprocessor that emits HoloViz `InputSpec` data plus overlay tensors
+4. map RF coordinates into normalized screen coordinates in that postprocessor
+5. keep the renderer itself agnostic to detector internals
 
 ## Remote Strategy
 
