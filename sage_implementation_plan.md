@@ -1,6 +1,6 @@
 # Sage Step-by-Step Implementation Plan
 
-Last updated: 2026-04-02
+Last updated: 2026-04-03
 
 ## Current re-entry status (2026-04-02)
 
@@ -15,10 +15,10 @@ Completed since the original step-10 resume:
 
 Immediate next steps:
 
-1. run the strict TorchScript detector path on live USRP input and verify `dinov3_signal_detector` emits masks or equivalent downstream outputs,
-2. confirm operator logs and metadata report `dino_backend=torchscript` with no fallback warnings,
-3. record the first successful single-channel detection pass against known 2.4 GHz activity, and
-4. only then restore broader load, additional channels, or saved debug artifacts.
+1. run the strict single-channel TorchScript detector path on live USRP input and verify `dinov3_signal_detector` emits masks or equivalent downstream outputs,
+2. copy the active pipeline constants and detector behavior from `../Dinov3-RF-Signal-Detection/signal_detection_holoscanv1.ipynb` into the Holohub signal-detector path using GPU-resident C++/PyTorch execution and config-backed parameters,
+3. add a debug timing summary for the major detector stages so the first optimization pass is driven by measured hotspots rather than guesswork, and
+4. only after functional validation and notebook-parity confidence use `../Dinov3-RF-Signal-Detection/speed_optimization_todo.md` to drive runtime optimization work.
 
 ## 1) Purpose and Scope
 
@@ -242,29 +242,26 @@ Attach DINOv3 inference to spectrogram outputs using the most maintainable path.
 
 ### Notebook reference for algorithm flow
 
-- Reference implementation notebook:
+- Primary reproduction notebook:
+   - `../Dinov3-RF-Signal-Detection/signal_detection_holoscanv1.ipynb`
+- Supporting earlier spectrogram notebook:
    - `../Dinov3-RF-Signal-Detection/rf_spectrogram_segmentation.ipynb`
-- This notebook defines the current algorithmic flow to preserve during operatorization:
-   1. Spectrogram slice/window selection (`H x W`, patch-size aligned).
-   2. Input normalization to image-like tensor (ImageNet mean/std style in the Python prototype).
-   3. DINOv3 feature extraction (patch embeddings).
-   4. Patch-space postprocess for detection mask candidates (prototype uses PCA + clustering and mask scoring).
-   5. Visualization/debug outputs (prototype only; not in hot path).
-
-### Decision gate
-
-Choose one:
-
-- **Path A (preferred first):** Holoscan `InferenceOp` backend=TRT with CUDA tensors.
-- **Path B:** custom DINOv3 operator if preprocessing/postprocessing requirements exceed InferenceOp flexibility.
+- `signal_detection_holoscanv1.ipynb` is now the algorithmic source of truth for the active detector path and defines the behavior to preserve during operatorization:
+   1. sideband-ignore calculation and optional frontend correction before DINO input formation,
+   2. patch-size alignment, resize/crop policy, and ImageNet-style normalization,
+   3. DINOv3 feature extraction through the current PyTorch model path,
+   4. DINO grouping, coherence gating, texture scoring, power scoring, and multilevel final-mask fusion, and
+   5. per-slice timing checkpoints that should be mirrored in the C++ debug path.
 
 ### Implementation decision for this project stage
 
-- **Primary execution target:** C++/CUDA operator path for production throughput.
-- **Role of Python notebook:** algorithm prototyping and regression reference only.
-- **Recommended staging:**
-   1. Use `InferenceOp` as bring-up path for engine/runtime validation.
-   2. Implement `dinov3_signal_detector` custom C++ operator for fused preprocess + inference glue + postprocess once contracts are stable.
+- **Primary execution target:** custom `dinov3_signal_detector` C++/CUDA operator using LibTorch / TorchScript for model execution.
+- **Role of Python notebook:** algorithmic source of truth for constants, parity, and debug expectations; not the production runtime.
+- **Active staging order:**
+   1. validate the current strict TorchScript model-forward path on reduced live input,
+   2. copy the notebook detector constants and postprocess behavior into the C++ path while keeping tensors GPU-resident across the hot path,
+   3. expose notebook-derived tuning constants in app config rather than hard-coding them in the operator, and
+   4. add timing instrumentation before any optimization pass.
 
 ### Tasks (common)
 
@@ -272,12 +269,13 @@ Choose one:
 2. Define output contract:
    - logits/embedding/detections
    - metadata attached to output messages
-3. Add explicit inference cadence control:
+3. Promote notebook-derived detector constants into config with stable names and documented defaults.
+4. Add explicit inference cadence control:
    - frame stride
    - optional queue depth cap
-4. Add model config and runtime options:
+5. Add model config and runtime options:
    - precision mode
-   - engine cache behavior
+   - TorchScript / LibTorch artifact behavior
    - device assignment
 
 ### Tasks (C++ operator track: required for performance)
@@ -285,51 +283,91 @@ Choose one:
 1. Define `dinov3_signal_detector` operator contract:
    - input: spectrogram tensor + metadata (`channel_number`, timing/frame index)
    - output: detection mask(s), confidence/score summary, passthrough metadata
-2. Implement GPU preprocess in operator (no host copy):
-   - patch-size alignment/cropping policy (e.g., multiple of 16)
+2. Reproduce the active notebook preprocessing path on GPU in operator code:
+   - optional frontend correction and sideband-ignore crop behavior
+   - patch-size alignment/cropping policy (multiple of `patch_size`)
    - dtype/layout conversion to model input layout
    - normalization policy equivalent to notebook baseline
-3. Integrate TRT inference execution path:
-   - engine load/init in `initialize()`
-   - async enqueue on provided CUDA stream in `compute()`
-4. Implement GPU postprocess (minimum viable):
-   - produce deterministic binary/score mask from model outputs
-   - include threshold parameters and deterministic tie-break rules
+3. Integrate LibTorch / TorchScript inference execution path:
+   - model load/init in `initialize()`
+   - async forward launch on the provided CUDA stream in `compute()`
+4. Reproduce the current notebook postprocess path in C++ with GPU-first execution:
+   - DINO grouping constants and affinity behavior
+   - coherence gating
+   - texture and power scoring
+   - multilevel fusion and final mask cleanup
 5. Add debug parity hooks (off by default):
    - optional sampled host export for parity checks vs notebook outputs
-6. Add cadence/backpressure controls in operator config:
+   - optional dump of intermediate maps for one selected frame when parity debugging is needed
+6. Add debug timing instrumentation for major steps:
+   - input staging / shape match
+   - frontend correction and sideband crop
+   - DINO preprocess and TorchScript forward
+   - grouping / coherence / texture / power / final fusion
+   - total operator compute time and emitted summary statistics
+7. Add cadence/backpressure controls in operator config:
    - `emit_stride`, queue cap, frame-drop policy
 
 ### File touchpoints
 
-- If Path A:
-  - `applications/psd_pipeline/main.cpp`
-  - `applications/psd_pipeline/config.yaml` (or dedicated app config)
-- If Path B:
-   - new `operators/dinov3_signal_detector/dinov3_signal_detector.hpp`
-   - new `operators/dinov3_signal_detector/dinov3_signal_detector.cu`
-   - new `operators/dinov3_signal_detector/CMakeLists.txt`
-   - new `operators/dinov3_signal_detector/README.md`
-   - new `operators/dinov3_signal_detector/metadata.json`
-  - `operators/CMakeLists.txt`
-  - app wiring/config files above
+- `applications/usrp_wideband_signal_detection/config.yaml`
+- `applications/usrp_wideband_signal_detection/main.cpp`
+- `operators/dinov3_signal_detector/dinov3_signal_detector.hpp`
+- `operators/dinov3_signal_detector/dinov3_signal_detector.cpp` or `operators/dinov3_signal_detector/dinov3_signal_detector.cu`
+- `operators/dinov3_signal_detector/CMakeLists.txt`
+- `operators/dinov3_signal_detector/README.md`
+- `operators/dinov3_signal_detector/metadata.json`
+- `operators/CMakeLists.txt`
 
-### Initial operator parameters (proposed)
+### Initial operator parameters (promote from notebook into config)
 
 - `num_channels`
 - `input_height`, `input_width`
-- `patch_size` (default 16)
+- `patch_size` (default from model, currently 16)
 - `input_layout` (`NCHW` default)
 - `input_dtype` (`fp16` default, `fp32` fallback)
-- `normalize_mode` (`imagenet`, `none`, or custom constants)
-- `engine_path` / `onnx_path` / `engine_cache_dir`
+- `imagenet_mean`, `imagenet_std`
+- `fft_size`
+- `noverlap`
+- `ignore_sideband_hz`
+- `frontend_correction_enable`
+- `frontend_correction_row_q`
+- `frontend_correction_smooth_sigma`
+- `frontend_correction_reference_q`
+- `frontend_correction_max_boost_db`
+- `frontend_correction_soft_knee_db`
+- `frontend_correction_edge_taper_fraction`
+- `frontend_correction_edge_taper_sigma`
+- `frontend_correction_edge_target_drop_db`
+- `frontend_edge_guard_floor`
+- `dino_coherence_gate_floor`
+- `texture_q`
+- `texture_k`
+- `power_q`
+- `dino_group_k`
+- `dino_group_spatial_weight`
+- `dino_group_score_q`
+- `pipeline_final_threshold`
+- `pipeline_final_threshold_no_speckle`
+- `pipeline_gap_floor`
+- `pipeline_component_min_size`
+- `pipeline_component_min_size_no_speckle`
+- `pipeline_power_rescue_floor`
+- `pipeline_power_rescue_gain`
+- `pipeline_strong_speckle_min_component`
+- `pipeline_texture_speckle_clean_threshold`
+- `pipeline_texture_speckle_strong_threshold`
+- `model_repo_path`
+- `weights_path`
+- `model_script_path`
 - `infer_batch_size`
-- `mask_threshold`
-- `postprocess_mode` (`argmax`, `threshold`, future `cluster`)
 - `emit_stride`
 - `max_inflight`
 - `debug_dump_enable`
 - `debug_dump_every_n`
+- `timing_summary_enable`
+- `timing_summary_every_n`
+- `timing_summary_window`
 
 ### Validation
 
@@ -340,12 +378,14 @@ Choose one:
 ### Validation additions for notebook parity
 
 1. Fixed-input parity test:
-   - run one captured spectrogram slice through notebook reference and C++ operator path
-   - compare output mask overlap metric (IoU) and summary statistics
+   - run one captured spectrogram slice through `signal_detection_holoscanv1.ipynb` and the C++ operator path
+   - compare output mask overlap metric (IoU), foreground fraction, and threshold-sensitive summary statistics
 2. Throughput validation:
    - verify no GPU->CPU transfer in hot path (except optional debug mode)
 3. Determinism check:
    - same input + config yields identical mask output over repeated runs
+4. Timing visibility check:
+   - operator logs emit per-stage timing summaries that can be compared against notebook timing categories
 
 ### Exit criteria
 
@@ -358,6 +398,8 @@ Choose one:
 ### Objective
 
 Harden for high-rate sustained operation.
+
+Start this phase only after the strict single-channel detector path is functional and the notebook-derived pipeline behavior is validated.
 
 ### Tasks
 
@@ -453,7 +495,7 @@ These should be decided before Phase 2 completion:
 1. **Spectrogram output layout** (`NCHW` vs `NHWC`)
 2. **Output precision** (`FP16` preferred for throughput unless model accuracy needs FP32)
 3. **Inference cadence policy** (every frame vs stride/window)
-4. **DINOv3 deployment path** (InferenceOp TensorRT vs custom operator)
+4. **DINOv3 deployment path** (custom LibTorch/TorchScript operator as active target, with other backends only as contingency)
 5. **Per-channel model policy** (shared model instance vs channel-specific handling)
 6. **Postprocess definition** (model-native mask head vs patch-feature clustering fallback)
 7. **Parity metric** (e.g., IoU threshold against notebook reference outputs)
@@ -535,7 +577,9 @@ Next active step:
    - detector metadata reports `dino_backend=torchscript`
    - no fallback warnings are emitted
    - mask or detector output is produced on the strict model-forward path
-3. If detector output is absent, use `notebooks/test_radio.ipynb` first as the RF sanity check before changing detector thresholds or operator logic.
+3. After the first successful strict run, immediately promote the active notebook constants and detector behavior from `../Dinov3-RF-Signal-Detection/signal_detection_holoscanv1.ipynb` into config-backed C++/GPU implementation work.
+4. Add timing instrumentation before optimization so the first performance pass is based on measured step costs.
+5. If detector output is absent, use `notebooks/test_radio.ipynb` first as the RF sanity check before changing detector thresholds or operator logic.
 
 ### 10.0 Package DINOv3 assets into the Holohub container
 
@@ -631,7 +675,7 @@ Exit criteria:
 - build output confirms Torch support is active for `dinov3_signal_detector`.
 - status: complete on 2026-04-01; app binary produced at `build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection/usrp_wideband_signal_detection`.
 
-### 10.5 Operator bring-up sequence
+### 10.5 Strict operator bring-up sequence
 
 Perform bring-up in this order:
 
@@ -652,7 +696,91 @@ Immediate next action:
 3. Capture operator logs and metadata for the first successful `torchscript` inference pass before any throughput tuning.
 4. If masks are not emitted, confirm live RF activity again with `notebooks/test_radio.ipynb` on the same antenna, channel, center frequency, and gain settings before debugging the detector.
 
-### 10.6 Input contract audit
+### 10.6 Notebook-constant promotion and C++/GPU reproduction
+
+Use `../Dinov3-RF-Signal-Detection/signal_detection_holoscanv1.ipynb` as the immediate source of truth for the first non-placeholder detector implementation.
+
+Tasks:
+
+1. Copy the current detector constants into `applications/usrp_wideband_signal_detection/config.yaml` and operator params using notebook-aligned names where practical.
+2. Promote at least the following notebook defaults into config:
+   - `DINO_COHERENCE_GATE_FLOOR = 0.25`
+   - `TEXTURE_Q = 0.90`
+   - `TEXTURE_K = 6`
+   - `POWER_Q = 0.90`
+   - `DINO_GROUP_K = 8`
+   - `DINO_GROUP_SPATIAL_WEIGHT = 0.35`
+   - `DINO_GROUP_SCORE_Q = 0.60`
+   - `PIPELINE_FINAL_THRESHOLD = 0.2`
+   - `PIPELINE_FINAL_THRESHOLD_NO_SPECKLE = 0.10`
+   - `PIPELINE_GAP_FLOOR = 0.10`
+   - `PIPELINE_COMPONENT_MIN_SIZE = 5`
+   - `PIPELINE_COMPONENT_MIN_SIZE_NO_SPECKLE = 2`
+   - `PIPELINE_POWER_RESCUE_FLOOR = 0.10`
+   - `PIPELINE_POWER_RESCUE_GAIN = 2.0`
+   - `PIPELINE_STRONG_SPECKLE_MIN_COMPONENT = 10`
+   - `PIPELINE_TEXTURE_SPECKLE_CLEAN_THRESHOLD = 0.85`
+   - `PIPELINE_TEXTURE_SPECKLE_STRONG_THRESHOLD = 0.20`
+   - `FRONTEND_CORRECTION_ROW_Q = 25.0`
+   - `FRONTEND_CORRECTION_SMOOTH_SIGMA = 12.0`
+   - `FRONTEND_CORRECTION_REFERENCE_Q = 75.0`
+   - `FRONTEND_CORRECTION_MAX_BOOST_DB = 12.0`
+   - `FRONTEND_CORRECTION_SOFT_KNEE_DB = 4.0`
+   - `FRONTEND_CORRECTION_EDGE_TAPER_FRACTION = 0.10`
+   - `FRONTEND_CORRECTION_EDGE_TAPER_SIGMA = 6.0`
+   - `FRONTEND_CORRECTION_EDGE_TARGET_DROP_DB = 2.5`
+   - `FRONTEND_EDGE_GUARD_FLOOR = 0.35`
+   - `IGNORE_SIDEBAND_HZ = 7e6`
+3. Reproduce the notebook pipeline behavior in C++ while keeping the hot path on GPU:
+   - sideband-ignore calculation and crop
+   - optional frontend correction
+   - patch-aligned DINO input preparation
+   - DINO grouping
+   - coherence gate
+   - texture and power maps
+   - multilevel final fusion and mask cleanup
+4. Keep the production model execution path in LibTorch / TorchScript rather than reintroducing Python into the runtime path.
+5. Treat notebook parity as required before any performance-driven simplification.
+
+Exit criteria:
+
+- the placeholder detector constants are replaced by notebook-backed config values,
+- the operator behavior matches the active notebook pipeline closely enough for fixed-input parity checks, and
+- the hot path remains GPU-resident apart from optional debug exports.
+
+### 10.7 Debug timing summary and hotspot visibility
+
+After the notebook-faithful detector path is implemented, add timing summary instrumentation before performance optimization.
+
+Required timing checkpoints:
+
+1. input load / message unpack and shape match
+2. frontend correction
+3. sideband-ignore crop and patch alignment
+4. DINO preprocess and normalization
+5. TorchScript forward
+6. DINO grouping
+7. DINO coherence gate
+8. texture scoring
+9. power scoring
+10. multilevel pipeline fusion
+11. final mask cleanup / emit
+12. total detector runtime
+
+Reporting requirements:
+
+1. add a config-gated debug timing summary to the operator logs,
+2. report at least mean, max, and recent-window totals every `timing_summary_every_n` frames,
+3. preserve a per-frame debug mode for one selected frame when parity debugging is needed, and
+4. use notebook timing column names where practical so comparisons stay straightforward.
+
+Exit criteria:
+
+- operator logs clearly identify the dominant runtime stages on representative input,
+- timing output is lightweight enough to leave enabled for short validation runs, and
+- the instrumentation is in place before speed-optimization work starts.
+
+### 10.8 Input contract audit
 
 Validate and document the current detector input contract before broader optimization:
 
@@ -665,7 +793,7 @@ Exit criteria:
 
 - the temporary input contract is documented and acknowledged as intentional.
 
-### 10.7 Parity validation against notebook references
+### 10.9 Parity validation against notebook references
 
 Run one fixed captured input through both the notebook and C++ paths.
 
@@ -673,8 +801,10 @@ Notebook references:
 
 1. `noise_detection_dino_experiments2.ipynb`
    - source of truth for local repo loading assumptions, weight selection, and patch-size assumptions
-2. `rf_spectrogram_segmentation.ipynb`
-   - preprocessing and mask-parity reference
+2. `signal_detection_holoscanv1.ipynb`
+   - source of truth for the active detector constants, frontend correction, grouping, coherence, and final fusion path
+3. `rf_spectrogram_segmentation.ipynb`
+   - earlier preprocessing and mask-parity reference
 
 Validation layers:
 
@@ -687,7 +817,28 @@ Exit criteria:
 
 - parity metrics meet the agreed threshold and are recorded.
 
-### 10.8 Throughput restoration and scale-up
+### 10.10 Runtime optimization pass after functionality validation
+
+Use `../Dinov3-RF-Signal-Detection/speed_optimization_todo.md` only after steps 10.5 through 10.9 are complete.
+
+Execution order:
+
+1. use the debug timing summary to identify the dominant detector stages on representative single-channel input,
+2. prioritize optimizations in the order suggested by the optimization note:
+   - eliminate avoidable GPU-to-CPU transfers,
+   - move neighbor search and grouping work to GPU-friendly tensor code,
+   - reduce or simplify coherence cost only if output quality remains acceptable,
+   - remove residual Python-style loops from the reproduced notebook logic,
+3. re-measure after each change before applying the next optimization, and
+4. defer quality-risk tradeoffs such as lower `k`, fewer coherence scales, or no-PCA variants until after a parity baseline is recorded.
+
+Exit criteria:
+
+- optimization work is driven by measured bottlenecks rather than guesswork,
+- no optimization begins before functional validation is complete, and
+- each optimization pass is accompanied by parity and latency comparison notes.
+
+### 10.11 Throughput restoration and scale-up
 
 After strict bring-up and parity pass:
 
@@ -701,14 +852,14 @@ Exit criteria:
 
 - stable sustained run with bounded memory, controlled inference cadence, and no unintended backend regressions.
 
-### 10.9 Immediate follow-on tasks
+### 10.12 Immediate follow-on tasks
 
 1. Add a postprocess or sink stage after the detector so outputs are validated by more than logs and metadata.
 2. Promote debug metadata into a formal downstream output schema.
 3. Add explicit troubleshooting notes for model-load, export, packaging, and fallback modes.
 4. Decide whether the spectrogram operator remains a debug saver or becomes the true tensor-producing preprocessing stage.
 
-### 10.10 Session restart quick checks
+### 10.13 Session restart quick checks
 
 Use the following session checklist after any pause in work:
 
