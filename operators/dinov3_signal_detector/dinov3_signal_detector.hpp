@@ -3,19 +3,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "dinov3_torch_runtime.hpp"
+
 #include <array>
 #include <chrono>
 #include <cuda/std/complex>
 #include <holoscan/holoscan.hpp>
 #include <matx.h>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
-
-#ifdef HOLOHUB_HAS_TORCH
-#include <torch/script.h>
-#endif
 
 using namespace matx;
 
@@ -106,18 +103,9 @@ class DinoV3SignalDetector : public holoscan::Operator {
   matx::tensor_t<float, 3> detection_masks_;
   bool pytorch_runtime_ready_ = false;
   bool pytorch_warning_emitted_ = false;
-  bool torchscript_model_loaded_ = false;
-  bool torchscript_load_attempted_ = false;
-  bool torchscript_load_failed_ = false;
-  bool torchscript_forward_ready_ = false;
-  bool torchscript_forward_warning_emitted_ = false;
   bool torchscript_forward_trace_emitted_ = false;
-  bool torchscript_module_on_cuda_ = false;
 
-#ifdef HOLOHUB_HAS_TORCH
-  std::mutex torchscript_load_mutex_;
-  std::unique_ptr<torch::jit::script::Module> torchscript_module_;
-#endif
+  std::unique_ptr<DinoTorchRuntime> torch_runtime_;
 };
 
 }  // namespace holoscan::ops

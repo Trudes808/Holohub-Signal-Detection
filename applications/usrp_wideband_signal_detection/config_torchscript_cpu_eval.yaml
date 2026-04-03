@@ -151,7 +151,7 @@ dinov3_signal_detector:
   model_name: "dinov3_vitb16"
   model_repo_path: "/workspace/models/dinov3"
   weights_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
-  model_script_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"
+  model_script_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be_cpu.ts"
   torchscript_init_mode: "load_cpu_eval"
   strict_model_forward: false
   imagenet_mean: [0.485, 0.456, 0.406]

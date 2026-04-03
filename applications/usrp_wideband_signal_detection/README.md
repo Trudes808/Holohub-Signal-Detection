@@ -37,7 +37,7 @@ Available configs copied into the build directory:
 	- forces `use_pytorch_backend: false` and `inference_backend: "cuda_threshold_fallback"` so detector behavior stays on the non-Torch path
 - `config_torchscript_cpu_eval.yaml`
 	- isolates whether `eval()` is safe while the module is still on CPU
-	- uses `inference_backend: "torchscript"`, `torchscript_init_mode: "load_cpu_eval"`, and `strict_model_forward: false`
+	- uses `inference_backend: "torchscript"`, `torchscript_init_mode: "load_cpu_eval"`, `strict_model_forward: false`, and the CPU-exported TorchScript artifact `dinov3_vitb16_pretrain_lvd1689m-73cec8be_cpu.ts`
 - `config_torchscript_cuda_no_eval.yaml`
 	- isolates whether the CUDA transfer itself is safe before `eval()` runs
 	- uses `inference_backend: "torchscript"`, `torchscript_init_mode: "load_cuda_no_eval"`, and `strict_model_forward: false`
@@ -114,6 +114,47 @@ cd applications/usrp_wideband_signal_detection
 ./rebuild_demo_container_app.sh
 ```
 
+## Offline Visualizer
+
+An initial offline viewer executable is now part of this application directory:
+
+- `offline_spectrogram_visualizer`
+
+Purpose:
+
+- replay saved spectrogram `.pgm` frames without a connected radio
+- exercise the HoloViz rendering path before live pipeline integration
+- provide a usable visualization path during remote development
+
+Example usage from the build directory:
+
+```bash
+./offline_spectrogram_visualizer --offline-dir /tmp/usrp_spectrograms --fps 8
+```
+
+Useful flags:
+
+- `--offline-dir <DIR>`
+	- directory containing saved `.pgm` spectrogram frames
+- `--fps <FPS>`
+	- playback rate for offline replay
+- `--count <COUNT>`
+	- stop after a fixed number of frames
+- `--color-mode <MODE>`
+	- `gray` or `heatmap`
+- `--no-loop`
+	- stop advancing once the final frame is reached
+- `--hide-fake-overlay`
+	- disable the prototype overlay labels at startup
+
+Remote usage note:
+
+- the viewer uses HoloViz and opens a native window on the machine running the executable
+- this works well in a local desktop session, inside a remote desktop session, or with display forwarding configured correctly
+- this is not expected to render in a plain headless SSH session with no display server
+
+The current viewer is intentionally offline-only. The next step is to add overlay rendering and then connect the same viewer path to live spectrogram output.
+
 ## Validation Notes
 
 - `config.yaml` is now the stable debug run configuration. It intentionally keeps `inference_backend: "pytorch_placeholder"` while saving the first 5 spectrograms and detector masks per channel.
@@ -121,6 +162,7 @@ cd applications/usrp_wideband_signal_detection
 - `config_torchscript_validation.yaml` is the strict TorchScript bring-up configuration. Use it when you want the C++ TorchScript path to fail loudly.
 - `config_torchscript_load_only.yaml` is the first diagnostic step for the C++ TorchScript path. It confirms whether `torch::jit::load(...)` itself is safe before the operator attempts CUDA transfer.
 - `config_torchscript_cpu_eval.yaml` is the second diagnostic step. It tests whether `eval()` is safe while staying entirely on CPU.
+- The CPU validation flow should use the CPU-exported artifact `dinov3_vitb16_pretrain_lvd1689m-73cec8be_cpu.ts`; the original `dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts` remains the CUDA-traced artifact.
 - `config_torchscript_cuda_no_eval.yaml` is the third diagnostic step. It tests whether `to(torch::kCUDA)` is safe before `eval()` runs.
 - Because the current executable is linked against libtorch when Torch is available at build time, the Torch runtime libraries still need to be present in the container even when you launch `config_cuda_fallback.yaml`.
 - The selected runtime weight is `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`.

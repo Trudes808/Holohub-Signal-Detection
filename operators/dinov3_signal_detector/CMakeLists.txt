@@ -13,6 +13,24 @@ find_package(matx CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+set(CUDA_LINK_DIRS
+  "/usr/local/cuda/targets/x86_64-linux/lib"
+  "/usr/local/cuda/lib64"
+  "/usr/local/cuda-12.6/targets/x86_64-linux/lib"
+  "/usr/local/cuda-12.6/lib64"
+)
+
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "import importlib.util, pathlib; spec = importlib.util.find_spec('nvidia.nvjitlink'); print(pathlib.Path(spec.submodule_search_locations[0]) / 'lib' if spec and spec.submodule_search_locations else '')"
+  OUTPUT_VARIABLE PY_NVJITLINK_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+
+if(PY_NVJITLINK_DIR AND EXISTS "${PY_NVJITLINK_DIR}/libnvJitLink.so.12")
+  list(APPEND CUDA_LINK_DIRS ${PY_NVJITLINK_DIR})
+endif()
+
 execute_process(
   COMMAND ${Python3_EXECUTABLE} -c "from pathlib import Path; import sys; hints=[];\ntry:\n import torch, torch.utils\n cmake_prefix=getattr(torch.utils, 'cmake_prefix_path', '')\n torch_file=Path(torch.__file__).resolve()\n torch_dir=torch_file.parent\n candidates=[cmake_prefix, str(torch_dir), str(torch_dir / 'share' / 'cmake'), str(torch_dir / 'share' / 'cmake' / 'Torch'), str(torch_dir.parent), str(torch_dir.parent / 'share' / 'cmake'), str(torch_dir.parent / 'share' / 'cmake' / 'Torch')]\n for item in candidates:\n  if item and item not in hints:\n   hints.append(item)\n print(';'.join(hints))\nexcept Exception:\n print('')"
   OUTPUT_VARIABLE PYTORCH_CMAKE_HINTS
@@ -47,7 +65,9 @@ if(NOT Torch_FOUND)
 endif()
 
 add_library(dinov3_signal_detector
+  dinov3_torch_runtime.cpp
   dinov3_signal_detector.cu
+  dinov3_torch_runtime.hpp
   dinov3_signal_detector.hpp
 )
 add_library(holoscan::ops::dinov3_signal_detector ALIAS dinov3_signal_detector)
@@ -62,32 +82,59 @@ target_link_libraries(dinov3_signal_detector
 if(Torch_FOUND)
   target_link_libraries(dinov3_signal_detector PRIVATE ${TORCH_LIBRARIES})
 
+  set(OP_NVJITLINK_LINK_ITEM "")
   if(TARGET CUDA::nvJitLink)
-    target_link_libraries(dinov3_signal_detector PRIVATE CUDA::nvJitLink)
+    set(OP_NVJITLINK_LINK_ITEM CUDA::nvJitLink)
   else()
-    get_filename_component(CUDAToolkit_ROOT_DIR "${CUDAToolkit_BIN_DIR}" DIRECTORY)
-    set(NVJITLINK_LIBRARY "")
-    foreach(NVJITLINK_CANDIDATE
-      "${CUDAToolkit_ROOT_DIR}/targets/x86_64-linux/lib/libnvJitLink.so.12"
-      "${CUDAToolkit_ROOT_DIR}/lib64/libnvJitLink.so.12"
-      "/usr/local/cuda-12.6/targets/x86_64-linux/lib/libnvJitLink.so.12"
-      "/usr/local/cuda-12.6/lib64/libnvJitLink.so.12")
-      if(EXISTS "${NVJITLINK_CANDIDATE}")
-        set(NVJITLINK_LIBRARY "${NVJITLINK_CANDIDATE}")
-        break()
-      endif()
-    endforeach()
+    unset(OP_NVJITLINK_LINK_ITEM CACHE)
+    find_library(OP_NVJITLINK_LINK_ITEM
+      NAMES libnvJitLink.so.12 nvJitLink
+      PATHS ${CUDA_LINK_DIRS}
+      NO_DEFAULT_PATH
+    )
 
-    if(NVJITLINK_LIBRARY)
-      target_link_libraries(dinov3_signal_detector PRIVATE ${NVJITLINK_LIBRARY})
+    if(OP_NVJITLINK_LINK_ITEM)
+      get_filename_component(OP_NVJITLINK_LINK_DIR "${OP_NVJITLINK_LINK_ITEM}" DIRECTORY)
+      if(EXISTS "${OP_NVJITLINK_LINK_DIR}")
+        list(APPEND CUDA_LINK_DIRS ${OP_NVJITLINK_LINK_DIR})
+      endif()
     else()
       message(WARNING "dinov3_signal_detector: nvJitLink library not found; Torch linkage may fail")
     endif()
   endif()
 
+  if(OP_NVJITLINK_LINK_ITEM)
+    target_link_libraries(dinov3_signal_detector PRIVATE ${OP_NVJITLINK_LINK_ITEM})
+  endif()
+
+  list(REMOVE_DUPLICATES CUDA_LINK_DIRS)
+  target_link_directories(dinov3_signal_detector PRIVATE ${CUDA_LINK_DIRS})
+  foreach(CUDA_LINK_DIR IN LISTS CUDA_LINK_DIRS)
+    if(EXISTS "${CUDA_LINK_DIR}")
+      target_link_options(dinov3_signal_detector PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
+    endif()
+  endforeach()
+
   target_compile_options(dinov3_signal_detector PRIVATE ${TORCH_CXX_FLAGS})
   target_compile_definitions(dinov3_signal_detector PRIVATE HOLOHUB_HAS_TORCH=1)
   target_compile_features(dinov3_signal_detector PRIVATE cxx_std_17)
+
+  add_executable(dinov3_libtorch_sandbox
+    dinov3_libtorch_sandbox.cpp
+  )
+  target_link_libraries(dinov3_libtorch_sandbox PRIVATE ${TORCH_LIBRARIES})
+  if(OP_NVJITLINK_LINK_ITEM)
+    target_link_libraries(dinov3_libtorch_sandbox PRIVATE ${OP_NVJITLINK_LINK_ITEM})
+  endif()
+  target_link_directories(dinov3_libtorch_sandbox PRIVATE ${CUDA_LINK_DIRS})
+  foreach(CUDA_LINK_DIR IN LISTS CUDA_LINK_DIRS)
+    if(EXISTS "${CUDA_LINK_DIR}")
+      target_link_options(dinov3_libtorch_sandbox PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
+    endif()
+  endforeach()
+  target_compile_options(dinov3_libtorch_sandbox PRIVATE ${TORCH_CXX_FLAGS})
+  target_compile_features(dinov3_libtorch_sandbox PRIVATE cxx_std_17)
+
   message(STATUS "dinov3_signal_detector: Torch found, enabling PyTorch backend path")
 else()
   message(STATUS "dinov3_signal_detector: Torch not found, building CUDA fallback path only")

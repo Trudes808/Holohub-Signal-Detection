@@ -83,6 +83,16 @@ target_link_libraries(usrp_wideband_signal_detection
   CHDR_converter_wideband
 )
 
+add_executable(offline_spectrogram_visualizer
+  offline_spectrogram_visualizer.cpp
+)
+
+target_link_libraries(offline_spectrogram_visualizer
+  PRIVATE
+  holoscan::core
+  holoscan::ops::holoviz
+)
+
 if(APP_NVJITLINK_LINK_ITEM)
   target_link_libraries(usrp_wideband_signal_detection PRIVATE ${APP_NVJITLINK_LINK_ITEM})
 endif()
@@ -95,6 +105,11 @@ foreach(CUDA_LINK_DIR IN LISTS CUDA_LINK_DIRS)
 endforeach()
 
 target_include_directories(usrp_wideband_signal_detection
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_include_directories(offline_spectrogram_visualizer
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
