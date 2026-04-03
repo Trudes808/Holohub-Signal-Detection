@@ -11,6 +11,26 @@ find_package(matx CONFIG REQUIRED
 find_package(CUDAToolkit REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+find_library(APP_VULKAN_LINK_ITEM
+  NAMES vulkan libvulkan.so.1
+  PATHS
+    /usr/lib/x86_64-linux-gnu
+    /lib/x86_64-linux-gnu
+    /usr/local/lib
+    /usr/local/lib64
+)
+
+set(APP_SYSTEM_LINK_DIRS
+  /usr/lib/x86_64-linux-gnu
+  /lib/x86_64-linux-gnu
+  /usr/local/lib
+  /usr/local/lib64
+)
+
+if(NOT APP_VULKAN_LINK_ITEM)
+  message(WARNING "usrp_wideband_signal_detection: Vulkan loader library not found; visualization binaries may fail to link")
+endif()
+
 set(CMAKE_CUDA_ARCHITECTURES "70;80;90")
 enable_language(CUDA)
 
@@ -71,27 +91,47 @@ target_include_directories(CHDR_converter_wideband
 
 add_executable(usrp_wideband_signal_detection
   main.cpp
+  spectrogram_visualization.cu
+  screenshot_sink.cpp
 )
 target_link_libraries(usrp_wideband_signal_detection
   PRIVATE
   matx::matx
+  CUDA::cudart
   holoscan::core
   holoscan::advanced_network
   holoscan::ops::fft
+  holoscan::ops::holoviz
   holoscan::ops::spectrogram
   holoscan::ops::dinov3_signal_detector
   CHDR_converter_wideband
 )
 
 add_executable(offline_spectrogram_visualizer
-  offline_spectrogram_visualizer.cpp
+  offline_spectrogram_replay.cpp
+  spectrogram_visualization.cu
+  screenshot_sink.cpp
 )
 
 target_link_libraries(offline_spectrogram_visualizer
   PRIVATE
+  CUDA::cudart
+  matx::matx
   holoscan::core
   holoscan::ops::holoviz
 )
+
+if(APP_VULKAN_LINK_ITEM)
+  target_link_libraries(usrp_wideband_signal_detection PRIVATE ${APP_VULKAN_LINK_ITEM})
+  target_link_libraries(offline_spectrogram_visualizer PRIVATE ${APP_VULKAN_LINK_ITEM})
+endif()
+
+target_link_directories(offline_spectrogram_visualizer PRIVATE ${APP_SYSTEM_LINK_DIRS})
+foreach(APP_LINK_DIR IN LISTS APP_SYSTEM_LINK_DIRS)
+  if(EXISTS "${APP_LINK_DIR}")
+    target_link_options(offline_spectrogram_visualizer PRIVATE "LINKER:-rpath-link,${APP_LINK_DIR}")
+  endif()
+endforeach()
 
 if(APP_NVJITLINK_LINK_ITEM)
   target_link_libraries(usrp_wideband_signal_detection PRIVATE ${APP_NVJITLINK_LINK_ITEM})
@@ -119,6 +159,11 @@ target_compile_definitions(usrp_wideband_signal_detection
   USRP_WIDEBAND_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
+target_compile_definitions(offline_spectrogram_visualizer
+  PRIVATE
+  USRP_WIDEBAND_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
 if(NOT DEFINED ANO_MGR)
     set(ANO_MGR "dpdk gpunetio" CACHE STRING "Manager type(s) list")
 endif()
@@ -130,6 +175,7 @@ endforeach()
 
   set(USRP_WIDEBAND_CONFIG_FILES
     config.yaml
+    config_offline_replay.yaml
     config_cuda_fallback.yaml
     config_torchscript_cpu_eval.yaml
     config_torchscript_cuda_no_eval.yaml

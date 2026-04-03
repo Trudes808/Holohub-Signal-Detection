@@ -114,17 +114,24 @@ cd applications/usrp_wideband_signal_detection
 ./rebuild_demo_container_app.sh
 ```
 
-## Offline Visualizer
+## Visualization
 
-An initial offline viewer executable is now part of this application directory:
+The visualization path is now structured around the real C++ pipeline:
 
-- `offline_spectrogram_visualizer`
+- `usrp_wideband_signal_detection` can open a HoloViz spectrogram window from the live `spectrogramOp` branch when `visualization.enable: true`
+- `offline_spectrogram_visualizer` replays saved `.pgm` spectrogram frames without requiring a connected radio
 
-Purpose:
+### Live Spectrogram Window
 
-- replay saved spectrogram `.pgm` frames without a connected radio
-- exercise the HoloViz rendering path before live pipeline integration
-- provide a usable visualization path during remote development
+Set `visualization.enable: true` in `config.yaml` to turn on the live spectrogram branch.
+
+The current live renderer:
+
+- branches directly from `spectrogramOp`
+- converts the spectrogram tensor into a HoloViz color image
+- keeps detector overlay work separate so the render path stays reusable
+
+### Offline Replay
 
 Example usage from the build directory:
 
@@ -132,28 +139,36 @@ Example usage from the build directory:
 ./offline_spectrogram_visualizer --offline-dir /tmp/usrp_spectrograms --fps 8
 ```
 
+Headless screenshot export:
+
+```bash
+./offline_spectrogram_visualizer --offline-dir /workspace/spectrograms --screenshot offline_preview.png
+```
+
 Useful flags:
 
+- `--config <FILE>`
+	- use a specific replay config file, defaulting to `config_offline_replay.yaml`
 - `--offline-dir <DIR>`
 	- directory containing saved `.pgm` spectrogram frames
 - `--fps <FPS>`
 	- playback rate for offline replay
-- `--count <COUNT>`
-	- stop after a fixed number of frames
-- `--color-mode <MODE>`
-	- `gray` or `heatmap`
+- `--screenshot <FILE>`
+	- export the first replayed `.pgm` frame directly to PNG without starting HoloViz; relative paths are saved under `/workspace/spectrograms`, which maps back to the host spectrogram directory
 - `--no-loop`
-	- stop advancing once the final frame is reached
-- `--hide-fake-overlay`
-	- disable the prototype overlay labels at startup
+	- stop after the final frame instead of looping
 
 Remote usage note:
 
 - the viewer uses HoloViz and opens a native window on the machine running the executable
-- this works well in a local desktop session, inside a remote desktop session, or with display forwarding configured correctly
+- this works in a local desktop session, a remote desktop session, or a correctly configured display-forwarded container
 - this is not expected to render in a plain headless SSH session with no display server
 
-The current viewer is intentionally offline-only. The next step is to add overlay rendering and then connect the same viewer path to live spectrogram output.
+The `--screenshot` path is the current no-desktop fallback. It writes a PNG directly from the first replayed frame and does not depend on HoloViz, GLFW, or Vulkan. If you pass a simple filename such as `offline_preview.png`, it will be written to `/workspace/spectrograms/offline_preview.png` in the container and show up in the mapped host directory, typically `/tmp/usrp_spectrograms/offline_preview.png`.
+
+If you run inside the demo container and see `Failed to initialize glfw` or `Failed to detect any supported platform`, the container was started without host display forwarding. Relaunch it from a desktop-capable session with `DISPLAY` set so `run_demo_container.sh` can forward `/tmp/.X11-unix` and `XAUTHORITY` into the container.
+
+The next visualization step is to add a detector overlay postprocessor that emits HoloViz overlay tensors and `InputSpec` metadata.
 
 ## Validation Notes
 

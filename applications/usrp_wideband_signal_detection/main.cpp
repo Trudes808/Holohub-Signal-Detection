@@ -2,8 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 #include "../usrp_freq_detection/CHDR_converter/chdr_rx.h"
+#include "spectrogram_visualization.hpp"
 #include <dinov3_signal_detector.hpp>
 #include <fft.hpp>
+#include <holoscan/operators/holoviz/holoviz.hpp>
 #include <spectrogram.hpp>
 
 namespace {
@@ -39,7 +41,7 @@ class LogOp: public holoscan::Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(LogOp)
 
-  using in_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
+  using in_t = holoscan::ops::in_t;
 
   LogOp() = default;
 
@@ -126,6 +128,20 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         "dinoV3SignalDetectorOp",
         from_config("dinov3_signal_detector"));
 
+    const bool enable_visualization = from_config("visualization.enable").as<bool>();
+    std::shared_ptr<holoscan::Operator> spectrogramVisualizerOp;
+    std::shared_ptr<holoscan::Operator> holovizOp;
+    if (enable_visualization) {
+      const auto tensor_name = from_config("visualization.renderer.tensor_name").as<std::string>();
+      spectrogramVisualizerOp = make_operator<ops::SpectrogramToHolovizOp>(
+        "spectrogramVisualizerOp",
+        from_config("visualization.renderer"));
+      holovizOp = make_operator<ops::HolovizOp>(
+        "holovizOp",
+        from_config("visualization.holoviz"),
+        holoscan::Arg("tensors") = ops::make_spectrogram_input_specs(tensor_name));
+    }
+
     auto logOp = make_operator<LogOp>(
         "logOp",
         from_config("logger"),
@@ -135,11 +151,19 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     add_operator(fftOp);
     add_operator(spectrogramOp);
     add_operator(dinoV3SignalDetectorOp);
+    if (enable_visualization) {
+      add_operator(spectrogramVisualizerOp);
+      add_operator(holovizOp);
+    }
     add_operator(logOp);
 
     add_flow(chdrConverterOp, fftOp);
     add_flow(fftOp, spectrogramOp);
     add_flow(spectrogramOp, dinoV3SignalDetectorOp);
+    if (enable_visualization) {
+      add_flow(spectrogramOp, spectrogramVisualizerOp);
+      add_flow(spectrogramVisualizerOp, holovizOp, {{"outputs", "receivers"}});
+    }
     add_flow(fftOp, logOp);
   }
 };

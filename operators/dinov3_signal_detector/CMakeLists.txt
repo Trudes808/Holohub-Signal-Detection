@@ -38,6 +38,13 @@ execute_process(
   ERROR_QUIET
 )
 
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "from pathlib import Path; import sys; includes=[];\ntry:\n import torch\n torch_dir=Path(torch.__file__).resolve().parent\n candidates=[torch_dir / 'include', torch_dir / 'include' / 'torch' / 'csrc' / 'api' / 'include', torch_dir.parent / 'include', torch_dir.parent / 'include' / 'torch' / 'csrc' / 'api' / 'include']\n for item in candidates:\n  if item.exists():\n   includes.append(str(item))\n print(';'.join(dict.fromkeys(includes)))\nexcept Exception:\n print('')"
+  OUTPUT_VARIABLE PYTORCH_INCLUDE_HINTS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+
 set(TORCH_SEARCH_HINTS "")
 
 if(PYTORCH_CMAKE_HINTS)
@@ -50,6 +57,17 @@ if(PYTORCH_CMAKE_HINTS)
 endif()
 
 list(REMOVE_DUPLICATES TORCH_SEARCH_HINTS)
+
+set(TORCH_INCLUDE_HINTS "")
+if(PYTORCH_INCLUDE_HINTS)
+  string(REPLACE ";" ";" PYTORCH_INCLUDE_HINTS_LIST "${PYTORCH_INCLUDE_HINTS}")
+  foreach(TORCH_INCLUDE_HINT IN LISTS PYTORCH_INCLUDE_HINTS_LIST)
+    if(TORCH_INCLUDE_HINT AND EXISTS "${TORCH_INCLUDE_HINT}")
+      list(APPEND TORCH_INCLUDE_HINTS "${TORCH_INCLUDE_HINT}")
+    endif()
+  endforeach()
+endif()
+list(REMOVE_DUPLICATES TORCH_INCLUDE_HINTS)
 
 if(TORCH_SEARCH_HINTS)
   list(PREPEND CMAKE_PREFIX_PATH ${TORCH_SEARCH_HINTS})
@@ -64,11 +82,20 @@ if(NOT Torch_FOUND)
   find_package(Torch QUIET)
 endif()
 
-add_library(dinov3_signal_detector
-  dinov3_torch_runtime.cpp
+set(DINOV3_SIGNAL_DETECTOR_SOURCES
   dinov3_signal_detector.cu
   dinov3_torch_runtime.hpp
   dinov3_signal_detector.hpp
+)
+
+if(Torch_FOUND)
+  list(APPEND DINOV3_SIGNAL_DETECTOR_SOURCES dinov3_torch_runtime.cpp)
+else()
+  list(APPEND DINOV3_SIGNAL_DETECTOR_SOURCES dinov3_torch_runtime_stub.cpp)
+endif()
+
+add_library(dinov3_signal_detector
+  ${DINOV3_SIGNAL_DETECTOR_SOURCES}
 )
 add_library(holoscan::ops::dinov3_signal_detector ALIAS dinov3_signal_detector)
 target_include_directories(dinov3_signal_detector INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -81,6 +108,13 @@ target_link_libraries(dinov3_signal_detector
 
 if(Torch_FOUND)
   target_link_libraries(dinov3_signal_detector PRIVATE ${TORCH_LIBRARIES})
+  if(TORCH_INCLUDE_DIRS)
+    target_include_directories(dinov3_signal_detector PRIVATE ${TORCH_INCLUDE_DIRS})
+  endif()
+  if(TORCH_INCLUDE_HINTS)
+    target_include_directories(dinov3_signal_detector PRIVATE ${TORCH_INCLUDE_HINTS})
+    message(STATUS "dinov3_signal_detector: Torch include hints=${TORCH_INCLUDE_HINTS}")
+  endif()
 
   set(OP_NVJITLINK_LINK_ITEM "")
   if(TARGET CUDA::nvJitLink)
@@ -123,6 +157,12 @@ if(Torch_FOUND)
     dinov3_libtorch_sandbox.cpp
   )
   target_link_libraries(dinov3_libtorch_sandbox PRIVATE ${TORCH_LIBRARIES})
+  if(TORCH_INCLUDE_DIRS)
+    target_include_directories(dinov3_libtorch_sandbox PRIVATE ${TORCH_INCLUDE_DIRS})
+  endif()
+  if(TORCH_INCLUDE_HINTS)
+    target_include_directories(dinov3_libtorch_sandbox PRIVATE ${TORCH_INCLUDE_HINTS})
+  endif()
   if(OP_NVJITLINK_LINK_ITEM)
     target_link_libraries(dinov3_libtorch_sandbox PRIVATE ${OP_NVJITLINK_LINK_ITEM})
   endif()

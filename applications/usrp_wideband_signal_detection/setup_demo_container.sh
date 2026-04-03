@@ -37,6 +37,14 @@ install_matx() {
     rm -rf /tmp/matx"
 }
 
+ensure_vulkan_runtime() {
+  sudo docker exec "${CONTAINER_NAME}" bash -lc 'set -euo pipefail
+if ! ldconfig -p | grep -q "libvulkan.so.1"; then
+  apt-get update
+  apt-get install -y --no-install-recommends libvulkan1
+fi'
+}
+
 ensure_nvjitlink_symlink() {
   sudo docker exec "${CONTAINER_NAME}" bash -lc 'set -euo pipefail
 for libdir in \
@@ -141,6 +149,7 @@ print(f"cuda_device_name={torch.cuda.get_device_name(0)}")
 PY
 
 ensure_nvjitlink_symlink
+ensure_vulkan_runtime
 
 if ! sudo docker exec "${CONTAINER_NAME}" test -f /usr/local/lib/cmake/matx/matx-config.cmake; then
   install_matx

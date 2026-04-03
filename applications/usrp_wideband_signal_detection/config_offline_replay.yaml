@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 National Instruments Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+scheduler:
+  worker_thread_number: 1
+  stop_on_deadlock: true
+  stop_on_deadlock_timeout: 500
+
+offline_replay:
+  directory: "/workspace/spectrograms"
+  frame_rate: 6.0
+  repeat: true
+  channel_filter: -1
+  tensor_name: "spectrogram"
+
+visualization:
+  holoviz:
+    width: 1280
+    height: 720
+    window_title: "USRP Offline Spectrogram Replay"
+    fullscreen: false

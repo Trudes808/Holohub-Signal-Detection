@@ -16,6 +16,12 @@ if [[ "$(sudo docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}")" != "t
   sudo docker start "${CONTAINER_NAME}" >/dev/null
 fi
 
+sudo docker exec "${CONTAINER_NAME}" bash -lc 'set -euo pipefail
+if ! ldconfig -p | grep -q "libvulkan.so.1"; then
+  apt-get update
+  apt-get install -y --no-install-recommends libvulkan1
+fi'
+
 if ! sudo docker exec "${CONTAINER_NAME}" bash -lc 'python3 - <<"PY"
 import importlib.util
 from pathlib import Path

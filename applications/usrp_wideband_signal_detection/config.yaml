@@ -125,6 +125,19 @@ logger:
   num_channels: 2
   log_interval: 1
 
+visualization:
+  enable: false
+  renderer:
+    output_height: 256
+    output_width: 512
+    channel_filter: 0
+    tensor_name: "spectrogram"
+  holoviz:
+    width: 1280
+    height: 720
+    window_title: "USRP Wideband Spectrogram"
+    fullscreen: false
+
 spectrogram:
   num_channels: 2
   enable_save: false

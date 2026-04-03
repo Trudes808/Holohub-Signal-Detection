@@ -10,6 +10,9 @@ HUGEPAGES_DIR=${HUGEPAGES_DIR:-/dev/hugepages}
 SPECTROGRAM_HOST_DIR=${SPECTROGRAM_HOST_DIR:-/tmp/usrp_spectrograms}
 DINO_MASK_HOST_DIR=${DINO_MASK_HOST_DIR:-/tmp/usrp_dino_masks}
 DETACH=${DETACH:-1}
+DISPLAY_VALUE=${DISPLAY:-}
+XAUTHORITY_VALUE=${XAUTHORITY:-}
+X11_SOCKET_DIR=/tmp/.X11-unix
 
 cd "${REPO_ROOT}"
 
@@ -38,6 +41,20 @@ DOCKER_RUN_CMD=(
   --ipc=host \
 )
 
+if [[ -n "${DISPLAY_VALUE}" && -d "${X11_SOCKET_DIR}" ]]; then
+  DOCKER_RUN_CMD+=(
+    -e DISPLAY="${DISPLAY_VALUE}" \
+    -v "${X11_SOCKET_DIR}:${X11_SOCKET_DIR}:rw"
+  )
+
+  if [[ -n "${XAUTHORITY_VALUE}" && -f "${XAUTHORITY_VALUE}" ]]; then
+    DOCKER_RUN_CMD+=(
+      -e XAUTHORITY="${XAUTHORITY_VALUE}" \
+      -v "${XAUTHORITY_VALUE}:${XAUTHORITY_VALUE}:ro"
+    )
+  fi
+fi
+
 if [[ "${DETACH}" == "1" ]]; then
   DOCKER_RUN_CMD+=(
     --detach
@@ -50,6 +67,11 @@ if [[ "${DETACH}" == "1" ]]; then
   echo "Started container ${CONTAINER_NAME} from image ${IMAGE_NAME}."
   echo "Host spectrogram output: ${SPECTROGRAM_HOST_DIR}"
   echo "Host DINO mask output: ${DINO_MASK_HOST_DIR}"
+  if [[ -n "${DISPLAY_VALUE}" && -d "${X11_SOCKET_DIR}" ]]; then
+    echo "Display forwarding enabled for DISPLAY=${DISPLAY_VALUE}."
+  else
+    echo "Display forwarding not configured; HoloViz viewers will fail unless you launch from a desktop session with DISPLAY set."
+  fi
   echo "Attach with: sudo docker exec -it ${CONTAINER_NAME} bash"
   exit 0
 fi

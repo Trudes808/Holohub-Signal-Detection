@@ -2,255 +2,184 @@
 
 ## Objective
 
-Create a visualization path for the USRP wideband signal detection work that can:
+Build the visualization path as part of the real C++ Holoscan pipeline, not as a disconnected prototype. The final system must:
 
-- display a live spectrogram in a Holoscan window
-- overlay signal detection results on top of the spectrogram
-- run without a connected radio by replaying saved spectrogram frames
-- remain usable when the app is launched on a remote machine
+- branch directly from the existing spectrogram output in the live app
+- render the spectrogram in HoloViz with the same image contract in live and offline modes
+- support offline replay from saved `.pgm` spectrogram frames so development does not depend on a connected radio
+- leave a clean insertion point for detector overlays once the detector output contract is finalized
 
 ## Short Answers
 
-### Can we add a flag to use offline data?
+### Can we enable offline replay while building the real viewer?
 
-Yes. This is practical and should be part of the first implementation slice.
+Yes. That should be a first-class part of the design.
 
-The cleanest approach is to support an input mode flag such as:
+The correct split is:
 
-```text
---input-source live
---input-source offline
---input-source synthetic
-```
+- live app: branch from `spectrogramOp` into a visualization renderer
+- offline harness: replay saved spectrogram artifacts and feed the same HoloViz image contract
 
-For offline mode, the visualizer can read previously saved spectrogram frames from a directory such as `/tmp/usrp_spectrograms` on the host or `/workspace/spectrograms` inside the demo container.
+This keeps the production render path in C++ while still letting us debug without RF hardware.
 
 ### Will it work over a remote connection?
 
-Yes, with an important caveat: HoloViz renders a native window on the machine running the application. That means remote viewing is possible, but only if the remote session supports graphics forwarding or desktop remoting.
+Yes, with the normal HoloViz caveat: it opens a native window on the machine running the process.
 
 Practical remote options:
 
-- local desktop session on the machine running the app
-- SSH with X11 forwarding if OpenGL support is sufficient
-- VNC, NICE DCV, or another remote desktop session
-- running inside a container while forwarding the host display into the container
+- local desktop on the host machine
+- X11 forwarding if OpenGL and latency are acceptable
+- remote desktop sessions such as VNC or NICE DCV
+- containerized runs with the host display forwarded into the container
 
-What is not guaranteed to work well:
+Not a primary target for the first milestone:
 
 - plain headless SSH with no display server
-- browser-only access without an additional streaming layer
+- browser delivery without adding a streaming layer such as WebRTC
 
-Because of that, the visualization plan should also include a fallback mode that writes frames or clips to disk when no display is available.
+## Architecture Decision
 
-## Recommended Architecture
+Use HoloViz as the renderer and keep the final path in C++.
 
-Use HoloViz as the default renderer.
+### Live path
 
-Why:
+1. `chdrConverterOp -> fftOp -> spectrogramOp`
+2. branch `spectrogramOp` to the detector path and to a spectrogram visualization renderer
+3. feed the renderer output into `HolovizOp`
 
-- it is already the standard Holoscan visualization operator
-- it supports image rendering and overlay layers
-- it supports an ImGui callback for lightweight controls
-- it fits the current C++ app better than introducing a separate GUI stack
+### Offline path
 
-Recommended app split:
+1. replay saved `.pgm` spectrogram frames from disk
+2. convert them into the same HoloViz image tensor contract
+3. feed them into `HolovizOp`
 
-1. Keep the current radio ingest and detection executable focused on processing.
-2. Add a dedicated visualization executable in the same application directory.
-3. Let the visualization executable support both offline replay and, later, live detector output.
+### Why this is the correct pipeline
 
-This avoids forcing offline development to initialize Advanced Network or require a connected USRP.
+- the live viewer stays attached to the real data path instead of a disposable side executable
+- the offline harness exists only to replace the source, not the renderer contract
+- the render contract becomes reusable for future remote streaming or recording paths
+- detector overlays can be added without rewriting the image renderer
 
-## Proposed Viewer Modes
+## Current Contract
 
-### Mode 1: Offline replay
+The spectrogram operator already forwards its tensor output, so it is the right branch point.
 
-Read saved spectrogram frames from disk and display them in HoloViz.
+The image contract for the viewer should be:
 
-Primary use:
+- one color image tensor emitted to HoloViz on `receivers`
+- a stable tensor name for the spectrogram image
+- overlay specs emitted later on `input_specs` when detector overlays are introduced
 
-- UI development without hardware
-- overlay prototyping
-- remote debugging
-- demo recording
+This matches the HoloViz patterns used elsewhere in Holohub.
 
-Inputs:
+## Overlay Plan
 
-- directory of `.pgm` spectrogram files
-- optional directory of matching detector mask files
+The detector side should ultimately emit visualization-friendly data rather than forcing HoloViz-specific logic into the detector itself.
 
-### Mode 2: Synthetic replay
+Preferred overlay contract:
 
-Generate a fake spectrogram and fake detections in-process.
-
-Primary use:
-
-- rapid UI work
-- sanity checks in environments without saved artifacts
-- CI-friendly smoke testing later
-
-### Mode 3: Live stream
-
-Render the real spectrogram output and real detection overlays from the Holoscan pipeline.
-
-Primary use:
-
-- final integrated demo
-- live RF debugging
-
-## Overlay Strategy
-
-The current spectrogram operator already forwards its tensor downstream, which makes it a good branch point for visualization.
-
-The detection side should eventually expose one of these visualization-friendly outputs:
-
-- mask tensor for alpha overlay
-- bounding boxes
-- contours or polygons
-- detection metadata with confidence and frequency-time extents
+- rectangles for quick validation and operator debugging
+- optional text labels for confidence or class summaries
+- optional mask output later if the segmentation view is more useful than boxes
 
 Recommended sequence:
 
-1. Start with spectrogram-only viewing.
-2. Add a fake overlay generator for rectangles or masks.
-3. Add a small postprocessor that converts detector outputs into a HoloViz-friendly overlay representation.
-4. Replace fake overlays with real detections once the detector contract is finalized.
+1. finish spectrogram-only rendering in the live and offline paths
+2. add a detector postprocessor that emits HoloViz `InputSpec` data plus overlay tensors
+3. map RF coordinates into normalized screen coordinates in that postprocessor
+4. keep the renderer itself agnostic to detector internals
 
-## Remote Viewing Strategy
+## Remote Strategy
 
 Primary path:
 
 - HoloViz native window for local or remote-desktop sessions
 
-Fallback path:
+Fallback path after the first milestone:
 
-- headless mode that saves annotated frames to disk
-- optional future path for streamed viewing, such as WebRTC or video publishing
+- export annotated frames or clips when no display is available
+- optionally add a streaming frontend later without changing the core spectrogram renderer contract
 
-Recommendation:
+## Implementation Phases
 
-Do not block the first visualizer on browser delivery. Start with HoloViz, but keep the offline replay format reusable so a later streaming frontend can read the same data.
-
-## Phased Implementation Plan
-
-### Phase 1: Offline spectrogram viewer
+### Phase 1: Shared spectrogram rendering contract
 
 Deliverable:
 
-- a new executable that replays `.pgm` spectrograms in HoloViz
+- a reusable C++ spectrogram-to-HoloViz image path
 
 Scope:
 
-- command-line flags for `--input-source offline` and `--offline-dir`
-- file enumeration and replay timing controls
-- grayscale or false-color rendering
-- window title and basic playback controls if convenient
+- create a renderer operator for live spectrogram tensors
+- define a stable image tensor name for HoloViz
+- add visualization config to the main app
 
 Success criteria:
 
-- can run without USRP hardware
-- can display saved spectrograms from `/tmp/usrp_spectrograms`
+- the live app can open a spectrogram window when visualization is enabled
 
-### Phase 2: Fake overlay support
+### Phase 2: Offline replay harness
 
 Deliverable:
 
-- simple boxes or mask overlays drawn on top of offline spectrogram frames
+- an offline replay executable that uses the same HoloViz image contract
 
 Scope:
 
-- deterministic fake detections
-- optional ImGui toggles for overlay visibility, threshold, and channel selection
+- enumerate `.pgm` frames from disk
+- replay with configurable frame rate and loop behavior
+- support development without Advanced Network or a radio
 
 Success criteria:
 
-- verify overlay rendering path before real detector integration
+- replay works from `/workspace/spectrograms` or mounted host artifacts
 
-### Phase 3: Real detector overlay contract
+### Phase 3: Detector overlay contract
 
 Deliverable:
 
-- detection output path from the detector or a detector postprocessor
+- a dedicated overlay postprocessor between detector output and HoloViz
 
 Scope:
 
-- define emitted structure for detections
-- decide whether mask, boxes, or both should be supported
-- map RF coordinates to screen coordinates
+- emit overlay tensors and `InputSpec` metadata
+- support rectangles first, masks later if needed
+- preserve a clean separation between inference and rendering
 
 Success criteria:
 
-- live detector output can be rendered without changing the visualizer core
+- live detections can be drawn without changing the spectrogram renderer or HoloViz setup
 
-### Phase 4: Live integrated viewer
+### Phase 4: Remote-friendly fallback
 
 Deliverable:
 
-- visualization branch connected to the real-time Holoscan pipeline
+- a no-display export mode or later streaming path
 
 Scope:
 
-- branch from spectrogram output to HoloViz
-- branch from detector output to overlay renderer
-- optional runtime flag to enable or disable the viewer
+- save annotated frames or video when no interactive display is available
+- keep the underlying render contract unchanged
 
 Success criteria:
 
-- same viewer code works for offline replay and live mode
+- the viewer workflow still produces debuggable output on headless systems
 
-### Phase 5: Remote-friendly fallback
+## Immediate Work Items
 
-Deliverable:
+1. Add the shared C++ spectrogram renderer used by the live pipeline.
+2. Wire an optional visualization branch off `spectrogramOp` in the main app.
+3. Add an offline replay executable that reuses the same HoloViz tensor contract.
+4. Keep detector overlay work as the next focused step instead of baking fake overlays into the renderer.
 
-- no-display mode for remote or automated runs
-
-Scope:
-
-- save annotated frames
-- optional MP4 or image sequence export
-- detect missing display and fail clearly or switch modes
-
-Success criteria:
-
-- viewer workflow remains usable on systems without an interactive desktop
-
-## First Implementation Slice
-
-Start with a new executable dedicated to offline replay.
-
-Reasoning:
-
-- it removes dependency on the radio and Advanced Network during UI work
-- it gives a fast development loop
-- it exercises HoloViz immediately
-- it can later share rendering logic with the live pipeline
-
-First slice tasks:
-
-1. Add a new C++ source file for an offline spectrogram viewer application.
-2. Add a small source operator that loads `.pgm` files from a directory and emits image tensors.
-3. Connect that source to `HolovizOp`.
-4. Add command-line flags for offline directory and replay rate.
-5. Add an optional fake overlay layer callback.
-6. Update CMake to build the visualizer executable.
-7. Update the application README with offline and remote usage notes.
-
-## Open Design Decisions
-
-- whether the viewer should be a separate executable or a mode inside the main app
-- whether the first overlay should be boxes or masks
-- whether false-color mapping should happen in a preprocessor operator or directly in the viewer path
-- whether headless export should be part of the first milestone or immediately after
-
-## Recommended Decision
+## Recommended Direction
 
 Proceed with:
 
-- separate visualization executable
-- offline replay as the first supported mode
+- C++ live visualization branch in the main app
+- offline replay as a debug harness, not the core architecture
 - HoloViz as the renderer
-- fake overlays before real detector overlays
-- remote desktop and display-forwarded sessions as the first remote target
+- detector overlays added via a separate postprocessor contract
 
-This gives the shortest path to a usable result while the radio remains disconnected.
+This is the shortest path that is still structurally correct for a fast production viewer.
