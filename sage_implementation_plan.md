@@ -874,7 +874,7 @@ Status update (2026-04-12):
 - In progress.
 - `config_torchscript_performance.yaml` and `run_torchscript_performance_test.sh` were added specifically for this step.
 - The performance config keeps the real TorchScript path but disables spectrogram saves, mask saves, detailed detection logs, and timing summaries.
-- It also increases RX memory pools, reduces DPDK queue `batch_size`, and increases `num_simul_batches` to give the ingest path more headroom.
+- It reduces DPDK queue `batch_size` and increases `num_simul_batches` to give the ingest path more headroom while keeping GPU RX pools at the known-safe `25000` buffers per channel to avoid GPUDirect BAR1 DMA-map failures.
 
 Exit criteria:
 

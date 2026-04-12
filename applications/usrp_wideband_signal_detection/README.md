@@ -47,7 +47,7 @@ Available configs copied into the build directory:
 - `config_torchscript_performance.yaml`
 	- two-channel throughput test mode
 	- disables spectrogram saves, detector mask saves, per-frame detection logging, and timing summaries to keep the data path as lean as possible
-	- increases RX buffer pools, reduces queue burst size, and raises `num_simul_batches` so the graph can absorb more ingress jitter before dropping packets
+	- keeps GPU RX pools at the known-safe `25000` buffers per channel to avoid GPUDirect BAR1 DMA-map failures, while reducing queue burst size and raising `num_simul_batches` so the graph can absorb more ingress jitter before dropping packets
 - `config_torchscript_load_only.yaml`
 	- lower-risk TorchScript diagnostic mode
 	- loads the TorchScript artifact without moving it to CUDA or attempting `eval()`, then falls back to placeholder inference during compute
