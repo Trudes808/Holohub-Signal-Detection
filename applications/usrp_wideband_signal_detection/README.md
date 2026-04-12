@@ -44,74 +44,114 @@ Available configs copied into the build directory:
 - `config_torchscript_validation.yaml`
 	- strict crash-repro and validation mode
 	- uses `inference_backend: "torchscript"`, `strict_model_forward: true`, and `torchscript_init_mode: "load_cuda_eval"`
+- `config_torchscript_performance.yaml`
+	- two-channel throughput test mode
+	- disables spectrogram saves, detector mask saves, per-frame detection logging, and timing summaries to keep the data path as lean as possible
+	- increases RX buffer pools, reduces queue burst size, and raises `num_simul_batches` so the graph can absorb more ingress jitter before dropping packets
 - `config_torchscript_load_only.yaml`
 	- lower-risk TorchScript diagnostic mode
 	- loads the TorchScript artifact without moving it to CUDA or attempting `eval()`, then falls back to placeholder inference during compute
 
 Use the same external USRP stream command used by `usrp_freq_detection`.
 
-## Host Automation Scripts
+## Host Workflow
 
-The application directory now includes three host-side helper scripts for the container workflow:
+The container workflow is now organized around four primary host-side scripts:
 
 - `build_demo_container.sh`
-	- builds the Holohub image with `IMAGE_NAME` defaulting to `usrp_x410_signal_detection_demo:latest`
-	- uses `applications/usrp_freq_detection/Dockerfile` by default so the image inherits the same MatX and USRP-facing dependencies already used by the working frequency-detection app
+	- initial setup script for a new machine or fresh container
+	- builds the demo image, creates the container, mounts `/tmp/usrp_spectrograms` and `/tmp/usrp_dino_masks`, stages the local DINOv3 repo and weight, installs the pinned CUDA 12.6 PyTorch stack when needed, exports the TorchScript artifact, ensures Vulkan and MatX are present, and builds the app in the container
 - `run_demo_container.sh`
-	- starts a fresh privileged container with `CONTAINER_NAME` defaulting to `usrp_x410_signal_detection_demo`
-	- by default it starts the container detached with a keepalive command so setup can target it reliably
-	- exports `HOLOHUB_BUILD_LOCAL=1` so build commands executed inside the container stay in local mode
-	- mounts `/tmp/usrp_spectrograms` on the host to `/workspace/spectrograms` in the container so the viewer notebook can read generated debug spectrograms after the run
-	- mounts `/tmp/usrp_dino_masks` on the host to `/workspace/dino_masks` in the container for detector mask artifacts
-	- host output paths can be overridden with `SPECTROGRAM_HOST_DIR=...` and `DINO_MASK_HOST_DIR=...`
-- `setup_demo_container.sh`
-	- stages the local DINOv3 repo and selected weight into the running container, verifies `nvidia-smi` works inside the container, installs a pinned CUDA 12.6 PyTorch stack plus the DINOv3 Python requirements when needed, exports the TorchScript artifact on GPU, and by default builds the application inside the container
-	- bootstraps MatX inside the running container if `/usr/local/lib/cmake/matx/matx-config.cmake` is missing, so an older image can still complete the build without a full rebuild
-	- verifies DPDK build dependencies are present before the application configure step and stops early if the container must be rebuilt from the MatX/USRP-enabled image
+	- starts an already-created container if it is stopped
+	- does not recreate or reprovision the container
 - `rebuild_demo_container_app.sh`
-	- rebuilds only `usrp_wideband_signal_detection` inside the existing container and lists the generated app build directory
-	- use this after source edits when the container already has staged models and dependencies
+	- checks whether tracked build targets are already up to date and only rebuilds when necessary
+	- always syncs the latest `config*.yaml` files into the build output directory after the check
 - `enter_demo_container.sh`
-	- opens an interactive bash shell in the named container and auto-starts it if needed
+	- opens an interactive shell in the running container
 
-Typical usage from the host:
+Compatibility wrappers still exist:
 
-```bash
-cd applications/usrp_wideband_signal_detection
-./build_demo_container.sh
-./run_demo_container.sh
-```
+- `setup_demo_container.sh`
+	- deprecated wrapper that forwards to `build_demo_container.sh`
+- `rebuild_and_debug.sh`
+	- deprecated wrapper that forwards to `rebuild_demo_container_app.sh`
 
-Default host-side debug outputs after container startup:
+Default host-side debug outputs:
 
 - spectrograms: `/tmp/usrp_spectrograms`
 - DINO masks: `/tmp/usrp_dino_masks`
 
-In a second terminal:
+### First-Time Setup
+
+Run this once when bringing the app up on a new machine or when recreating the container from scratch:
 
 ```bash
 cd applications/usrp_wideband_signal_detection
-./setup_demo_container.sh
+./build_demo_container.sh
 ```
 
-To open a shell after the container is up:
+If the container already exists later and is only stopped, restart it with:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+./run_demo_container.sh
+```
+
+### Enter And Run The App
+
+Enter the container:
 
 ```bash
 cd applications/usrp_wideband_signal_detection
 ./enter_demo_container.sh
 ```
 
-If you want setup to skip dependency installation or app build:
+Inside the container, run the application from the build directory. For the current non-Torch smoke-test path that saves spectrograms and detector masks to the mounted host `/tmp` directories:
 
 ```bash
-INSTALL_PYTHON_DEPS=0 BUILD_APP_IN_CONTAINER=0 ./setup_demo_container.sh
+cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection
+./usrp_wideband_signal_detection config_cuda_fallback.yaml
 ```
 
-If the running container has a stale binary after source changes, rebuild just this app:
+If you want the stable placeholder debug path instead:
+
+```bash
+cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection
+./usrp_wideband_signal_detection config.yaml
+```
+
+Start the radio stream from a second host terminal using the same external USRP command family as `usrp_freq_detection`.
+
+### After Code Changes
+
+When you change code or config files in the repository:
 
 ```bash
 cd applications/usrp_wideband_signal_detection
 ./rebuild_demo_container_app.sh
+./enter_demo_container.sh
+```
+
+Then rerun the app inside the container:
+
+```bash
+cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection
+./usrp_wideband_signal_detection config_cuda_fallback.yaml
+```
+
+For the two-channel performance pass with the real TorchScript detector path and debug outputs disabled:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+./run_torchscript_performance_test.sh
+```
+
+If you need to force a rebuild even when the targets look current:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+FORCE_REBUILD=1 ./rebuild_demo_container_app.sh
 ```
 
 ## Visualization
@@ -191,6 +231,7 @@ The next visualization step is to add a detector overlay postprocessor that emit
 - `config.yaml` is now the stable debug run configuration. It intentionally keeps `inference_backend: "pytorch_placeholder"` while saving the first 5 spectrograms and detector masks per channel.
 - `config_cuda_fallback.yaml` is the debug configuration for the pure C++/CUDA detector path. It disables the PyTorch backend in operator logic and uses `cuda_threshold_fallback` while keeping artifact saves enabled.
 - `config_torchscript_validation.yaml` is the strict TorchScript bring-up configuration. Use it when you want the C++ TorchScript path to fail loudly.
+- `config_torchscript_performance.yaml` is the low-overhead throughput configuration for two-channel rate testing. It keeps the real TorchScript detector path but disables artifact saves, detailed detection logs, and timing summaries.
 - `config_torchscript_load_only.yaml` is the first diagnostic step for the C++ TorchScript path. It confirms whether `torch::jit::load(...)` itself is safe before the operator attempts CUDA transfer.
 - `config_torchscript_cpu_eval.yaml` is the second diagnostic step. It tests whether `eval()` is safe while staying entirely on CPU.
 - The CPU validation flow should use the CPU-exported artifact `dinov3_vitb16_pretrain_lvd1689m-73cec8be_cpu.ts`; the original `dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts` remains the CUDA-traced artifact.

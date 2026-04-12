@@ -1,8 +1,8 @@
 # Sage Step-by-Step Implementation Plan
 
-Last updated: 2026-04-03
+Last updated: 2026-04-12
 
-## Current re-entry status (2026-04-02)
+## Current re-entry status (2026-04-12)
 
 Completed since the original step-10 resume:
 
@@ -10,15 +10,20 @@ Completed since the original step-10 resume:
 - the local DINOv3 repo and weights are staged into the Holohub container and exported to TorchScript in-container,
 - the application builds successfully in local container mode with Torch enabled,
 - the wideband signal detection application now runs against the live USRP hardware,
-- RF receive and spectrogram plotting were validated independently in `notebooks/test_radio.ipynb`, and
-- the active resume point is now signal-detector operator validation on real over-the-air input.
+- RF receive and spectrogram plotting were validated independently in `notebooks/test_radio.ipynb`,
+- a strict single-channel validation path and helper were added for low-risk live detector bring-up,
+- the single-channel validation path now runs end-to-end on live input with spectrogram and mask artifact support,
+- host-side UHD bring-up issues were resolved by using the system Python 3.12 interpreter and the correct X410 address,
+- a dedicated 2-channel low-overhead performance config and launcher helper were added for throughput testing, and
+- the active resume point is now performance tuning and low-drop validation on the real TorchScript detector path.
 
 Immediate next steps:
 
-1. run the strict single-channel TorchScript detector path on live USRP input and verify `dinov3_signal_detector` emits masks or equivalent downstream outputs,
-2. copy the active pipeline constants and detector behavior from `../Dinov3-RF-Signal-Detection/signal_detection_holoscanv1.ipynb` into the Holohub signal-detector path using GPU-resident C++/PyTorch execution and config-backed parameters,
-3. add a debug timing summary for the major detector stages so the first optimization pass is driven by measured hotspots rather than guesswork, and
-4. only after functional validation and notebook-parity confidence use `../Dinov3-RF-Signal-Detection/speed_optimization_todo.md` to drive runtime optimization work.
+1. run the new 2-channel performance configuration at the expected ingest rate and record DPDK RX buffer-drop counters, per-queue application packet counts, and any backend warnings,
+2. tune receive buffering and batching until packet drops are minimized without re-enabling slow debug paths,
+3. once the low-overhead runtime path is stable, compare detector behavior and constants against `../Dinov3-RF-Signal-Detection/signal_detection_holoscanv2.ipynb` and close remaining notebook-parity gaps,
+4. re-enable targeted timing summaries only after the throughput baseline is understood, and
+5. only after functionality and low-drop throughput are stable use `../Dinov3-RF-Signal-Detection/speed_optimization_todo.md` to drive deeper optimization work.
 
 ## 1) Purpose and Scope
 
@@ -399,7 +404,7 @@ Attach DINOv3 inference to spectrogram outputs using the most maintainable path.
 
 Harden for high-rate sustained operation.
 
-Start this phase only after the strict single-channel detector path is functional and the notebook-derived pipeline behavior is validated.
+Start this phase only after the strict single-channel detector path is functional enough to prove the runtime path and the low-overhead 2-channel performance config is in place.
 
 ### Tasks
 
@@ -414,6 +419,7 @@ Start this phase only after the strict single-channel detector path is functiona
 ### Validation metrics
 
 - sustained runtime stability
+- minimal RX buffer drops under representative 2-channel load
 - no unbounded queue growth
 - inference latency distribution
 - GPU memory plateau
@@ -541,15 +547,16 @@ The first session back should produce a short packaging and runtime-readiness re
 3. confirmation that those assets have been staged into the Holohub container under `/workspace/models/dinov3`,
 4. confirmation that a TorchScript export exists at the final container runtime path,
 5. confirmation that the app config points to real staged artifacts rather than placeholders,
-6. confirmation that spectrogram debug image saving is disabled for model-forward validation runs, and
-7. any build or runtime issues that must be resolved before strict single-channel bring-up.
+6. confirmation that spectrogram debug image saving is disabled for performance-oriented runs,
+7. confirmation that a low-overhead 2-channel performance config exists for drop-rate testing, and
+8. any build or runtime issues that must be resolved before sustained 2-channel throughput tuning.
 
 
 ## 10) Resume Plan For Holohub Re-Entry
 
 Use this section as the exact re-entry checklist for returning to Holohub development on the current wideband signal-detection path.
 
-### Current re-entry status (2026-04-02)
+### Current re-entry status (2026-04-12)
 
 Completed in the current session:
 
@@ -568,18 +575,25 @@ Completed in the current session:
    - The app can now run against the live USRP without blocking on basic device bring-up.
 7. Spectrogram validation is complete.
    - `notebooks/test_radio.ipynb` confirmed short IQ capture, receive power plotting, and spectrogram rendering on the target radio path.
+8. Step 10.5 is partially complete.
+   - A strict single-channel live-validation config and launcher were added.
+   - The graph now runs end-to-end on live RF input and can emit saved spectrograms and detector masks for bring-up.
+   - The main remaining concern is ingress packet loss during validation, not basic graph startup.
+9. Throughput-prep work is complete.
+   - A dedicated low-overhead 2-channel performance config and launcher were added.
+   - The performance path disables artifact saves, detailed per-frame logs, and timing summaries while increasing RX buffer pools and in-flight batching.
 
 Next active step:
 
-1. Start at step 10.5.
-2. Perform first signal-detector validation run with reduced load and verify:
-   - TorchScript loads from the staged container path
-   - detector metadata reports `dino_backend=torchscript`
-   - no fallback warnings are emitted
-   - mask or detector output is produced on the strict model-forward path
-3. After the first successful strict run, immediately promote the active notebook constants and detector behavior from `../Dinov3-RF-Signal-Detection/signal_detection_holoscanv1.ipynb` into config-backed C++/GPU implementation work.
-4. Add timing instrumentation before optimization so the first performance pass is based on measured step costs.
-5. If detector output is absent, use `notebooks/test_radio.ipynb` first as the RF sanity check before changing detector thresholds or operator logic.
+1. Run the 2-channel low-overhead performance configuration at the expected radio rate.
+2. Capture and review:
+   - `RX out of buffers`
+   - `rx_mbuf_allocation_errors`
+   - per-queue application packet totals
+   - any backend fallback warnings
+3. Tune the performance config until drops are minimal enough that detector quality and throughput measurements are meaningful.
+4. After that baseline is stable, return to notebook-parity review against `../Dinov3-RF-Signal-Detection/signal_detection_holoscanv2.ipynb`.
+5. Keep `notebooks/test_radio.ipynb` as the RF sanity-check path if live detector output becomes ambiguous during tuning.
 
 ### 10.0 Package DINOv3 assets into the Holohub container
 
@@ -689,12 +703,19 @@ Exit criteria:
 
 - model-forward path runs without fallback for at least a short sustained single-channel run.
 
+Status update (2026-04-12):
+
+- Partially complete.
+- The reduced-load live validation path exists and runs end-to-end.
+- Debug artifact saving during validation was useful for bring-up but materially increases backpressure and packet drops.
+- Treat the current single-channel validation config as a correctness and debugging config, not a throughput config.
+
 Immediate next action:
 
-1. Launch the built app inside the refreshed container using the strict TorchScript configuration already in `applications/usrp_wideband_signal_detection/config.yaml`.
-2. Keep channel count and load reduced for first runtime confirmation.
-3. Capture operator logs and metadata for the first successful `torchscript` inference pass before any throughput tuning.
-4. If masks are not emitted, confirm live RF activity again with `notebooks/test_radio.ipynb` on the same antenna, channel, center frequency, and gain settings before debugging the detector.
+1. Preserve the single-channel validation path as the debug config for detector bring-up.
+2. Do not use it for drop-rate conclusions because spectrogram saving, mask saving, and per-frame timing/logging distort throughput behavior.
+3. Move the next round of runtime testing to the dedicated 2-channel performance config.
+4. If the performance path still shows material drops, tune buffer pools and batching before changing detector logic.
 
 ### 10.6 Notebook-constant promotion and C++/GPU reproduction
 
@@ -848,6 +869,13 @@ After strict bring-up and parity pass:
 4. Keep spectrogram saving disabled unless it is explicitly needed for sampled debug output.
 5. Capture latency, bounded-memory behavior, and sustained-run stability metrics.
 
+Status update (2026-04-12):
+
+- In progress.
+- `config_torchscript_performance.yaml` and `run_torchscript_performance_test.sh` were added specifically for this step.
+- The performance config keeps the real TorchScript path but disables spectrogram saves, mask saves, detailed detection logs, and timing summaries.
+- It also increases RX memory pools, reduces DPDK queue `batch_size`, and increases `num_simul_batches` to give the ingest path more headroom.
+
 Exit criteria:
 
 - stable sustained run with bounded memory, controlled inference cadence, and no unintended backend regressions.
@@ -870,3 +898,4 @@ Use the following session checklist after any pause in work:
 5. Rebuild and confirm Torch support is still enabled.
 6. Re-run `notebooks/test_radio.ipynb` if basic RF visibility is in doubt.
 7. Re-run strict single-channel detector validation before returning to 2-channel throughput tuning.
+8. Re-run the dedicated performance config before drawing conclusions about packet-drop rate or throughput headroom.

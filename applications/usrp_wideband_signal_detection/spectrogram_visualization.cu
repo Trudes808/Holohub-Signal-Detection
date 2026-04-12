@@ -289,9 +289,131 @@ std::array<uint8_t, 7> glyph_rows(char c) {
 }
 
 int text_pixel_width(const std::string& text, int scale) {
-  const int glyph_width = 5 * scale;
-  const int spacing = scale;
-  return text.empty() ? 0 : static_cast<int>(text.size()) * (glyph_width + spacing) - spacing;
+  auto advance_units = [](char raw_char) {
+    const char c = static_cast<char>(std::toupper(static_cast<unsigned char>(raw_char)));
+    switch (c) {
+      case 'I':
+      case '1':
+      case '.':
+      case ':':
+        return 4;
+      case 'M':
+      case 'W':
+        return 8;
+      case ' ':
+        return 4;
+      default:
+        return 6;
+    }
+  };
+
+  int width_units = 0;
+  for (char c : text) {
+    width_units += advance_units(c);
+  }
+  return width_units * scale;
+}
+
+void draw_line(std::vector<uint8_t>& canvas,
+               int width,
+               int height,
+               int x0,
+               int y0,
+               int x1,
+               int y1,
+               const RgbColor& color,
+               int thickness) {
+  const int dx = std::abs(x1 - x0);
+  const int sx = x0 < x1 ? 1 : -1;
+  const int dy = -std::abs(y1 - y0);
+  const int sy = y0 < y1 ? 1 : -1;
+  int error = dx + dy;
+  int x = x0;
+  int y = y0;
+
+  while (true) {
+    fill_rect(canvas, width, height, x - thickness / 2, y - thickness / 2, thickness, thickness, color);
+    if (x == x1 && y == y1) {
+      break;
+    }
+    const int twice_error = 2 * error;
+    if (twice_error >= dy) {
+      error += dy;
+      x += sx;
+    }
+    if (twice_error <= dx) {
+      error += dx;
+      y += sy;
+    }
+  }
+}
+
+int draw_stroke_char(std::vector<uint8_t>& canvas,
+                     int width,
+                     int height,
+                     int x,
+                     int y,
+                     char raw_char,
+                     const RgbColor& color,
+                     int scale) {
+  const char c = static_cast<char>(std::toupper(static_cast<unsigned char>(raw_char)));
+  const int thickness = std::max(1, scale / 2 + 1);
+  auto line = [&](int x0, int y0, int x1, int y1) {
+    draw_line(canvas,
+              width,
+              height,
+              x + x0 * scale,
+              y + y0 * scale,
+              x + x1 * scale,
+              y + y1 * scale,
+              color,
+              thickness);
+  };
+
+  switch (c) {
+    case 'A': line(0, 6, 2, 0); line(2, 0, 4, 6); line(1, 3, 3, 3); return 6 * scale;
+    case 'B': line(0, 0, 0, 6); line(0, 0, 3, 0); line(3, 0, 4, 1); line(4, 1, 4, 2); line(4, 2, 3, 3); line(0, 3, 3, 3); line(3, 3, 4, 4); line(4, 4, 4, 5); line(4, 5, 3, 6); line(0, 6, 3, 6); return 6 * scale;
+    case 'C': line(4, 1, 3, 0); line(3, 0, 1, 0); line(1, 0, 0, 1); line(0, 1, 0, 5); line(0, 5, 1, 6); line(1, 6, 3, 6); line(3, 6, 4, 5); return 6 * scale;
+    case 'D': line(0, 0, 0, 6); line(0, 0, 3, 0); line(3, 0, 4, 1); line(4, 1, 4, 5); line(4, 5, 3, 6); line(0, 6, 3, 6); return 6 * scale;
+    case 'E': line(0, 0, 0, 6); line(0, 0, 4, 0); line(0, 3, 3, 3); line(0, 6, 4, 6); return 6 * scale;
+    case 'F': line(0, 0, 0, 6); line(0, 0, 4, 0); line(0, 3, 3, 3); return 6 * scale;
+    case 'G': line(4, 1, 3, 0); line(3, 0, 1, 0); line(1, 0, 0, 1); line(0, 1, 0, 5); line(0, 5, 1, 6); line(1, 6, 3, 6); line(3, 6, 4, 5); line(4, 5, 4, 4); line(4, 4, 2, 4); return 6 * scale;
+    case 'H': line(0, 0, 0, 6); line(4, 0, 4, 6); line(0, 3, 4, 3); return 6 * scale;
+    case 'I': line(0, 0, 2, 0); line(1, 0, 1, 6); line(0, 6, 2, 6); return 4 * scale;
+    case 'J': line(4, 0, 4, 5); line(4, 5, 3, 6); line(3, 6, 1, 6); line(1, 6, 0, 5); return 6 * scale;
+    case 'K': line(0, 0, 0, 6); line(4, 0, 0, 3); line(0, 3, 4, 6); return 6 * scale;
+    case 'L': line(0, 0, 0, 6); line(0, 6, 4, 6); return 6 * scale;
+    case 'M': line(0, 6, 0, 0); line(0, 0, 3, 3); line(3, 3, 6, 0); line(6, 0, 6, 6); return 8 * scale;
+    case 'N': line(0, 6, 0, 0); line(0, 0, 4, 6); line(4, 6, 4, 0); return 6 * scale;
+    case 'O': line(1, 0, 3, 0); line(3, 0, 4, 1); line(4, 1, 4, 5); line(4, 5, 3, 6); line(3, 6, 1, 6); line(1, 6, 0, 5); line(0, 5, 0, 1); line(0, 1, 1, 0); return 6 * scale;
+    case 'P': line(0, 6, 0, 0); line(0, 0, 3, 0); line(3, 0, 4, 1); line(4, 1, 4, 2); line(4, 2, 3, 3); line(3, 3, 0, 3); return 6 * scale;
+    case 'Q': line(1, 0, 3, 0); line(3, 0, 4, 1); line(4, 1, 4, 5); line(4, 5, 3, 6); line(3, 6, 1, 6); line(1, 6, 0, 5); line(0, 5, 0, 1); line(0, 1, 1, 0); line(2, 4, 4, 6); return 6 * scale;
+    case 'R': line(0, 6, 0, 0); line(0, 0, 3, 0); line(3, 0, 4, 1); line(4, 1, 4, 2); line(4, 2, 3, 3); line(3, 3, 0, 3); line(0, 3, 4, 6); return 6 * scale;
+    case 'S': line(4, 1, 3, 0); line(3, 0, 1, 0); line(1, 0, 0, 1); line(0, 1, 0, 2); line(0, 2, 1, 3); line(1, 3, 3, 3); line(3, 3, 4, 4); line(4, 4, 4, 5); line(4, 5, 3, 6); line(3, 6, 1, 6); line(1, 6, 0, 5); return 6 * scale;
+    case 'T': line(0, 0, 4, 0); line(2, 0, 2, 6); return 6 * scale;
+    case 'U': line(0, 0, 0, 5); line(0, 5, 1, 6); line(1, 6, 3, 6); line(3, 6, 4, 5); line(4, 5, 4, 0); return 6 * scale;
+    case 'V': line(0, 0, 2, 6); line(2, 6, 4, 0); return 6 * scale;
+    case 'W': line(0, 0, 1, 6); line(1, 6, 3, 2); line(3, 2, 5, 6); line(5, 6, 6, 0); return 8 * scale;
+    case 'X': line(0, 0, 4, 6); line(4, 0, 0, 6); return 6 * scale;
+    case 'Y': line(0, 0, 2, 3); line(4, 0, 2, 3); line(2, 3, 2, 6); return 6 * scale;
+    case 'Z': line(0, 0, 4, 0); line(4, 0, 0, 6); line(0, 6, 4, 6); return 6 * scale;
+    case '0': line(1, 0, 3, 0); line(3, 0, 4, 1); line(4, 1, 4, 5); line(4, 5, 3, 6); line(3, 6, 1, 6); line(1, 6, 0, 5); line(0, 5, 0, 1); line(0, 1, 1, 0); line(0, 6, 4, 0); return 6 * scale;
+    case '1': line(1, 1, 2, 0); line(2, 0, 2, 6); line(1, 6, 3, 6); return 4 * scale;
+    case '2': line(0, 1, 1, 0); line(1, 0, 3, 0); line(3, 0, 4, 1); line(4, 1, 4, 2); line(4, 2, 0, 6); line(0, 6, 4, 6); return 6 * scale;
+    case '3': line(0, 0, 4, 0); line(4, 0, 2, 3); line(2, 3, 4, 6); line(0, 6, 4, 6); return 6 * scale;
+    case '4': line(3, 0, 3, 6); line(0, 4, 4, 4); line(0, 4, 3, 0); return 6 * scale;
+    case '5': line(4, 0, 0, 0); line(0, 0, 0, 3); line(0, 3, 3, 3); line(3, 3, 4, 4); line(4, 4, 4, 5); line(4, 5, 3, 6); line(3, 6, 0, 6); return 6 * scale;
+    case '6': line(4, 1, 3, 0); line(3, 0, 1, 0); line(1, 0, 0, 2); line(0, 2, 0, 5); line(0, 5, 1, 6); line(1, 6, 3, 6); line(3, 6, 4, 5); line(4, 5, 4, 4); line(4, 4, 3, 3); line(3, 3, 0, 3); return 6 * scale;
+    case '7': line(0, 0, 4, 0); line(4, 0, 1, 6); return 6 * scale;
+    case '8': line(1, 0, 3, 0); line(3, 0, 4, 1); line(4, 1, 4, 2); line(4, 2, 3, 3); line(3, 3, 1, 3); line(1, 3, 0, 2); line(0, 2, 0, 1); line(0, 1, 1, 0); line(1, 3, 3, 3); line(3, 3, 4, 4); line(4, 4, 4, 5); line(4, 5, 3, 6); line(3, 6, 1, 6); line(1, 6, 0, 5); line(0, 5, 0, 4); line(0, 4, 1, 3); return 6 * scale;
+    case '9': line(4, 4, 3, 6); line(3, 6, 1, 6); line(1, 6, 0, 5); line(0, 5, 0, 4); line(0, 4, 1, 3); line(1, 3, 4, 3); line(4, 3, 4, 1); line(4, 1, 3, 0); line(3, 0, 1, 0); return 6 * scale;
+    case '.': fill_rect(canvas, width, height, x + 2 * scale, y + 6 * scale, thickness, thickness, color); return 4 * scale;
+    case ':': fill_rect(canvas, width, height, x + 2 * scale, y + 2 * scale, thickness, thickness, color); fill_rect(canvas, width, height, x + 2 * scale, y + 5 * scale, thickness, thickness, color); return 4 * scale;
+    case '-': line(0, 3, 4, 3); return 6 * scale;
+    case '+': line(2, 1, 2, 5); line(0, 3, 4, 3); return 6 * scale;
+    case ' ': return 4 * scale;
+    default: line(0, 0, 4, 0); line(4, 0, 0, 6); line(0, 6, 4, 6); return 6 * scale;
+  }
 }
 
 void draw_text(std::vector<uint8_t>& canvas,
@@ -302,21 +424,9 @@ void draw_text(std::vector<uint8_t>& canvas,
                const std::string& text,
                const RgbColor& color,
                int scale) {
-  const int glyph_width = 5 * scale;
-  const int spacing = scale;
   int cursor_x = x;
   for (char raw_char : text) {
-    const char c = static_cast<char>(std::toupper(static_cast<unsigned char>(raw_char)));
-    const auto rows = glyph_rows(c);
-    for (int row = 0; row < 7; ++row) {
-      for (int col = 0; col < 5; ++col) {
-        if (((rows[static_cast<size_t>(row)] >> (4 - col)) & 0x1u) == 0u) {
-          continue;
-        }
-        fill_rect(canvas, width, height, cursor_x + col * scale, y + row * scale, scale, scale, color);
-      }
-    }
-    cursor_x += glyph_width + spacing;
+    cursor_x += draw_stroke_char(canvas, width, height, cursor_x, y, raw_char, color, scale);
   }
 }
 
@@ -1007,57 +1117,63 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   const int channel_psd_height = 92;
   const int channel_heat_height = 220;
   const int channel_block_height = channel_psd_height + channel_heat_height + kPanelPadding * 2;
+  const int columns = std::min(2, active_channels);
+  const int rows = std::max(1, (active_channels + columns - 1) / columns);
+  const int grid_width = columns * main_width + (columns - 1) * kPanelPadding;
 
-  output_width = main_width + kSidebarWidth + kPanelPadding * 3;
-  output_height = kHeaderHeight + active_channels * channel_block_height + kFooterHeight + kPanelPadding * 2;
+  output_width = grid_width + kSidebarWidth + kPanelPadding * 3;
+  output_height = kHeaderHeight + rows * channel_block_height + kFooterHeight + kPanelPadding * 2;
 
   std::vector<uint8_t> canvas(static_cast<size_t>(output_width) * static_cast<size_t>(output_height) * 3, 0);
   fill_vertical_gradient(canvas, output_width, output_height, {7, 10, 18}, {14, 19, 29});
 
-  const int main_x = kPanelPadding;
-  const int sidebar_x = main_x + main_width + kPanelPadding;
+  const int grid_x = kPanelPadding;
+  const int sidebar_x = grid_x + grid_width + kPanelPadding;
   const int sidebar_y = kHeaderHeight + kPanelPadding;
   const int sidebar_height = output_height - sidebar_y - kFooterHeight - kPanelPadding;
 
   fill_rect(canvas, output_width, output_height, 0, 0, output_width, kHeaderHeight, {8, 12, 18});
   fill_rect(canvas, output_width, output_height, 0, kHeaderHeight - 2, output_width, 2, {124, 198, 255});
   draw_text(canvas, output_width, output_height, 18, 10, "USRP WIDEBAND", {232, 236, 241}, 2);
-  draw_text(canvas, output_width, output_height, 18, 24, "DUAL CHANNEL ANALYZER", {156, 173, 192}, 1);
+  draw_text(canvas, output_width, output_height, 18, 24, "TWO CHANNEL ANALYZER", {156, 173, 192}, 1);
 
   for (int channel_index = 0; channel_index < active_channels; ++channel_index) {
     const auto& channel = channels[static_cast<size_t>(channel_index)];
-    const int panel_y = kHeaderHeight + kPanelPadding + channel_index * channel_block_height;
+    const int column_index = channel_index % columns;
+    const int row_index = channel_index / columns;
+    const int panel_x = grid_x + column_index * (main_width + kPanelPadding);
+    const int panel_y = kHeaderHeight + kPanelPadding + row_index * channel_block_height;
     const int psd_y = panel_y;
     const int heatmap_y = panel_y + channel_psd_height + kPanelPadding;
 
-    fill_rect(canvas, output_width, output_height, main_x - 8, psd_y - 8, main_width + 16, channel_psd_height + 16, {14, 18, 28});
+    fill_rect(canvas, output_width, output_height, panel_x - 8, psd_y - 8, main_width + 16, channel_psd_height + 16, {14, 18, 28});
     if (!channel.density_trace.empty()) {
       for (int col = 0; col < main_width; ++col) {
         const size_t density_index = std::min(static_cast<size_t>(col) * channel.density_trace.size() / std::max(1, main_width), channel.density_trace.size() - 1);
         const float density_value = std::clamp(channel.density_trace[density_index], 0.0f, 1.0f);
         const auto color = heatmap_color(density_value);
-        fill_rect(canvas, output_width, output_height, main_x + col, psd_y, 1, channel_psd_height, {static_cast<uint8_t>(color[0] * 0.35f), static_cast<uint8_t>(color[1] * 0.35f), static_cast<uint8_t>(color[2] * 0.35f)});
+        fill_rect(canvas, output_width, output_height, panel_x + col, psd_y, 1, channel_psd_height, {static_cast<uint8_t>(color[0] * 0.35f), static_cast<uint8_t>(color[1] * 0.35f), static_cast<uint8_t>(color[2] * 0.35f)});
       }
     }
-    draw_plot_axes(canvas, output_width, output_height, main_x, psd_y, main_width, channel_psd_height, "-SPAN", "+SPAN", "-110", "0");
-    draw_trace_plot(canvas, output_width, output_height, main_x, psd_y, main_width, channel_psd_height, channel.current_psd_trace, {84, 196, 255}, 2);
-    draw_trace_plot(canvas, output_width, output_height, main_x, psd_y, main_width, channel_psd_height, channel.max_hold_trace, {255, 212, 89}, 1);
-    draw_text(canvas, output_width, output_height, main_x + 8, psd_y + 8, std::string("CH") + std::to_string(channel.info.channel), {232, 236, 241}, 1);
-    draw_text(canvas, output_width, output_height, main_x + 42, psd_y + 8, "PSD", {156, 173, 192}, 1);
-    draw_text(canvas, output_width, output_height, main_x + 72, psd_y + 8, "MAX HOLD", {255, 212, 89}, 1);
+    draw_plot_axes(canvas, output_width, output_height, panel_x, psd_y, main_width, channel_psd_height, "-SPAN", "+SPAN", "-110", "0");
+    draw_trace_plot(canvas, output_width, output_height, panel_x, psd_y, main_width, channel_psd_height, channel.current_psd_trace, {84, 196, 255}, 2);
+    draw_trace_plot(canvas, output_width, output_height, panel_x, psd_y, main_width, channel_psd_height, channel.max_hold_trace, {255, 212, 89}, 1);
+    draw_text(canvas, output_width, output_height, panel_x + 8, psd_y + 8, std::string("CH") + std::to_string(channel.info.channel), {232, 236, 241}, 1);
+    draw_text(canvas, output_width, output_height, panel_x + 42, psd_y + 8, "PSD", {156, 173, 192}, 1);
+    draw_text(canvas, output_width, output_height, panel_x + 72, psd_y + 8, "MAX HOLD", {255, 212, 89}, 1);
 
     const int history_rows = channel.history_width > 0 ? static_cast<int>(channel.history_grayscale.size() / static_cast<size_t>(channel.history_width)) : 0;
     auto spectrogram_rgb = colorize_grayscale_spectrogram(channel.history_grayscale.empty() ? std::vector<uint8_t>(static_cast<size_t>(main_width) * static_cast<size_t>(channel_heat_height), 0) : channel.history_grayscale,
                                                           blue_limit,
                                                           red_limit);
-    fill_rect(canvas, output_width, output_height, main_x - 8, heatmap_y - 8, main_width + 16, channel_heat_height + 16, {14, 18, 28});
-    draw_plot_axes(canvas, output_width, output_height, main_x, heatmap_y, main_width, channel_heat_height, "START", "STOP", "NOW", "HIST");
+    fill_rect(canvas, output_width, output_height, panel_x - 8, heatmap_y - 8, main_width + 16, channel_heat_height + 16, {14, 18, 28});
+    draw_plot_axes(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height, "START", "STOP", "NOW", "HIST");
     if (!channel.history_grayscale.empty() && history_rows > 0) {
-      blit_rgb_nearest(canvas, output_width, output_height, main_x, heatmap_y, main_width, channel_heat_height, spectrogram_rgb, channel.history_width, history_rows);
+      blit_rgb_nearest(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height, spectrogram_rgb, channel.history_width, history_rows);
     }
-    draw_grid(canvas, output_width, output_height, main_x, heatmap_y, main_width, channel_heat_height);
+    draw_grid(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height);
     if (channel.overlay_available) {
-      overlay_mask(canvas, output_width, output_height, main_x, heatmap_y + channel_heat_height - channel.latest_frame_height, main_width, channel.latest_frame_height, channel.latest_mask, overlay_alpha);
+      overlay_mask(canvas, output_width, output_height, panel_x, heatmap_y + channel_heat_height - channel.latest_frame_height, main_width, channel.latest_frame_height, channel.latest_mask, overlay_alpha);
     }
   }
 
@@ -1093,8 +1209,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   }
 
   const int footer_y = output_height - kFooterHeight + 10;
-  draw_text(canvas, output_width, output_height, main_x, footer_y, "CLASSIC ANALYZER VIEW", {156, 173, 192}, 1);
-  draw_text(canvas, output_width, output_height, main_x + 160, footer_y, "DENSITY HEAT UNDER MAX HOLD", {116, 132, 150}, 1);
+  draw_text(canvas, output_width, output_height, grid_x, footer_y, "CLASSIC ANALYZER VIEW", {156, 173, 192}, 1);
+  draw_text(canvas, output_width, output_height, grid_x + 180, footer_y, "DENSITY HEAT UNDER MAX HOLD", {116, 132, 150}, 1);
   return canvas;
 }
 

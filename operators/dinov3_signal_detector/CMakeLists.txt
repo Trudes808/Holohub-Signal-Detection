@@ -84,12 +84,26 @@ endif()
 
 set(DINOV3_SIGNAL_DETECTOR_SOURCES
   dinov3_signal_detector.cu
-  dinov3_torch_runtime.hpp
   dinov3_signal_detector.hpp
 )
 
 if(Torch_FOUND)
-  list(APPEND DINOV3_SIGNAL_DETECTOR_SOURCES dinov3_torch_runtime.cpp)
+  add_library(dinov3_torch_runtime_obj OBJECT dinov3_torch_runtime.cpp)
+  target_include_directories(dinov3_torch_runtime_obj
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_link_libraries(dinov3_torch_runtime_obj
+    PRIVATE
+      ${TORCH_LIBRARIES}
+  )
+  if(TORCH_INCLUDE_DIRS)
+    target_include_directories(dinov3_torch_runtime_obj PRIVATE ${TORCH_INCLUDE_DIRS})
+  endif()
+  if(TORCH_INCLUDE_HINTS)
+    target_include_directories(dinov3_torch_runtime_obj PRIVATE ${TORCH_INCLUDE_HINTS})
+    message(STATUS "dinov3_signal_detector: Torch include hints=${TORCH_INCLUDE_HINTS}")
+  endif()
 else()
   list(APPEND DINOV3_SIGNAL_DETECTOR_SOURCES dinov3_torch_runtime_stub.cpp)
 endif()
@@ -97,6 +111,11 @@ endif()
 add_library(dinov3_signal_detector
   ${DINOV3_SIGNAL_DETECTOR_SOURCES}
 )
+
+if(Torch_FOUND)
+  target_sources(dinov3_signal_detector PRIVATE $<TARGET_OBJECTS:dinov3_torch_runtime_obj>)
+endif()
+
 add_library(holoscan::ops::dinov3_signal_detector ALIAS dinov3_signal_detector)
 target_include_directories(dinov3_signal_detector INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -108,13 +127,6 @@ target_link_libraries(dinov3_signal_detector
 
 if(Torch_FOUND)
   target_link_libraries(dinov3_signal_detector PRIVATE ${TORCH_LIBRARIES})
-  if(TORCH_INCLUDE_DIRS)
-    target_include_directories(dinov3_signal_detector PRIVATE ${TORCH_INCLUDE_DIRS})
-  endif()
-  if(TORCH_INCLUDE_HINTS)
-    target_include_directories(dinov3_signal_detector PRIVATE ${TORCH_INCLUDE_HINTS})
-    message(STATUS "dinov3_signal_detector: Torch include hints=${TORCH_INCLUDE_HINTS}")
-  endif()
 
   set(OP_NVJITLINK_LINK_ITEM "")
   if(TARGET CUDA::nvJitLink)
@@ -149,9 +161,12 @@ if(Torch_FOUND)
     endif()
   endforeach()
 
-  target_compile_options(dinov3_signal_detector PRIVATE ${TORCH_CXX_FLAGS})
   target_compile_definitions(dinov3_signal_detector PRIVATE HOLOHUB_HAS_TORCH=1)
   target_compile_features(dinov3_signal_detector PRIVATE cxx_std_17)
+
+  target_compile_options(dinov3_torch_runtime_obj PRIVATE ${TORCH_CXX_FLAGS})
+  target_compile_definitions(dinov3_torch_runtime_obj PRIVATE HOLOHUB_HAS_TORCH=1)
+  target_compile_features(dinov3_torch_runtime_obj PRIVATE cxx_std_17)
 
   add_executable(dinov3_libtorch_sandbox
     dinov3_libtorch_sandbox.cpp

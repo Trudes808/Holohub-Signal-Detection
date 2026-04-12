@@ -127,7 +127,7 @@ logger:
 
 spectrogram:
   num_channels: 2
-  enable_save: false
+  enable_save: true
   save_every_n_frames: 1
   max_images_per_channel: 5
   output_height: 256
@@ -142,7 +142,7 @@ dinov3_signal_detector:
   emit_stride: 1
   mask_threshold_db: -20.0
   log_detections: false
-  enable_mask_save: false
+  enable_mask_save: true
   save_every_n_frames: 1
   max_masks_per_channel: 5
   output_dir: "/workspace/dino_masks"

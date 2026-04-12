@@ -177,6 +177,8 @@ endforeach()
     config.yaml
     config_offline_replay.yaml
     config_cuda_fallback.yaml
+    config_torchscript_performance.yaml
+    config_torchscript_validation_single_channel.yaml
     config_torchscript_cpu_eval.yaml
     config_torchscript_cuda_no_eval.yaml
     config_torchscript_validation.yaml
