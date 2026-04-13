@@ -97,6 +97,10 @@ void place_packet_data(complex* out,
 
 namespace holoscan::ops {
 
+int ChdrConverterOpRx::max_inflight_batches() const {
+  return std::max(1, std::min<int>(num_concurrent, num_simul_batches_.get()));
+}
+
 void ChdrConverterOpRx::setup(OperatorSpec& spec) {
   spec.output<out_t>("out");
 
@@ -150,6 +154,13 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
 void ChdrConverterOpRx::initialize() {
   holoscan::Operator::initialize();
 
+  if (num_simul_batches_.get() > num_concurrent) {
+    HOLOSCAN_LOG_ERROR("Configured num_simul_batches={} exceeds supported in-flight batch slots {}",
+                       num_simul_batches_.get(),
+                       num_concurrent);
+    exit(1);
+  }
+
   port_id_ = get_port_id(interface_name_.get());
   if (port_id_ == -1) {
     HOLOSCAN_LOG_ERROR("Invalid RX port {} specified in the config", interface_name_.get());
@@ -193,13 +204,80 @@ std::optional<ChdrConverterOpRx::RxMsg> ChdrConverterOpRx::free_buf(
     auto first = channel->out_q.front();
     if (cudaEventQuery(first.evt) == cudaSuccess) {
       for (auto m = 0; m < first.num_batches; m++) {
-        free_all_packets_and_burst_rx(first.msg[m]);
+        release_burst_ref(channel, first.msg[m]);
       }
       channel->out_q.pop();
       return std::optional<ChdrConverterOpRx::RxMsg>{first};
     }
   }
   return std::nullopt;
+}
+
+void ChdrConverterOpRx::retain_burst_ref(
+        std::shared_ptr<struct Channel> channel,
+        BurstParams* burst) {
+  channel->burst_refcounts[burst]++;
+}
+
+void ChdrConverterOpRx::release_burst_ref(
+        std::shared_ptr<struct Channel> channel,
+        BurstParams* burst) {
+  auto ref = channel->burst_refcounts.find(burst);
+  if (ref == channel->burst_refcounts.end()) {
+    HOLOSCAN_LOG_ERROR("Missing burst refcount while releasing CHDR burst on channel {}",
+                       channel->channel_num);
+    free_all_packets_and_burst_rx(burst);
+    return;
+  }
+
+  if (--ref->second == 0) {
+    channel->burst_refcounts.erase(ref);
+    free_all_packets_and_burst_rx(burst);
+  }
+}
+
+void ChdrConverterOpRx::queue_completed_batch(
+        std::shared_ptr<struct Channel> channel) {
+  const int completed_batch_idx = channel->cur_idx;
+
+  HOLOSCAN_LOG_DEBUG("Aggregated {} packets on channel {} index {} - sending downstream",
+                     channel->aggr_pkts_recv,
+                     channel->channel_num,
+                     completed_batch_idx);
+
+  place_packet_data(channel->rf_data.Data(),
+                    channel->h_dev_ptrs[completed_batch_idx],
+                    completed_batch_idx,
+                    num_ffts_per_batch_.get(),
+                    num_packets_per_fft_.get(),
+                    num_complex_samples_per_packet_.get(),
+                    channel->streams[completed_batch_idx]);
+
+  if (log_data_) {
+    HOLOSCAN_LOG_INFO("Inspecting RF channel {} data from thread {} with shape: ({}, {}, {})",
+      channel->channel_num, completed_batch_idx,
+      channel->rf_data.Size(0), channel->rf_data.Size(1), channel->rf_data.Size(2));
+    set_print_format_type(MATX_PRINT_FORMAT_PYTHON);
+    print(slice<1>(channel->rf_data, {static_cast<index_t>(completed_batch_idx), 0, 0}, {matxDropDim, matxDropDim, 1024}));
+  }
+
+  cudaEventRecord(channel->events[completed_batch_idx], channel->streams[completed_batch_idx]);
+  channel->cur_msg.batch_idx = completed_batch_idx;
+  channel->cur_msg.stream = channel->streams[completed_batch_idx];
+  channel->cur_msg.evt = channel->events[completed_batch_idx];
+  channel->out_q.push(channel->cur_msg);
+  channel->cur_msg.num_batches = 0;
+  channel->ttl_pkts_recv += num_packets_per_batch;
+
+  auto ret = cudaGetLastError();
+  if (ret != cudaSuccess) {
+    HOLOSCAN_LOG_ERROR("CUDA error with {} packets in batch", num_ffts_per_batch_.get());
+    HOLOSCAN_LOG_ERROR("Error: {}", cudaGetErrorString(ret));
+    exit(1);
+  }
+
+  channel->aggr_pkts_recv = 0;
+  channel->cur_idx = (channel->cur_idx + 1) % num_simul_batches_.get();
 }
 
 bool ChdrConverterOpRx::free_bufs_and_emit_arrays(
@@ -213,7 +291,7 @@ bool ChdrConverterOpRx::free_bufs_and_emit_arrays(
   auto meta = metadata();
   meta->set("channel_number", channel->channel_num);
 
-  auto data = slice<2>(channel->rf_data, {static_cast<index_t>(channel->cur_idx), 0, 0},
+  auto data = slice<2>(channel->rf_data, {static_cast<index_t>(completed_msg.value().batch_idx), 0, 0},
               {matxDropDim, matxEnd, matxEnd});
   op_output.emit(out_t {data, completed_msg.value().stream}, "out");
   return true;
@@ -224,16 +302,22 @@ void ChdrConverterOpRx::compute(
         OutputContext& op_output,
         ExecutionContext& context) {
   const auto num_rx_queues = get_num_rx_queues(port_id_);
-  // Try to emit any waiting data on any channel that's ready (but
-  // only one "emit()" call per "compute()" call).
+
+  // Drain any completed batches first so ANO buffers can be freed as early as possible,
+  // but keep the legacy one-emit-per-compute behavior because operator metadata is reused
+  // across emits within a single compute call.
+  bool emitted = false;
   for (uint16_t q = 0; q < num_rx_queues; q++) {
     auto channel = channel_list.at(q);
-    if (free_bufs_and_emit_arrays(op_output, channel)) {
-      break;
+    if (!emitted && free_bufs_and_emit_arrays(op_output, channel)) {
+      emitted = true;
     }
-    if (channel->out_q.size() >= num_concurrent) {
+    if (static_cast<int>(channel->out_q.size()) >= max_inflight_batches()) {
       HOLOSCAN_LOG_ERROR("Fell behind in processing on GPU!");
       cudaStreamSynchronize(channel->streams[channel->cur_idx]);
+      if (!emitted && free_bufs_and_emit_arrays(op_output, channel)) {
+        emitted = true;
+      }
     }
   }
 
@@ -254,14 +338,7 @@ void ChdrConverterOpRx::process_channel_data(
         uint16_t channel_num) {
   auto channel = channel_list.at(channel_num);
 
-  uint64_t ttl_bytes_in_cur_batch = 0;
-  for (int p = 0; p < get_num_packets(burst); p++) {
-      channel->h_dev_ptrs[channel->cur_idx][channel->aggr_pkts_recv + p]
-          = get_segment_packet_ptr(burst, 2, p);
-      ttl_bytes_in_cur_batch += get_segment_packet_length(burst, 0, p)
-          + get_segment_packet_length(burst, 1, p)
-          + get_segment_packet_length(burst, 2, p);
-  }
+  const int burst_packets = get_num_packets(burst);
 
   // Log packet details for debugging
   if (log_packets_) {
@@ -307,51 +384,45 @@ void ChdrConverterOpRx::process_channel_data(
   }
   // End packet logging 
 
-  channel->ttl_bytes_recv += ttl_bytes_in_cur_batch;
-  channel->aggr_pkts_recv += get_num_packets(burst);
-  channel->cur_msg.msg[channel->cur_msg.num_batches++] = burst;
-
-  // Once we've aggregated enough packets, do some work
-  if (channel->aggr_pkts_recv >= num_packets_per_batch) {
-    HOLOSCAN_LOG_DEBUG("Aggregated {} packets on channel {} index {} - sending downstream",
-                      channel->aggr_pkts_recv, channel->channel_num, channel->cur_idx);
-
-    // Copy packet I/Q contents to appropriate location in 'rf_data'
-    place_packet_data(channel->rf_data.Data(),
-                      channel->h_dev_ptrs[channel->cur_idx],
-                      channel->cur_idx,
-                      num_ffts_per_batch_.get(),
-                      num_packets_per_fft_.get(),
-                      num_complex_samples_per_packet_.get(),
-                      channel->streams[channel->cur_idx]);
-
-    // Log data for debugging
-    if (log_data_) {
-      HOLOSCAN_LOG_INFO("Inspecting RF channel {} data from thread {} with shape: ({}, {}, {})",
-        channel->channel_num, channel->cur_idx,
-        channel->rf_data.Size(0), channel->rf_data.Size(1), channel->rf_data.Size(2));
-      set_print_format_type(MATX_PRINT_FORMAT_PYTHON);
-      print(slice<1>(channel->rf_data, {static_cast<index_t>(channel->cur_idx), 0, 0}, {matxDropDim, matxDropDim, 1024}));
+  int packet_offset = 0;
+  while (packet_offset < burst_packets) {
+    if (channel->aggr_pkts_recv == num_packets_per_batch) {
+      queue_completed_batch(channel);
     }
-    // End data logging
 
-    cudaEventRecord(channel->events[channel->cur_idx], channel->streams[channel->cur_idx]);
-    channel->cur_msg.stream = channel->streams[channel->cur_idx];
-    channel->cur_msg.evt = channel->events[channel->cur_idx];
-    channel->out_q.push(channel->cur_msg);
-    channel->cur_msg.num_batches = 0;
-
-    channel->ttl_pkts_recv += channel->aggr_pkts_recv;
-
-    auto ret = cudaGetLastError();
-    if (ret != cudaSuccess) {
-      HOLOSCAN_LOG_ERROR("CUDA error with {} packets in batch", num_ffts_per_batch_.get());
-      HOLOSCAN_LOG_ERROR("Error: {}", cudaGetErrorString(ret));
+    const uint32_t remaining_capacity = num_packets_per_batch - channel->aggr_pkts_recv;
+    const int packets_to_copy = std::min<int>(remaining_capacity, burst_packets - packet_offset);
+    if (packets_to_copy <= 0) {
+      HOLOSCAN_LOG_ERROR("Unable to copy packets from CHDR burst on channel {}", channel->channel_num);
       exit(1);
     }
 
-    channel->aggr_pkts_recv = 0;
-    channel->cur_idx = (channel->cur_idx + 1) % num_simul_batches_.get();
+    if (channel->cur_msg.num_batches >= MAX_ANO_BATCHES) {
+      HOLOSCAN_LOG_ERROR("Exceeded MAX_ANO_BATCHES while accumulating CHDR burst references on channel {}",
+                         channel->channel_num);
+      exit(1);
+    }
+
+    retain_burst_ref(channel, burst);
+    channel->cur_msg.msg[channel->cur_msg.num_batches++] = burst;
+
+    uint64_t ttl_bytes_in_cur_chunk = 0;
+    for (int p = 0; p < packets_to_copy; p++) {
+      const int burst_packet_idx = packet_offset + p;
+      channel->h_dev_ptrs[channel->cur_idx][channel->aggr_pkts_recv + p]
+          = get_segment_packet_ptr(burst, 2, burst_packet_idx);
+      ttl_bytes_in_cur_chunk += get_segment_packet_length(burst, 0, burst_packet_idx)
+          + get_segment_packet_length(burst, 1, burst_packet_idx)
+          + get_segment_packet_length(burst, 2, burst_packet_idx);
+    }
+
+    channel->ttl_bytes_recv += ttl_bytes_in_cur_chunk;
+    channel->aggr_pkts_recv += packets_to_copy;
+    packet_offset += packets_to_copy;
+
+    if (channel->aggr_pkts_recv == num_packets_per_batch) {
+      queue_completed_batch(channel);
+    }
   }
 }
 

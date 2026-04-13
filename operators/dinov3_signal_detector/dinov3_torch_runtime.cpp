@@ -15,6 +15,7 @@
 #include <utility>
 
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/nn/functional.h>
 #include <torch/script.h>
 #include <torch/torch.h>
@@ -58,15 +59,19 @@ int64_t quantile_index(int64_t size, double q) {
   return static_cast<int64_t>(std::llround(clamped * static_cast<double>(size - 1)));
 }
 
+int64_t quantile_kth(int64_t size, double q) {
+  return std::min<int64_t>(size, quantile_index(size, q) + 1);
+}
+
 torch::Tensor select_quantile_along_dim(const torch::Tensor& input, double q, int64_t dim) {
-  auto sorted = std::get<0>(torch::sort(input, dim));
-  return sorted.select(dim, quantile_index(input.size(dim), q));
+  const auto k = quantile_kth(input.size(dim), q);
+  return std::get<0>(torch::kthvalue(input, k, dim, false));
 }
 
 double scalar_quantile(const torch::Tensor& input, double q) {
   auto flat = input.reshape({-1});
-  auto sorted = std::get<0>(torch::sort(flat, 0));
-  return sorted[quantile_index(sorted.size(0), q)].item<double>();
+  const auto k = quantile_kth(flat.size(0), q);
+  return std::get<0>(torch::kthvalue(flat, k, 0, false)).item<double>();
 }
 
 torch::Tensor gaussian_filter1d(const torch::Tensor& input, double sigma) {
@@ -169,9 +174,7 @@ class DinoTorchRuntime::Impl {
     std::string failure_detail;
 
     try {
-      if (!input.power_db || input.power_db->size() != static_cast<size_t>(input.src_rows) * static_cast<size_t>(input.src_cols)) {
-        throw std::runtime_error("Invalid host power_db input buffer");
-      }
+      const size_t expected_bins = static_cast<size_t>(input.src_rows) * static_cast<size_t>(input.src_cols);
 
       failure_detail = std::string("channel=") + std::to_string(input.channel_number) +
                        " frame=" + std::to_string(input.frame_number) +
@@ -182,20 +185,34 @@ class DinoTorchRuntime::Impl {
       const auto init_mode = normalize_torchscript_init_mode(config.torchscript_init_mode);
       const bool use_cuda_torch = (config.inference_backend != "torchscript") || torchscript_init_moves_to_cuda(init_mode);
       c10::Device compute_device = use_cuda_torch ? c10::Device(torch::kCUDA, 0) : c10::Device(torch::kCPU);
-      std::unique_ptr<c10::cuda::CUDAGuard> device_guard;
+      std::unique_ptr<c10::cuda::CUDAStreamGuard> stream_guard;
       if (use_cuda_torch) {
-        device_guard = std::make_unique<c10::cuda::CUDAGuard>(compute_device);
+        const auto torch_stream = input.cuda_stream
+                                      ? c10::cuda::getStreamFromExternal(input.cuda_stream, compute_device.index())
+                                      : c10::cuda::getDefaultCUDAStream(compute_device.index());
+        stream_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(torch_stream);
       }
 
       failure_stage = "power_db_tensor_create";
-      auto cpu_float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-      auto power_db = torch::from_blob(const_cast<float*>(input.power_db->data()),
-                                       {static_cast<int64_t>(input.src_rows), static_cast<int64_t>(input.src_cols)},
-                                       cpu_float_options)
-                          .clone();
-      if (use_cuda_torch) {
-        failure_stage = "power_db_to_device";
-        power_db = power_db.to(compute_device);
+      torch::Tensor power_db;
+      if (use_cuda_torch && input.power_db_device) {
+        auto device_float_options = torch::TensorOptions().dtype(torch::kFloat32).device(compute_device);
+        power_db = torch::from_blob(const_cast<float*>(input.power_db_device),
+                                    {static_cast<int64_t>(input.src_rows), static_cast<int64_t>(input.src_cols)},
+                                    device_float_options);
+      } else {
+        if (!input.power_db || input.power_db->size() != expected_bins) {
+          throw std::runtime_error("Invalid power_db input buffer");
+        }
+        auto cpu_float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+        power_db = torch::from_blob(const_cast<float*>(input.power_db->data()),
+                                    {static_cast<int64_t>(input.src_rows), static_cast<int64_t>(input.src_cols)},
+                                    cpu_float_options)
+                       .clone();
+        if (use_cuda_torch) {
+          failure_stage = "power_db_to_device";
+          power_db = power_db.to(compute_device);
+        }
       }
 
       auto backend = config.inference_backend;
@@ -381,10 +398,12 @@ class DinoTorchRuntime::Impl {
         final_mask = final_score.ge(config.pipeline_final_threshold).to(torch::kFloat32).contiguous();
       });
 
-      failure_stage = "final_mask_to_cpu";
-      auto final_mask_cpu = final_mask.device().is_cuda() ? final_mask.to(torch::kCPU) : final_mask;
-      result.final_mask.resize(static_cast<size_t>(input.dst_rows) * static_cast<size_t>(input.dst_cols));
-      std::memcpy(result.final_mask.data(), final_mask_cpu.data_ptr<float>(), result.final_mask.size() * sizeof(float));
+      if (config.return_final_mask) {
+        failure_stage = "final_mask_to_cpu";
+        auto final_mask_cpu = final_mask.device().is_cuda() ? final_mask.to(torch::kCPU) : final_mask;
+        result.final_mask.resize(static_cast<size_t>(input.dst_rows) * static_cast<size_t>(input.dst_cols));
+        std::memcpy(result.final_mask.data(), final_mask_cpu.data_ptr<float>(), result.final_mask.size() * sizeof(float));
+      }
       result.torchscript_forward_ready = torchscript_forward_ready_;
       result.success = true;
       return result;

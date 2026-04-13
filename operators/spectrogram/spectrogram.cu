@@ -17,21 +17,26 @@ namespace fs = std::filesystem;
 
 namespace {
 
+int64_t current_timestamp_ms() {
+  const auto now = std::chrono::system_clock::now();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+}
+
 std::string make_output_path(const std::string& output_dir,
+                             const std::string& prefix,
                              uint16_t channel,
                              uint64_t frame_number,
+                             int64_t timestamp_ms,
                              int rows,
-                             int cols) {
-  const auto now = std::chrono::system_clock::now();
-  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-
+                             int cols,
+                             const std::string& extension) {
   std::ostringstream oss;
   oss << output_dir
-      << "/spectrogram_ch" << channel
+      << "/" << prefix << "_ch" << channel
       << "_f" << frame_number
-      << "_" << ms
+      << "_" << timestamp_ms
       << "_" << rows << "x" << cols
-      << ".pgm";
+      << extension;
   return oss.str();
 }
 
@@ -46,6 +51,40 @@ bool write_pgm(const std::string& path, const std::vector<uint8_t>& image, int w
   return out.good();
 }
 
+bool write_complex64_npy(const std::string& path, const std::vector<holoscan::ops::complex>& tensor, int rows, int cols) {
+  static_assert(sizeof(holoscan::ops::complex) == sizeof(float) * 2,
+                "Spectrogram tensor snapshots require complex<float> storage.");
+
+  std::ofstream out(path, std::ios::binary);
+  if (!out.is_open()) {
+    return false;
+  }
+
+  const char magic[] = {'\x93', 'N', 'U', 'M', 'P', 'Y'};
+  out.write(magic, sizeof(magic));
+  out.put(static_cast<char>(1));
+  out.put(static_cast<char>(0));
+
+  std::ostringstream header_stream;
+  header_stream << "{'descr': '<c8', 'fortran_order': False, 'shape': (" << rows << ", " << cols << "), }";
+  std::string header = header_stream.str();
+  const size_t preamble_size = 6 + 2 + 2;
+  const size_t padding = (16 - ((preamble_size + header.size() + 1) % 16)) % 16;
+  header.append(padding, ' ');
+  header.push_back('\n');
+
+  const uint16_t header_len = static_cast<uint16_t>(header.size());
+  const char header_len_bytes[] = {
+      static_cast<char>(header_len & 0xFF),
+      static_cast<char>((header_len >> 8) & 0xFF),
+  };
+  out.write(header_len_bytes, sizeof(header_len_bytes));
+  out.write(header.data(), static_cast<std::streamsize>(header.size()));
+  out.write(reinterpret_cast<const char*>(tensor.data()),
+            static_cast<std::streamsize>(tensor.size() * sizeof(holoscan::ops::complex)));
+  return out.good();
+}
+
 }  // namespace
 
 namespace holoscan::ops {
@@ -56,6 +95,11 @@ void Spectrogram::setup(holoscan::OperatorSpec& spec) {
 
   spec.param(num_channels_, "num_channels", "Number of channels", "Number of channels in the stream.", 1);
   spec.param(enable_save_, "enable_save", "Enable save", "Enable writing spectrogram images to disk.", true);
+  spec.param(enable_tensor_save_,
+             "enable_tensor_save",
+             "Enable tensor save",
+             "Enable writing the exact complex spectrogram tensor passed downstream to disk.",
+             false);
   spec.param(save_every_n_frames_,
              "save_every_n_frames",
              "Save stride",
@@ -81,6 +125,11 @@ void Spectrogram::setup(holoscan::OperatorSpec& spec) {
              "Output directory",
              "Directory where spectrogram images are written.",
              std::string("/workspace/spectrograms"));
+  spec.param(tensor_output_dir_,
+             "tensor_output_dir",
+             "Tensor output directory",
+             "Directory where detector-input tensor snapshots are written.",
+             std::string("/workspace/spectrogram_tensors"));
 }
 
 void Spectrogram::initialize() {
@@ -93,6 +142,11 @@ void Spectrogram::initialize() {
     HOLOSCAN_LOG_INFO("Spectrogram save enabled. Output dir: {}", output_dir_.get());
   } else {
     HOLOSCAN_LOG_INFO("Spectrogram save disabled.");
+  }
+
+  if (enable_tensor_save_.get()) {
+    fs::create_directories(tensor_output_dir_.get());
+    HOLOSCAN_LOG_INFO("Spectrogram tensor save enabled. Tensor output dir: {}", tensor_output_dir_.get());
   }
 }
 
@@ -117,7 +171,9 @@ void Spectrogram::compute(holoscan::InputContext& op_input,
 
   op_output.emit(out_t {tensor, stream}, "out");
 
-  if (!enable_save_.get()) {
+  const bool save_image = enable_save_.get();
+  const bool save_tensor = enable_tensor_save_.get();
+  if (!save_image && !save_tensor) {
     return;
   }
 
@@ -152,6 +208,25 @@ void Spectrogram::compute(holoscan::InputContext& op_input,
   if (sync_result != cudaSuccess) {
     HOLOSCAN_LOG_ERROR("Spectrogram cudaStreamSynchronize failed: {}", cudaGetErrorString(sync_result));
     return;
+  }
+
+  const int64_t timestamp_ms = current_timestamp_ms();
+  bool artifact_saved = false;
+  if (save_tensor) {
+    const auto tensor_path = make_output_path(tensor_output_dir_.get(),
+                                              "spectrogram_tensor",
+                                              channel_number,
+                                              frame_number,
+                                              timestamp_ms,
+                                              src_rows,
+                                              src_cols,
+                                              ".npy");
+    if (!write_complex64_npy(tensor_path, host_fft, src_rows, src_cols)) {
+      HOLOSCAN_LOG_ERROR("Failed to write spectrogram tensor snapshot: {}", tensor_path);
+    } else {
+      artifact_saved = true;
+      HOLOSCAN_LOG_INFO("Saved spectrogram tensor for channel {} to {}", channel_number, tensor_path);
+    }
   }
 
   std::vector<float> reduced(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols), -120.0f);
@@ -197,14 +272,28 @@ void Spectrogram::compute(holoscan::InputContext& op_input,
     image[i] = static_cast<uint8_t>(std::clamp(normalized * 255.0f, 0.0f, 255.0f));
   }
 
-  const auto path = make_output_path(output_dir_.get(), channel_number, frame_number, dst_rows, dst_cols);
-  if (!write_pgm(path, image, dst_cols, dst_rows)) {
-    HOLOSCAN_LOG_ERROR("Failed to write spectrogram image: {}", path);
+  if (save_image) {
+    const auto path = make_output_path(output_dir_.get(),
+                                       "spectrogram",
+                                       channel_number,
+                                       frame_number,
+                                       timestamp_ms,
+                                       dst_rows,
+                                       dst_cols,
+                                       ".pgm");
+    if (!write_pgm(path, image, dst_cols, dst_rows)) {
+      HOLOSCAN_LOG_ERROR("Failed to write spectrogram image: {}", path);
+    } else {
+      artifact_saved = true;
+      HOLOSCAN_LOG_INFO("Saved spectrogram image for channel {} to {}", channel_number, path);
+    }
+  }
+
+  if (!artifact_saved) {
     return;
   }
 
   ++images_saved_[channel_number];
-  HOLOSCAN_LOG_INFO("Saved spectrogram image for channel {} to {}", channel_number, path);
 }
 
 }  // namespace holoscan::ops

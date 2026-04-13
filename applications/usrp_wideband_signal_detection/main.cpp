@@ -122,13 +122,31 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     auto fftOp = make_operator<ops::FFT>("fftOp", from_config("fft"));
 
-    auto spectrogramOp = make_operator<ops::Spectrogram>("spectrogramOp", from_config("spectrogram"));
+    const bool enable_spectrogram = from_config("pipeline.enable_spectrogram").as<bool>();
+    const bool enable_detector = from_config("pipeline.enable_detector").as<bool>();
+    const bool log_from_spectrogram = from_config("pipeline.log_from_spectrogram").as<bool>();
 
-    auto dinoV3SignalDetectorOp = make_operator<ops::DinoV3SignalDetector>(
-        "dinoV3SignalDetectorOp",
-        from_config("dinov3_signal_detector"));
+    if (enable_detector && !enable_spectrogram) {
+      HOLOSCAN_LOG_ERROR("pipeline.enable_detector=true requires pipeline.enable_spectrogram=true");
+      exit(1);
+    }
+
+    std::shared_ptr<holoscan::Operator> spectrogramOp;
+    std::shared_ptr<holoscan::Operator> dinoV3SignalDetectorOp;
+    if (enable_spectrogram) {
+      spectrogramOp = make_operator<ops::Spectrogram>("spectrogramOp", from_config("spectrogram"));
+    }
+    if (enable_detector) {
+      dinoV3SignalDetectorOp = make_operator<ops::DinoV3SignalDetector>(
+          "dinoV3SignalDetectorOp",
+          from_config("dinov3_signal_detector"));
+    }
 
     const bool enable_visualization = from_config("visualization.enable").as<bool>();
+    if (enable_visualization && !enable_spectrogram) {
+      HOLOSCAN_LOG_ERROR("visualization.enable=true requires pipeline.enable_spectrogram=true");
+      exit(1);
+    }
     std::shared_ptr<holoscan::Operator> spectrogramVisualizerOp;
     std::shared_ptr<holoscan::Operator> holovizOp;
     if (enable_visualization) {
@@ -149,8 +167,12 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     add_operator(chdrConverterOp);
     add_operator(fftOp);
-    add_operator(spectrogramOp);
-    add_operator(dinoV3SignalDetectorOp);
+    if (enable_spectrogram) {
+      add_operator(spectrogramOp);
+    }
+    if (enable_detector) {
+      add_operator(dinoV3SignalDetectorOp);
+    }
     if (enable_visualization) {
       add_operator(spectrogramVisualizerOp);
       add_operator(holovizOp);
@@ -158,13 +180,25 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     add_operator(logOp);
 
     add_flow(chdrConverterOp, fftOp);
-    add_flow(fftOp, spectrogramOp);
-    add_flow(spectrogramOp, dinoV3SignalDetectorOp);
+    if (enable_spectrogram) {
+      add_flow(fftOp, spectrogramOp);
+    }
+    if (enable_detector) {
+      add_flow(spectrogramOp, dinoV3SignalDetectorOp);
+    }
     if (enable_visualization) {
       add_flow(spectrogramOp, spectrogramVisualizerOp);
       add_flow(spectrogramVisualizerOp, holovizOp, {{"outputs", "receivers"}});
     }
-    add_flow(fftOp, logOp);
+    if (log_from_spectrogram) {
+      if (!enable_spectrogram) {
+        HOLOSCAN_LOG_ERROR("pipeline.log_from_spectrogram=true requires pipeline.enable_spectrogram=true");
+        exit(1);
+      }
+      add_flow(spectrogramOp, logOp);
+    } else {
+      add_flow(fftOp, logOp);
+    }
   }
 };
 

@@ -303,6 +303,8 @@ void DinoV3SignalDetector::initialize() {
   frame_count_.assign(num_channels_.get(), 0);
   masks_saved_.assign(num_channels_.get(), 0);
   timing_stats_.assign(num_channels_.get(), ChannelTimingStats {});
+  power_db_device_buffers_.assign(num_channels_.get(), nullptr);
+  power_db_device_buffer_sizes_.assign(num_channels_.get(), 0);
 
   make_tensor(detection_masks_,
               {num_channels_.get(), input_height_.get(), input_width_.get()},
@@ -381,6 +383,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
   const int dst_cols = std::max(1, input_width_.get());
   const int patch_size = std::max(1, patch_size_.get());
   const bool timing_enabled = timing_summary_enable_.get();
+  const bool need_device_mask = enable_mask_save_.get();
   const auto total_start = std::chrono::steady_clock::now();
   std::array<double, kTimingStageCount> stage_ms {};
 
@@ -414,15 +417,19 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
                             {static_cast<matx::index_t>(channel_number), 0, 0},
                             {matxDropDim, matxEnd, matxEnd});
 
-  time_step_ms(kInputStage, [&] {
-    auto clear_result = cudaMemsetAsync(out.Data(),
-                                        0,
-                                        static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols) * sizeof(float),
-                                        stream);
-    if (clear_result != cudaSuccess) {
-      throw std::runtime_error(std::string("cudaMemsetAsync failed: ") + cudaGetErrorString(clear_result));
-    }
-  });
+  if (need_device_mask) {
+    time_step_ms(kInputStage, [&] {
+      auto clear_result = cudaMemsetAsync(out.Data(),
+                                          0,
+                                          static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols) * sizeof(float),
+                                          stream);
+      if (clear_result != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemsetAsync failed: ") + cudaGetErrorString(clear_result));
+      }
+    });
+  } else {
+    time_step_ms(kInputStage, [&] {});
+  }
 
   auto maybe_save_mask = [&](const std::string& backend_name) {
     if (!enable_mask_save_.get()) {
@@ -489,6 +496,9 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     time_step_ms(kDinoScoreStage, [&] {});
     time_step_ms(kPowerScoreStage, [&] {});
     time_step_ms(kFusionStage, [&] {
+      if (!need_device_mask) {
+        return;
+      }
       power_db_mask_kernel<<<blocks, threads, 0, stream>>>(fft_tensor.Data(),
                                                             out.Data(),
                                                             src_rows,
@@ -535,35 +545,30 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         failure_detail = oss.str();
       }
 
-      auto stream_sync_result = cudaStreamSynchronize(stream);
-      if (stream_sync_result != cudaSuccess) {
-        throw std::runtime_error(std::string("input stream synchronize failed: ") + cudaGetErrorString(stream_sync_result));
-      }
-
       const int total_bins = src_rows * src_cols;
-      std::vector<dino_complex> host_fft(static_cast<size_t>(total_bins));
-      failure_stage = "input_copy_to_host";
-      auto host_copy_result = cudaMemcpyAsync(host_fft.data(),
-                                              fft_tensor.Data(),
-                                              host_fft.size() * sizeof(dino_complex),
-                                              cudaMemcpyDeviceToHost,
-                                              stream);
-      if (host_copy_result != cudaSuccess) {
-        throw std::runtime_error(std::string("input host copy failed: ") + cudaGetErrorString(host_copy_result));
-      }
-      auto host_copy_sync_result = cudaStreamSynchronize(stream);
-      if (host_copy_sync_result != cudaSuccess) {
-        throw std::runtime_error(std::string("input host copy synchronize failed: ") + cudaGetErrorString(host_copy_sync_result));
+      const size_t power_db_bytes = static_cast<size_t>(total_bins) * sizeof(float);
+      if (power_db_device_buffer_sizes_[channel_number] != static_cast<size_t>(total_bins)) {
+        if (power_db_device_buffers_[channel_number] != nullptr) {
+          cudaFree(power_db_device_buffers_[channel_number]);
+          power_db_device_buffers_[channel_number] = nullptr;
+        }
+        auto alloc_result = cudaMalloc(reinterpret_cast<void**>(&power_db_device_buffers_[channel_number]), power_db_bytes);
+        if (alloc_result != cudaSuccess) {
+          throw std::runtime_error(std::string("power_db device buffer allocation failed: ") + cudaGetErrorString(alloc_result));
+        }
+        power_db_device_buffer_sizes_[channel_number] = static_cast<size_t>(total_bins);
       }
 
-      failure_stage = "power_db_host_compute";
-      std::vector<float> host_power_db(static_cast<size_t>(total_bins));
-      for (int idx = 0; idx < total_bins; ++idx) {
-        const auto v = host_fft[static_cast<size_t>(idx)];
-        const float re = v.real();
-        const float im = v.imag();
-        const float power = re * re + im * im + 1e-12f;
-        host_power_db[static_cast<size_t>(idx)] = 10.0f * std::log10(power);
+      failure_stage = "power_db_device_compute";
+      const int threads = 256;
+      const int blocks = (total_bins + threads - 1) / threads;
+      complex_to_power_db_kernel<<<blocks, threads, 0, stream>>>(fft_tensor.Data(),
+                                                                 power_db_device_buffers_[channel_number],
+                                                                 src_rows,
+                                                                 src_cols);
+      auto power_db_kernel_result = cudaGetLastError();
+      if (power_db_kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("power_db kernel launch failed: ") + cudaGetErrorString(power_db_kernel_result));
       }
 
       if (inference_backend_.get() == "torchscript" && !torchscript_forward_trace_emitted_) {
@@ -582,6 +587,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       runtime_config.torchscript_init_mode = torchscript_init_mode_.get();
       runtime_config.imagenet_mean = imagenet_mean_.get();
       runtime_config.imagenet_std = imagenet_std_.get();
+      runtime_config.return_final_mask = need_device_mask;
       runtime_config.ignore_sideband_hz = ignore_sideband_hz_.get();
       runtime_config.frontend_correction_enable = frontend_correction_enable_.get();
       runtime_config.frontend_correction_row_q = frontend_correction_row_q_.get();
@@ -607,10 +613,11 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       runtime_input.dst_rows = dst_rows;
       runtime_input.dst_cols = dst_cols;
       runtime_input.patch_size = patch_size;
+      runtime_input.cuda_stream = stream;
       failure_stage = "metadata_read";
       runtime_input.resolution_hz = static_cast<double>(meta->get<uint64_t>("resolution", 0));
       runtime_input.span_hz = static_cast<double>(meta->get<uint64_t>("span", 0));
-      runtime_input.power_db = &host_power_db;
+      runtime_input.power_db_device = power_db_device_buffers_[channel_number];
 
       failure_stage = "torch_runtime";
       auto runtime_result = torch_runtime_->run(runtime_config, runtime_input);
@@ -651,22 +658,26 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         torchscript_forward_trace_emitted_ = true;
       }
 
-      if (runtime_result.final_mask.size() != static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols)) {
-        throw std::runtime_error("Torch runtime returned an unexpected final mask size");
-      }
-
-      failure_stage = "device_copy";
-      time_step_ms(kDeviceCopyStage, [&] {
-        const size_t output_bytes = static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols) * sizeof(float);
-        auto copy_result = cudaMemcpyAsync(out.Data(),
-                                           runtime_result.final_mask.data(),
-                                           output_bytes,
-                                           cudaMemcpyHostToDevice,
-                                           stream);
-        if (copy_result != cudaSuccess) {
-          throw std::runtime_error(std::string("torch-path memcpy failed: ") + cudaGetErrorString(copy_result));
+      if (need_device_mask) {
+        if (runtime_result.final_mask.size() != static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols)) {
+          throw std::runtime_error("Torch runtime returned an unexpected final mask size");
         }
-      });
+
+        failure_stage = "device_copy";
+        time_step_ms(kDeviceCopyStage, [&] {
+          const size_t output_bytes = static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols) * sizeof(float);
+          auto copy_result = cudaMemcpyAsync(out.Data(),
+                                             runtime_result.final_mask.data(),
+                                             output_bytes,
+                                             cudaMemcpyHostToDevice,
+                                             stream);
+          if (copy_result != cudaSuccess) {
+            throw std::runtime_error(std::string("torch-path memcpy failed: ") + cudaGetErrorString(copy_result));
+          }
+        });
+      } else {
+        time_step_ms(kDeviceCopyStage, [&] {});
+      }
 
       meta->set("dino_frame_number", frame_number);
       meta->set("dino_mask_height", static_cast<uint32_t>(dst_rows));

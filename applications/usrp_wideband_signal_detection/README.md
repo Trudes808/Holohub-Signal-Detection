@@ -10,6 +10,15 @@ Flow:
 
 A side logger branch is kept from `fftOp` for throughput visibility.
 
+The app now supports pipeline-isolation modes through config:
+
+- `pipeline.enable_spectrogram`
+	- bypasses `spectrogramOp` entirely when false
+- `pipeline.enable_detector`
+	- bypasses `dinoV3SignalDetectorOp` entirely when false
+- `pipeline.log_from_spectrogram`
+	- switches the throughput logger to the post-spectrogram path when true
+
 The current runtime target is the Holohub development container. The local DINOv3 source of truth lives outside the container and must be staged into the container runtime tree before model-forward validation:
 
 - host repo: `/home/sat3737/holoscan_demo_workspace/dinov3`
@@ -48,6 +57,16 @@ Available configs copied into the build directory:
 	- two-channel throughput test mode
 	- disables spectrogram saves, detector mask saves, per-frame detection logging, and timing summaries to keep the data path as lean as possible
 	- keeps GPU RX pools at the known-safe `25000` buffers per channel to avoid GPUDirect BAR1 DMA-map failures, while reducing queue burst size and raising `num_simul_batches` so the graph can absorb more ingress jitter before dropping packets
+- `config_torchscript_performance_fft_only.yaml`
+	- ingress and FFT isolation mode
+	- bypasses both spectrogram and detector so the first throughput ceiling can be measured without downstream ML work
+	- uses legacy-style large ingress batches (`12500` packets / `625` FFTs, `2` simultaneous batches) to mirror the older PSD path more closely
+- `config_torchscript_performance_spectrogram_only.yaml`
+	- ingress, FFT, and spectrogram isolation mode
+	- bypasses the detector while logging from the post-spectrogram path to prove whether `spectrogramOp` is still throughput-safe when save is disabled
+- `config_torchscript_performance_small_batches.yaml`
+	- detector-enabled throughput mode with smaller CHDR/FFT batches
+	- reduces `num_ffts_per_batch` and queue batch size to test whether coarse batch retention is a major source of drops before detector rewrite work begins
 - `config_torchscript_load_only.yaml`
 	- lower-risk TorchScript diagnostic mode
 	- loads the TorchScript artifact without moving it to CUDA or attempting `eval()`, then falls back to placeholder inference during compute
@@ -145,6 +164,15 @@ For the two-channel performance pass with the real TorchScript detector path and
 ```bash
 cd applications/usrp_wideband_signal_detection
 ./run_torchscript_performance_test.sh
+```
+
+For the staged bottleneck-isolation passes, reuse the same helper with `CONFIG_NAME`:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+CONFIG_NAME=config_torchscript_performance_fft_only.yaml ./run_torchscript_performance_test.sh
+CONFIG_NAME=config_torchscript_performance_spectrogram_only.yaml ./run_torchscript_performance_test.sh
+CONFIG_NAME=config_torchscript_performance_small_batches.yaml ./run_torchscript_performance_test.sh
 ```
 
 If you need to force a rebuild even when the targets look current:

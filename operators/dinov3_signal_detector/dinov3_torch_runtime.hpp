@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cuda_runtime_api.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@ struct DinoTorchRuntimeConfig {
   std::string torchscript_init_mode;
   std::vector<double> imagenet_mean;
   std::vector<double> imagenet_std;
+  bool return_final_mask = true;
   double ignore_sideband_hz = 0.0;
   bool frontend_correction_enable = true;
   double frontend_correction_row_q = 25.0;
@@ -42,9 +44,11 @@ struct DinoTorchRuntimeInput {
   int dst_rows = 0;
   int dst_cols = 0;
   int patch_size = 16;
+  cudaStream_t cuda_stream = nullptr;
   double resolution_hz = 0.0;
   double span_hz = 0.0;
   const std::vector<float>* power_db = nullptr;
+  const float* power_db_device = nullptr;
 };
 
 struct DinoTorchRuntimeTiming {

@@ -28,11 +28,13 @@ class Spectrogram : public holoscan::Operator {
  private:
   holoscan::Parameter<int> num_channels_;
   holoscan::Parameter<bool> enable_save_;
+    holoscan::Parameter<bool> enable_tensor_save_;
   holoscan::Parameter<int> save_every_n_frames_;
   holoscan::Parameter<int> max_images_per_channel_;
   holoscan::Parameter<int> output_height_;
   holoscan::Parameter<int> output_width_;
   holoscan::Parameter<std::string> output_dir_;
+    holoscan::Parameter<std::string> tensor_output_dir_;
 
   std::vector<uint64_t> frame_count_;
   std::vector<int> images_saved_;

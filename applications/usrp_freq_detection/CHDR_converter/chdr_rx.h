@@ -22,6 +22,8 @@
 #include "matx.h"
 #include "advanced_network/common.h"
 
+#include <unordered_map>
+
 using namespace holoscan::advanced_network;
 using namespace matx;
 using complex = cuda::std::complex<float>;
@@ -65,6 +67,7 @@ class ChdrConverterOpRx : public Operator {
   struct RxMsg {
     std::array<BurstParams *, MAX_ANO_BATCHES> msg;
     int num_batches;
+    int batch_idx;
     cudaStream_t stream;
     cudaEvent_t evt;
   };
@@ -78,6 +81,7 @@ class ChdrConverterOpRx : public Operator {
     std::array<cudaEvent_t, num_concurrent> events;
     RxMsg cur_msg{};
     std::queue<RxMsg> out_q;
+    std::unordered_map<BurstParams*, uint32_t> burst_refcounts;
     uint64_t ttl_bytes_recv = 0;
     uint64_t ttl_pkts_recv = 0;
     uint64_t aggr_pkts_recv = 0;
@@ -87,10 +91,14 @@ class ChdrConverterOpRx : public Operator {
 
   std::optional<RxMsg> free_buf(std::shared_ptr<struct Channel> channel);
   bool free_bufs_and_emit_arrays(OutputContext& op_output, std::shared_ptr<struct Channel> channel);
+  void retain_burst_ref(std::shared_ptr<struct Channel> channel, BurstParams* burst);
+  void release_burst_ref(std::shared_ptr<struct Channel> channel, BurstParams* burst);
+  void queue_completed_batch(std::shared_ptr<struct Channel> channel);
   void process_channel_data(
           OutputContext& op_output,
           BurstParams *burst,
           uint16_t channel_num);
+  int max_inflight_batches() const;
 };  // ChdrConverterOpRx
 
 }  // namespace holoscan::ops

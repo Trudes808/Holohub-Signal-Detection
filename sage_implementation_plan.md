@@ -19,11 +19,12 @@ Completed since the original step-10 resume:
 
 Immediate next steps:
 
-1. run the new 2-channel performance configuration at the expected ingest rate and record DPDK RX buffer-drop counters, per-queue application packet counts, and any backend warnings,
-2. tune receive buffering and batching until packet drops are minimized without re-enabling slow debug paths,
-3. once the low-overhead runtime path is stable, compare detector behavior and constants against `../Dinov3-RF-Signal-Detection/signal_detection_holoscanv2.ipynb` and close remaining notebook-parity gaps,
-4. re-enable targeted timing summaries only after the throughput baseline is understood, and
-5. only after functionality and low-drop throughput are stable use `../Dinov3-RF-Signal-Detection/speed_optimization_todo.md` to drive deeper optimization work.
+1. add staged pipeline-isolation configs so ingress+FFT, ingress+FFT+spectrogram, and ingress+FFT+spectrogram+detector can be measured separately,
+2. tune receive buffering and batching until the throughput ceiling clearly moves downstream to the detector stage,
+3. define success for the pre-detector tuning pass as: FFT-only and spectrogram-only runs sustain the target 2-channel rate with minimal RX buffer drops while the detector-enabled path still shows a clear additional throughput cliff,
+4. once the detector is isolated as the dominant bottleneck, redesign the detector hot path to eliminate host round-trips and blocking stream synchronizations,
+5. after detector rewrite work, compare behavior and constants against `../Dinov3-RF-Signal-Detection/signal_detection_holoscanv2.ipynb`, and
+6. only after functionality and low-drop throughput are stable use `../Dinov3-RF-Signal-Detection/speed_optimization_todo.md` to drive deeper optimization work.
 
 ## 1) Purpose and Scope
 
@@ -875,17 +876,106 @@ Status update (2026-04-12):
 - `config_torchscript_performance.yaml` and `run_torchscript_performance_test.sh` were added specifically for this step.
 - The performance config keeps the real TorchScript path but disables spectrogram saves, mask saves, detailed detection logs, and timing summaries.
 - It reduces DPDK queue `batch_size` and increases `num_simul_batches` to give the ingest path more headroom while keeping GPU RX pools at the known-safe `25000` buffers per channel to avoid GPUDirect BAR1 DMA-map failures.
+- The next stage of this step is explicit pipeline isolation: FFT-only, spectrogram-only, and detector-enabled small-batch runs.
+- Treat the pre-detector optimization pass as successful only when FFT-only and spectrogram-only sustain the target 2-channel rate with minimal drops and the detector-enabled path remains the clearly dominant throughput limiter.
 
 Exit criteria:
 
 - stable sustained run with bounded memory, controlled inference cadence, and no unintended backend regressions.
 
+### 10.11.1 Bottleneck isolation sequence before detector rewrite
+
+Run the throughput investigation in this order:
+
+1. `config_torchscript_performance_fft_only.yaml`
+   - proves whether ingress + CHDR conversion + FFT can sustain the target rate.
+2. `config_torchscript_performance_spectrogram_only.yaml`
+   - proves whether adding `spectrogramOp` with save disabled still sustains the target rate.
+3. `config_torchscript_performance_small_batches.yaml`
+   - tests whether smaller CHDR/FFT batch retention materially reduces drops before detector redesign.
+4. `config_torchscript_performance.yaml`
+   - keeps the full detector path for the final comparison against the isolated stages.
+
+Quantify success as follows:
+
+1. FFT-only and spectrogram-only runs should show near-parity in throughput and only minimal additional RX buffer-drop pressure relative to each other.
+2. If FFT-only and spectrogram-only are both healthy while detector-enabled runs collapse, the bottleneck has been isolated to the detector path.
+3. If FFT-only already drops heavily, continue working upstream on CHDR batching, queue sizing, and scheduling before changing detector code.
+4. If spectrogram-only drops materially more than FFT-only, fix spectrogram-path behavior before changing detector code.
+
+Once this sequence shows the detector as the dominant limiter, detector rewrite work becomes the next active implementation step.
+
+Measured status update (2026-04-12):
+
+- `config_torchscript_performance_fft_only.yaml`
+   - initial isolation run accepted packets: `72,528`
+   - initial isolation run wire packets: `721,808`
+   - initial isolation run `RX out of buffers`: `649,280`
+   - initial isolation accepted fraction: about `10.0%`
+- `config_torchscript_performance_fft_only.yaml` after CHDR converter fixes
+   - accepted packets: `1,010,336`
+   - wire packets: `1,012,735`
+   - `RX out of buffers`: `2,399`
+   - accepted fraction: about `99.8%`
+   - per-queue packets delivered to the app: `506,018` on queue 0 and `504,318` on queue 1
+   - CHDR converter completed exactly `500,000` packets per channel, with the remaining packets explained by partial final batches at interruption time rather than catastrophic upstream loss
+- `config_torchscript_performance_spectrogram_only.yaml`
+   - initial isolation run accepted packets: `78,672`
+   - initial isolation run wire packets: `1,170,450`
+   - initial isolation run `RX out of buffers`: `1,091,778`
+   - initial isolation accepted fraction: about `6.7%`
+- reported `config_torchscript_performance_spectrogram_only.yaml` rerun after CHDR converter fixes
+   - accepted packets: `2,161,980`
+   - wire packets: `2,161,980`
+   - `RX out of buffers`: `0`
+   - accepted fraction: `100%`
+   - per-queue packets delivered to the app: `1,080,986` on queue 0 and `1,080,994` on queue 1
+- `config_torchscript_performance_small_batches.yaml`
+   - accepted packets: `78,672`
+   - wire packets: `1,387,636`
+   - `RX out of buffers`: `1,308,964`
+   - accepted fraction: about `5.7%`
+
+Current conclusion:
+
+1. The CHDR + FFT path is now close to healthy and no longer appears to be the dominant throughput limiter.
+2. The large upstream failure observed earlier was caused by CHDR converter correctness bugs rather than an unavoidable FFT-side throughput ceiling.
+3. `spectrogramOp` with save disabled also runs at or near line rate, so it is no longer a credible throughput bottleneck in the current path.
+4. The dominant remaining throughput cliff is now downstream of spectrogram and is most likely the detector path.
+5. Any remaining gap between app-delivered packets and CHDR completed packets in FFT-only is currently consistent with partial final batches when the run is interrupted, not systemic collapse.
+
+Next action after these measurements:
+
+1. Rerun the full detector path and treat the detector hot path as the dominant remaining optimization target.
+2. Compare the full detector path directly against the now-healthy FFT-only and spectrogram-only baselines.
+3. Focus detector optimization on eliminating host round-trips, blocking stream synchronizations, and unnecessary host/device copies.
+4. Preserve the corrected CHDR converter behavior as the new upstream baseline for all further throughput comparisons.
+
+Detector optimization update (2026-04-12):
+
+1. The full detector-path rerun still collapsed badly even though FFT-only and spectrogram-only were healthy:
+   - accepted packets: `68,432`
+   - `RX out of buffers`: improved from `1,698,317` to `933,051` after the first detector-side copy eliminations, but a later rerun regressed to `1,172,170`
+   - per-queue app totals: `39,336` and `29,096`
+2. Detector hot-path optimizations implemented so far:
+   - the operator no longer copies the full FFT tensor to host just to derive `power_db`
+   - `complex_to_power_db_kernel` now generates `power_db` on GPU into a reusable per-channel device buffer
+   - the Torch runtime can now consume that device-resident `power_db` buffer directly, skipping the previous host-to-device upload inside the runtime
+   - final-mask materialization and host/device mask copies are skipped entirely when `enable_mask_save=false`
+   - the detector no longer calls `cudaStreamSynchronize(stream)` before entering LibTorch; instead it passes the upstream CUDA stream into the runtime and uses LibTorch's external-stream guard so Torch work stays ordered on that producer stream
+   - quantile threshold lookups in the Torch runtime now use `torch::kthvalue(...)` instead of full `torch::sort(...)` calls to avoid repeated whole-tensor sorts during frontend correction and score thresholding
+3. Current conclusion:
+   - ingress, FFT, and spectrogram are no longer the dominant bottlenecks
+   - the remaining throughput cliff is inside detector-side preprocessing and Torch runtime work on full wideband frames
+   - the external-stream change by itself did not materially improve end-to-end throughput, so the next work should focus on reducing full-frame preprocessing cost rather than stream handoff mechanics
+4. The next measurement should rerun `config_torchscript_performance.yaml` after rebuild to quantify whether the `kthvalue` quantile change materially reduces the remaining detector bottleneck.
+
 ### 10.12 Immediate follow-on tasks
 
-1. Add a postprocess or sink stage after the detector so outputs are validated by more than logs and metadata.
-2. Promote debug metadata into a formal downstream output schema.
-3. Add explicit troubleshooting notes for model-load, export, packaging, and fallback modes.
-4. Decide whether the spectrogram operator remains a debug saver or becomes the true tensor-producing preprocessing stage.
+1. Rebuild the containerized app and rerun `config_torchscript_performance.yaml` to measure the `torch::kthvalue(...)` detector optimization.
+2. If the full detector path is still badly stalled, instrument or simplify detector-side frontend correction to identify which full-frame operations still dominate runtime.
+3. Consider moving more notebook-style preprocessing out of the detector hot path, or reducing its scope, so Torch sees a smaller or cheaper input representation.
+4. After detector throughput is materially better, add a downstream sink or schema cleanup pass so detector outputs are validated by more than logs and metadata.
 
 ### 10.13 Session restart quick checks
 

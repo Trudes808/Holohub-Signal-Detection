@@ -16,7 +16,8 @@ The operator:
 - computes log-power values,
 - downsamples to configurable output dimensions,
 - normalizes to grayscale,
-- writes `.pgm` images to a configurable directory.
+- writes `.pgm` images to a configurable directory,
+- can optionally save the exact downstream complex tensor as a `.npy` snapshot for detector parity checks.
 
 This is a debug/verification path intended for early bring-up.
 
@@ -26,12 +27,16 @@ This is a debug/verification path intended for early bring-up.
 spectrogram:
   num_channels: 2
   enable_save: true
+  enable_tensor_save: true
   save_every_n_frames: 100
   max_images_per_channel: 20
   output_height: 256
   output_width: 512
   output_dir: "/workspace/spectrograms"
+  tensor_output_dir: "/workspace/spectrogram_tensors"
 ```
+
+When `enable_tensor_save` is true, the operator writes the exact `complex64` tensor that is forwarded to downstream consumers, before any debug-image reduction or 8-bit normalization. The `.npy` filename stores the source tensor dimensions, not the reduced image dimensions.
 
 ## Metadata
 

@@ -4,8 +4,8 @@
 num_runs: -1
 
 pipeline:
-  enable_spectrogram: true
-  enable_detector: true
+  enable_spectrogram: false
+  enable_detector: false
   log_from_spectrogram: false
 
 scheduler:
@@ -67,7 +67,7 @@ advanced_network:
             - name: "Channel 1 data"
               id: 0
               cpu_core: 10
-              batch_size: 2048
+              batch_size: 12500
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
@@ -75,7 +75,7 @@ advanced_network:
             - name: "Channel 2 data"
               id: 1
               cpu_core: 11
-              batch_size: 2048
+              batch_size: 12500
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH2_CHDR_Headers_RX_CPU"
@@ -103,15 +103,15 @@ chdr_converter:
   interface_name: sdr_data
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 250
-  num_simul_batches: 4
+  num_ffts_per_batch: 625
+  num_simul_batches: 2
   num_channels: 2
   log_packets: false
   log_data: false
 
 fft:
   burst_size: 20480
-  num_bursts: 250
+  num_bursts: 625
   num_channels: 2
   spectrum_type: 1
   averaging_type: 1

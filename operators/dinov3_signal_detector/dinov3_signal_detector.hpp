@@ -101,6 +101,8 @@ class DinoV3SignalDetector : public holoscan::Operator {
   std::vector<int> masks_saved_;
   std::vector<ChannelTimingStats> timing_stats_;
   matx::tensor_t<float, 3> detection_masks_;
+  std::vector<float*> power_db_device_buffers_;
+  std::vector<size_t> power_db_device_buffer_sizes_;
   bool pytorch_runtime_ready_ = false;
   bool pytorch_warning_emitted_ = false;
   bool torchscript_forward_trace_emitted_ = false;
