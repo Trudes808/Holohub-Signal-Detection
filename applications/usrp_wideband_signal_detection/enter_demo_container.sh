@@ -13,4 +13,4 @@ if [[ "$(sudo docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}")" != "t
   sudo docker start "${CONTAINER_NAME}" >/dev/null
 fi
 
-exec sudo docker exec -it "${CONTAINER_NAME}" bash
+exec sudo docker exec -it -e DISPLAY="${DISPLAY}" "${CONTAINER_NAME}" bash

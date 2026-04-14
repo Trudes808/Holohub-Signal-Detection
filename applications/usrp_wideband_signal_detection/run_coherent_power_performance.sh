@@ -16,4 +16,4 @@ echo "Running usrp_wideband_signal_detection with config: ${CONFIG_NAME}"
 
 "${SCRIPT_DIR}/run_demo_container.sh"
 
-exec sudo docker exec -it "${CONTAINER_NAME}" bash -lc "cd ${BUILD_APP_DIR} && ./usrp_wideband_signal_detection ${CONFIG_NAME}"
+exec sudo docker exec -it -e DISPLAY="${DISPLAY}" "${CONTAINER_NAME}" bash -lc "cd ${BUILD_APP_DIR} && ./usrp_wideband_signal_detection ${CONFIG_NAME}"
