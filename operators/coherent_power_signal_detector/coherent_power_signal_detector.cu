@@ -23,7 +23,7 @@ namespace {
 enum TimingStageIndex : size_t {
   kInputStage = 0,
   kPowerDbStage,
-  kHostPipelineStage,
+  kPipelineStage,
   kDeviceCopyStage,
   kMaskSaveStage,
   kTotalStage,
@@ -33,7 +33,7 @@ constexpr std::array<const char*, holoscan::ops::CoherentPowerSignalDetector::kT
     kTimingStageNames = {
         "input_ms",
         "power_db_ms",
-        "host_pipeline_ms",
+      "pipeline_ms",
         "device_copy_ms",
         "mask_save_ms",
         "total_ms",
@@ -71,6 +71,14 @@ struct GroupingResult {
 struct PipelineSummary {
   std::vector<float> final_mask;
   int subsection_count = 0;
+  int grouped_box_count = 0;
+  int ignore_bins_per_side = 0;
+  float merged_threshold = 0.0f;
+  float seed_threshold = 0.0f;
+};
+
+struct FastGpuMetadataSummary {
+  int subsection_count = 1;
   int grouped_box_count = 0;
   int ignore_bins_per_side = 0;
   float merged_threshold = 0.0f;
@@ -123,6 +131,236 @@ __global__ void coherent_power_power_db_kernel(const cuda::std::complex<float>* 
   const float im = value.imag();
   const float power = re * re + im * im + 1e-12f;
   output[idx] = 10.0f * log10f(power);
+}
+
+__global__ void coherent_power_row_mean_kernel(const float* input,
+                                               int rows,
+                                               int cols,
+                                               float* row_mean) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  __shared__ float partial[256];
+  const int tid = threadIdx.x;
+  float sum = 0.0f;
+  for (int col = tid; col < cols; col += blockDim.x) {
+    sum += input[static_cast<size_t>(row) * static_cast<size_t>(cols) + static_cast<size_t>(col)];
+  }
+  partial[tid] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      partial[tid] += partial[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    row_mean[row] = partial[0] / static_cast<float>(max(cols, 1));
+  }
+}
+
+__global__ void coherent_power_gaussian_smooth_rows_kernel(const float* input,
+                                                           int rows,
+                                                           int radius,
+                                                           float sigma,
+                                                           float* output) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  float sum = 0.0f;
+  float weight_sum = 0.0f;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const int src_row = max(0, min(rows - 1, row + offset));
+    const float weight = expf(-(static_cast<float>(offset * offset)) / (2.0f * sigma * sigma));
+    sum += input[src_row] * weight;
+    weight_sum += weight;
+  }
+  output[row] = weight_sum > 0.0f ? sum / weight_sum : input[row];
+}
+
+__global__ void coherent_power_frontend_reference_kernel(const float* row_smooth,
+                                                         int rows,
+                                                         float quantile,
+                                                         float* reference_level) {
+  __shared__ float partial_sum[256];
+  __shared__ float partial_max[256];
+
+  const int tid = threadIdx.x;
+  float thread_sum = 0.0f;
+  float thread_max = -1.0e30f;
+  for (int row = tid; row < rows; row += blockDim.x) {
+    const float value = row_smooth[row];
+    thread_sum += value;
+    thread_max = fmaxf(thread_max, value);
+  }
+
+  partial_sum[tid] = thread_sum;
+  partial_max[tid] = thread_max;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      partial_sum[tid] += partial_sum[tid + stride];
+      partial_max[tid] = fmaxf(partial_max[tid], partial_max[tid + stride]);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const float mean_value = partial_sum[0] / static_cast<float>(max(rows, 1));
+    const float blend = fminf(fmaxf((quantile - 0.5f) / 0.5f, 0.0f), 1.0f);
+    reference_level[0] = mean_value + blend * (partial_max[0] - mean_value);
+  }
+}
+
+__global__ void coherent_power_frontend_correction_kernel(const float* input,
+                                                          int rows,
+                                                          int cols,
+                                                          const float* row_smooth,
+                                                          const float* reference_level,
+                                                          float max_boost_db,
+                                                          float* corrected) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const int row = idx / cols;
+  const float boost = fminf(fmaxf(reference_level[0] - row_smooth[row], 0.0f), max_boost_db);
+  corrected[idx] = input[idx] + boost;
+}
+
+__global__ void coherent_power_box_mean_cols_kernel(const float* input,
+                                                    int rows,
+                                                    int cols,
+                                                    int radius_cols,
+                                                    float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const int row = idx / cols;
+  const int col = idx % cols;
+  const int col_start = max(0, col - radius_cols);
+  const int col_stop = min(cols - 1, col + radius_cols);
+
+  const size_t row_offset = static_cast<size_t>(row) * static_cast<size_t>(cols);
+  float sum = 0.0f;
+  int count = 0;
+  for (int src_col = col_start; src_col <= col_stop; ++src_col) {
+    sum += input[row_offset + static_cast<size_t>(src_col)];
+    ++count;
+  }
+  output[idx] = count > 0 ? sum / static_cast<float>(count) : 0.0f;
+}
+
+__global__ void coherent_power_box_mean_rows_kernel(const float* input,
+                                                    int rows,
+                                                    int cols,
+                                                    int radius_rows,
+                                                    float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const int row = idx / cols;
+  const int col = idx % cols;
+  const int row_start = max(0, row - radius_rows);
+  const int row_stop = min(rows - 1, row + radius_rows);
+
+  float sum = 0.0f;
+  int count = 0;
+  for (int src_row = row_start; src_row <= row_stop; ++src_row) {
+    const size_t src_index = static_cast<size_t>(src_row) * static_cast<size_t>(cols) + static_cast<size_t>(col);
+    sum += input[src_index];
+    ++count;
+  }
+  output[idx] = count > 0 ? sum / static_cast<float>(count) : 0.0f;
+}
+
+__global__ void coherent_power_fast_score_kernel(const float* corrected,
+                                                 const float* time_mean,
+                                                 const float* freq_mean,
+                                                 const float* background,
+                                                 int rows,
+                                                 int cols,
+                                                 int ignore_bins_per_side,
+                                                 float coherence_weight,
+                                                 float power_weight,
+                                                 float power_floor_db,
+                                                 float power_span_db,
+                                                 float coherence_floor_db,
+                                                 float coherence_span_db,
+                                                 float score_threshold,
+                                                 float* score,
+                                                 uint8_t* mask) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const int row = idx / cols;
+  const bool valid_row = row >= ignore_bins_per_side && row < (rows - ignore_bins_per_side);
+  if (!valid_row) {
+    score[idx] = 0.0f;
+    mask[idx] = 0;
+    return;
+  }
+
+  const float support_db = corrected[idx] - background[idx];
+  const float coherence_db = time_mean[idx] - freq_mean[idx];
+  const float support = fminf(fmaxf((support_db - power_floor_db) / fmaxf(power_span_db, 1e-6f), 0.0f), 1.0f);
+  const float coherence = fminf(fmaxf((coherence_db - coherence_floor_db) / fmaxf(coherence_span_db, 1e-6f), 0.0f), 1.0f);
+  const float combined = coherence_weight * coherence + power_weight * support;
+  score[idx] = combined;
+  mask[idx] = (combined >= score_threshold && support > 0.0f && coherence > 0.0f) ? 1 : 0;
+}
+
+__global__ void coherent_power_majority_smooth_kernel(const uint8_t* input,
+                                                      int rows,
+                                                      int cols,
+                                                      int ignore_bins_per_side,
+                                                      uint8_t* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const int row = idx / cols;
+  const int col = idx % cols;
+  if (row < ignore_bins_per_side || row >= (rows - ignore_bins_per_side)) {
+    output[idx] = 0;
+    return;
+  }
+
+  int sum = 0;
+  int count = 0;
+  for (int d_row = -1; d_row <= 1; ++d_row) {
+    const int src_row = max(0, min(rows - 1, row + d_row));
+    if (src_row < ignore_bins_per_side || src_row >= (rows - ignore_bins_per_side)) {
+      continue;
+    }
+    for (int d_col = -1; d_col <= 1; ++d_col) {
+      const int src_col = max(0, min(cols - 1, col + d_col));
+      sum += input[static_cast<size_t>(src_row) * static_cast<size_t>(cols) + static_cast<size_t>(src_col)] ? 1 : 0;
+      ++count;
+    }
+  }
+
+  output[idx] = (sum * 2 >= max(count, 1)) ? 1 : 0;
 }
 
 float clamp_float(float value, float low, float high) {
@@ -1230,17 +1468,23 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
 namespace holoscan::ops {
 
 CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
-  for (float*& buffer : power_db_device_buffers_) {
-    if (buffer != nullptr) {
-      cudaFree(buffer);
-      buffer = nullptr;
-    }
-  }
-  for (float*& buffer : power_db_host_buffers_) {
-    if (buffer != nullptr) {
-      cudaFreeHost(buffer);
-      buffer = nullptr;
-    }
+  for (auto& buffers : channel_buffers_) {
+    cudaFree(buffers.power_db_device);
+    cudaFree(buffers.corrected_db_device);
+    cudaFree(buffers.time_mean_device);
+    cudaFree(buffers.freq_mean_device);
+    cudaFree(buffers.background_device);
+    cudaFree(buffers.box_filter_scratch_device);
+    cudaFree(buffers.score_device);
+    cudaFree(buffers.row_stat_device);
+    cudaFree(buffers.row_smooth_device);
+    cudaFree(buffers.frontend_reference_device);
+    cudaFree(buffers.mask_device);
+    cudaFree(buffers.scratch_mask_device);
+    cudaFreeHost(buffers.power_db_host);
+    cudaFreeHost(buffers.mask_host);
+
+    buffers = ChannelBuffers {};
   }
 }
 
@@ -1251,7 +1495,9 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(input_height_, "input_height", "Input height", "Detector output height.", 256);
   spec.param(input_width_, "input_width", "Input width", "Detector output width.", 512);
   spec.param(emit_stride_, "emit_stride", "Emit stride", "Emit one output every N input frames per channel.", 1);
+  spec.param(channel_filter_, "channel_filter", "Channel filter", "If non-negative, only process frames for this channel number.", -1);
   spec.param(log_detections_, "log_detections", "Log detections", "If true, logs detector execution details.", false);
+  spec.param(backend_mode_, "backend_mode", "Backend mode", "Detector backend mode: auto, fast_gpu, or reference.", std::string("auto"));
   spec.param(enable_mask_save_, "enable_mask_save", "Enable mask save", "Enable writing detector masks to disk for debug runs.", false);
   spec.param(save_every_n_frames_, "save_every_n_frames", "Save stride", "Save one detector mask every N frames per channel.", 1);
   spec.param(max_masks_per_channel_, "max_masks_per_channel", "Max masks per channel", "Maximum number of detector masks to save per channel for a run.", 5);
@@ -1271,6 +1517,16 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(coherence_power_support_q_, "coherence_power_support_q", "Support quantile", "Notebook-derived support quantile.", 0.82);
   spec.param(coherence_power_q_, "coherence_power_q", "Final quantile", "Notebook-derived final score quantile.", 0.92);
   spec.param(min_component_size_, "min_component_size", "Minimum component size", "Notebook-derived minimum component size.", 6);
+  spec.param(fast_power_floor_db_, "fast_power_floor_db", "Fast path power floor", "Support floor in dB for the fast GPU detector path.", 1.5);
+  spec.param(fast_power_span_db_, "fast_power_span_db", "Fast path power span", "Support normalization span in dB for the fast GPU detector path.", 8.0);
+  spec.param(fast_coherence_floor_db_, "fast_coherence_floor_db", "Fast path coherence floor", "Coherence floor in dB for the fast GPU detector path.", 0.4);
+  spec.param(fast_coherence_span_db_, "fast_coherence_span_db", "Fast path coherence span", "Coherence normalization span in dB for the fast GPU detector path.", 3.0);
+  spec.param(fast_score_threshold_, "fast_score_threshold", "Fast path score threshold", "Score threshold for the fast GPU detector path.", 0.58);
+  spec.param(fast_time_smooth_radius_, "fast_time_smooth_radius", "Fast path time radius", "Time-axis radius for the fast GPU coherence proxy.", 4);
+  spec.param(fast_freq_smooth_radius_, "fast_freq_smooth_radius", "Fast path frequency radius", "Frequency-axis radius for the fast GPU coherence proxy.", 3);
+  spec.param(fast_background_freq_radius_, "fast_background_freq_radius", "Fast path background frequency radius", "Frequency-axis radius for the fast GPU local background.", 8);
+  spec.param(fast_background_time_radius_, "fast_background_time_radius", "Fast path background time radius", "Time-axis radius for the fast GPU local background.", 10);
+  spec.param(fast_mask_smooth_iterations_, "fast_mask_smooth_iterations", "Fast path mask smoothing", "Number of 3x3 majority-filter iterations for the fast GPU mask.", 1);
   spec.param(grouping_seed_score_q_, "grouping_seed_score_q", "Grouping seed score quantile", "Notebook-derived grouping seed quantile.", 0.72);
   spec.param(grouping_bridge_freq_px_, "grouping_bridge_freq_px", "Grouping bridge frequency", "Notebook-derived grouping bridge size in frequency bins.", 33);
   spec.param(grouping_bridge_time_px_, "grouping_bridge_time_px", "Grouping bridge time", "Notebook-derived grouping bridge size in time bins.", 5);
@@ -1289,10 +1545,162 @@ void CoherentPowerSignalDetector::initialize() {
   frame_count_.assign(num_channels_.get(), 0);
   masks_saved_.assign(num_channels_.get(), 0);
   timing_stats_.assign(num_channels_.get(), ChannelTimingStats {});
-  power_db_device_buffers_.assign(num_channels_.get(), nullptr);
-  power_db_device_buffer_sizes_.assign(num_channels_.get(), 0);
-  power_db_host_buffers_.assign(num_channels_.get(), nullptr);
-  power_db_host_buffer_sizes_.assign(num_channels_.get(), 0);
+  channel_buffers_.assign(num_channels_.get(), ChannelBuffers {});
+
+  auto cuda_result = cudaFree(nullptr);
+  if (cuda_result != cudaSuccess) {
+    throw std::runtime_error(std::string("CUDA context initialization failed: ") + cudaGetErrorString(cuda_result));
+  }
+
+  const int configured_rows = std::max(1, input_height_.get());
+  const int configured_cols = std::max(1, input_width_.get());
+  const size_t configured_elements = static_cast<size_t>(configured_rows) * static_cast<size_t>(configured_cols);
+
+  auto allocate_device_float = [](float*& pointer, size_t requested_elements) {
+    const auto alloc_result = cudaMalloc(reinterpret_cast<void**>(&pointer), requested_elements * sizeof(float));
+    if (alloc_result != cudaSuccess) {
+      throw std::runtime_error(std::string("device float buffer allocation failed: ") + cudaGetErrorString(alloc_result));
+    }
+  };
+  auto allocate_device_u8 = [](uint8_t*& pointer, size_t requested_elements) {
+    const auto alloc_result = cudaMalloc(reinterpret_cast<void**>(&pointer), requested_elements * sizeof(uint8_t));
+    if (alloc_result != cudaSuccess) {
+      throw std::runtime_error(std::string("device mask buffer allocation failed: ") + cudaGetErrorString(alloc_result));
+    }
+  };
+
+  for (auto& buffers : channel_buffers_) {
+    allocate_device_float(buffers.power_db_device, configured_elements);
+    allocate_device_float(buffers.corrected_db_device, configured_elements);
+    allocate_device_float(buffers.time_mean_device, configured_elements);
+    allocate_device_float(buffers.freq_mean_device, configured_elements);
+    allocate_device_float(buffers.background_device, configured_elements);
+    allocate_device_float(buffers.box_filter_scratch_device, configured_elements);
+    allocate_device_float(buffers.score_device, configured_elements);
+    allocate_device_float(buffers.row_stat_device, static_cast<size_t>(configured_rows));
+    allocate_device_float(buffers.row_smooth_device, static_cast<size_t>(configured_rows));
+    allocate_device_float(buffers.frontend_reference_device, 1);
+    allocate_device_u8(buffers.mask_device, configured_elements);
+    allocate_device_u8(buffers.scratch_mask_device, configured_elements);
+
+    buffers.frame_elements = configured_elements;
+    buffers.row_elements = static_cast<size_t>(configured_rows);
+    buffers.mask_elements = configured_elements;
+
+    if (enable_mask_save_.get()) {
+      const auto host_mask_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.mask_host), configured_elements * sizeof(uint8_t));
+      if (host_mask_result != cudaSuccess) {
+        throw std::runtime_error(std::string("mask host buffer allocation failed: ") + cudaGetErrorString(host_mask_result));
+      }
+    }
+  }
+
+  const auto backend_mode = backend_mode_.get();
+  if (!channel_buffers_.empty() && backend_mode != "reference") {
+    const size_t frame_bytes = configured_elements * sizeof(float);
+    const size_t row_bytes = static_cast<size_t>(configured_rows) * sizeof(float);
+    const size_t mask_bytes = configured_elements * sizeof(uint8_t);
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>((configured_elements + threads - 1) / threads);
+    const int row_blocks = (configured_rows + threads - 1) / threads;
+    const int smooth_radius = std::max(1, static_cast<int>(std::ceil(std::max(frontend_smooth_sigma_.get(), 1.0) * 1.5)));
+    const int channel_filter = channel_filter_.get();
+
+    for (size_t channel_index = 0; channel_index < channel_buffers_.size(); ++channel_index) {
+      if (channel_filter >= 0 && static_cast<int>(channel_index) != channel_filter) {
+        continue;
+      }
+
+      auto& buffers = channel_buffers_[channel_index];
+      cuda_result = cudaMemset(buffers.power_db_device, 0, frame_bytes);
+      if (cuda_result != cudaSuccess) {
+        throw std::runtime_error(std::string("power_db warmup memset failed: ") + cudaGetErrorString(cuda_result));
+      }
+      cuda_result = cudaMemset(buffers.corrected_db_device, 0, frame_bytes);
+      if (cuda_result != cudaSuccess) {
+        throw std::runtime_error(std::string("corrected_db warmup memset failed: ") + cudaGetErrorString(cuda_result));
+      }
+      cuda_result = cudaMemset(buffers.row_stat_device, 0, row_bytes);
+      if (cuda_result != cudaSuccess) {
+        throw std::runtime_error(std::string("row_stat warmup memset failed: ") + cudaGetErrorString(cuda_result));
+      }
+      cuda_result = cudaMemset(buffers.row_smooth_device, 0, row_bytes);
+      if (cuda_result != cudaSuccess) {
+        throw std::runtime_error(std::string("row_smooth warmup memset failed: ") + cudaGetErrorString(cuda_result));
+      }
+      cuda_result = cudaMemset(buffers.mask_device, 0, mask_bytes);
+      if (cuda_result != cudaSuccess) {
+        throw std::runtime_error(std::string("mask warmup memset failed: ") + cudaGetErrorString(cuda_result));
+      }
+
+      coherent_power_row_mean_kernel<<<configured_rows, threads>>>(buffers.power_db_device,
+                                                                   configured_rows,
+                                                                   configured_cols,
+                                                                   buffers.row_stat_device);
+      coherent_power_gaussian_smooth_rows_kernel<<<row_blocks, threads>>>(buffers.row_stat_device,
+                                                                          configured_rows,
+                                                                          smooth_radius,
+                                                                          static_cast<float>(std::max(frontend_smooth_sigma_.get(), 1.0)),
+                                                                          buffers.row_smooth_device);
+      coherent_power_frontend_reference_kernel<<<1, threads>>>(buffers.row_smooth_device,
+                                                               configured_rows,
+                                                               static_cast<float>(frontend_reference_q_.get() / 100.0),
+                                                               buffers.frontend_reference_device);
+      coherent_power_frontend_correction_kernel<<<blocks, threads>>>(buffers.power_db_device,
+                                                                     configured_rows,
+                                                                     configured_cols,
+                                                                     buffers.row_smooth_device,
+                                                                     buffers.frontend_reference_device,
+                                                                     static_cast<float>(frontend_max_boost_db_.get()),
+                                                                     buffers.corrected_db_device);
+      coherent_power_box_mean_cols_kernel<<<blocks, threads>>>(buffers.corrected_db_device,
+                                                               configured_rows,
+                                                               configured_cols,
+                                                               std::max(1, fast_time_smooth_radius_.get()),
+                                                               buffers.time_mean_device);
+      coherent_power_box_mean_rows_kernel<<<blocks, threads>>>(buffers.corrected_db_device,
+                                                               configured_rows,
+                                                               configured_cols,
+                                                               std::max(1, fast_freq_smooth_radius_.get()),
+                                                               buffers.freq_mean_device);
+      coherent_power_box_mean_cols_kernel<<<blocks, threads>>>(buffers.corrected_db_device,
+                                                               configured_rows,
+                                                               configured_cols,
+                                                               std::max(1, fast_background_time_radius_.get()),
+                                                               buffers.box_filter_scratch_device);
+      coherent_power_box_mean_rows_kernel<<<blocks, threads>>>(buffers.box_filter_scratch_device,
+                                                               configured_rows,
+                                                               configured_cols,
+                                                               std::max(1, fast_background_freq_radius_.get()),
+                                                               buffers.background_device);
+      coherent_power_fast_score_kernel<<<blocks, threads>>>(buffers.corrected_db_device,
+                                                            buffers.time_mean_device,
+                                                            buffers.freq_mean_device,
+                                                            buffers.background_device,
+                                                            configured_rows,
+                                                            configured_cols,
+                                                            0,
+                                                            static_cast<float>(coherence_weight_.get()),
+                                                            static_cast<float>(power_weight_.get()),
+                                                            static_cast<float>(fast_power_floor_db_.get()),
+                                                            static_cast<float>(fast_power_span_db_.get()),
+                                                            static_cast<float>(fast_coherence_floor_db_.get()),
+                                                            static_cast<float>(fast_coherence_span_db_.get()),
+                                                            static_cast<float>(fast_score_threshold_.get()),
+                                                            buffers.score_device,
+                                                            buffers.mask_device);
+      coherent_power_majority_smooth_kernel<<<blocks, threads>>>(buffers.mask_device,
+                                                                 configured_rows,
+                                                                 configured_cols,
+                                                                 0,
+                                                                 buffers.scratch_mask_device);
+    }
+
+    cuda_result = cudaDeviceSynchronize();
+    if (cuda_result != cudaSuccess) {
+      throw std::runtime_error(std::string("fast path warmup failed: ") + cudaGetErrorString(cuda_result));
+    }
+  }
 
   if (enable_mask_save_.get()) {
     std::filesystem::create_directories(output_dir_.get());
@@ -1312,6 +1720,11 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     HOLOSCAN_LOG_WARN("Coherent power detector received out-of-range channel {} (configured channels: {}).",
                       channel_number,
                       frame_count_.size());
+    return;
+  }
+
+  const int channel_filter = channel_filter_.get();
+  if (channel_filter >= 0 && static_cast<int>(channel_number) != channel_filter) {
     return;
   }
 
@@ -1365,32 +1778,114 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
   const int total_bins = src_rows * src_cols;
   const size_t power_db_bytes = static_cast<size_t>(total_bins) * sizeof(float);
+  const size_t mask_bytes = static_cast<size_t>(total_bins) * sizeof(uint8_t);
+  auto& buffers = channel_buffers_[channel_number];
+
+  const auto backend_mode = backend_mode_.get();
+  const bool backend_is_reference = backend_mode == "reference";
+  const bool backend_is_fast = backend_mode == "fast_gpu";
+  const bool backend_is_auto = backend_mode == "auto";
+  if (!backend_is_reference && !backend_is_fast && !backend_is_auto) {
+    HOLOSCAN_LOG_WARN("Unsupported coherent backend_mode='{}'. Falling back to auto.", backend_mode);
+  }
+  const bool save_requested = enable_mask_save_.get();
+  const bool require_reference_dimensions = src_rows != dst_rows || src_cols != dst_cols;
+  const bool use_reference_backend = backend_is_reference ||
+                                     (!backend_is_fast && (save_requested || require_reference_dimensions));
+  const bool should_save_mask = save_requested &&
+                                (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
+                                (masks_saved_[channel_number] < max_masks_per_channel_.get());
 
   time_step_ms(kInputStage, [&] {
-    if (power_db_host_buffer_sizes_[channel_number] != static_cast<size_t>(total_bins)) {
-      if (power_db_host_buffers_[channel_number] != nullptr) {
-        cudaFreeHost(power_db_host_buffers_[channel_number]);
-        power_db_host_buffers_[channel_number] = nullptr;
+    auto allocate_device_float = [](float*& pointer, size_t requested_elements) {
+      const auto alloc_result = cudaMalloc(reinterpret_cast<void**>(&pointer), requested_elements * sizeof(float));
+      if (alloc_result != cudaSuccess) {
+        throw std::runtime_error(std::string("device float buffer allocation failed: ") + cudaGetErrorString(alloc_result));
       }
-      auto alloc_result = cudaMallocHost(reinterpret_cast<void**>(&power_db_host_buffers_[channel_number]), power_db_bytes);
+    };
+    auto allocate_device_u8 = [](uint8_t*& pointer, size_t requested_elements) {
+      const auto alloc_result = cudaMalloc(reinterpret_cast<void**>(&pointer), requested_elements * sizeof(uint8_t));
+      if (alloc_result != cudaSuccess) {
+        throw std::runtime_error(std::string("device mask buffer allocation failed: ") + cudaGetErrorString(alloc_result));
+      }
+    };
+
+    if (buffers.frame_elements != static_cast<size_t>(total_bins)) {
+      cudaFree(buffers.power_db_device);
+      cudaFree(buffers.corrected_db_device);
+      cudaFree(buffers.time_mean_device);
+      cudaFree(buffers.freq_mean_device);
+      cudaFree(buffers.background_device);
+      cudaFree(buffers.box_filter_scratch_device);
+      cudaFree(buffers.score_device);
+      cudaFree(buffers.mask_device);
+      cudaFree(buffers.scratch_mask_device);
+      cudaFree(buffers.frontend_reference_device);
+      cudaFreeHost(buffers.power_db_host);
+      cudaFreeHost(buffers.mask_host);
+
+      buffers.power_db_device = nullptr;
+      buffers.corrected_db_device = nullptr;
+      buffers.time_mean_device = nullptr;
+      buffers.freq_mean_device = nullptr;
+      buffers.background_device = nullptr;
+      buffers.box_filter_scratch_device = nullptr;
+      buffers.score_device = nullptr;
+      buffers.mask_device = nullptr;
+      buffers.scratch_mask_device = nullptr;
+      buffers.frontend_reference_device = nullptr;
+      buffers.power_db_host = nullptr;
+      buffers.mask_host = nullptr;
+
+      allocate_device_float(buffers.power_db_device, static_cast<size_t>(total_bins));
+      allocate_device_float(buffers.corrected_db_device, static_cast<size_t>(total_bins));
+      allocate_device_float(buffers.time_mean_device, static_cast<size_t>(total_bins));
+      allocate_device_float(buffers.freq_mean_device, static_cast<size_t>(total_bins));
+      allocate_device_float(buffers.background_device, static_cast<size_t>(total_bins));
+      allocate_device_float(buffers.box_filter_scratch_device, static_cast<size_t>(total_bins));
+      allocate_device_float(buffers.score_device, static_cast<size_t>(total_bins));
+      allocate_device_float(buffers.frontend_reference_device, 1);
+      allocate_device_u8(buffers.mask_device, static_cast<size_t>(total_bins));
+      allocate_device_u8(buffers.scratch_mask_device, static_cast<size_t>(total_bins));
+
+      buffers.frame_elements = static_cast<size_t>(total_bins);
+      buffers.mask_elements = static_cast<size_t>(total_bins);
+    }
+
+    if (buffers.row_elements != static_cast<size_t>(src_rows)) {
+      if (buffers.row_stat_device != nullptr) {
+        cudaFree(buffers.row_stat_device);
+        buffers.row_stat_device = nullptr;
+      }
+      if (buffers.row_smooth_device != nullptr) {
+        cudaFree(buffers.row_smooth_device);
+        buffers.row_smooth_device = nullptr;
+      }
+      const auto row_stat_result = cudaMalloc(reinterpret_cast<void**>(&buffers.row_stat_device), static_cast<size_t>(src_rows) * sizeof(float));
+      if (row_stat_result != cudaSuccess) {
+        throw std::runtime_error(std::string("row_stat buffer allocation failed: ") + cudaGetErrorString(row_stat_result));
+      }
+      const auto row_smooth_result = cudaMalloc(reinterpret_cast<void**>(&buffers.row_smooth_device), static_cast<size_t>(src_rows) * sizeof(float));
+      if (row_smooth_result != cudaSuccess) {
+        throw std::runtime_error(std::string("row_smooth buffer allocation failed: ") + cudaGetErrorString(row_smooth_result));
+      }
+      buffers.row_elements = static_cast<size_t>(src_rows);
+    }
+
+    if (use_reference_backend && buffers.frame_elements == static_cast<size_t>(total_bins) && buffers.power_db_host == nullptr) {
+      const auto alloc_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.power_db_host), power_db_bytes);
       if (alloc_result != cudaSuccess) {
         throw std::runtime_error(std::string("power_db host buffer allocation failed: ") + cudaGetErrorString(alloc_result));
       }
-      power_db_host_buffer_sizes_[channel_number] = static_cast<size_t>(total_bins);
+    }
+
+    if (should_save_mask && buffers.mask_host == nullptr) {
+      const auto alloc_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.mask_host), mask_bytes);
+      if (alloc_result != cudaSuccess) {
+        throw std::runtime_error(std::string("mask host buffer allocation failed: ") + cudaGetErrorString(alloc_result));
+      }
     }
   });
-
-  if (power_db_device_buffer_sizes_[channel_number] != static_cast<size_t>(total_bins)) {
-    if (power_db_device_buffers_[channel_number] != nullptr) {
-      cudaFree(power_db_device_buffers_[channel_number]);
-      power_db_device_buffers_[channel_number] = nullptr;
-    }
-    auto alloc_result = cudaMalloc(reinterpret_cast<void**>(&power_db_device_buffers_[channel_number]), power_db_bytes);
-    if (alloc_result != cudaSuccess) {
-      throw std::runtime_error(std::string("power_db device buffer allocation failed: ") + cudaGetErrorString(alloc_result));
-    }
-    power_db_device_buffer_sizes_[channel_number] = static_cast<size_t>(total_bins);
-  }
 
   time_step_ms(kPowerDbStage, [&] {
     constexpr int threads = 256;
@@ -1398,7 +1893,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     coherent_power_power_db_kernel<<<blocks, threads, 0, stream>>>(fft_tensor.Data(),
                                                                     src_rows,
                                                                     src_cols,
-                                                                    power_db_device_buffers_[channel_number]);
+                                                                    buffers.power_db_device);
     auto kernel_result = cudaGetLastError();
     if (kernel_result != cudaSuccess) {
       throw std::runtime_error(std::string("power_db kernel launch failed: ") + cudaGetErrorString(kernel_result));
@@ -1406,68 +1901,194 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   });
 
   PipelineSummary pipeline_summary;
-  time_step_ms(kHostPipelineStage, [&] {
-    auto copy_result = cudaMemcpyAsync(power_db_host_buffers_[channel_number],
-                                       power_db_device_buffers_[channel_number],
-                                       power_db_bytes,
-                                       cudaMemcpyDeviceToHost,
-                                       stream);
-    if (copy_result != cudaSuccess) {
-      throw std::runtime_error(std::string("power_db device-to-host copy failed: ") + cudaGetErrorString(copy_result));
+  FastGpuMetadataSummary fast_summary;
+  std::string coherent_backend_name = use_reference_backend ? "coherent_power_reference_v1" : "coherent_power_fast_gpu_v1";
+  std::string coherent_variant_name = use_reference_backend ? "frontend_chunked_grouped_box_mask_v1" : "frontend_local_fast_mask_v1";
+  time_step_ms(kPipelineStage, [&] {
+    if (use_reference_backend) {
+      auto copy_result = cudaMemcpyAsync(buffers.power_db_host,
+                                         buffers.power_db_device,
+                                         power_db_bytes,
+                                         cudaMemcpyDeviceToHost,
+                                         stream);
+      if (copy_result != cudaSuccess) {
+        throw std::runtime_error(std::string("power_db device-to-host copy failed: ") + cudaGetErrorString(copy_result));
+      }
+      auto sync_result = cudaStreamSynchronize(stream);
+      if (sync_result != cudaSuccess) {
+        throw std::runtime_error(std::string("power_db synchronization failed: ") + cudaGetErrorString(sync_result));
+      }
+      std::vector<float> host_power_db(buffers.power_db_host,
+                                       buffers.power_db_host + static_cast<size_t>(total_bins));
+      pipeline_summary = run_reference_pipeline(host_power_db,
+                                                src_rows,
+                                                src_cols,
+                                                dst_rows,
+                                                dst_cols,
+                                                ignore_bins_per_side,
+                                                resolution_hz,
+                                                chunk_bandwidth_hz_.get(),
+                                                chunk_overlap_hz_.get(),
+                                                uncalibrated_chunk_fraction_.get(),
+                                                uncalibrated_overlap_fraction_.get(),
+                                                ignore_sideband_percent_.get(),
+                                                frontend_row_q_.get(),
+                                                frontend_reference_q_.get(),
+                                                frontend_smooth_sigma_.get(),
+                                                frontend_max_boost_db_.get(),
+                                                coherence_weight_.get(),
+                                                power_weight_.get(),
+                                                coherence_power_support_q_.get(),
+                                                coherence_power_q_.get(),
+                                                min_component_size_.get(),
+                                                grouping_seed_score_q_.get(),
+                                                grouping_bridge_freq_px_.get(),
+                                                grouping_bridge_time_px_.get(),
+                                                grouping_min_component_size_.get(),
+                                                grouping_min_freq_span_px_.get(),
+                                                grouping_min_time_span_px_.get(),
+                                                grouping_min_density_.get());
+      return;
     }
-    auto sync_result = cudaStreamSynchronize(stream);
-    if (sync_result != cudaSuccess) {
-      throw std::runtime_error(std::string("power_db synchronization failed: ") + cudaGetErrorString(sync_result));
+
+    constexpr int threads = 256;
+    const int blocks = (total_bins + threads - 1) / threads;
+    coherent_power_row_mean_kernel<<<src_rows, threads, 0, stream>>>(buffers.power_db_device,
+                                                                      src_rows,
+                                                                      src_cols,
+                                                                      buffers.row_stat_device);
+    auto kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("row_mean kernel launch failed: ") + cudaGetErrorString(kernel_result));
     }
-    std::vector<float> host_power_db(power_db_host_buffers_[channel_number],
-                                     power_db_host_buffers_[channel_number] + static_cast<size_t>(total_bins));
-    pipeline_summary = run_reference_pipeline(host_power_db,
-                                              src_rows,
-                                              src_cols,
-                                              dst_rows,
-                                              dst_cols,
-                                              ignore_bins_per_side,
-                                              resolution_hz,
-                                              chunk_bandwidth_hz_.get(),
-                                              chunk_overlap_hz_.get(),
-                                              uncalibrated_chunk_fraction_.get(),
-                                              uncalibrated_overlap_fraction_.get(),
-                                              ignore_sideband_percent_.get(),
-                                              frontend_row_q_.get(),
-                                              frontend_reference_q_.get(),
-                                              frontend_smooth_sigma_.get(),
-                                              frontend_max_boost_db_.get(),
-                                              coherence_weight_.get(),
-                                              power_weight_.get(),
-                                              coherence_power_support_q_.get(),
-                                              coherence_power_q_.get(),
-                                              min_component_size_.get(),
-                                              grouping_seed_score_q_.get(),
-                                              grouping_bridge_freq_px_.get(),
-                                              grouping_bridge_time_px_.get(),
-                                              grouping_min_component_size_.get(),
-                                              grouping_min_freq_span_px_.get(),
-                                              grouping_min_time_span_px_.get(),
-                                              grouping_min_density_.get());
+
+    const int smooth_radius = std::max(1, static_cast<int>(std::ceil(std::max(frontend_smooth_sigma_.get(), 1.0) * 1.5)));
+    const int row_blocks = (src_rows + threads - 1) / threads;
+    coherent_power_gaussian_smooth_rows_kernel<<<row_blocks, threads, 0, stream>>>(buffers.row_stat_device,
+                                                                                     src_rows,
+                                                                                     smooth_radius,
+                                                                                     static_cast<float>(std::max(frontend_smooth_sigma_.get(), 1.0)),
+                                                                                     buffers.row_smooth_device);
+    kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("row_smooth kernel launch failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    coherent_power_frontend_reference_kernel<<<1, threads, 0, stream>>>(buffers.row_smooth_device,
+                                                                         src_rows,
+                                                                         static_cast<float>(frontend_reference_q_.get() / 100.0),
+                                                                         buffers.frontend_reference_device);
+    kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("frontend_reference kernel launch failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    coherent_power_frontend_correction_kernel<<<blocks, threads, 0, stream>>>(buffers.power_db_device,
+                                                                               src_rows,
+                                                                               src_cols,
+                                                                               buffers.row_smooth_device,
+                                                                               buffers.frontend_reference_device,
+                                                                               static_cast<float>(frontend_max_boost_db_.get()),
+                                                                               buffers.corrected_db_device);
+    kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("frontend_correction kernel launch failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    coherent_power_box_mean_cols_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+                                                                         src_rows,
+                                                                         src_cols,
+                                                                         std::max(1, fast_time_smooth_radius_.get()),
+                                                                         buffers.time_mean_device);
+    coherent_power_box_mean_rows_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+                                                                         src_rows,
+                                                                         src_cols,
+                                                                         std::max(1, fast_freq_smooth_radius_.get()),
+                                                                         buffers.freq_mean_device);
+    coherent_power_box_mean_cols_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+                                                                         src_rows,
+                                                                         src_cols,
+                                                                         std::max(1, fast_background_time_radius_.get()),
+                                                                         buffers.box_filter_scratch_device);
+    coherent_power_box_mean_rows_kernel<<<blocks, threads, 0, stream>>>(buffers.box_filter_scratch_device,
+                                                                         src_rows,
+                                                                         src_cols,
+                                                                         std::max(1, fast_background_freq_radius_.get()),
+                                                                         buffers.background_device);
+    kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("separable box_mean kernel launch failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    coherent_power_fast_score_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+                                                                      buffers.time_mean_device,
+                                                                      buffers.freq_mean_device,
+                                                                      buffers.background_device,
+                                                                      src_rows,
+                                                                      src_cols,
+                                                                      ignore_bins_per_side,
+                                                                      static_cast<float>(coherence_weight_.get()),
+                                                                      static_cast<float>(power_weight_.get()),
+                                                                      static_cast<float>(fast_power_floor_db_.get()),
+                                                                      static_cast<float>(fast_power_span_db_.get()),
+                                                                      static_cast<float>(fast_coherence_floor_db_.get()),
+                                                                      static_cast<float>(fast_coherence_span_db_.get()),
+                                                                      static_cast<float>(fast_score_threshold_.get()),
+                                                                      buffers.score_device,
+                                                                      buffers.mask_device);
+    kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("fast_score kernel launch failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    for (int iter = 0; iter < std::max(0, fast_mask_smooth_iterations_.get()); ++iter) {
+      coherent_power_majority_smooth_kernel<<<blocks, threads, 0, stream>>>(buffers.mask_device,
+                                                                             src_rows,
+                                                                             src_cols,
+                                                                             ignore_bins_per_side,
+                                                                             buffers.scratch_mask_device);
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("mask_smooth kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+      std::swap(buffers.mask_device, buffers.scratch_mask_device);
+    }
+
+    fast_summary.ignore_bins_per_side = ignore_bins_per_side;
+    fast_summary.merged_threshold = static_cast<float>(fast_score_threshold_.get());
+    fast_summary.seed_threshold = static_cast<float>(fast_score_threshold_.get());
   });
 
   stage_ms[kDeviceCopyStage] = 0.0;
 
   auto maybe_save_mask = [&] {
-    if (!enable_mask_save_.get()) {
+    if (!should_save_mask) {
       return;
     }
-    const int save_stride = std::max(1, save_every_n_frames_.get());
-    if ((frame_number % static_cast<uint64_t>(save_stride)) != 0) {
-      return;
-    }
-    if (masks_saved_[channel_number] >= max_masks_per_channel_.get()) {
-      return;
-    }
-
-    std::vector<uint8_t> image(pipeline_summary.final_mask.size(), 0);
-    for (size_t idx = 0; idx < pipeline_summary.final_mask.size(); ++idx) {
-      image[idx] = pipeline_summary.final_mask[idx] > 0.5f ? 255 : 0;
+    std::vector<uint8_t> image;
+    image.reserve(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols));
+    if (use_reference_backend) {
+      image.assign(pipeline_summary.final_mask.size(), 0);
+      for (size_t idx = 0; idx < pipeline_summary.final_mask.size(); ++idx) {
+        image[idx] = pipeline_summary.final_mask[idx] > 0.5f ? 255 : 0;
+      }
+    } else {
+      auto copy_result = cudaMemcpyAsync(buffers.mask_host,
+                                         buffers.mask_device,
+                                         mask_bytes,
+                                         cudaMemcpyDeviceToHost,
+                                         stream);
+      if (copy_result != cudaSuccess) {
+        throw std::runtime_error(std::string("mask device-to-host copy failed: ") + cudaGetErrorString(copy_result));
+      }
+      auto sync_result = cudaStreamSynchronize(stream);
+      if (sync_result != cudaSuccess) {
+        throw std::runtime_error(std::string("mask synchronization failed: ") + cudaGetErrorString(sync_result));
+      }
+      image.assign(buffers.mask_host, buffers.mask_host + static_cast<size_t>(total_bins));
+      for (uint8_t& pixel : image) {
+        pixel = pixel ? 255 : 0;
+      }
     }
 
     const auto path = make_mask_output_path(output_dir_.get(), channel_number, frame_number, dst_rows, dst_cols);
@@ -1493,13 +2114,13 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   meta->set("coherent_frame_number", frame_number);
   meta->set("coherent_mask_height", static_cast<uint32_t>(dst_rows));
   meta->set("coherent_mask_width", static_cast<uint32_t>(dst_cols));
-  meta->set("coherent_backend", std::string("coherent_power_reference_v1"));
-  meta->set("coherent_chunk_count", static_cast<uint32_t>(pipeline_summary.subsection_count));
-  meta->set("coherent_grouped_box_count", static_cast<uint32_t>(pipeline_summary.grouped_box_count));
-  meta->set("coherent_ignore_bins_per_side", pipeline_summary.ignore_bins_per_side);
-  meta->set("coherent_merged_threshold", pipeline_summary.merged_threshold);
-  meta->set("coherent_seed_threshold", pipeline_summary.seed_threshold);
-  meta->set("coherent_pipeline_variant", std::string("frontend_chunked_grouped_box_mask_v1"));
+  meta->set("coherent_backend", coherent_backend_name);
+  meta->set("coherent_chunk_count", static_cast<uint32_t>(use_reference_backend ? pipeline_summary.subsection_count : fast_summary.subsection_count));
+  meta->set("coherent_grouped_box_count", static_cast<uint32_t>(use_reference_backend ? pipeline_summary.grouped_box_count : fast_summary.grouped_box_count));
+  meta->set("coherent_ignore_bins_per_side", use_reference_backend ? pipeline_summary.ignore_bins_per_side : fast_summary.ignore_bins_per_side);
+  meta->set("coherent_merged_threshold", use_reference_backend ? pipeline_summary.merged_threshold : fast_summary.merged_threshold);
+  meta->set("coherent_seed_threshold", use_reference_backend ? pipeline_summary.seed_threshold : fast_summary.seed_threshold);
+  meta->set("coherent_pipeline_variant", coherent_variant_name);
   meta->set("coherent_timing_total_ms", stage_ms[kTotalStage]);
 
   if (!timing_enabled) {

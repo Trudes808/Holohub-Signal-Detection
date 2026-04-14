@@ -183,6 +183,15 @@ cd applications/usrp_wideband_signal_detection
 ./run_coherent_power_performance.sh
 ```
 
+For the cleanest startup behavior, launch the app before starting the RF transmitter. The advanced-network DPDK workers are started during app initialization, before the Holoscan graph is fully active, so starting the transmitter first can produce a brief burst of startup-only drops even when steady-state throughput is healthy.
+
+For a more conservative coherent real-time profile that prioritizes sustained ingest headroom while the coherent detector still contains host-side stages:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+CONFIG_NAME=config_coherent_power_realtime_guarded.yaml ./run_coherent_power_performance.sh
+```
+
 To run the coherent detector with an explicit config through the same sudo/docker flow:
 
 ```bash

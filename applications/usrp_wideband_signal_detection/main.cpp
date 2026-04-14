@@ -141,6 +141,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     std::shared_ptr<holoscan::Operator> spectrogramOp;
     std::shared_ptr<holoscan::Operator> detectorOp;
+    std::vector<std::shared_ptr<holoscan::Operator>> coherentDetectorOps;
     if (enable_spectrogram) {
       spectrogramOp = make_operator<ops::Spectrogram>("spectrogramOp", from_config("spectrogram"));
     }
@@ -149,9 +150,13 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         detectorOp = make_operator<ops::DinoV3SignalDetector>("dinoV3SignalDetectorOp",
                                                                from_config("dinov3_signal_detector"));
       } else {
-        detectorOp = make_operator<ops::CoherentPowerSignalDetector>(
-            "coherentPowerSignalDetectorOp",
-            from_config("coherent_power_signal_detector"));
+        const int detector_channels = from_config("coherent_power_signal_detector.num_channels").as<int>();
+        for (int channel_index = 0; channel_index < std::max(1, detector_channels); ++channel_index) {
+          coherentDetectorOps.push_back(make_operator<ops::CoherentPowerSignalDetector>(
+              std::string("coherentPowerSignalDetectorOpCh") + std::to_string(channel_index),
+              from_config("coherent_power_signal_detector"),
+              holoscan::Arg("channel_filter") = channel_index));
+        }
       }
     }
 
@@ -184,7 +189,13 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       add_operator(spectrogramOp);
     }
     if (enable_detector) {
-      add_operator(detectorOp);
+      if (detector_type == "coherent_power") {
+        for (auto& op : coherentDetectorOps) {
+          add_operator(op);
+        }
+      } else {
+        add_operator(detectorOp);
+      }
     }
     if (enable_visualization) {
       add_operator(spectrogramVisualizerOp);
@@ -197,7 +208,13 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       add_flow(fftOp, spectrogramOp);
     }
     if (enable_detector) {
-      add_flow(spectrogramOp, detectorOp);
+      if (detector_type == "coherent_power") {
+        for (auto& op : coherentDetectorOps) {
+          add_flow(spectrogramOp, op);
+        }
+      } else {
+        add_flow(spectrogramOp, detectorOp);
+      }
     }
     if (enable_visualization) {
       add_flow(spectrogramOp, spectrogramVisualizerOp);

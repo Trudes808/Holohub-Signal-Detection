@@ -32,6 +32,26 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
                holoscan::ExecutionContext& context) override;
 
  private:
+  struct ChannelBuffers {
+    float* power_db_device = nullptr;
+    float* corrected_db_device = nullptr;
+    float* time_mean_device = nullptr;
+    float* freq_mean_device = nullptr;
+    float* background_device = nullptr;
+    float* box_filter_scratch_device = nullptr;
+    float* score_device = nullptr;
+    float* row_stat_device = nullptr;
+    float* row_smooth_device = nullptr;
+    float* frontend_reference_device = nullptr;
+    float* power_db_host = nullptr;
+    uint8_t* mask_device = nullptr;
+    uint8_t* scratch_mask_device = nullptr;
+    uint8_t* mask_host = nullptr;
+    size_t frame_elements = 0;
+    size_t row_elements = 0;
+    size_t mask_elements = 0;
+  };
+
   struct ChannelTimingStats {
     uint64_t window_frames = 0;
     std::array<double, kTimingStageCount> total_ms {};
@@ -42,7 +62,9 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<int> input_height_;
   holoscan::Parameter<int> input_width_;
   holoscan::Parameter<int> emit_stride_;
+  holoscan::Parameter<int> channel_filter_;
   holoscan::Parameter<bool> log_detections_;
+  holoscan::Parameter<std::string> backend_mode_;
   holoscan::Parameter<bool> enable_mask_save_;
   holoscan::Parameter<int> save_every_n_frames_;
   holoscan::Parameter<int> max_masks_per_channel_;
@@ -62,6 +84,16 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<double> coherence_power_support_q_;
   holoscan::Parameter<double> coherence_power_q_;
   holoscan::Parameter<int> min_component_size_;
+  holoscan::Parameter<double> fast_power_floor_db_;
+  holoscan::Parameter<double> fast_power_span_db_;
+  holoscan::Parameter<double> fast_coherence_floor_db_;
+  holoscan::Parameter<double> fast_coherence_span_db_;
+  holoscan::Parameter<double> fast_score_threshold_;
+  holoscan::Parameter<int> fast_time_smooth_radius_;
+  holoscan::Parameter<int> fast_freq_smooth_radius_;
+  holoscan::Parameter<int> fast_background_freq_radius_;
+  holoscan::Parameter<int> fast_background_time_radius_;
+  holoscan::Parameter<int> fast_mask_smooth_iterations_;
   holoscan::Parameter<double> grouping_seed_score_q_;
   holoscan::Parameter<int> grouping_bridge_freq_px_;
   holoscan::Parameter<int> grouping_bridge_time_px_;
@@ -76,10 +108,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   std::vector<uint64_t> frame_count_;
   std::vector<int> masks_saved_;
   std::vector<ChannelTimingStats> timing_stats_;
-  std::vector<float*> power_db_device_buffers_;
-  std::vector<size_t> power_db_device_buffer_sizes_;
-  std::vector<float*> power_db_host_buffers_;
-  std::vector<size_t> power_db_host_buffer_sizes_;
+  std::vector<ChannelBuffers> channel_buffers_;
 };
 
 }  // namespace holoscan::ops

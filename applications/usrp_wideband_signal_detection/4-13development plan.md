@@ -17,14 +17,36 @@ Current implementation status as of 2026-04-13:
 - Phase 2 complete: the new operator package is integrated, takes the live FFT input contract, emits metadata, and can save coherent-power masks.
 - Phase 3 complete for functional parity: the operator now performs frontend correction, chunk planning, per-chunk coherent-power scoring, support thresholding, and chunk mask generation.
 - Phase 4 complete for mask contract: the operator now groups detections into boxes, merges them, and emits the final binary mask as the rasterized union of merged boxes.
-- Phase 5 still open: the current implementation computes power dB on GPU and returns the final mask to device, but the notebook-reference frontend, grouping, and merge stages still run on host and need a second pass to eliminate the full-frame device-to-host copy.
+- Phase 5 partially complete: live runs now have a fast GPU backend that keeps the frontend correction, local support/coherence scoring, thresholding, and mask cleanup on device. The notebook-reference backend is still retained for validation and mask-save runs.
+- Remaining Phase 5 work: the notebook-faithful chunk grouping and merged box formation still run on host in the reference backend and need a later GPU port if we want full parity and full-rate operation from the exact reference algorithm.
 
 Current backend summary:
 
 - detector selection is live through `pipeline.detector_type`
 - DINO remains unchanged when selected
 - coherent-power now produces a real box-derived mask instead of the earlier placeholder threshold path
-- performance tuning remains a follow-on task, not a completed claim
+- live coherent-power runs no longer default to the full host reference path when mask saving is disabled
+- performance tuning is now focused on GPU-side grouping/parity work rather than the entire detector hot path
+
+Latest runtime evidence after the fast GPU backend landed:
+
+- coherent live runs now show a clear improvement over the earlier host-heavy path: the run can recover after a few startup `Fell behind in processing on GPU!` errors and then sustain several seconds in the roughly 337-409 MSps/channel range
+- DPDK starvation is no longer the active limiter for this profile: the latest performance run finished with zero `RX out of buffers` and zero missed packets
+- this means ingress headroom is now adequate and the remaining gap to 500 MSps/channel is dominated by detector compute cost in the fast GPU backend
+- the remaining fast-path frontend synchronization has now been removed by computing the frontend reference level on device rather than copying smoothed row statistics back to host every emitted frame
+- the next likely optimization targets are the fast path's local background filter cost, startup warmup/allocation cost, and any remaining GPU-side grouping/parity work needed to close the gap to 500 MSps/channel
+- startup initialization work has now been moved out of `compute()` and into `initialize()` for the fast path, including CUDA context bring-up, buffer allocation, and a first-use kernel warmup pass
+- the next runtime check should confirm whether the initial burst of `Fell behind in processing on GPU!` shrinks now that startup costs are paid before the graph starts pulling live data
+- latest runtime result after startup warmup: ingress remains clean with zero missed packets and zero `RX out of buffers`; the initial `Fell behind in processing on GPU!` burst is smaller than the worst earlier runs but still present
+- sustained throughput now appears constrained by the detector path itself rather than network starvation, and the next likely root cause to investigate is channel serialization through a single detector operator instance in addition to remaining per-frame compute cost
+- coherent-power detection is now being split into one operator instance per channel, with a `channel_filter` gate in the operator, so the scheduler can run channel-local detector work independently instead of funneling both channels through one detector instance
+- the next runtime check should determine whether this removes the observed cross-channel imbalance and raises sustained throughput toward the 500 MSps/channel target
+- latest runtime result after the per-channel detector split: sustained throughput improved substantially, with one channel running well above 500 MSps and the other hovering around the target band, confirming that operator-level channel serialization was a real bottleneck
+- however, startup `Fell behind in processing on GPU!` errors and renewed RX buffer starvation showed that the fast-path warmup was still incomplete after the split because only buffer index 0 was being warmed; that warmup bug has now been corrected so each per-channel detector instance warms its actual channel buffer before live ingest starts
+- the next runtime check should confirm whether startup drops and RX buffer starvation disappear while keeping the new higher sustained throughput
+- latest runtime result after the warmup fix: steady-state throughput is now at or above target on both channels for the sampled windows, and ingress remains clean with zero missed packets and zero `RX out of buffers`
+- the remaining issue appears isolated to startup only. Code inspection shows `adv_net_init()` starts the DPDK RX workers before graph activation, so if the upstream transmitter is already running, the application can begin life with in-flight traffic before the graph is ready to drain it
+- practical operating guidance: if startup-only drops matter, launch the application first and start the transmitter only after the graph is active; otherwise, the current implementation is effectively realtime-capable after a brief startup transient
 
 ## Source Of Truth
 
@@ -48,6 +70,86 @@ Primary operator reference implementation to mirror structurally:
 - `operators/dinov3_signal_detector/dinov3_signal_detector.cu`
 - `operators/dinov3_signal_detector/CMakeLists.txt`
 - `operators/dinov3_signal_detector/metadata.json`
+
+## Verification Plan
+
+The current implementation now has two coherent detector variants that must be evaluated differently:
+
+- `backend_mode: "reference"` is the notebook-faithful path and should be verified for algorithmic parity against `run_coherent_power_pipeline(...)` in `coherant_power_signal_detection_helpers.py`
+- `backend_mode: "fast_gpu"` is the realtime path and should be verified for operational usefulness, stability, and broad detection agreement rather than exact numeric parity with the notebook
+
+### What Should Match The Notebook
+
+For the reference backend, these aspects should be treated as parity targets and verified directly:
+
+- sideband suppression behavior:
+  - ignored rows should match the notebook `compute_ignore_sideband_rows(...)` logic for calibrated and uncalibrated inputs
+  - `ignore_bins_per_side` metadata should match the notebook's `applied_bins`
+- frontend correction behavior:
+  - row-floor estimation, smoothed frontend response, reference level, and per-row boost profile should match the notebook `apply_global_frontend_correction(...)` within numeric tolerance
+- chunk planning:
+  - chunk count, `row_start`, `row_stop`, and overlap behavior should match notebook `build_frequency_chunks(...)`
+- per-chunk scoring:
+  - structure-tensor coherence map, local relative power support map, fused score map, support threshold, and final chunk threshold should match the notebook `detect_chunk_coherent_power(...)` flow within tolerance
+- chunk grouping:
+  - grouped masks and chunk-local boxes should match notebook `group_signal_mask_regions(...)`, including the bridge and density filters
+- merged global result:
+  - overlap weighting, merged score, merged threshold, seed threshold, merged grouped boxes, and final box-rasterized mask should match notebook `merge_chunk_results(...)` and final pipeline output
+- final contract:
+  - the output mask must remain the rasterized union of final merged boxes, not the raw score mask
+
+### What Is Expected To Differ
+
+These differences are expected today and should not be treated as bugs unless we explicitly decide to close them:
+
+- the fast GPU backend is not notebook-faithful:
+  - it does not run chunk planning, chunk-local notebook grouping, merged global grouping, or final box rasterization
+  - it uses a simplified local score path built from frontend correction, directional local means, local background subtraction, thresholding, and mask cleanup
+  - it emits `coherent_power_fast_gpu_v1` metadata and is intended to trade exact parity for sustained realtime throughput
+- the fast frontend reference calculation is approximate:
+  - the fast path uses a device-side approximation for the frontend reference level instead of the notebook's exact percentile over the smoothed row response
+- some notebook diagnostics are intentionally absent from the runtime operator:
+  - the notebook exposes debug overlays, rejected-component reasons, peak-floor omission diagnostics, and intermediate plots that the operator does not currently emit
+- one notebook config surface is not yet exposed as a runtime parameter:
+  - `grouping_time_continuity_ratio` is fixed to `0.85` in the C++ grouping helper rather than being a configurable operator parameter
+- reference and fast backends are expected to differ in grouped box count metadata:
+  - the reference path reports notebook-style grouped-box counts
+  - the fast path currently reports a mask-only result and does not produce notebook-style grouped boxes
+
+### Concrete Verification Tasks
+
+1. Reference-backend parity on offline captures
+   - Run `config_coherent_power_validation.yaml` with `backend_mode: "reference"` on fixed saved inputs used by the notebook.
+   - Compare final masks, grouped box counts, `ignore_bins_per_side`, `merged_threshold`, and `seed_threshold` against notebook outputs.
+
+2. Intermediate-stage parity checks
+   - Add or reuse offline harness outputs so the reference backend can be compared against notebook intermediates for:
+   - corrected spectrogram
+   - chunk plan
+   - chunk-local score/support masks
+   - merged score map
+   - grouped boxes
+
+3. Tolerance definition for parity
+   - Treat exact byte-for-byte equality as unnecessary for floating-point intermediates.
+   - Require semantic agreement on final mask and grouped boxes, with only small tolerance for threshold drift due to Python vs C++ numerics and implementation details.
+
+4. Fast-backend usefulness validation
+   - Compare `backend_mode: "fast_gpu"` against the notebook/reference backend on the same fixed captures.
+   - Verify that strong signals are still detected, false negatives remain acceptable, and mask morphology remains usable for the downstream task even though exact box parity is not expected.
+
+5. Realtime acceptance validation
+   - Continue using `config_coherent_power_performance.yaml` for sustained-rate checks.
+   - Acceptance condition:
+   - after startup, both channels sustain the target rate with no continuing RX starvation and no recurring detector-induced throughput collapse.
+
+6. Startup-transient validation
+   - Verify whether startup-only drops disappear when the app is launched before the transmitter.
+   - If they do, treat remaining startup drops as an operating-sequence issue rather than a detector-algorithm correctness issue.
+
+7. Outstanding parity gap review
+   - Decide whether `grouping_time_continuity_ratio` and notebook reject-reason diagnostics need to be surfaced in the operator.
+   - Decide whether the fast path must ever emit notebook-style grouped boxes, or whether its current mask-only contract is sufficient for realtime use.
 
 ## What The Notebook Actually Does
 

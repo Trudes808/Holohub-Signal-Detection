@@ -205,6 +205,7 @@ coherent_power_signal_detector:
   input_width: 512
   emit_stride: 1
   log_detections: true
+  backend_mode: "reference"
   enable_mask_save: true
   save_every_n_frames: 100
   max_masks_per_channel: 4

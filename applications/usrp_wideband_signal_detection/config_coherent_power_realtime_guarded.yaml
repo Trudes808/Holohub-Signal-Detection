@@ -68,7 +68,7 @@ advanced_network:
             - name: "Channel 1 data"
               id: 0
               cpu_core: 10
-              batch_size: 1024
+              batch_size: 512
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
@@ -76,7 +76,7 @@ advanced_network:
             - name: "Channel 2 data"
               id: 1
               cpu_core: 11
-              batch_size: 1024
+              batch_size: 512
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH2_CHDR_Headers_RX_CPU"
@@ -104,7 +104,7 @@ chdr_converter:
   interface_name: sdr_data
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 64
+  num_ffts_per_batch: 32
   num_simul_batches: 4
   num_channels: 2
   log_packets: false
@@ -112,7 +112,7 @@ chdr_converter:
 
 fft:
   burst_size: 20480
-  num_bursts: 64
+  num_bursts: 32
   num_channels: 2
   spectrum_type: 1
   averaging_type: 1
@@ -203,7 +203,7 @@ coherent_power_signal_detector:
   num_channels: 2
   input_height: 256
   input_width: 512
-  emit_stride: 4
+  emit_stride: 16
   log_detections: false
   backend_mode: "fast_gpu"
   enable_mask_save: false
