@@ -114,12 +114,21 @@ add_executable(offline_spectrogram_visualizer
   screenshot_sink.cpp
 )
 
+add_executable(offline_coherent_power_validator
+  offline_coherent_power_validator.cpp
+)
+
 target_link_libraries(offline_spectrogram_visualizer
   PRIVATE
   CUDA::cudart
   matx::matx
   holoscan::core
   holoscan::ops::holoviz
+)
+
+target_link_libraries(offline_coherent_power_validator
+  PRIVATE
+  holoscan::ops::coherent_power_signal_detector
 )
 
 if(APP_VULKAN_LINK_ITEM)
@@ -155,6 +164,12 @@ target_include_directories(offline_spectrogram_visualizer
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+target_include_directories(offline_coherent_power_validator
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/coherent_power_signal_detector
+)
+
 target_compile_definitions(usrp_wideband_signal_detection
   PRIVATE
   USRP_WIDEBAND_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
@@ -164,6 +179,8 @@ target_compile_definitions(offline_spectrogram_visualizer
   PRIVATE
   USRP_WIDEBAND_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
+
+target_compile_features(offline_coherent_power_validator PRIVATE cxx_std_17)
 
 if(NOT DEFINED ANO_MGR)
     set(ANO_MGR "dpdk gpunetio" CACHE STRING "Manager type(s) list")
@@ -176,6 +193,7 @@ endforeach()
 
   set(USRP_WIDEBAND_CONFIG_FILES
     config.yaml
+    config_coherent_power_debug_capture.yaml
     config_coherent_power_performance.yaml
     config_coherent_power_realtime_guarded.yaml
     config_coherent_power_validation.yaml
@@ -206,3 +224,4 @@ endforeach()
 
   add_custom_target(usrp_wideband_configs DEPENDS ${USRP_WIDEBAND_CONFIG_OUTPUTS})
   add_dependencies(usrp_wideband_signal_detection usrp_wideband_configs)
+  add_dependencies(offline_coherent_power_validator usrp_wideband_configs)

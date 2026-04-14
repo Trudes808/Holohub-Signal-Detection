@@ -47,6 +47,25 @@ struct ChunkPlanEntry {
   double freq_stop_hz = 0.0;
 };
 
+struct DetectionBox {
+  int freq_start = 0;
+  int freq_stop = 0;
+  int time_start = 0;
+  int time_stop = 0;
+  int freq_span = 0;
+  int time_span = 0;
+  int filled_area = 0;
+  float density = 0.0f;
+  float bbox_density = 0.0f;
+  float envelope_density = 0.0f;
+  float score_mean = 0.0f;
+  float score_peak = 0.0f;
+  std::string split_role = "unsplit";
+  bool split_applied = false;
+  int parent_component_id = -1;
+  std::vector<int> source_chunk_indices;
+};
+
 struct DetectionChunkResult {
   ChunkPlanEntry chunk;
   std::vector<float> coherence_px;
@@ -57,14 +76,14 @@ struct DetectionChunkResult {
   std::vector<uint8_t> grouped_mask;
   std::vector<uint8_t> valid_row_mask;
   std::vector<uint8_t> valid_score_mask;
-  std::vector<std::array<int, 4>> grouped_boxes;
+  std::vector<DetectionBox> grouped_boxes;
   float support_threshold = 0.0f;
   float score_threshold = 0.0f;
 };
 
 struct GroupingResult {
   std::vector<uint8_t> grouped_mask;
-  std::vector<std::array<int, 4>> boxes;
+  std::vector<DetectionBox> boxes;
   float peak_score_floor = 0.0f;
 };
 
@@ -84,6 +103,55 @@ struct FastGpuMetadataSummary {
   float merged_threshold = 0.0f;
   float seed_threshold = 0.0f;
 };
+
+std::string json_bool(bool value) {
+  return value ? "true" : "false";
+}
+
+std::string json_escape(const std::string& value) {
+  std::string escaped;
+  escaped.reserve(value.size() + 8);
+  for (const char ch : value) {
+    switch (ch) {
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      default:
+        escaped += ch;
+        break;
+    }
+  }
+  return escaped;
+}
+
+std::string make_debug_artifact_stem(const std::string& output_dir,
+                                     uint16_t channel,
+                                     uint64_t frame_number,
+                                     int rows,
+                                     int cols) {
+  const auto now = std::chrono::system_clock::now();
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+
+  std::ostringstream oss;
+  oss << output_dir
+      << "/coherent_power_snapshot_ch" << channel
+      << "_f" << frame_number
+      << "_" << ms
+      << "_" << rows << "x" << cols;
+  return oss.str();
+}
 
 std::string make_mask_output_path(const std::string& output_dir,
                                   uint16_t channel,
@@ -111,6 +179,45 @@ bool write_pgm(const std::string& path, const std::vector<uint8_t>& image, int w
 
   out << "P5\n" << width << " " << height << "\n255\n";
   out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(image.size()));
+  return out.good();
+}
+
+bool write_npy_2d(const std::string& path,
+                  const void* payload,
+                  size_t payload_bytes,
+                  int rows,
+                  int cols,
+                  const std::string& dtype_descr) {
+  std::ofstream out(path, std::ios::binary);
+  if (!out.is_open()) {
+    return false;
+  }
+
+  std::ostringstream header_builder;
+  header_builder << "{'descr': '" << dtype_descr << "', 'fortran_order': False, 'shape': ("
+                 << rows << ", " << cols << "), }";
+  std::string header = header_builder.str();
+
+  const size_t preamble_size = 10;
+  const size_t padding = (16 - ((preamble_size + header.size() + 1) % 16)) % 16;
+  header.append(padding, ' ');
+  header.push_back('\n');
+
+  if (header.size() > std::numeric_limits<uint16_t>::max()) {
+    return false;
+  }
+
+  out.write("\x93NUMPY", 6);
+  const unsigned char version[2] = {1, 0};
+  out.write(reinterpret_cast<const char*>(version), 2);
+  const uint16_t header_len = static_cast<uint16_t>(header.size());
+  const unsigned char header_len_le[2] = {
+      static_cast<unsigned char>(header_len & 0xFF),
+      static_cast<unsigned char>((header_len >> 8) & 0xFF),
+  };
+  out.write(reinterpret_cast<const char*>(header_len_le), 2);
+  out.write(header.data(), static_cast<std::streamsize>(header.size()));
+  out.write(reinterpret_cast<const char*>(payload), static_cast<std::streamsize>(payload_bytes));
   return out.good();
 }
 
@@ -903,6 +1010,230 @@ void binary_close_freq(std::vector<uint8_t>& mask, int rows, int cols, int bridg
   mask.swap(eroded);
 }
 
+std::vector<std::pair<int, int>> true_runs(const std::vector<uint8_t>& mask_1d) {
+  std::vector<std::pair<int, int>> runs;
+  if (mask_1d.empty()) {
+    return runs;
+  }
+
+  int run_start = -1;
+  for (int index = 0; index < static_cast<int>(mask_1d.size()); ++index) {
+    if (mask_1d[static_cast<size_t>(index)]) {
+      if (run_start < 0) {
+        run_start = index;
+      }
+      continue;
+    }
+    if (run_start >= 0) {
+      runs.push_back({run_start, index});
+      run_start = -1;
+    }
+  }
+  if (run_start >= 0) {
+    runs.push_back({run_start, static_cast<int>(mask_1d.size())});
+  }
+  return runs;
+}
+
+struct CandidateMask {
+  std::vector<uint8_t> mask;
+  std::string split_role = "unsplit";
+  bool split_applied = false;
+};
+
+int component_envelope_area(const std::vector<uint8_t>& component_mask, int rows, int cols) {
+  if (rows <= 0 || cols <= 0) {
+    return 0;
+  }
+  int envelope_area = 0;
+  for (int col = 0; col < cols; ++col) {
+    int min_row = rows;
+    int max_row = -1;
+    for (int row = 0; row < rows; ++row) {
+      if (!component_mask[flat_index(rows, cols, row, col)]) {
+        continue;
+      }
+      min_row = std::min(min_row, row);
+      max_row = std::max(max_row, row);
+    }
+    if (max_row >= min_row) {
+      envelope_area += (max_row - min_row + 1);
+    }
+  }
+  return envelope_area;
+}
+
+std::vector<CandidateMask> split_component_candidate_masks(const std::vector<uint8_t>& component_mask,
+                                                           int rows,
+                                                           int cols,
+                                                           int min_freq_span_px,
+                                                           int min_time_span_px) {
+  std::vector<CandidateMask> unsplit {{component_mask, "unsplit", false}};
+  if (rows <= 0 || cols <= 0) {
+    return unsplit;
+  }
+
+  std::vector<int> active_cols;
+  active_cols.reserve(cols);
+  for (int col = 0; col < cols; ++col) {
+    bool active = false;
+    for (int row = 0; row < rows; ++row) {
+      if (component_mask[flat_index(rows, cols, row, col)]) {
+        active = true;
+        break;
+      }
+    }
+    if (active) {
+      active_cols.push_back(col);
+    }
+  }
+  if (static_cast<int>(active_cols.size()) < std::max(6, 2 * min_time_span_px)) {
+    return unsplit;
+  }
+
+  std::vector<int> col_span(static_cast<size_t>(cols), 0);
+  std::vector<int> active_spans;
+  active_spans.reserve(active_cols.size());
+  for (const int col : active_cols) {
+    int min_row = rows;
+    int max_row = -1;
+    for (int row = 0; row < rows; ++row) {
+      if (!component_mask[flat_index(rows, cols, row, col)]) {
+        continue;
+      }
+      min_row = std::min(min_row, row);
+      max_row = std::max(max_row, row);
+    }
+    if (max_row >= min_row) {
+      col_span[static_cast<size_t>(col)] = max_row - min_row + 1;
+      active_spans.push_back(col_span[static_cast<size_t>(col)]);
+    }
+  }
+  if (static_cast<int>(active_spans.size()) < std::max(6, 2 * min_time_span_px)) {
+    return unsplit;
+  }
+
+  std::sort(active_spans.begin(), active_spans.end());
+  const size_t baseline_index = static_cast<size_t>(std::clamp<int>(
+      static_cast<int>(std::floor(0.35 * static_cast<double>(std::max<int>(static_cast<int>(active_spans.size()) - 1, 0)))),
+      0,
+      std::max<int>(static_cast<int>(active_spans.size()) - 1, 0)));
+  const float baseline_span = static_cast<float>(active_spans[baseline_index]);
+
+  int global_min_row = rows;
+  int global_max_row = -1;
+  for (int row = 0; row < rows; ++row) {
+    for (int col = 0; col < cols; ++col) {
+      if (!component_mask[flat_index(rows, cols, row, col)]) {
+        continue;
+      }
+      global_min_row = std::min(global_min_row, row);
+      global_max_row = std::max(global_max_row, row);
+      break;
+    }
+  }
+  if (global_max_row < global_min_row) {
+    return unsplit;
+  }
+
+  const int global_span = global_max_row - global_min_row + 1;
+  const int burst_span_threshold = std::max({
+      static_cast<int>(std::ceil(baseline_span * 1.8f)),
+      static_cast<int>(std::ceil(baseline_span + std::max(4.0f, static_cast<float>(min_freq_span_px) * 0.5f))),
+      min_freq_span_px,
+  });
+  if (burst_span_threshold >= global_span) {
+    return unsplit;
+  }
+
+  std::vector<uint8_t> burst_cols_mask(static_cast<size_t>(cols), 0);
+  for (const int col : active_cols) {
+    burst_cols_mask[static_cast<size_t>(col)] = col_span[static_cast<size_t>(col)] >= burst_span_threshold ? 1 : 0;
+  }
+
+  std::vector<std::pair<int, int>> burst_runs;
+  for (const auto& run : true_runs(burst_cols_mask)) {
+    const int run_width = run.second - run.first;
+    if (run_width < min_time_span_px) {
+      continue;
+    }
+    if (run_width >= std::max(static_cast<int>(active_cols.size() * 0.7f), min_time_span_px + 1)) {
+      continue;
+    }
+    burst_runs.push_back(run);
+  }
+  if (burst_runs.empty()) {
+    return unsplit;
+  }
+
+  std::vector<int> non_burst_cols;
+  non_burst_cols.reserve(active_cols.size());
+  for (const int col : active_cols) {
+    if (!burst_cols_mask[static_cast<size_t>(col)]) {
+      non_burst_cols.push_back(col);
+    }
+  }
+  if (static_cast<int>(non_burst_cols.size()) < std::max(4, 2 * min_time_span_px)) {
+    return unsplit;
+  }
+
+  const int min_row_hits = std::max(2, static_cast<int>(std::ceil(static_cast<double>(non_burst_cols.size()) * 0.45)));
+  std::vector<uint8_t> carrier_rows_mask(static_cast<size_t>(rows), 0);
+  for (int row = 0; row < rows; ++row) {
+    int row_hits = 0;
+    for (const int col : non_burst_cols) {
+      row_hits += component_mask[flat_index(rows, cols, row, col)] ? 1 : 0;
+    }
+    carrier_rows_mask[static_cast<size_t>(row)] = row_hits >= min_row_hits ? 1 : 0;
+  }
+  const auto carrier_row_runs = true_runs(carrier_rows_mask);
+  if (carrier_row_runs.empty()) {
+    return unsplit;
+  }
+
+  auto carrier_run = *std::max_element(
+      carrier_row_runs.begin(),
+      carrier_row_runs.end(),
+      [](const auto& left, const auto& right) { return (left.second - left.first) < (right.second - right.first); });
+  const int carrier_freq_start = carrier_run.first;
+  const int carrier_freq_stop = carrier_run.second;
+  const int carrier_freq_span = carrier_freq_stop - carrier_freq_start;
+  if (carrier_freq_span < std::max(2, static_cast<int>(std::floor(baseline_span))) || carrier_freq_span >= burst_span_threshold) {
+    return unsplit;
+  }
+
+  std::vector<uint8_t> carrier_mask(component_mask.size(), 0);
+  for (int row = carrier_freq_start; row < carrier_freq_stop; ++row) {
+    for (int col = 0; col < cols; ++col) {
+      carrier_mask[flat_index(rows, cols, row, col)] = component_mask[flat_index(rows, cols, row, col)];
+    }
+  }
+  const int carrier_count = static_cast<int>(std::count(carrier_mask.begin(), carrier_mask.end(), static_cast<uint8_t>(1)));
+  if (carrier_count < std::max(2, min_time_span_px * 2)) {
+    return unsplit;
+  }
+
+  std::vector<CandidateMask> candidates;
+  candidates.push_back({carrier_mask, "persistent_carrier", true});
+  for (const auto& run : burst_runs) {
+    std::vector<uint8_t> burst_mask(component_mask.size(), 0);
+    for (int row = 0; row < rows; ++row) {
+      for (int col = run.first; col < run.second; ++col) {
+        burst_mask[flat_index(rows, cols, row, col)] = component_mask[flat_index(rows, cols, row, col)];
+      }
+    }
+    if (std::count(burst_mask.begin(), burst_mask.end(), static_cast<uint8_t>(1)) == 0) {
+      continue;
+    }
+    candidates.push_back({burst_mask, "transient_wideband_burst", true});
+  }
+
+  if (candidates.size() < 2) {
+    return unsplit;
+  }
+  return candidates;
+}
+
 GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
                                          const std::vector<float>& score_map,
                                          int rows,
@@ -940,8 +1271,9 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
 
   std::vector<uint8_t> grouped_mask(mask.size(), 0);
   std::vector<uint8_t> visited(mask.size(), 0);
-  std::vector<std::array<int, 4>> boxes;
+  std::vector<DetectionBox> boxes;
   const std::array<std::pair<int, int>, 4> neighbors{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
+  int output_component_id = 0;
   for (int row = 0; row < rows; ++row) {
     for (int col = 0; col < cols; ++col) {
       const size_t seed = flat_index(rows, cols, row, col);
@@ -956,7 +1288,6 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
       int max_row = row;
       int min_col = col;
       int max_col = col;
-      float score_peak = -std::numeric_limits<float>::infinity();
       while (!queue.empty()) {
         const auto [current_row, current_col] = queue.front();
         queue.pop();
@@ -966,7 +1297,6 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
         max_row = std::max(max_row, current_row);
         min_col = std::min(min_col, current_col);
         max_col = std::max(max_col, current_col);
-        score_peak = std::max(score_peak, score_map[current_index]);
         for (const auto& [delta_row, delta_col] : neighbors) {
           const int next_row = current_row + delta_row;
           const int next_col = current_col + delta_col;
@@ -982,27 +1312,116 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
         }
       }
 
-      const int freq_start = min_row;
-      const int freq_stop = max_row + 1;
-      const int time_start = min_col;
-      const int time_stop = max_col + 1;
-      const int freq_span = freq_stop - freq_start;
-      const int time_span = time_stop - time_start;
-      const int filled_area = static_cast<int>(component.size());
-      const int bbox_area = std::max(freq_span * time_span, 1);
-      const float density = static_cast<float>(filled_area) / static_cast<float>(bbox_area);
-      const bool keep_component = filled_area >= min_component_size &&
-                                  freq_span >= min_freq_span_px &&
-                                  time_span >= min_time_span_px &&
-                                  density >= min_density &&
-                                  score_peak >= peak_score_floor;
-      if (!keep_component) {
-        continue;
-      }
+      const int parent_freq_start = min_row;
+      const int parent_freq_stop = max_row + 1;
+      const int parent_time_start = min_col;
+      const int parent_time_stop = max_col + 1;
+      const int local_rows = parent_freq_stop - parent_freq_start;
+      const int local_cols = parent_time_stop - parent_time_start;
+      std::vector<uint8_t> component_mask_local(static_cast<size_t>(local_rows) * static_cast<size_t>(local_cols), 0);
       for (const size_t index : component) {
-        grouped_mask[index] = 1;
+        const int component_row = static_cast<int>(index / static_cast<size_t>(cols));
+        const int component_col = static_cast<int>(index % static_cast<size_t>(cols));
+        component_mask_local[flat_index(local_rows, local_cols, component_row - parent_freq_start, component_col - parent_time_start)] = 1;
       }
-      boxes.push_back({freq_start, freq_stop, time_start, time_stop});
+
+      const auto candidate_masks = split_component_candidate_masks(
+          component_mask_local,
+          local_rows,
+          local_cols,
+          min_freq_span_px,
+          min_time_span_px);
+
+      for (const auto& candidate : candidate_masks) {
+        const auto& candidate_mask_local = candidate.mask;
+        int local_min_row = local_rows;
+        int local_max_row = -1;
+        int local_min_col = local_cols;
+        int local_max_col = -1;
+        for (int local_row = 0; local_row < local_rows; ++local_row) {
+          for (int local_col = 0; local_col < local_cols; ++local_col) {
+            if (!candidate_mask_local[flat_index(local_rows, local_cols, local_row, local_col)]) {
+              continue;
+            }
+            local_min_row = std::min(local_min_row, local_row);
+            local_max_row = std::max(local_max_row, local_row);
+            local_min_col = std::min(local_min_col, local_col);
+            local_max_col = std::max(local_max_col, local_col);
+          }
+        }
+        if (local_max_row < local_min_row || local_max_col < local_min_col) {
+          continue;
+        }
+
+        const int freq_start = parent_freq_start + local_min_row;
+        const int freq_stop = parent_freq_start + local_max_row + 1;
+        const int time_start = parent_time_start + local_min_col;
+        const int time_stop = parent_time_start + local_max_col + 1;
+        const int freq_span = freq_stop - freq_start;
+        const int time_span = time_stop - time_start;
+        const int cropped_rows = local_max_row - local_min_row + 1;
+        const int cropped_cols = local_max_col - local_min_col + 1;
+        std::vector<uint8_t> cropped_candidate_mask(static_cast<size_t>(cropped_rows) * static_cast<size_t>(cropped_cols), 0);
+        int filled_area = 0;
+        float score_peak = 0.0f;
+        float score_sum = 0.0f;
+        for (int local_row = 0; local_row < cropped_rows; ++local_row) {
+          for (int local_col = 0; local_col < cropped_cols; ++local_col) {
+            const bool active = candidate_mask_local[flat_index(local_rows, local_cols, local_min_row + local_row, local_min_col + local_col)] != 0;
+            cropped_candidate_mask[flat_index(cropped_rows, cropped_cols, local_row, local_col)] = active ? 1 : 0;
+            if (!active) {
+              continue;
+            }
+            ++filled_area;
+            const float score = score_map[flat_index(rows, cols, freq_start + local_row, time_start + local_col)];
+            score_sum += score;
+            score_peak = std::max(score_peak, score);
+          }
+        }
+        const int bbox_area = std::max(freq_span * time_span, 1);
+        const int envelope_area = std::max(component_envelope_area(cropped_candidate_mask, cropped_rows, cropped_cols), 1);
+        const float bbox_density = static_cast<float>(filled_area) / static_cast<float>(bbox_area);
+        const float envelope_density = static_cast<float>(filled_area) / static_cast<float>(envelope_area);
+        const float density = envelope_density;
+        const float score_mean = filled_area > 0 ? score_sum / static_cast<float>(filled_area) : 0.0f;
+
+        const bool keep_component = filled_area >= min_component_size &&
+                                    freq_span >= min_freq_span_px &&
+                                    time_span >= min_time_span_px &&
+                                    density >= min_density &&
+                                    score_peak >= peak_score_floor;
+        ++output_component_id;
+        if (!keep_component) {
+          continue;
+        }
+
+        for (int local_row = 0; local_row < cropped_rows; ++local_row) {
+          for (int local_col = 0; local_col < cropped_cols; ++local_col) {
+            if (!cropped_candidate_mask[flat_index(cropped_rows, cropped_cols, local_row, local_col)]) {
+              continue;
+            }
+            grouped_mask[flat_index(rows, cols, freq_start + local_row, time_start + local_col)] = 1;
+          }
+        }
+
+        DetectionBox box;
+        box.freq_start = freq_start;
+        box.freq_stop = freq_stop;
+        box.time_start = time_start;
+        box.time_stop = time_stop;
+        box.freq_span = freq_span;
+        box.time_span = time_span;
+        box.filled_area = filled_area;
+        box.density = density;
+        box.bbox_density = bbox_density;
+        box.envelope_density = envelope_density;
+        box.score_mean = score_mean;
+        box.score_peak = score_peak;
+        box.split_role = candidate.split_role;
+        box.split_applied = candidate.split_applied;
+        box.parent_component_id = output_component_id;
+        boxes.push_back(std::move(box));
+      }
     }
   }
 
@@ -1020,14 +1439,14 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
 
 std::vector<uint8_t> boxes_to_mask(int rows,
                                    int cols,
-                                   const std::vector<std::array<int, 4>>& boxes,
+                                   const std::vector<DetectionBox>& boxes,
                                    const std::vector<uint8_t>& valid_row_mask) {
   std::vector<uint8_t> mask(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
   for (const auto& box : boxes) {
-    const int freq_start = clamp_int(box[0], 0, rows);
-    const int freq_stop = clamp_int(box[1], freq_start, rows);
-    const int time_start = clamp_int(box[2], 0, cols);
-    const int time_stop = clamp_int(box[3], time_start, cols);
+    const int freq_start = clamp_int(box.freq_start, 0, rows);
+    const int freq_stop = clamp_int(box.freq_stop, freq_start, rows);
+    const int time_start = clamp_int(box.time_start, 0, cols);
+    const int time_stop = clamp_int(box.time_stop, time_start, cols);
     for (int row = freq_start; row < freq_stop; ++row) {
       for (int col = time_start; col < time_stop; ++col) {
         mask[flat_index(rows, cols, row, col)] = 1;
@@ -1043,6 +1462,173 @@ std::vector<uint8_t> boxes_to_mask(int rows,
     }
   }
   return mask;
+}
+
+bool boxes_overlap(const DetectionBox& box_a, const DetectionBox& box_b) {
+  return box_a.freq_start < box_b.freq_stop && box_b.freq_start < box_a.freq_stop &&
+         box_a.time_start < box_b.time_stop && box_b.time_start < box_a.time_stop;
+}
+
+bool boxes_should_merge(const DetectionBox& box_a, const DetectionBox& box_b) {
+  if (!boxes_overlap(box_a, box_b)) {
+    return false;
+  }
+  if (((box_a.split_role == "persistent_carrier") && (box_b.split_role == "transient_wideband_burst")) ||
+      ((box_a.split_role == "transient_wideband_burst") && (box_b.split_role == "persistent_carrier"))) {
+    return false;
+  }
+  return true;
+}
+
+DetectionBox merge_box_cluster(const std::vector<DetectionBox>& cluster) {
+  DetectionBox merged;
+  merged.freq_start = std::numeric_limits<int>::max();
+  merged.time_start = std::numeric_limits<int>::max();
+  merged.freq_stop = 0;
+  merged.time_stop = 0;
+  int score_weight = 0;
+  std::vector<std::string> split_roles;
+
+  for (const auto& box : cluster) {
+    merged.freq_start = std::min(merged.freq_start, box.freq_start);
+    merged.freq_stop = std::max(merged.freq_stop, box.freq_stop);
+    merged.time_start = std::min(merged.time_start, box.time_start);
+    merged.time_stop = std::max(merged.time_stop, box.time_stop);
+    merged.filled_area += box.filled_area;
+    merged.score_peak = std::max(merged.score_peak, box.score_peak);
+    const int box_weight = std::max(box.filled_area, 1);
+    merged.score_mean += box.score_mean * static_cast<float>(box_weight);
+    score_weight += box_weight;
+    merged.split_applied = merged.split_applied || box.split_applied;
+    if (std::find(split_roles.begin(), split_roles.end(), box.split_role) == split_roles.end()) {
+      split_roles.push_back(box.split_role);
+    }
+    for (const int chunk_index : box.source_chunk_indices) {
+      if (std::find(merged.source_chunk_indices.begin(), merged.source_chunk_indices.end(), chunk_index) == merged.source_chunk_indices.end()) {
+        merged.source_chunk_indices.push_back(chunk_index);
+      }
+    }
+  }
+
+  merged.freq_span = merged.freq_stop - merged.freq_start;
+  merged.time_span = merged.time_stop - merged.time_start;
+  const int bbox_area = std::max(merged.freq_span * merged.time_span, 1);
+  merged.density = static_cast<float>(merged.filled_area) / static_cast<float>(bbox_area);
+  merged.score_mean = score_weight > 0 ? merged.score_mean / static_cast<float>(score_weight) : 0.0f;
+  std::sort(split_roles.begin(), split_roles.end());
+  merged.split_role = split_roles.size() == 1 ? split_roles.front() : "mixed";
+  std::sort(merged.source_chunk_indices.begin(), merged.source_chunk_indices.end());
+  return merged;
+}
+
+std::vector<DetectionBox> project_chunk_boxes_to_global(const std::vector<DetectionChunkResult>& chunk_results,
+                                                        int rows,
+                                                        int cols) {
+  std::vector<DetectionBox> projected_boxes;
+  for (const auto& chunk : chunk_results) {
+    const int row_start = chunk.chunk.row_start;
+    const int chunk_index = chunk.chunk.chunk_index;
+    for (const auto& box : chunk.grouped_boxes) {
+      DetectionBox projected = box;
+      projected.freq_start = std::clamp(row_start + box.freq_start, 0, rows);
+      projected.freq_stop = std::clamp(row_start + box.freq_stop, projected.freq_start, rows);
+      projected.time_start = std::clamp(box.time_start, 0, cols);
+      projected.time_stop = std::clamp(box.time_stop, projected.time_start, cols);
+      projected.freq_span = projected.freq_stop - projected.freq_start;
+      projected.time_span = projected.time_stop - projected.time_start;
+      projected.source_chunk_indices = {chunk_index};
+      if (projected.freq_span > 0 && projected.time_span > 0) {
+        projected_boxes.push_back(std::move(projected));
+      }
+    }
+  }
+  return projected_boxes;
+}
+
+GroupingResult merge_projected_subsection_boxes(int rows,
+                                                int cols,
+                                                const std::vector<DetectionChunkResult>& chunk_results,
+                                                const std::vector<float>& merged_score,
+                                                const std::vector<uint8_t>& valid_row_mask,
+                                                int bridge_freq_px,
+                                                int bridge_time_px,
+                                                int min_component_size,
+                                                int min_freq_span_px,
+                                                int min_time_span_px,
+                                                float min_density,
+                                                float time_continuity_ratio) {
+  std::vector<uint8_t> source_mask(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
+  for (const auto& chunk : chunk_results) {
+    const int row_start = chunk.chunk.row_start;
+    const int row_stop = chunk.chunk.row_stop;
+    const int chunk_rows = row_stop - row_start;
+    const auto& local_mask = chunk.grouped_mask.empty() ? chunk.mask_px : chunk.grouped_mask;
+    for (int row = 0; row < chunk_rows; ++row) {
+      for (int col = 0; col < cols; ++col) {
+        source_mask[flat_index(rows, cols, row_start + row, col)] =
+            source_mask[flat_index(rows, cols, row_start + row, col)] ||
+            local_mask[flat_index(chunk_rows, cols, row, col)];
+      }
+    }
+  }
+  for (int row = 0; row < rows; ++row) {
+    if (valid_row_mask[static_cast<size_t>(row)]) {
+      continue;
+    }
+    for (int col = 0; col < cols; ++col) {
+      source_mask[flat_index(rows, cols, row, col)] = 0;
+    }
+  }
+
+  auto projected_boxes = project_chunk_boxes_to_global(chunk_results, rows, cols);
+  if (projected_boxes.empty()) {
+    return {std::vector<uint8_t>(source_mask.size(), 0), {}, 0.0f};
+  }
+
+  const bool has_split_boxes = std::any_of(
+      projected_boxes.begin(), projected_boxes.end(), [](const DetectionBox& box) { return box.split_applied; });
+  if (has_split_boxes) {
+    std::vector<DetectionBox> merged_boxes;
+    std::vector<uint8_t> visited(projected_boxes.size(), 0);
+    for (size_t start_index = 0; start_index < projected_boxes.size(); ++start_index) {
+      if (visited[start_index]) {
+        continue;
+      }
+      std::vector<size_t> pending {start_index};
+      visited[start_index] = 1;
+      std::vector<DetectionBox> cluster;
+      while (!pending.empty()) {
+        const size_t current_index = pending.back();
+        pending.pop_back();
+        cluster.push_back(projected_boxes[current_index]);
+        for (size_t other_index = 0; other_index < projected_boxes.size(); ++other_index) {
+          if (visited[other_index]) {
+            continue;
+          }
+          if (boxes_should_merge(projected_boxes[current_index], projected_boxes[other_index])) {
+            visited[other_index] = 1;
+            pending.push_back(other_index);
+          }
+        }
+      }
+      merged_boxes.push_back(merge_box_cluster(cluster));
+    }
+    return {boxes_to_mask(rows, cols, merged_boxes, valid_row_mask), merged_boxes, 0.0f};
+  }
+
+  return group_signal_mask_regions(
+      source_mask,
+      merged_score,
+      rows,
+      cols,
+      valid_row_mask,
+      bridge_freq_px,
+      bridge_time_px,
+      min_component_size,
+      min_freq_span_px,
+      min_time_span_px,
+      min_density,
+      time_continuity_ratio);
 }
 
 std::vector<ChunkPlanEntry> build_frequency_chunks(int rows,
@@ -1245,28 +1831,9 @@ DetectionChunkResult detect_chunk_coherent_power(const std::vector<float>& corre
   return result;
 }
 
-std::array<int, 4> scale_box(const std::array<int, 4>& box,
-                             int src_rows,
-                             int src_cols,
-                             int dst_rows,
-                             int dst_cols) {
-  if (src_rows == dst_rows && src_cols == dst_cols) {
-    return box;
-  }
-  const float row_scale = static_cast<float>(dst_rows) / static_cast<float>(std::max(src_rows, 1));
-  const float col_scale = static_cast<float>(dst_cols) / static_cast<float>(std::max(src_cols, 1));
-  const int freq_start = clamp_int(static_cast<int>(std::floor(static_cast<float>(box[0]) * row_scale)), 0, dst_rows);
-  const int freq_stop = clamp_int(static_cast<int>(std::ceil(static_cast<float>(box[1]) * row_scale)), freq_start, dst_rows);
-  const int time_start = clamp_int(static_cast<int>(std::floor(static_cast<float>(box[2]) * col_scale)), 0, dst_cols);
-  const int time_stop = clamp_int(static_cast<int>(std::ceil(static_cast<float>(box[3]) * col_scale)), time_start, dst_cols);
-  return {freq_start, freq_stop, time_start, time_stop};
-}
-
 PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                        int src_rows,
                                        int src_cols,
-                                       int dst_rows,
-                                       int dst_cols,
                                        int ignore_bins_per_side,
                                        double resolution_hz,
                                        double chunk_bandwidth_hz,
@@ -1289,7 +1856,8 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                        int grouping_min_component_size,
                                        int grouping_min_freq_span_px,
                                        int grouping_min_time_span_px,
-                                       double grouping_min_density) {
+                                       double grouping_min_density,
+                                       double grouping_time_continuity_ratio) {
   PipelineSummary summary;
   if (resolution_hz <= 0.0 && ignore_bins_per_side == 0 && ignore_sideband_percent > 0.0) {
     ignore_bins_per_side = static_cast<int>(std::floor(static_cast<double>(src_rows) * ignore_sideband_percent / 100.0));
@@ -1429,33 +1997,21 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
     const bool seed = raw_merged_mask[index] || (merged_support[index] && merged_score[index] >= summary.seed_threshold);
     seed_mask[index] = seed ? 1 : 0;
   }
-  const auto merged_grouping = group_signal_mask_regions(seed_mask,
-                                                         merged_score,
-                                                         src_rows,
-                                                         src_cols,
-                                                         valid_row_mask,
-                                                         grouping_bridge_freq_px,
-                                                         grouping_bridge_time_px,
-                                                         std::max(grouping_min_component_size, min_component_size),
-                                                         grouping_min_freq_span_px,
-                                                         grouping_min_time_span_px,
-                                                         static_cast<float>(grouping_min_density));
+  const auto merged_grouping = merge_projected_subsection_boxes(src_rows,
+                                                                src_cols,
+                                                                chunk_results,
+                                                                merged_score,
+                                                                valid_row_mask,
+                                                                grouping_bridge_freq_px,
+                                                                grouping_bridge_time_px,
+                                                                std::max(grouping_min_component_size, min_component_size),
+                                                                grouping_min_freq_span_px,
+                                                                grouping_min_time_span_px,
+                                                                static_cast<float>(grouping_min_density),
+                                                                static_cast<float>(grouping_time_continuity_ratio));
   summary.grouped_box_count = static_cast<int>(merged_grouping.boxes.size());
 
-  std::vector<std::array<int, 4>> scaled_boxes;
-  scaled_boxes.reserve(merged_grouping.boxes.size());
-  for (const auto& box : merged_grouping.boxes) {
-    scaled_boxes.push_back(scale_box(box, src_rows, src_cols, dst_rows, dst_cols));
-  }
-  std::vector<uint8_t> dst_valid_row_mask(static_cast<size_t>(dst_rows), 1);
-  for (int row = 0; row < dst_rows; ++row) {
-    const int src_row = clamp_int(static_cast<int>(std::floor(static_cast<float>(row) * static_cast<float>(src_rows) /
-                                                              static_cast<float>(std::max(dst_rows, 1)))),
-                                  0,
-                                  src_rows - 1);
-    dst_valid_row_mask[static_cast<size_t>(row)] = valid_row_mask[static_cast<size_t>(src_row)];
-  }
-  const auto final_mask_u8 = boxes_to_mask(dst_rows, dst_cols, scaled_boxes, dst_valid_row_mask);
+  const auto final_mask_u8 = boxes_to_mask(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
   summary.final_mask.assign(final_mask_u8.size(), 0.0f);
   for (size_t index = 0; index < final_mask_u8.size(); ++index) {
     summary.final_mask[index] = final_mask_u8[index] ? 1.0f : 0.0f;
@@ -1467,8 +2023,97 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
 
 namespace holoscan::ops {
 
+CoherentPowerReferenceResult run_coherent_power_reference_validation(
+    const std::vector<coherent_power_complex>& input_tensor,
+    int src_rows,
+    int src_cols,
+    double resolution_hz,
+    const CoherentPowerReferenceConfig& config) {
+  if (src_rows <= 0 || src_cols <= 0) {
+    throw std::invalid_argument("coherent power reference validation requires positive tensor dimensions");
+  }
+  if (input_tensor.size() != static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols)) {
+    throw std::invalid_argument("coherent power reference validation received mismatched tensor size");
+  }
+
+  CoherentPowerReferenceResult result;
+  result.src_rows = src_rows;
+  result.src_cols = src_cols;
+  result.dst_rows = src_rows;
+  result.dst_cols = src_cols;
+  result.frequency_axis_calibrated = resolution_hz > 0.0;
+
+  result.power_db.assign(input_tensor.size(), 0.0f);
+  for (size_t index = 0; index < input_tensor.size(); ++index) {
+    const float re = input_tensor[index].real();
+    const float im = input_tensor[index].imag();
+    result.power_db[index] = 10.0f * std::log10(re * re + im * im + 1e-12f);
+  }
+
+  int ignore_bins_per_side = 0;
+  if (resolution_hz > 0.0 && config.ignore_sideband_hz > 0.0) {
+    ignore_bins_per_side = static_cast<int>(std::ceil(config.ignore_sideband_hz / resolution_hz));
+    ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
+  } else if (resolution_hz <= 0.0 && config.ignore_sideband_percent > 0.0) {
+    ignore_bins_per_side = static_cast<int>(std::floor(static_cast<double>(src_rows) * config.ignore_sideband_percent / 100.0));
+    ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
+  }
+  result.ignore_bins_per_side = ignore_bins_per_side;
+
+  std::vector<uint8_t> valid_row_mask(static_cast<size_t>(src_rows), 1);
+  for (int row = 0; row < ignore_bins_per_side; ++row) {
+    valid_row_mask[static_cast<size_t>(row)] = 0;
+    valid_row_mask[static_cast<size_t>(src_rows - 1 - row)] = 0;
+  }
+
+  std::vector<float> boost_db;
+  result.corrected_sxx_db = apply_frontend_correction(result.power_db,
+                                                      src_rows,
+                                                      src_cols,
+                                                      valid_row_mask,
+                                                      static_cast<float>(config.frontend_row_q),
+                                                      static_cast<float>(config.frontend_reference_q),
+                                                      static_cast<float>(config.frontend_smooth_sigma),
+                                                      static_cast<float>(config.frontend_max_boost_db),
+                                                      boost_db);
+
+  const auto summary = run_reference_pipeline(result.power_db,
+                                              src_rows,
+                                              src_cols,
+                                              ignore_bins_per_side,
+                                              resolution_hz,
+                                              config.chunk_bandwidth_hz,
+                                              config.chunk_overlap_hz,
+                                              config.uncalibrated_chunk_fraction,
+                                              config.uncalibrated_overlap_fraction,
+                                              config.ignore_sideband_percent,
+                                              config.frontend_row_q,
+                                              config.frontend_reference_q,
+                                              config.frontend_smooth_sigma,
+                                              config.frontend_max_boost_db,
+                                              config.coherence_weight,
+                                              config.power_weight,
+                                              config.coherence_power_support_q,
+                                              config.coherence_power_q,
+                                              config.min_component_size,
+                                              config.grouping_seed_score_q,
+                                              config.grouping_bridge_freq_px,
+                                              config.grouping_bridge_time_px,
+                                              config.grouping_min_component_size,
+                                              config.grouping_min_freq_span_px,
+                                              config.grouping_min_time_span_px,
+                                              config.grouping_min_density,
+                                              config.grouping_time_continuity_ratio);
+  result.final_mask = summary.final_mask;
+  result.grouped_box_count = summary.grouped_box_count;
+  result.merged_threshold = summary.merged_threshold;
+  result.seed_threshold = summary.seed_threshold;
+  return result;
+}
+
 CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
   for (auto& buffers : channel_buffers_) {
+    cudaFreeHost(buffers.input_tensor_host);
     cudaFree(buffers.power_db_device);
     cudaFree(buffers.corrected_db_device);
     cudaFree(buffers.time_mean_device);
@@ -1499,9 +2144,13 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(log_detections_, "log_detections", "Log detections", "If true, logs detector execution details.", false);
   spec.param(backend_mode_, "backend_mode", "Backend mode", "Detector backend mode: auto, fast_gpu, or reference.", std::string("auto"));
   spec.param(enable_mask_save_, "enable_mask_save", "Enable mask save", "Enable writing detector masks to disk for debug runs.", false);
+  spec.param(enable_tensor_snapshot_save_, "enable_tensor_snapshot_save", "Enable tensor snapshot save", "Enable writing frozen detector input snapshots for offline parity runs.", false);
   spec.param(save_every_n_frames_, "save_every_n_frames", "Save stride", "Save one detector mask every N frames per channel.", 1);
   spec.param(max_masks_per_channel_, "max_masks_per_channel", "Max masks per channel", "Maximum number of detector masks to save per channel for a run.", 5);
+  spec.param(max_snapshots_per_channel_, "max_snapshots_per_channel", "Max snapshots per channel", "Maximum number of frozen detector input snapshots to save per channel for a run.", 2);
   spec.param(output_dir_, "output_dir", "Output directory", "Directory where detector masks are written.", std::string("/workspace/coherent_power_masks"));
+  spec.param(tensor_snapshot_dir_, "tensor_snapshot_dir", "Tensor snapshot directory", "Directory where frozen detector input snapshots are written.", std::string("/workspace/coherent_power_snapshots"));
+  spec.param(save_power_db_snapshot_, "save_power_db_snapshot", "Save power dB snapshot", "If true, also saves the post power_db frame alongside the complex tensor snapshot.", true);
   spec.param(chunk_bandwidth_hz_, "chunk_bandwidth_hz", "Chunk bandwidth", "Chunk bandwidth in Hz.", 25.0e6);
   spec.param(chunk_overlap_hz_, "chunk_overlap_hz", "Chunk overlap", "Chunk overlap in Hz.", 6.25e6);
   spec.param(uncalibrated_chunk_fraction_, "uncalibrated_chunk_fraction", "Uncalibrated chunk fraction", "Fractional chunk span for uncalibrated inputs.", 0.40);
@@ -1534,6 +2183,7 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(grouping_min_freq_span_px_, "grouping_min_freq_span_px", "Grouping minimum frequency span", "Notebook-derived grouping minimum frequency span.", 18);
   spec.param(grouping_min_time_span_px_, "grouping_min_time_span_px", "Grouping minimum time span", "Notebook-derived grouping minimum time span.", 2);
   spec.param(grouping_min_density_, "grouping_min_density", "Grouping minimum density", "Notebook-derived grouping minimum density.", 0.06);
+  spec.param(grouping_time_continuity_ratio_, "grouping_time_continuity_ratio", "Grouping time continuity ratio", "Notebook-derived grouping time continuity ratio.", 0.85);
   spec.param(timing_summary_enable_, "timing_summary_enable", "Timing summary enable", "Enable per-stage timing summaries.", true);
   spec.param(timing_summary_every_n_, "timing_summary_every_n", "Timing summary every N", "Emit timing summaries every N emitted frames per channel.", 16);
   spec.param(timing_summary_window_, "timing_summary_window", "Timing summary window", "Maximum number of emitted frames to accumulate before reset.", 16);
@@ -1544,6 +2194,7 @@ void CoherentPowerSignalDetector::initialize() {
 
   frame_count_.assign(num_channels_.get(), 0);
   masks_saved_.assign(num_channels_.get(), 0);
+  snapshots_saved_.assign(num_channels_.get(), 0);
   timing_stats_.assign(num_channels_.get(), ChannelTimingStats {});
   channel_buffers_.assign(num_channels_.get(), ChannelBuffers {});
 
@@ -1705,6 +2356,9 @@ void CoherentPowerSignalDetector::initialize() {
   if (enable_mask_save_.get()) {
     std::filesystem::create_directories(output_dir_.get());
   }
+  if (enable_tensor_snapshot_save_.get()) {
+    std::filesystem::create_directories(tensor_snapshot_dir_.get());
+  }
 }
 
 void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
@@ -1736,8 +2390,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
   const int src_rows = static_cast<int>(fft_tensor.Size(0));
   const int src_cols = static_cast<int>(fft_tensor.Size(1));
-  const int dst_rows = std::max(1, input_height_.get());
-  const int dst_cols = std::max(1, input_width_.get());
+  const int configured_rows = std::max(1, input_height_.get());
+  const int configured_cols = std::max(1, input_width_.get());
   if (src_rows <= 0 || src_cols <= 0) {
     HOLOSCAN_LOG_WARN("Coherent power detector received empty tensor on channel {}", channel_number);
     return;
@@ -1789,12 +2443,19 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     HOLOSCAN_LOG_WARN("Unsupported coherent backend_mode='{}'. Falling back to auto.", backend_mode);
   }
   const bool save_requested = enable_mask_save_.get();
-  const bool require_reference_dimensions = src_rows != dst_rows || src_cols != dst_cols;
+  const bool require_reference_dimensions = src_rows != configured_rows || src_cols != configured_cols;
   const bool use_reference_backend = backend_is_reference ||
                                      (!backend_is_fast && (save_requested || require_reference_dimensions));
+  const int output_rows = use_reference_backend ? src_rows : configured_rows;
+  const int output_cols = use_reference_backend ? src_cols : configured_cols;
   const bool should_save_mask = save_requested &&
                                 (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
                                 (masks_saved_[channel_number] < max_masks_per_channel_.get());
+  const bool should_save_tensor_snapshot = enable_tensor_snapshot_save_.get() &&
+                                           (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
+                                           (snapshots_saved_[channel_number] < max_snapshots_per_channel_.get());
+  const bool should_save_power_db_snapshot = should_save_tensor_snapshot && save_power_db_snapshot_.get();
+  const bool frequency_axis_calibrated = resolution_hz > 0.0;
 
   time_step_ms(kInputStage, [&] {
     auto allocate_device_float = [](float*& pointer, size_t requested_elements) {
@@ -1811,6 +2472,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     };
 
     if (buffers.frame_elements != static_cast<size_t>(total_bins)) {
+      cudaFreeHost(buffers.input_tensor_host);
       cudaFree(buffers.power_db_device);
       cudaFree(buffers.corrected_db_device);
       cudaFree(buffers.time_mean_device);
@@ -1824,6 +2486,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       cudaFreeHost(buffers.power_db_host);
       cudaFreeHost(buffers.mask_host);
 
+      buffers.input_tensor_host = nullptr;
       buffers.power_db_device = nullptr;
       buffers.corrected_db_device = nullptr;
       buffers.time_mean_device = nullptr;
@@ -1879,10 +2542,36 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       }
     }
 
+    if (should_save_power_db_snapshot && buffers.power_db_host == nullptr) {
+      const auto alloc_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.power_db_host), power_db_bytes);
+      if (alloc_result != cudaSuccess) {
+        throw std::runtime_error(std::string("power_db snapshot host buffer allocation failed: ") + cudaGetErrorString(alloc_result));
+      }
+    }
+
+    if (should_save_tensor_snapshot && buffers.input_tensor_host == nullptr) {
+      const auto alloc_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.input_tensor_host),
+                                               static_cast<size_t>(total_bins) * sizeof(coherent_power_complex));
+      if (alloc_result != cudaSuccess) {
+        throw std::runtime_error(std::string("input tensor snapshot host buffer allocation failed: ") + cudaGetErrorString(alloc_result));
+      }
+    }
+
     if (should_save_mask && buffers.mask_host == nullptr) {
       const auto alloc_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.mask_host), mask_bytes);
       if (alloc_result != cudaSuccess) {
         throw std::runtime_error(std::string("mask host buffer allocation failed: ") + cudaGetErrorString(alloc_result));
+      }
+    }
+
+    if (should_save_tensor_snapshot) {
+      auto copy_result = cudaMemcpyAsync(buffers.input_tensor_host,
+                                         fft_tensor.Data(),
+                                         static_cast<size_t>(total_bins) * sizeof(coherent_power_complex),
+                                         cudaMemcpyDeviceToHost,
+                                         stream);
+      if (copy_result != cudaSuccess) {
+        throw std::runtime_error(std::string("input tensor snapshot copy failed: ") + cudaGetErrorString(copy_result));
       }
     }
   });
@@ -1947,7 +2636,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                                 grouping_min_component_size_.get(),
                                                 grouping_min_freq_span_px_.get(),
                                                 grouping_min_time_span_px_.get(),
-                                                grouping_min_density_.get());
+                                                grouping_min_density_.get(),
+                                                grouping_time_continuity_ratio_.get());
       return;
     }
 
@@ -2061,59 +2751,170 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
   stage_ms[kDeviceCopyStage] = 0.0;
 
-  auto maybe_save_mask = [&] {
-    if (!should_save_mask) {
+  auto maybe_save_debug_artifacts = [&] {
+    std::string mask_path;
+    if (should_save_mask) {
+      std::vector<uint8_t> image;
+      image.reserve(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols));
+      if (use_reference_backend) {
+        image.assign(pipeline_summary.final_mask.size(), 0);
+        for (size_t idx = 0; idx < pipeline_summary.final_mask.size(); ++idx) {
+          image[idx] = pipeline_summary.final_mask[idx] > 0.5f ? 255 : 0;
+        }
+      } else {
+        auto copy_result = cudaMemcpyAsync(buffers.mask_host,
+                                           buffers.mask_device,
+                                           mask_bytes,
+                                           cudaMemcpyDeviceToHost,
+                                           stream);
+        if (copy_result != cudaSuccess) {
+          throw std::runtime_error(std::string("mask device-to-host copy failed: ") + cudaGetErrorString(copy_result));
+        }
+        auto sync_result = cudaStreamSynchronize(stream);
+        if (sync_result != cudaSuccess) {
+          throw std::runtime_error(std::string("mask synchronization failed: ") + cudaGetErrorString(sync_result));
+        }
+        image.assign(buffers.mask_host, buffers.mask_host + static_cast<size_t>(total_bins));
+        for (uint8_t& pixel : image) {
+          pixel = pixel ? 255 : 0;
+        }
+      }
+
+      mask_path = make_mask_output_path(output_dir_.get(), channel_number, frame_number, output_rows, output_cols);
+      if (!write_pgm(mask_path, image, output_cols, output_rows)) {
+        HOLOSCAN_LOG_ERROR("Failed to write coherent power mask image: {}", mask_path);
+      } else {
+        ++masks_saved_[channel_number];
+        if (log_detections_.get()) {
+          HOLOSCAN_LOG_INFO("Saved coherent power mask for channel {} frame {} to {}",
+                            channel_number,
+                            frame_number,
+                            mask_path);
+        }
+      }
+    }
+
+    if (!should_save_tensor_snapshot) {
       return;
     }
-    std::vector<uint8_t> image;
-    image.reserve(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols));
-    if (use_reference_backend) {
-      image.assign(pipeline_summary.final_mask.size(), 0);
-      for (size_t idx = 0; idx < pipeline_summary.final_mask.size(); ++idx) {
-        image[idx] = pipeline_summary.final_mask[idx] > 0.5f ? 255 : 0;
-      }
-    } else {
-      auto copy_result = cudaMemcpyAsync(buffers.mask_host,
-                                         buffers.mask_device,
-                                         mask_bytes,
+
+    if (should_save_power_db_snapshot && !use_reference_backend) {
+      auto copy_result = cudaMemcpyAsync(buffers.power_db_host,
+                                         buffers.power_db_device,
+                                         power_db_bytes,
                                          cudaMemcpyDeviceToHost,
                                          stream);
       if (copy_result != cudaSuccess) {
-        throw std::runtime_error(std::string("mask device-to-host copy failed: ") + cudaGetErrorString(copy_result));
-      }
-      auto sync_result = cudaStreamSynchronize(stream);
-      if (sync_result != cudaSuccess) {
-        throw std::runtime_error(std::string("mask synchronization failed: ") + cudaGetErrorString(sync_result));
-      }
-      image.assign(buffers.mask_host, buffers.mask_host + static_cast<size_t>(total_bins));
-      for (uint8_t& pixel : image) {
-        pixel = pixel ? 255 : 0;
+        throw std::runtime_error(std::string("power_db snapshot copy failed: ") + cudaGetErrorString(copy_result));
       }
     }
 
-    const auto path = make_mask_output_path(output_dir_.get(), channel_number, frame_number, dst_rows, dst_cols);
-    if (!write_pgm(path, image, dst_cols, dst_rows)) {
-      HOLOSCAN_LOG_ERROR("Failed to write coherent power mask image: {}", path);
-      return;
+    auto sync_result = cudaStreamSynchronize(stream);
+    if (sync_result != cudaSuccess) {
+      throw std::runtime_error(std::string("snapshot synchronization failed: ") + cudaGetErrorString(sync_result));
     }
 
-    ++masks_saved_[channel_number];
+    const auto snapshot_stem = make_debug_artifact_stem(tensor_snapshot_dir_.get(), channel_number, frame_number, src_rows, src_cols);
+    const auto tensor_path = snapshot_stem + "_tensor.npy";
+    const auto power_db_path = snapshot_stem + "_power_db.npy";
+    const auto metadata_path = snapshot_stem + ".json";
+
+    if (!write_npy_2d(tensor_path,
+                      buffers.input_tensor_host,
+                      static_cast<size_t>(total_bins) * sizeof(coherent_power_complex),
+                      src_rows,
+                      src_cols,
+                      "<c8")) {
+      throw std::runtime_error("failed to write coherent input tensor snapshot");
+    }
+
+    if (should_save_power_db_snapshot &&
+        !write_npy_2d(power_db_path,
+                      buffers.power_db_host,
+                      power_db_bytes,
+                      src_rows,
+                      src_cols,
+                      "<f4")) {
+      throw std::runtime_error("failed to write coherent power_db snapshot");
+    }
+
+    const double center_frequency_hz = static_cast<double>(meta->get<uint64_t>("center_frequency", 0));
+    std::ofstream meta_out(metadata_path, std::ios::binary);
+    if (!meta_out.is_open()) {
+      throw std::runtime_error("failed to open coherent snapshot metadata sidecar");
+    }
+    meta_out << "{\n";
+    meta_out << "  \"channel_number\": " << channel_number << ",\n";
+    meta_out << "  \"frame_number\": " << frame_number << ",\n";
+    meta_out << "  \"rows\": " << src_rows << ",\n";
+    meta_out << "  \"cols\": " << src_cols << ",\n";
+    meta_out << "  \"input_height\": " << output_rows << ",\n";
+    meta_out << "  \"input_width\": " << output_cols << ",\n";
+    meta_out << "  \"resolution_hz\": " << resolution_hz << ",\n";
+    meta_out << "  \"center_frequency_hz\": " << center_frequency_hz << ",\n";
+    meta_out << "  \"frequency_axis_calibrated\": " << json_bool(frequency_axis_calibrated) << ",\n";
+    meta_out << "  \"ignore_bins_per_side\": " << ignore_bins_per_side << ",\n";
+    meta_out << "  \"backend_mode_requested\": \"" << json_escape(backend_mode) << "\",\n";
+    meta_out << "  \"backend_mode_effective\": \"" << json_escape(coherent_backend_name) << "\",\n";
+    meta_out << "  \"pipeline_variant\": \"" << json_escape(coherent_variant_name) << "\",\n";
+    meta_out << "  \"tensor_snapshot_path\": \"" << json_escape(tensor_path) << "\",\n";
+    if (should_save_power_db_snapshot) {
+      meta_out << "  \"power_db_snapshot_path\": \"" << json_escape(power_db_path) << "\",\n";
+    } else {
+      meta_out << "  \"power_db_snapshot_path\": null,\n";
+    }
+    if (!mask_path.empty()) {
+      meta_out << "  \"mask_path\": \"" << json_escape(mask_path) << "\",\n";
+    } else {
+      meta_out << "  \"mask_path\": null,\n";
+    }
+    meta_out << "  \"config\": {\n";
+    meta_out << "    \"chunk_bandwidth_hz\": " << chunk_bandwidth_hz_.get() << ",\n";
+    meta_out << "    \"chunk_overlap_hz\": " << chunk_overlap_hz_.get() << ",\n";
+    meta_out << "    \"uncalibrated_chunk_fraction\": " << uncalibrated_chunk_fraction_.get() << ",\n";
+    meta_out << "    \"uncalibrated_overlap_fraction\": " << uncalibrated_overlap_fraction_.get() << ",\n";
+    meta_out << "    \"ignore_sideband_percent\": " << ignore_sideband_percent_.get() << ",\n";
+    meta_out << "    \"ignore_sideband_hz\": " << ignore_sideband_hz_.get() << ",\n";
+    meta_out << "    \"frontend_row_q\": " << frontend_row_q_.get() << ",\n";
+    meta_out << "    \"frontend_reference_q\": " << frontend_reference_q_.get() << ",\n";
+    meta_out << "    \"frontend_smooth_sigma\": " << frontend_smooth_sigma_.get() << ",\n";
+    meta_out << "    \"frontend_max_boost_db\": " << frontend_max_boost_db_.get() << ",\n";
+    meta_out << "    \"coherence_weight\": " << coherence_weight_.get() << ",\n";
+    meta_out << "    \"power_weight\": " << power_weight_.get() << ",\n";
+    meta_out << "    \"coherence_power_support_q\": " << coherence_power_support_q_.get() << ",\n";
+    meta_out << "    \"coherence_power_q\": " << coherence_power_q_.get() << ",\n";
+    meta_out << "    \"min_component_size\": " << min_component_size_.get() << ",\n";
+    meta_out << "    \"grouping_seed_score_q\": " << grouping_seed_score_q_.get() << ",\n";
+    meta_out << "    \"grouping_bridge_freq_px\": " << grouping_bridge_freq_px_.get() << ",\n";
+    meta_out << "    \"grouping_bridge_time_px\": " << grouping_bridge_time_px_.get() << ",\n";
+    meta_out << "    \"grouping_min_component_size\": " << grouping_min_component_size_.get() << ",\n";
+    meta_out << "    \"grouping_min_freq_span_px\": " << grouping_min_freq_span_px_.get() << ",\n";
+    meta_out << "    \"grouping_min_time_span_px\": " << grouping_min_time_span_px_.get() << ",\n";
+    meta_out << "    \"grouping_min_density\": " << grouping_min_density_.get() << ",\n";
+    meta_out << "    \"grouping_time_continuity_ratio\": " << grouping_time_continuity_ratio_.get() << "\n";
+    meta_out << "  }\n";
+    meta_out << "}\n";
+    if (!meta_out.good()) {
+      throw std::runtime_error("failed to write coherent snapshot metadata sidecar");
+    }
+
+    ++snapshots_saved_[channel_number];
     if (log_detections_.get()) {
-      HOLOSCAN_LOG_INFO("Saved coherent power mask for channel {} frame {} to {}",
+      HOLOSCAN_LOG_INFO("Saved coherent tensor snapshot for channel {} frame {} to {}",
                         channel_number,
                         frame_number,
-                        path);
+                        tensor_path);
     }
   };
 
-  time_step_ms(kMaskSaveStage, maybe_save_mask);
+  time_step_ms(kMaskSaveStage, maybe_save_debug_artifacts);
 
   stage_ms[kTotalStage] =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - total_start).count();
 
   meta->set("coherent_frame_number", frame_number);
-  meta->set("coherent_mask_height", static_cast<uint32_t>(dst_rows));
-  meta->set("coherent_mask_width", static_cast<uint32_t>(dst_cols));
+  meta->set("coherent_mask_height", static_cast<uint32_t>(output_rows));
+  meta->set("coherent_mask_width", static_cast<uint32_t>(output_cols));
   meta->set("coherent_backend", coherent_backend_name);
   meta->set("coherent_chunk_count", static_cast<uint32_t>(use_reference_backend ? pipeline_summary.subsection_count : fast_summary.subsection_count));
   meta->set("coherent_grouped_box_count", static_cast<uint32_t>(use_reference_backend ? pipeline_summary.grouped_box_count : fast_summary.grouped_box_count));

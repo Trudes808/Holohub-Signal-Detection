@@ -201,8 +201,8 @@ dinov3_signal_detector:
 
 coherent_power_signal_detector:
   num_channels: 2
-  input_height: 256
-  input_width: 512
+  input_height: 250
+  input_width: 20480
   emit_stride: 4
   log_detections: false
   backend_mode: "fast_gpu"
@@ -232,6 +232,7 @@ coherent_power_signal_detector:
   grouping_min_freq_span_px: 18
   grouping_min_time_span_px: 2
   grouping_min_density: 0.06
+  grouping_time_continuity_ratio: 0.85
   timing_summary_enable: false
   timing_summary_every_n: 64
   timing_summary_window: 64

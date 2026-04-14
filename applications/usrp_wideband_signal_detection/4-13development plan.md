@@ -151,6 +151,94 @@ These differences are expected today and should not be treated as bugs unless we
    - Decide whether `grouping_time_continuity_ratio` and notebook reject-reason diagnostics need to be surfaced in the operator.
    - Decide whether the fast path must ever emit notebook-style grouped boxes, or whether its current mask-only contract is sufficient for realtime use.
 
+## 4/14 Development Plan
+
+### Recommended Equivalence Harness
+
+The best way to prove notebook and operator equivalence is to stop comparing live runs against each other and instead compare both implementations against the exact same frozen detector input.
+
+Use a two-level golden-artifact strategy:
+
+1. golden complex tensor snapshot
+  - save the exact `tuple<tensor_t<complex, 2>, cudaStream_t>` detector input for one emitted frame before `coherent_power_power_db_kernel(...)`
+  - write it as a `.npy` complex64 array so the notebook can load it directly through the existing `tensor_npy` path
+  - this validates end-to-end parity from operator input onward, including the C++ power-to-dB conversion
+
+2. golden power-dB snapshot
+  - also save the post-kernel `power_db` frame as a float32 `.npy`
+  - use this only as a stage-isolation aid when the complex-tensor replay disagrees
+  - this lets us distinguish `complex -> power_db` drift from downstream coherent-power pipeline drift
+
+Each saved frame should include a small sidecar metadata file, for example `<stem>.json`, with at least:
+
+- `channel_number`
+- `frame_number`
+- `rows`
+- `cols`
+- `resolution_hz`
+- `center_frequency_hz` if present
+- `frequency_axis_calibrated`
+- `ignore_bins_per_side`
+- `backend_mode`
+- a full copy of the coherent detector config used for the run
+
+The metadata sidecar matters because the notebook `tensor_npy` loader currently treats tensors as uncalibrated by default, while the live operator may derive sideband-ignore behavior from `resolution`. Without this sidecar, we can accidentally compare two different problem statements.
+
+### Offline Comparison Workflow
+
+Add one explicit offline debug harness for the coherent detector rather than trying to reuse the live app for this step.
+
+Recommended flow:
+
+1. debug capture run
+  - run the normal app with a debug config that saves a bounded number of golden tensor snapshots, power-dB snapshots, final masks, and sidecar metadata
+  - keep this path off by default and enable it only with a dedicated config such as `config_coherent_power_debug_capture.yaml`
+
+2. notebook replay
+  - load the saved complex tensor snapshot in the notebook using the existing `tensor_npy` input path
+  - override the notebook config from the sidecar metadata so the notebook uses the same detector parameters and calibrated-vs-uncalibrated assumptions as the operator run
+  - save intermediate artifacts for the frozen frame: corrected spectrogram, chunk plan, chunk score maps, grouped boxes, merged score map, merged boxes, and final mask
+
+3. offline C++ replay
+  - add a small offline coherent-power replay executable or debug mode that loads the same saved snapshot and metadata without DPDK, networking, or scheduler noise
+  - route that snapshot through the reference backend only
+  - emit the same intermediate artifacts and printouts as the notebook-facing comparison set
+
+4. compare artifacts in tiers
+  - tier 1: `power_db`
+  - tier 2: frontend correction outputs (`row_floor`, smoothed response, reference level, boost profile, corrected spectrogram)
+  - tier 3: chunk plan and per-chunk thresholds
+  - tier 4: per-chunk masks and grouped boxes
+  - tier 5: merged score map, merged boxes, and final binary mask
+
+This tiered comparison is better than only comparing final masks because it tells us where the pipelines diverge instead of merely telling us that they diverged.
+
+### Practical Implementation Notes
+
+For this repo, the most useful first increment is:
+
+- add `enable_tensor_snapshot_save`, `tensor_snapshot_dir`, `save_power_db_snapshot`, and `max_snapshots_per_channel` to `coherent_power_signal_detector`
+- save the complex tensor snapshot before `coherent_power_power_db_kernel(...)`
+- save the float32 `power_db` snapshot immediately after the kernel in reference/debug runs
+- write a JSON sidecar next to each saved snapshot
+- add a notebook cell path that loads a snapshot directory entry instead of a generic `.pgm`
+- add an offline C++ reference replay target that prints stage scalars and optionally writes `.npy` or `.png` debug artifacts
+
+The operator should remain responsible only for bounded snapshot capture during a live debug run. The detailed printouts, plots, and artifact comparison should happen in the notebook replay path and the offline C++ replay path, where determinism is much higher and iteration is much faster.
+
+### Acceptance Criteria For Equivalence
+
+Treat notebook and offline C++ reference replay as equivalent when, for the same frozen snapshot and config:
+
+- `power_db` matches within a small floating-point tolerance
+- frontend correction outputs match within tolerance
+- chunk boundaries are identical
+- per-chunk thresholds differ only within tolerance
+- grouped boxes match exactly or differ only by an agreed one-pixel boundary tolerance
+- final merged mask has near-perfect overlap, with any residual mismatch explained by a known numeric tolerance rather than unexplained algorithm drift
+
+Only after the frozen-snapshot reference paths agree should we compare the fast GPU backend against the reference path for usefulness rather than exact parity.
+
 ## What The Notebook Actually Does
 
 The notebook implementation is not a simple threshold. Its coherent-power pipeline is:

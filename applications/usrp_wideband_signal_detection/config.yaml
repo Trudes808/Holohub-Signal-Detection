@@ -132,7 +132,7 @@ logger:
   log_interval: 1
 
 visualization:
-  enable: false
+  enable: true
   renderer:
     num_channels: 2
     history_frames: 5

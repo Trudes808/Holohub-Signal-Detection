@@ -12,6 +12,8 @@ CONTAINER_NAME=${CONTAINER_NAME:-usrp_x410_signal_detection_demo}
 HUGEPAGES_DIR=${HUGEPAGES_DIR:-/dev/hugepages}
 SPECTROGRAM_HOST_DIR=${SPECTROGRAM_HOST_DIR:-/tmp/usrp_spectrograms}
 DINO_MASK_HOST_DIR=${DINO_MASK_HOST_DIR:-/tmp/usrp_dino_masks}
+COHERENT_SNAPSHOT_HOST_DIR=${COHERENT_SNAPSHOT_HOST_DIR:-/tmp/coherent_power_snapshots}
+COHERENT_MASK_HOST_DIR=${COHERENT_MASK_HOST_DIR:-/tmp/coherent_power_masks}
 HOST_DINOV3_ROOT=${HOST_DINOV3_ROOT:-${WORKSPACE_ROOT}/dinov3}
 HOST_WEIGHT_PATH=${HOST_WEIGHT_PATH:-${HOST_DINOV3_ROOT}/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth}
 CONTAINER_DINOV3_ROOT=${CONTAINER_DINOV3_ROOT:-/workspace/models/dinov3}
@@ -91,7 +93,7 @@ if [[ ! -f "${HOST_WEIGHT_PATH}" ]]; then
 	exit 1
 fi
 
-mkdir -p "${SPECTROGRAM_HOST_DIR}" "${DINO_MASK_HOST_DIR}"
+mkdir -p "${SPECTROGRAM_HOST_DIR}" "${DINO_MASK_HOST_DIR}" "${COHERENT_SNAPSHOT_HOST_DIR}" "${COHERENT_MASK_HOST_DIR}"
 
 if [[ "${SKIP_IMAGE_BUILD}" != "1" ]]; then
 	sudo ./holohub build-container "${APP_NAME}" --docker-file "${DOCKER_FILE}" --img "${IMAGE_NAME}" "$@"
@@ -110,6 +112,8 @@ DOCKER_RUN_CMD=(
 	-v "${REPO_ROOT}:/workspace/holohub" \
 	-v "${SPECTROGRAM_HOST_DIR}:/workspace/spectrograms" \
 	-v "${DINO_MASK_HOST_DIR}:/workspace/dino_masks" \
+	-v "${COHERENT_SNAPSHOT_HOST_DIR}:/workspace/coherent_power_snapshots" \
+	-v "${COHERENT_MASK_HOST_DIR}:/workspace/coherent_power_masks" \
 	-v /dev:/dev \
 	-v "${HUGEPAGES_DIR}:/dev/hugepages" \
 	-w /workspace/holohub \
@@ -147,6 +151,8 @@ DOCKER_RUN_CMD+=(
 echo "Started container ${CONTAINER_NAME} from image ${IMAGE_NAME}."
 echo "Host spectrogram output: ${SPECTROGRAM_HOST_DIR}"
 echo "Host DINO mask output: ${DINO_MASK_HOST_DIR}"
+echo "Host coherent snapshot output: ${COHERENT_SNAPSHOT_HOST_DIR}"
+echo "Host coherent mask output: ${COHERENT_MASK_HOST_DIR}"
 
 sudo docker exec "${CONTAINER_NAME}" rm -rf "${CONTAINER_DINOV3_ROOT}"
 sudo docker exec "${CONTAINER_NAME}" mkdir -p "${CONTAINER_DINOV3_ROOT}/weights"

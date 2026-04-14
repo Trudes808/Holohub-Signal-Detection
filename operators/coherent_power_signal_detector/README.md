@@ -28,9 +28,13 @@ coherent_power_signal_detector:
   emit_stride: 1
   log_detections: false
   enable_mask_save: false
+  enable_tensor_snapshot_save: false
   save_every_n_frames: 1
   max_masks_per_channel: 5
+  max_snapshots_per_channel: 2
   output_dir: "/workspace/coherent_power_masks"
+  tensor_snapshot_dir: "/workspace/coherent_power_snapshots"
+  save_power_db_snapshot: true
   chunk_bandwidth_hz: 25000000.0
   chunk_overlap_hz: 6250000.0
   uncalibrated_chunk_fraction: 0.40

@@ -16,6 +16,56 @@ namespace holoscan::ops {
 using coherent_power_complex = cuda::std::complex<float>;
 using coherent_power_in_t = std::tuple<matx::tensor_t<coherent_power_complex, 2>, cudaStream_t>;
 
+struct CoherentPowerReferenceConfig {
+  int input_height = 256;
+  int input_width = 512;
+  double chunk_bandwidth_hz = 25.0e6;
+  double chunk_overlap_hz = 6.25e6;
+  double uncalibrated_chunk_fraction = 0.40;
+  double uncalibrated_overlap_fraction = 0.20;
+  double ignore_sideband_percent = 0.0;
+  double ignore_sideband_hz = 7.0e6;
+  double frontend_row_q = 25.0;
+  double frontend_reference_q = 75.0;
+  double frontend_smooth_sigma = 12.0;
+  double frontend_max_boost_db = 12.0;
+  double coherence_weight = 0.55;
+  double power_weight = 0.45;
+  double coherence_power_support_q = 0.82;
+  double coherence_power_q = 0.92;
+  int min_component_size = 6;
+  double grouping_seed_score_q = 0.72;
+  int grouping_bridge_freq_px = 33;
+  int grouping_bridge_time_px = 5;
+  int grouping_min_component_size = 24;
+  int grouping_min_freq_span_px = 18;
+  int grouping_min_time_span_px = 2;
+  double grouping_min_density = 0.06;
+  double grouping_time_continuity_ratio = 0.85;
+};
+
+struct CoherentPowerReferenceResult {
+  int src_rows = 0;
+  int src_cols = 0;
+  int dst_rows = 0;
+  int dst_cols = 0;
+  bool frequency_axis_calibrated = false;
+  int ignore_bins_per_side = 0;
+  int grouped_box_count = 0;
+  float merged_threshold = 0.0f;
+  float seed_threshold = 0.0f;
+  std::vector<float> power_db;
+  std::vector<float> corrected_sxx_db;
+  std::vector<float> final_mask;
+};
+
+CoherentPowerReferenceResult run_coherent_power_reference_validation(
+    const std::vector<coherent_power_complex>& input_tensor,
+    int src_rows,
+    int src_cols,
+    double resolution_hz,
+    const CoherentPowerReferenceConfig& config);
+
 class CoherentPowerSignalDetector : public holoscan::Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(CoherentPowerSignalDetector)
@@ -33,6 +83,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
 
  private:
   struct ChannelBuffers {
+    coherent_power_complex* input_tensor_host = nullptr;
     float* power_db_device = nullptr;
     float* corrected_db_device = nullptr;
     float* time_mean_device = nullptr;
@@ -66,9 +117,13 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<bool> log_detections_;
   holoscan::Parameter<std::string> backend_mode_;
   holoscan::Parameter<bool> enable_mask_save_;
+  holoscan::Parameter<bool> enable_tensor_snapshot_save_;
   holoscan::Parameter<int> save_every_n_frames_;
   holoscan::Parameter<int> max_masks_per_channel_;
+  holoscan::Parameter<int> max_snapshots_per_channel_;
   holoscan::Parameter<std::string> output_dir_;
+  holoscan::Parameter<std::string> tensor_snapshot_dir_;
+  holoscan::Parameter<bool> save_power_db_snapshot_;
   holoscan::Parameter<double> chunk_bandwidth_hz_;
   holoscan::Parameter<double> chunk_overlap_hz_;
   holoscan::Parameter<double> uncalibrated_chunk_fraction_;
@@ -101,12 +156,14 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<int> grouping_min_freq_span_px_;
   holoscan::Parameter<int> grouping_min_time_span_px_;
   holoscan::Parameter<double> grouping_min_density_;
+  holoscan::Parameter<double> grouping_time_continuity_ratio_;
   holoscan::Parameter<bool> timing_summary_enable_;
   holoscan::Parameter<int> timing_summary_every_n_;
   holoscan::Parameter<int> timing_summary_window_;
 
   std::vector<uint64_t> frame_count_;
   std::vector<int> masks_saved_;
+  std::vector<int> snapshots_saved_;
   std::vector<ChannelTimingStats> timing_stats_;
   std::vector<ChannelBuffers> channel_buffers_;
 };

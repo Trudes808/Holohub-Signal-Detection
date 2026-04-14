@@ -18,10 +18,10 @@ add_library(coherent_power_signal_detector
 )
 
 add_library(holoscan::ops::coherent_power_signal_detector ALIAS coherent_power_signal_detector)
-target_include_directories(coherent_power_signal_detector INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(coherent_power_signal_detector PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(coherent_power_signal_detector
-  PRIVATE
+  PUBLIC
     CUDA::cudart
     holoscan::core
     matx::matx

@@ -204,6 +204,30 @@ cd applications/usrp_wideband_signal_detection
 CONFIG_NAME=config_coherent_power_validation.yaml ./run_coherent_power_performance.sh
 ```
 
+To capture frozen coherent-power validation artifacts for notebook and offline replay:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+CONFIG_NAME=config_coherent_power_debug_capture.yaml ./run_coherent_power_performance.sh
+```
+
+That debug profile keeps the coherent detector on the notebook-faithful reference backend and saves a bounded set of:
+
+- final mask images
+- complex input tensor snapshots
+- optional `power_db` snapshots
+- JSON sidecars containing the detector config and frame metadata
+
+After a capture run, validate one frozen snapshot offline with the standalone C++ validator:
+
+```bash
+./offline_coherent_power_validator --snapshot-json /path/to/coherent_power_snapshot_ch0_f1_<timestamp>_<rows>x<cols>.json --verbose
+```
+
+The validator writes replay artifacts under `validator_artifacts/` next to the snapshot sidecar, including `offline_power_db.npy`, `offline_corrected_sxx_db.npy`, `offline_final_mask.npy`, preview `.pgm` images, and `offline_validation_summary.json`.
+
+The matching notebook replay path now lives in [dinov3/notebooks/coherant_power_signal_detector_validation.ipynb](dinov3/notebooks/coherant_power_signal_detector_validation.ipynb). Use that notebook to load the same snapshot sidecar, replay the Python reference pipeline, and compare the notebook outputs against the offline C++ validator on the exact same frozen input.
+
 For the staged bottleneck-isolation passes, reuse the same helper with `CONFIG_NAME`:
 
 ```bash
@@ -220,7 +244,7 @@ cd applications/usrp_wideband_signal_detection
 FORCE_REBUILD=1 ./rebuild_demo_container_app.sh
 ```
 
-`rebuild_demo_container_app.sh` now also tracks `coherent_power_signal_detector` directly in its dry-run target set, so operator-only source edits trigger the same rebuild path instead of relying on the app binary target alone.
+`rebuild_demo_container_app.sh` now also tracks `coherent_power_signal_detector` and `offline_coherent_power_validator` directly in its dry-run target set, and then explicitly builds those auxiliary targets after the main app configure/build step. That keeps operator-only and offline-validator edits from being skipped just because the app binary itself was already current.
 
 ## Visualization
 
@@ -297,6 +321,7 @@ The next visualization step is to add a detector overlay postprocessor that emit
 ## Validation Notes
 
 - `config.yaml` is now the stable debug run configuration. It intentionally keeps `inference_backend: "pytorch_placeholder"` while saving the first 5 spectrograms and detector masks per channel.
+- `config_coherent_power_debug_capture.yaml` is the coherent-power frozen-input capture profile. It enables tensor snapshot saves, optional `power_db` snapshot saves, and final mask saves so notebook and offline C++ parity checks can run on the exact same detector input.
 - `config_cuda_fallback.yaml` is the debug configuration for the pure C++/CUDA detector path. It disables the PyTorch backend in operator logic and uses `cuda_threshold_fallback` while keeping artifact saves enabled.
 - `config_torchscript_validation.yaml` is the strict TorchScript bring-up configuration. Use it when you want the C++ TorchScript path to fail loudly.
 - `config_torchscript_performance.yaml` is the low-overhead throughput configuration for two-channel rate testing. It keeps the real TorchScript detector path but disables artifact saves, detailed detection logs, and timing summaries.
