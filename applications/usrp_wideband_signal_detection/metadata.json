@@ -10,7 +10,8 @@
         "language": "C++",
         "version": "0.1.0",
         "changelog": {
-            "0.1.0": "Initial C++ application scaffold with spectrogram + DINOv3 signal detector flow"
+            "0.1.0": "Initial C++ application scaffold with spectrogram + DINOv3 signal detector flow",
+            "0.2.0": "Added selectable coherent-power detector scaffolding alongside the existing DINOv3 path"
         },
         "holoscan_sdk": {
             "minimum_required_version": "3.5.0",
@@ -23,13 +24,14 @@
             ]
         },
         "platforms": ["x86_64"],
-        "tags": ["USRP", "SDR", "DINOv3", "Signal Detection"],
+        "tags": ["USRP", "SDR", "DINOv3", "Coherent Power", "Signal Detection"],
         "ranking": 4,
         "dependencies": {
             "operators": [
                 "fft",
                 "spectrogram",
-                "dinov3_signal_detector"
+                "dinov3_signal_detector",
+                "coherent_power_signal_detector"
             ],
             "libraries": [{
               "name": "MatX",

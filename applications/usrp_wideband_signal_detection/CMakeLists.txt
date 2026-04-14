@@ -97,6 +97,7 @@ add_executable(usrp_wideband_signal_detection
 target_link_libraries(usrp_wideband_signal_detection
   PRIVATE
   matx::matx
+  holoscan::ops::coherent_power_signal_detector
   CUDA::cudart
   holoscan::core
   holoscan::advanced_network

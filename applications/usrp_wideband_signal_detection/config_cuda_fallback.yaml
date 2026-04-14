@@ -3,6 +3,12 @@
 ---
 num_runs: -1
 
+pipeline:
+  enable_spectrogram: true
+  enable_detector: true
+  detector_type: "dinov3"
+  log_from_spectrogram: false
+
 scheduler:
   worker_thread_number: 4
   stop_on_deadlock: true
@@ -186,6 +192,42 @@ dinov3_signal_detector:
   pipeline_strong_speckle_min_component: 10
   pipeline_texture_speckle_clean_threshold: 0.85
   pipeline_texture_speckle_strong_threshold: 0.20
+  timing_summary_enable: true
+  timing_summary_every_n: 4
+  timing_summary_window: 4
+
+coherent_power_signal_detector:
+  num_channels: 2
+  input_height: 256
+  input_width: 512
+  emit_stride: 1
+  log_detections: false
+  enable_mask_save: true
+  save_every_n_frames: 1
+  max_masks_per_channel: 5
+  output_dir: "/workspace/coherent_power_masks"
+  chunk_bandwidth_hz: 25000000.0
+  chunk_overlap_hz: 6250000.0
+  uncalibrated_chunk_fraction: 0.40
+  uncalibrated_overlap_fraction: 0.20
+  ignore_sideband_percent: 0.0
+  ignore_sideband_hz: 7000000.0
+  frontend_row_q: 25.0
+  frontend_reference_q: 75.0
+  frontend_smooth_sigma: 12.0
+  frontend_max_boost_db: 12.0
+  coherence_weight: 0.55
+  power_weight: 0.45
+  coherence_power_support_q: 0.82
+  coherence_power_q: 0.92
+  min_component_size: 6
+  grouping_seed_score_q: 0.72
+  grouping_bridge_freq_px: 33
+  grouping_bridge_time_px: 5
+  grouping_min_component_size: 24
+  grouping_min_freq_span_px: 18
+  grouping_min_time_span_px: 2
+  grouping_min_density: 0.06
   timing_summary_enable: true
   timing_summary_every_n: 4
   timing_summary_window: 4

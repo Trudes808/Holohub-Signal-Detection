@@ -2,11 +2,11 @@
 
 ## Overview
 
-This application mirrors the high-rate USRP ingest path and adds the new DINOv3 signal detector stage.
+This application mirrors the high-rate USRP ingest path and supports selectable detector stages.
 
 Flow:
 
-`chdrConverterOp -> fftOp -> spectrogramOp -> dinoV3SignalDetectorOp`
+`chdrConverterOp -> fftOp -> spectrogramOp -> detectorOp`
 
 A side logger branch is kept from `fftOp` for throughput visibility.
 
@@ -15,9 +15,19 @@ The app now supports pipeline-isolation modes through config:
 - `pipeline.enable_spectrogram`
 	- bypasses `spectrogramOp` entirely when false
 - `pipeline.enable_detector`
-	- bypasses `dinoV3SignalDetectorOp` entirely when false
+	- bypasses the detector operator entirely when false
+- `pipeline.detector_type`
+	- selects `dinov3` or `coherent_power` at graph construction time
 - `pipeline.log_from_spectrogram`
 	- switches the throughput logger to the post-spectrogram path when true
+
+Current detector choices:
+
+- `dinov3`
+	- existing notebook-aligned DINOv3 path with TorchScript and CUDA fallback modes
+- `coherent_power`
+	- new coherent-power detector scaffold derived from `coherant_power_signal_detection.ipynb`
+	- current state is plumbing-complete but algorithmically still a placeholder CUDA mask path until notebook stages are ported fully
 
 The current runtime target is the Holohub development container. The local DINOv3 source of truth lives outside the container and must be staged into the container runtime tree before model-forward validation:
 

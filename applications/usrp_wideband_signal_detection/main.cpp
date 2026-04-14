@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../usrp_freq_detection/CHDR_converter/chdr_rx.h"
 #include "spectrogram_visualization.hpp"
+#include <coherent_power_signal_detector.hpp>
 #include <dinov3_signal_detector.hpp>
 #include <fft.hpp>
 #include <holoscan/operators/holoviz/holoviz.hpp>
@@ -124,6 +125,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     const bool enable_spectrogram = from_config("pipeline.enable_spectrogram").as<bool>();
     const bool enable_detector = from_config("pipeline.enable_detector").as<bool>();
+    const std::string detector_type = from_config("pipeline.detector_type").as<std::string>();
     const bool log_from_spectrogram = from_config("pipeline.log_from_spectrogram").as<bool>();
 
     if (enable_detector && !enable_spectrogram) {
@@ -131,15 +133,26 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       exit(1);
     }
 
+    if (enable_detector && detector_type != "dinov3" && detector_type != "coherent_power") {
+      HOLOSCAN_LOG_ERROR("Unsupported pipeline.detector_type='{}'. Expected 'dinov3' or 'coherent_power'.",
+                         detector_type);
+      exit(1);
+    }
+
     std::shared_ptr<holoscan::Operator> spectrogramOp;
-    std::shared_ptr<holoscan::Operator> dinoV3SignalDetectorOp;
+    std::shared_ptr<holoscan::Operator> detectorOp;
     if (enable_spectrogram) {
       spectrogramOp = make_operator<ops::Spectrogram>("spectrogramOp", from_config("spectrogram"));
     }
     if (enable_detector) {
-      dinoV3SignalDetectorOp = make_operator<ops::DinoV3SignalDetector>(
-          "dinoV3SignalDetectorOp",
-          from_config("dinov3_signal_detector"));
+      if (detector_type == "dinov3") {
+        detectorOp = make_operator<ops::DinoV3SignalDetector>("dinoV3SignalDetectorOp",
+                                                               from_config("dinov3_signal_detector"));
+      } else {
+        detectorOp = make_operator<ops::CoherentPowerSignalDetector>(
+            "coherentPowerSignalDetectorOp",
+            from_config("coherent_power_signal_detector"));
+      }
     }
 
     const bool enable_visualization = from_config("visualization.enable").as<bool>();
@@ -171,7 +184,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       add_operator(spectrogramOp);
     }
     if (enable_detector) {
-      add_operator(dinoV3SignalDetectorOp);
+      add_operator(detectorOp);
     }
     if (enable_visualization) {
       add_operator(spectrogramVisualizerOp);
@@ -184,7 +197,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       add_flow(fftOp, spectrogramOp);
     }
     if (enable_detector) {
-      add_flow(spectrogramOp, dinoV3SignalDetectorOp);
+      add_flow(spectrogramOp, detectorOp);
     }
     if (enable_visualization) {
       add_flow(spectrogramOp, spectrogramVisualizerOp);
