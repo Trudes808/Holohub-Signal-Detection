@@ -176,6 +176,8 @@ endforeach()
 
   set(USRP_WIDEBAND_CONFIG_FILES
     config.yaml
+    config_coherent_power_performance.yaml
+    config_coherent_power_validation.yaml
     config_offline_replay.yaml
     config_cuda_fallback.yaml
     config_torchscript_performance.yaml

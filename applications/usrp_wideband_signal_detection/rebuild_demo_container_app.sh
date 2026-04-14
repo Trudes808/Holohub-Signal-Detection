@@ -32,9 +32,9 @@ PY'
 
 build_targets() {
   if torch_available_in_container >/dev/null 2>&1; then
-    echo "${APP_NAME} ${VISUALIZER_NAME} dinov3_signal_detector dinov3_libtorch_sandbox"
+    echo "${APP_NAME} ${VISUALIZER_NAME} coherent_power_signal_detector dinov3_signal_detector dinov3_libtorch_sandbox"
   else
-    echo "${APP_NAME} ${VISUALIZER_NAME}"
+    echo "${APP_NAME} ${VISUALIZER_NAME} coherent_power_signal_detector"
   fi
 }
 

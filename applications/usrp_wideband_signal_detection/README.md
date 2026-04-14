@@ -176,6 +176,20 @@ cd applications/usrp_wideband_signal_detection
 ./run_torchscript_performance_test.sh
 ```
 
+For the two-channel coherent-power real-time path with the coherent detector selected and debug outputs disabled:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+./run_coherent_power_performance.sh
+```
+
+To run the coherent detector with an explicit config through the same sudo/docker flow:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+CONFIG_NAME=config_coherent_power_validation.yaml ./run_coherent_power_performance.sh
+```
+
 For the staged bottleneck-isolation passes, reuse the same helper with `CONFIG_NAME`:
 
 ```bash
@@ -191,6 +205,8 @@ If you need to force a rebuild even when the targets look current:
 cd applications/usrp_wideband_signal_detection
 FORCE_REBUILD=1 ./rebuild_demo_container_app.sh
 ```
+
+`rebuild_demo_container_app.sh` now also tracks `coherent_power_signal_detector` directly in its dry-run target set, so operator-only source edits trigger the same rebuild path instead of relying on the app binary target alone.
 
 ## Visualization
 

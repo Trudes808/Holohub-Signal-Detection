@@ -1035,6 +1035,7 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                        double chunk_overlap_hz,
                                        double uncalibrated_chunk_fraction,
                                        double uncalibrated_overlap_fraction,
+                                       double ignore_sideband_percent,
                                        double frontend_row_q,
                                        double frontend_reference_q,
                                        double frontend_smooth_sigma,
@@ -1052,6 +1053,10 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                        int grouping_min_time_span_px,
                                        double grouping_min_density) {
   PipelineSummary summary;
+  if (resolution_hz <= 0.0 && ignore_bins_per_side == 0 && ignore_sideband_percent > 0.0) {
+    ignore_bins_per_side = static_cast<int>(std::floor(static_cast<double>(src_rows) * ignore_sideband_percent / 100.0));
+    ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
+  }
   summary.ignore_bins_per_side = ignore_bins_per_side;
 
   std::vector<uint8_t> valid_row_mask(static_cast<size_t>(src_rows), 1);
@@ -1219,29 +1224,6 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
   }
   return summary;
 }
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = dst_rows * dst_cols;
-  if (idx >= total) {
-    return;
-  }
-
-  const int r = idx / dst_cols;
-  const int c = idx % dst_cols;
-  const int src_r = min((r * src_rows) / dst_rows, src_rows - 1);
-  const int src_c = min((c * src_cols) / dst_cols, src_cols - 1);
-
-  if (src_r < ignore_bins_per_side || src_r >= max(src_rows - ignore_bins_per_side, 0)) {
-    output[idx] = 0.0f;
-    return;
-  }
-
-  const auto value = input[src_r * src_cols + src_c];
-  const float re = value.real();
-  const float im = value.imag();
-  const float power = re * re + im * im + 1e-12f;
-  const float power_db = 10.0f * log10f(power);
-  output[idx] = power_db >= threshold_db ? 1.0f : 0.0f;
-}
 
 }  // namespace
 
@@ -1251,6 +1233,12 @@ CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
   for (float*& buffer : power_db_device_buffers_) {
     if (buffer != nullptr) {
       cudaFree(buffer);
+      buffer = nullptr;
+    }
+  }
+  for (float*& buffer : power_db_host_buffers_) {
+    if (buffer != nullptr) {
+      cudaFreeHost(buffer);
       buffer = nullptr;
     }
   }
@@ -1303,10 +1291,8 @@ void CoherentPowerSignalDetector::initialize() {
   timing_stats_.assign(num_channels_.get(), ChannelTimingStats {});
   power_db_device_buffers_.assign(num_channels_.get(), nullptr);
   power_db_device_buffer_sizes_.assign(num_channels_.get(), 0);
-
-  matx::make_tensor(detection_masks_,
-                    {num_channels_.get(), input_height_.get(), input_width_.get()},
-                    MATX_DEVICE_MEMORY);
+  power_db_host_buffers_.assign(num_channels_.get(), nullptr);
+  power_db_host_buffer_sizes_.assign(num_channels_.get(), 0);
 
   if (enable_mask_save_.get()) {
     std::filesystem::create_directories(output_dir_.get());
@@ -1367,29 +1353,33 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
   };
 
-  auto out = matx::slice<2>(detection_masks_,
-                            {static_cast<matx::index_t>(channel_number), 0, 0},
-                            {matxDropDim, matxEnd, matxEnd});
-
   int ignore_bins_per_side = 0;
   const double resolution_hz = static_cast<double>(meta->get<uint64_t>("resolution", 0));
   if (resolution_hz > 0.0 && ignore_sideband_hz_.get() > 0.0) {
     ignore_bins_per_side = static_cast<int>(std::ceil(ignore_sideband_hz_.get() / resolution_hz));
     ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
+  } else if (resolution_hz <= 0.0 && ignore_sideband_percent_.get() > 0.0) {
+    ignore_bins_per_side = static_cast<int>(std::floor(static_cast<double>(src_rows) * ignore_sideband_percent_.get() / 100.0));
+    ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
   }
-
-  time_step_ms(kInputStage, [&] {
-    auto clear_result = cudaMemsetAsync(out.Data(),
-                                        0,
-                                        static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols) * sizeof(float),
-                                        stream);
-    if (clear_result != cudaSuccess) {
-      throw std::runtime_error(std::string("cudaMemsetAsync failed: ") + cudaGetErrorString(clear_result));
-    }
-  });
 
   const int total_bins = src_rows * src_cols;
   const size_t power_db_bytes = static_cast<size_t>(total_bins) * sizeof(float);
+
+  time_step_ms(kInputStage, [&] {
+    if (power_db_host_buffer_sizes_[channel_number] != static_cast<size_t>(total_bins)) {
+      if (power_db_host_buffers_[channel_number] != nullptr) {
+        cudaFreeHost(power_db_host_buffers_[channel_number]);
+        power_db_host_buffers_[channel_number] = nullptr;
+      }
+      auto alloc_result = cudaMallocHost(reinterpret_cast<void**>(&power_db_host_buffers_[channel_number]), power_db_bytes);
+      if (alloc_result != cudaSuccess) {
+        throw std::runtime_error(std::string("power_db host buffer allocation failed: ") + cudaGetErrorString(alloc_result));
+      }
+      power_db_host_buffer_sizes_[channel_number] = static_cast<size_t>(total_bins);
+    }
+  });
+
   if (power_db_device_buffer_sizes_[channel_number] != static_cast<size_t>(total_bins)) {
     if (power_db_device_buffers_[channel_number] != nullptr) {
       cudaFree(power_db_device_buffers_[channel_number]);
@@ -1417,8 +1407,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
   PipelineSummary pipeline_summary;
   time_step_ms(kHostPipelineStage, [&] {
-    std::vector<float> host_power_db(static_cast<size_t>(total_bins), 0.0f);
-    auto copy_result = cudaMemcpyAsync(host_power_db.data(),
+    auto copy_result = cudaMemcpyAsync(power_db_host_buffers_[channel_number],
                                        power_db_device_buffers_[channel_number],
                                        power_db_bytes,
                                        cudaMemcpyDeviceToHost,
@@ -1430,6 +1419,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     if (sync_result != cudaSuccess) {
       throw std::runtime_error(std::string("power_db synchronization failed: ") + cudaGetErrorString(sync_result));
     }
+    std::vector<float> host_power_db(power_db_host_buffers_[channel_number],
+                                     power_db_host_buffers_[channel_number] + static_cast<size_t>(total_bins));
     pipeline_summary = run_reference_pipeline(host_power_db,
                                               src_rows,
                                               src_cols,
@@ -1441,6 +1432,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                               chunk_overlap_hz_.get(),
                                               uncalibrated_chunk_fraction_.get(),
                                               uncalibrated_overlap_fraction_.get(),
+                                              ignore_sideband_percent_.get(),
                                               frontend_row_q_.get(),
                                               frontend_reference_q_.get(),
                                               frontend_smooth_sigma_.get(),
@@ -1459,17 +1451,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                               grouping_min_density_.get());
   });
 
-  time_step_ms(kDeviceCopyStage, [&] {
-    const size_t output_bytes = static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols) * sizeof(float);
-    auto copy_result = cudaMemcpyAsync(out.Data(),
-                                       pipeline_summary.final_mask.data(),
-                                       output_bytes,
-                                       cudaMemcpyHostToDevice,
-                                       stream);
-    if (copy_result != cudaSuccess) {
-      throw std::runtime_error(std::string("final mask host-to-device copy failed: ") + cudaGetErrorString(copy_result));
-    }
-  });
+  stage_ms[kDeviceCopyStage] = 0.0;
 
   auto maybe_save_mask = [&] {
     if (!enable_mask_save_.get()) {
@@ -1483,23 +1465,9 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       return;
     }
 
-    std::vector<float> host_mask(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols), 0.0f);
-    const size_t output_bytes = host_mask.size() * sizeof(float);
-    auto copy_result = cudaMemcpyAsync(host_mask.data(), out.Data(), output_bytes, cudaMemcpyDeviceToHost, stream);
-    if (copy_result != cudaSuccess) {
-      HOLOSCAN_LOG_ERROR("Coherent power mask cudaMemcpyAsync failed: {}", cudaGetErrorString(copy_result));
-      return;
-    }
-
-    auto sync_result = cudaStreamSynchronize(stream);
-    if (sync_result != cudaSuccess) {
-      HOLOSCAN_LOG_ERROR("Coherent power mask cudaStreamSynchronize failed: {}", cudaGetErrorString(sync_result));
-      return;
-    }
-
-    std::vector<uint8_t> image(host_mask.size(), 0);
-    for (size_t idx = 0; idx < host_mask.size(); ++idx) {
-      image[idx] = host_mask[idx] > 0.5f ? 255 : 0;
+    std::vector<uint8_t> image(pipeline_summary.final_mask.size(), 0);
+    for (size_t idx = 0; idx < pipeline_summary.final_mask.size(); ++idx) {
+      image[idx] = pipeline_summary.final_mask[idx] > 0.5f ? 255 : 0;
     }
 
     const auto path = make_mask_output_path(output_dir_.get(), channel_number, frame_number, dst_rows, dst_cols);

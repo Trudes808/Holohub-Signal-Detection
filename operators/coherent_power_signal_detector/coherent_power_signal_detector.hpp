@@ -76,9 +76,10 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   std::vector<uint64_t> frame_count_;
   std::vector<int> masks_saved_;
   std::vector<ChannelTimingStats> timing_stats_;
-  matx::tensor_t<float, 3> detection_masks_;
   std::vector<float*> power_db_device_buffers_;
   std::vector<size_t> power_db_device_buffer_sizes_;
+  std::vector<float*> power_db_host_buffers_;
+  std::vector<size_t> power_db_host_buffer_sizes_;
 };
 
 }  // namespace holoscan::ops
