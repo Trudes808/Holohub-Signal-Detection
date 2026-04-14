@@ -115,6 +115,11 @@ Default host-side debug outputs:
 
 Run this once when bringing the app up on a new machine or when recreating the container from scratch:
 
+Clone dinoV3 
+```bash
+git clone https://github.com/facebookresearch/dinov3
+```
+
 ```bash
 cd applications/usrp_wideband_signal_detection
 ./build_demo_container.sh
