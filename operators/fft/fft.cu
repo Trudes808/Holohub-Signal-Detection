@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "fft.hpp"
 
+#include <cmath>
+
 using in_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
 using out_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
 
@@ -101,14 +103,39 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
         meta->set("window_time_delta_interpretation", window_time.get());
     if (window_type.has_value())
         meta->set("window_type", window_type.get());
+    const uint32_t transform_count = transform_points.has_value() ? transform_points.get()
+                                                                  : static_cast<uint32_t>(out.Size(1));
     if (transform_points.has_value())
-        meta->set("num_transform_points", transform_points.get());
+        meta->set("num_transform_points", transform_count);
     if (window_points.has_value())
         meta->set("num_window_points", window_points.get());
-    if (resolution.has_value())
-        meta->set("resolution", resolution.get());
-    if (span.has_value())
-        meta->set("span", span.get());
+    double derived_span_hz = 0.0;
+    if (meta->has_key("sample_rate_hz")) {
+        derived_span_hz = meta->get<double>("sample_rate_hz");
+    } else if (meta->has_key("bandwidth_hz")) {
+        derived_span_hz = meta->get<double>("bandwidth_hz");
+    } else if (span.has_value()) {
+        derived_span_hz = static_cast<double>(span.get());
+    }
+    if (!std::isfinite(derived_span_hz) || derived_span_hz <= 0.0) {
+        derived_span_hz = 0.0;
+    }
+
+    uint64_t metadata_span_hz = span.has_value() ? span.get() : 0;
+    if (derived_span_hz > 0.0) {
+        metadata_span_hz = static_cast<uint64_t>(std::llround(derived_span_hz));
+    }
+    if (metadata_span_hz > 0) {
+        meta->set("span", metadata_span_hz);
+    }
+
+    uint64_t metadata_resolution_hz = resolution.has_value() ? resolution.get() : 0;
+    if (derived_span_hz > 0.0 && transform_count > 0) {
+        metadata_resolution_hz = static_cast<uint64_t>(std::llround(derived_span_hz / static_cast<double>(transform_count)));
+    }
+    if (metadata_resolution_hz > 0) {
+        meta->set("resolution", metadata_resolution_hz);
+    }
     if (weighting_factor.has_value())
         meta->set("weighting_factor", weighting_factor.get());
     if (f1_index.has_value())

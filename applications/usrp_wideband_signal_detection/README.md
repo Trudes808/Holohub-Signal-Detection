@@ -246,6 +246,8 @@ FORCE_REBUILD=1 ./rebuild_demo_container_app.sh
 
 `rebuild_demo_container_app.sh` now also tracks `coherent_power_signal_detector` and `offline_coherent_power_validator` directly in its dry-run target set, and then explicitly builds those auxiliary targets after the main app configure/build step. That keeps operator-only and offline-validator edits from being skipped just because the app binary itself was already current.
 
+The container helper scripts now also verify that the running `usrp_x410_signal_detection_demo` container is mounted from the same `holohub-dev` checkout as the script you launched. If the container was created from another clone, the scripts stop immediately and tell you to recreate it from the current checkout instead of silently using the wrong source tree.
+
 ## Visualization
 
 The visualization path is now structured around the real C++ pipeline:

@@ -49,6 +49,8 @@ struct CoherentPowerReferenceResult {
   int src_cols = 0;
   int dst_rows = 0;
   int dst_cols = 0;
+  double sample_rate_hz = 0.0;
+  double span_hz = 0.0;
   bool frequency_axis_calibrated = false;
   int ignore_bins_per_side = 0;
   int grouped_box_count = 0;
@@ -84,6 +86,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
  private:
   struct ChannelBuffers {
     coherent_power_complex* input_tensor_host = nullptr;
+    coherent_power_complex* analysis_tensor_device = nullptr;
     float* power_db_device = nullptr;
     float* corrected_db_device = nullptr;
     float* time_mean_device = nullptr;

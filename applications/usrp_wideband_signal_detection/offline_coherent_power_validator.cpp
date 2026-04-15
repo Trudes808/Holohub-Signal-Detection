@@ -33,6 +33,9 @@ struct SnapshotMetadata {
   int input_height = 256;
   int input_width = 512;
   double resolution_hz = 0.0;
+  double sample_rate_hz = 0.0;
+  double span_hz = 0.0;
+  std::string tensor_axis_order = "";
   std::filesystem::path tensor_snapshot_path;
   std::optional<std::filesystem::path> power_db_snapshot_path;
   holoscan::ops::CoherentPowerReferenceConfig config;
@@ -90,6 +93,9 @@ SnapshotMetadata load_snapshot_metadata(const std::filesystem::path& metadata_pa
   metadata.input_height = extract_number<int>(text, "input_height").value_or(256);
   metadata.input_width = extract_number<int>(text, "input_width").value_or(512);
   metadata.resolution_hz = extract_number<double>(text, "resolution_hz").value_or(0.0);
+  metadata.sample_rate_hz = extract_number<double>(text, "sample_rate_hz").value_or(0.0);
+  metadata.span_hz = extract_number<double>(text, "span_hz").value_or(0.0);
+  metadata.tensor_axis_order = extract_string(text, "tensor_axis_order").value_or("");
 
   const auto tensor_path = extract_string(text, "tensor_snapshot_path");
   if (!tensor_path) {
@@ -381,7 +387,13 @@ int main(int argc, char** argv) {
     summary << "  \"cols\": " << result.src_cols << ",\n";
     summary << "  \"input_height\": " << result.dst_rows << ",\n";
     summary << "  \"input_width\": " << result.dst_cols << ",\n";
+        summary << "  \"tensor_axis_order\": \""
+          << (metadata.tensor_axis_order.empty() ? "unspecified" : metadata.tensor_axis_order)
+          << "\",\n";
     summary << "  \"frequency_axis_calibrated\": " << (result.frequency_axis_calibrated ? "true" : "false") << ",\n";
+        summary << "  \"resolution_hz\": " << metadata.resolution_hz << ",\n";
+        summary << "  \"sample_rate_hz\": " << result.sample_rate_hz << ",\n";
+        summary << "  \"span_hz\": " << result.span_hz << ",\n";
     summary << "  \"ignore_bins_per_side\": " << result.ignore_bins_per_side << ",\n";
     summary << "  \"grouped_box_count\": " << result.grouped_box_count << ",\n";
     summary << "  \"merged_threshold\": " << result.merged_threshold << ",\n";
@@ -407,6 +419,12 @@ int main(int argc, char** argv) {
     std::cout << "  tensor snapshot: " << metadata.tensor_snapshot_path << "\n";
     std::cout << "  output dir: " << options.output_dir << "\n";
     std::cout << "  rows x cols: " << result.src_rows << " x " << result.src_cols << "\n";
+    std::cout << "  tensor axis order: "
+          << (metadata.tensor_axis_order.empty() ? "unspecified" : metadata.tensor_axis_order)
+          << "\n";
+    std::cout << "  resolution hz: " << metadata.resolution_hz << "\n";
+    std::cout << "  sample rate hz: " << result.sample_rate_hz << "\n";
+    std::cout << "  span hz: " << result.span_hz << "\n";
     std::cout << "  ignore bins per side: " << result.ignore_bins_per_side << "\n";
     std::cout << "  grouped box count: " << result.grouped_box_count << "\n";
     std::cout << "  merged threshold: " << result.merged_threshold << "\n";

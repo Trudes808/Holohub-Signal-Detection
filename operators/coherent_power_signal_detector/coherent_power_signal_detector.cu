@@ -104,6 +104,12 @@ struct FastGpuMetadataSummary {
   float seed_threshold = 0.0f;
 };
 
+struct CanonicalTensorView {
+  int rows = 0;
+  int cols = 0;
+  bool transposed = false;
+};
+
 std::string json_bool(bool value) {
   return value ? "true" : "false";
 }
@@ -219,6 +225,14 @@ bool write_npy_2d(const std::string& path,
   out.write(header.data(), static_cast<std::streamsize>(header.size()));
   out.write(reinterpret_cast<const char*>(payload), static_cast<std::streamsize>(payload_bytes));
   return out.good();
+}
+
+CanonicalTensorView canonical_tensor_view(int input_rows, int input_cols) {
+  CanonicalTensorView view;
+  view.transposed = input_rows < input_cols;
+  view.rows = view.transposed ? input_cols : input_rows;
+  view.cols = view.transposed ? input_rows : input_cols;
+  return view;
 }
 
 constexpr float kPi = 3.14159265358979323846f;
@@ -478,8 +492,22 @@ int clamp_int(int value, int low, int high) {
   return std::max(low, std::min(high, value));
 }
 
-size_t flat_index(int rows, int cols, int row, int col) {
+__host__ __device__ inline size_t flat_index(int rows, int cols, int row, int col) {
   return static_cast<size_t>(row) * static_cast<size_t>(cols) + static_cast<size_t>(col);
+}
+
+__global__ void coherent_power_transpose_kernel(const holoscan::ops::coherent_power_complex* input,
+                                                int input_rows,
+                                                int input_cols,
+                                                holoscan::ops::coherent_power_complex* output) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = input_rows * input_cols;
+  if (index >= total) {
+    return;
+  }
+  const int row = index / input_cols;
+  const int col = index % input_cols;
+  output[flat_index(input_cols, input_rows, col, row)] = input[index];
 }
 
 std::vector<float> collect_masked_values(const std::vector<float>& values,
@@ -2041,6 +2069,8 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
   result.src_cols = src_cols;
   result.dst_rows = src_rows;
   result.dst_cols = src_cols;
+  result.span_hz = resolution_hz > 0.0 ? resolution_hz * static_cast<double>(src_rows) : 0.0;
+  result.sample_rate_hz = result.span_hz;
   result.frequency_axis_calibrated = resolution_hz > 0.0;
 
   result.power_db.assign(input_tensor.size(), 0.0f);
@@ -2114,6 +2144,7 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
 CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
   for (auto& buffers : channel_buffers_) {
     cudaFreeHost(buffers.input_tensor_host);
+    cudaFree(buffers.analysis_tensor_device);
     cudaFree(buffers.power_db_device);
     cudaFree(buffers.corrected_db_device);
     cudaFree(buffers.time_mean_device);
@@ -2220,6 +2251,9 @@ void CoherentPowerSignalDetector::initialize() {
     }
   };
 
+  const auto backend_mode = backend_mode_.get();
+  const bool reference_only_mode = backend_mode == "reference";
+
   for (auto& buffers : channel_buffers_) {
     allocate_device_float(buffers.power_db_device, configured_elements);
     allocate_device_float(buffers.corrected_db_device, configured_elements);
@@ -2228,14 +2262,21 @@ void CoherentPowerSignalDetector::initialize() {
     allocate_device_float(buffers.background_device, configured_elements);
     allocate_device_float(buffers.box_filter_scratch_device, configured_elements);
     allocate_device_float(buffers.score_device, configured_elements);
-    allocate_device_float(buffers.row_stat_device, static_cast<size_t>(configured_rows));
-    allocate_device_float(buffers.row_smooth_device, static_cast<size_t>(configured_rows));
-    allocate_device_float(buffers.frontend_reference_device, 1);
+    if (!reference_only_mode) {
+      allocate_device_float(buffers.row_stat_device, static_cast<size_t>(configured_rows));
+      allocate_device_float(buffers.row_smooth_device, static_cast<size_t>(configured_rows));
+      allocate_device_float(buffers.frontend_reference_device, 1);
+    }
     allocate_device_u8(buffers.mask_device, configured_elements);
     allocate_device_u8(buffers.scratch_mask_device, configured_elements);
+    const auto analysis_tensor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
+                                                   configured_elements * sizeof(coherent_power_complex));
+    if (analysis_tensor_result != cudaSuccess) {
+      throw std::runtime_error(std::string("analysis tensor buffer allocation failed: ") + cudaGetErrorString(analysis_tensor_result));
+    }
 
     buffers.frame_elements = configured_elements;
-    buffers.row_elements = static_cast<size_t>(configured_rows);
+    buffers.row_elements = reference_only_mode ? 0 : static_cast<size_t>(configured_rows);
     buffers.mask_elements = configured_elements;
 
     if (enable_mask_save_.get()) {
@@ -2246,7 +2287,6 @@ void CoherentPowerSignalDetector::initialize() {
     }
   }
 
-  const auto backend_mode = backend_mode_.get();
   if (!channel_buffers_.empty() && backend_mode != "reference") {
     const size_t frame_bytes = configured_elements * sizeof(float);
     const size_t row_bytes = static_cast<size_t>(configured_rows) * sizeof(float);
@@ -2388,14 +2428,22 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     return;
   }
 
-  const int src_rows = static_cast<int>(fft_tensor.Size(0));
-  const int src_cols = static_cast<int>(fft_tensor.Size(1));
+  const int input_rows = static_cast<int>(fft_tensor.Size(0));
+  const int input_cols = static_cast<int>(fft_tensor.Size(1));
+  const auto canonical_view = canonical_tensor_view(input_rows, input_cols);
+  const int src_rows = canonical_view.rows;
+  const int src_cols = canonical_view.cols;
   const int configured_rows = std::max(1, input_height_.get());
   const int configured_cols = std::max(1, input_width_.get());
-  if (src_rows <= 0 || src_cols <= 0) {
+  if (input_rows <= 0 || input_cols <= 0) {
     HOLOSCAN_LOG_WARN("Coherent power detector received empty tensor on channel {}", channel_number);
     return;
   }
+
+  const int configured_analysis_rows =
+      (canonical_view.transposed && configured_rows == input_rows && configured_cols == input_cols) ? input_cols : configured_rows;
+  const int configured_analysis_cols =
+      (canonical_view.transposed && configured_rows == input_rows && configured_cols == input_cols) ? input_rows : configured_cols;
 
   const auto total_start = std::chrono::steady_clock::now();
   std::array<double, kTimingStageCount> stage_ms {};
@@ -2421,7 +2469,22 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   };
 
   int ignore_bins_per_side = 0;
-  const double resolution_hz = static_cast<double>(meta->get<uint64_t>("resolution", 0));
+  double span_hz = 0.0;
+  if (meta->has_key("sample_rate_hz")) {
+    span_hz = meta->get<double>("sample_rate_hz");
+  } else if (meta->has_key("span")) {
+    span_hz = static_cast<double>(meta->get<uint64_t>("span", 0));
+  } else if (meta->has_key("bandwidth_hz")) {
+    span_hz = meta->get<double>("bandwidth_hz");
+  }
+  if (!std::isfinite(span_hz) || span_hz <= 0.0) {
+    span_hz = 0.0;
+  }
+  double resolution_hz = static_cast<double>(meta->get<uint64_t>("resolution", 0));
+  if ((!std::isfinite(resolution_hz) || resolution_hz <= 0.0) && span_hz > 0.0 && src_rows > 0) {
+    resolution_hz = span_hz / static_cast<double>(src_rows);
+  }
+  const double sample_rate_hz = span_hz;
   if (resolution_hz > 0.0 && ignore_sideband_hz_.get() > 0.0) {
     ignore_bins_per_side = static_cast<int>(std::ceil(ignore_sideband_hz_.get() / resolution_hz));
     ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
@@ -2443,11 +2506,11 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     HOLOSCAN_LOG_WARN("Unsupported coherent backend_mode='{}'. Falling back to auto.", backend_mode);
   }
   const bool save_requested = enable_mask_save_.get();
-  const bool require_reference_dimensions = src_rows != configured_rows || src_cols != configured_cols;
+  const bool require_reference_dimensions = src_rows != configured_analysis_rows || src_cols != configured_analysis_cols;
   const bool use_reference_backend = backend_is_reference ||
                                      (!backend_is_fast && (save_requested || require_reference_dimensions));
-  const int output_rows = use_reference_backend ? src_rows : configured_rows;
-  const int output_cols = use_reference_backend ? src_cols : configured_cols;
+  const int output_rows = use_reference_backend ? src_rows : configured_analysis_rows;
+  const int output_cols = use_reference_backend ? src_cols : configured_analysis_cols;
   const bool should_save_mask = save_requested &&
                                 (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
                                 (masks_saved_[channel_number] < max_masks_per_channel_.get());
@@ -2483,10 +2546,12 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       cudaFree(buffers.mask_device);
       cudaFree(buffers.scratch_mask_device);
       cudaFree(buffers.frontend_reference_device);
+      cudaFree(buffers.analysis_tensor_device);
       cudaFreeHost(buffers.power_db_host);
       cudaFreeHost(buffers.mask_host);
 
       buffers.input_tensor_host = nullptr;
+      buffers.analysis_tensor_device = nullptr;
       buffers.power_db_device = nullptr;
       buffers.corrected_db_device = nullptr;
       buffers.time_mean_device = nullptr;
@@ -2510,12 +2575,25 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       allocate_device_float(buffers.frontend_reference_device, 1);
       allocate_device_u8(buffers.mask_device, static_cast<size_t>(total_bins));
       allocate_device_u8(buffers.scratch_mask_device, static_cast<size_t>(total_bins));
+      const auto analysis_tensor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
+                                                     static_cast<size_t>(total_bins) * sizeof(coherent_power_complex));
+      if (analysis_tensor_result != cudaSuccess) {
+        throw std::runtime_error(std::string("analysis tensor buffer allocation failed: ") + cudaGetErrorString(analysis_tensor_result));
+      }
 
       buffers.frame_elements = static_cast<size_t>(total_bins);
       buffers.mask_elements = static_cast<size_t>(total_bins);
     }
 
-    if (buffers.row_elements != static_cast<size_t>(src_rows)) {
+    if (buffers.analysis_tensor_device == nullptr) {
+      const auto analysis_tensor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
+                                                     static_cast<size_t>(total_bins) * sizeof(coherent_power_complex));
+      if (analysis_tensor_result != cudaSuccess) {
+        throw std::runtime_error(std::string("analysis tensor buffer allocation failed: ") + cudaGetErrorString(analysis_tensor_result));
+      }
+    }
+
+    if (!use_reference_backend && buffers.row_elements != static_cast<size_t>(src_rows)) {
       if (buffers.row_stat_device != nullptr) {
         cudaFree(buffers.row_stat_device);
         buffers.row_stat_device = nullptr;
@@ -2564,12 +2642,37 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       }
     }
 
-    if (should_save_tensor_snapshot) {
-      auto copy_result = cudaMemcpyAsync(buffers.input_tensor_host,
+    constexpr int threads = 256;
+    const int blocks = (total_bins + threads - 1) / threads;
+    if (canonical_view.transposed) {
+      coherent_power_transpose_kernel<<<blocks, threads, 0, stream>>>(fft_tensor.Data(),
+                                                                       input_rows,
+                                                                       input_cols,
+                                                                       buffers.analysis_tensor_device);
+      auto kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("analysis transpose kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+    } else {
+      auto copy_result = cudaMemcpyAsync(buffers.analysis_tensor_device,
                                          fft_tensor.Data(),
                                          static_cast<size_t>(total_bins) * sizeof(coherent_power_complex),
-                                         cudaMemcpyDeviceToHost,
+                                         cudaMemcpyDeviceToDevice,
                                          stream);
+      if (copy_result != cudaSuccess) {
+        throw std::runtime_error(std::string("analysis tensor copy failed: ") + cudaGetErrorString(copy_result));
+      }
+    }
+
+    if (should_save_tensor_snapshot) {
+      auto sync_result = cudaStreamSynchronize(stream);
+      if (sync_result != cudaSuccess) {
+        throw std::runtime_error(std::string("input tensor snapshot pre-copy sync failed: ") + cudaGetErrorString(sync_result));
+      }
+      auto copy_result = cudaMemcpy(buffers.input_tensor_host,
+                                    buffers.analysis_tensor_device,
+                                    static_cast<size_t>(total_bins) * sizeof(coherent_power_complex),
+                                    cudaMemcpyDeviceToHost);
       if (copy_result != cudaSuccess) {
         throw std::runtime_error(std::string("input tensor snapshot copy failed: ") + cudaGetErrorString(copy_result));
       }
@@ -2579,7 +2682,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   time_step_ms(kPowerDbStage, [&] {
     constexpr int threads = 256;
     const int blocks = (total_bins + threads - 1) / threads;
-    coherent_power_power_db_kernel<<<blocks, threads, 0, stream>>>(fft_tensor.Data(),
+    coherent_power_power_db_kernel<<<blocks, threads, 0, stream>>>(buffers.analysis_tensor_device,
                                                                     src_rows,
                                                                     src_cols,
                                                                     buffers.power_db_device);
@@ -2612,8 +2715,6 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       pipeline_summary = run_reference_pipeline(host_power_db,
                                                 src_rows,
                                                 src_cols,
-                                                dst_rows,
-                                                dst_cols,
                                                 ignore_bins_per_side,
                                                 resolution_hz,
                                                 chunk_bandwidth_hz_.get(),
@@ -2755,7 +2856,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     std::string mask_path;
     if (should_save_mask) {
       std::vector<uint8_t> image;
-      image.reserve(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols));
+      image.reserve(static_cast<size_t>(output_rows) * static_cast<size_t>(output_cols));
       if (use_reference_backend) {
         image.assign(pipeline_summary.final_mask.size(), 0);
         for (size_t idx = 0; idx < pipeline_summary.final_mask.size(); ++idx) {
@@ -2848,9 +2949,14 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     meta_out << "  \"frame_number\": " << frame_number << ",\n";
     meta_out << "  \"rows\": " << src_rows << ",\n";
     meta_out << "  \"cols\": " << src_cols << ",\n";
+    meta_out << "  \"original_input_rows\": " << input_rows << ",\n";
+    meta_out << "  \"original_input_cols\": " << input_cols << ",\n";
+    meta_out << "  \"tensor_axis_order\": \"frequency_time\",\n";
     meta_out << "  \"input_height\": " << output_rows << ",\n";
     meta_out << "  \"input_width\": " << output_cols << ",\n";
     meta_out << "  \"resolution_hz\": " << resolution_hz << ",\n";
+    meta_out << "  \"sample_rate_hz\": " << sample_rate_hz << ",\n";
+    meta_out << "  \"span_hz\": " << span_hz << ",\n";
     meta_out << "  \"center_frequency_hz\": " << center_frequency_hz << ",\n";
     meta_out << "  \"frequency_axis_calibrated\": " << json_bool(frequency_axis_calibrated) << ",\n";
     meta_out << "  \"ignore_bins_per_side\": " << ignore_bins_per_side << ",\n";
