@@ -18,6 +18,7 @@ struct DinoTorchRuntimeConfig {
   std::vector<double> imagenet_mean;
   std::vector<double> imagenet_std;
   bool return_final_mask = true;
+  bool return_final_mask_device = false;
   double ignore_sideband_hz = 0.0;
   bool frontend_correction_enable = true;
   double frontend_correction_row_q = 25.0;
@@ -78,6 +79,32 @@ struct DinoTorchRuntimeResult {
   double final_threshold = 0.0;
   DinoTorchRuntimeTiming timing;
   std::vector<float> final_mask;
+  const float* final_mask_device = nullptr;
+  std::shared_ptr<void> final_mask_device_owner;
+};
+
+struct DinoHybridPostGpuInput {
+  int src_rows = 0;
+  int dst_rows = 0;
+  int dst_cols = 0;
+  int ignore_bins_per_side = 0;
+  cudaStream_t cuda_stream = nullptr;
+  const float* dino_score_device = nullptr;
+  const float* coherence_gate_device = nullptr;
+};
+
+struct DinoHybridPostGpuResult {
+  bool success = false;
+  std::string error_message;
+  std::string error_detail;
+  float seed_freq_threshold = 1.0f;
+  float seed_res_threshold = 1.0f;
+  float grow_freq_threshold = 1.0f;
+  float grow_res_threshold = 1.0f;
+  float combined_threshold = 1.0f;
+  std::vector<uint8_t> seed_mask;
+  std::vector<uint8_t> grow_mask;
+  std::vector<uint8_t> combined_gate_mask;
 };
 
 class DinoTorchRuntime {
@@ -91,6 +118,8 @@ class DinoTorchRuntime {
   DinoTorchRuntime& operator=(DinoTorchRuntime&&) noexcept;
 
   DinoTorchRuntimeResult run(const DinoTorchRuntimeConfig& config, const DinoTorchRuntimeInput& input);
+  DinoHybridPostGpuResult run_hybrid_post_gpu(const DinoHybridPostGpuInput& input);
+  void warmup(const DinoTorchRuntimeConfig& config, int dst_rows, int dst_cols, int patch_size, cudaStream_t cuda_stream = nullptr);
 
  private:
   class Impl;

@@ -581,12 +581,43 @@ std::vector<float> convolve_axis(const std::vector<float>& input,
   return output;
 }
 
+std::vector<float> gaussian_blur(const std::vector<float>& input,
+                                 int rows,
+                                 int cols,
+                                 double sigma_rows,
+                                 double sigma_cols) {
+  auto row_blurred = convolve_axis(input, rows, cols, gaussian_kernel(sigma_rows), true);
+  return convolve_axis(row_blurred, rows, cols, gaussian_kernel(sigma_cols), false);
+}
+
+std::vector<float> gaussian_second_derivative_rows(const std::vector<float>& input,
+                                                   int rows,
+                                                   int cols,
+                                                   double sigma) {
+  if (sigma <= 0.0) {
+    return std::vector<float>(input.size(), 0.0f);
+  }
+
+  const int radius = std::max(1, static_cast<int>(std::ceil(3.0 * sigma)));
+  std::vector<float> kernel(static_cast<size_t>(2 * radius + 1), 0.0f);
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const double x = static_cast<double>(offset);
+    const double sigma2 = sigma * sigma;
+    const double weight = ((x * x - sigma2) / (sigma2 * sigma2)) * std::exp(-(x * x) / (2.0 * sigma2));
+    kernel[static_cast<size_t>(offset + radius)] = static_cast<float>(weight);
+  }
+
+  return convolve_axis(input, rows, cols, kernel, true);
+}
+
 ComponentLabelling label_components(const std::vector<uint8_t>& mask, int rows, int cols) {
   ComponentLabelling result;
   result.labels.assign(mask.size(), 0);
   int next_label = 0;
   constexpr std::array<int, 8> d_row = {-1, -1, -1, 0, 0, 1, 1, 1};
   constexpr std::array<int, 8> d_col = {-1, 0, 1, -1, 1, -1, 0, 1};
+  std::vector<int> pending;
+  pending.reserve(mask.size());
 
   for (int row = 0; row < rows; ++row) {
     for (int col = 0; col < cols; ++col) {
@@ -597,12 +628,14 @@ ComponentLabelling label_components(const std::vector<uint8_t>& mask, int rows, 
 
       ++next_label;
       int component_size = 0;
-      std::queue<std::pair<int, int>> pending;
-      pending.push({row, col});
+      pending.clear();
+      pending.push_back(static_cast<int>(index));
+      size_t pending_head = 0;
       result.labels[index] = next_label;
-      while (!pending.empty()) {
-        const auto [cur_row, cur_col] = pending.front();
-        pending.pop();
+      while (pending_head < pending.size()) {
+        const int flat_index_value = pending[pending_head++];
+        const int cur_row = flat_index_value / cols;
+        const int cur_col = flat_index_value % cols;
         ++component_size;
         for (size_t neighbor_index = 0; neighbor_index < d_row.size(); ++neighbor_index) {
           const int next_row = cur_row + d_row[neighbor_index];
@@ -615,7 +648,7 @@ ComponentLabelling label_components(const std::vector<uint8_t>& mask, int rows, 
             continue;
           }
           result.labels[flat] = next_label;
-          pending.push({next_row, next_col});
+          pending.push_back(static_cast<int>(flat));
         }
       }
       result.sizes.push_back(component_size);
@@ -633,6 +666,7 @@ std::vector<uint8_t> keep_large_components(const std::vector<uint8_t>& mask,
                                            int* kept_component_count) {
   auto labelled = label_components(mask, rows, cols);
   std::vector<uint8_t> output(mask.size(), 0);
+  int kept_count = 0;
   for (size_t index = 0; index < labelled.labels.size(); ++index) {
     const int label = labelled.labels[index];
     if (label <= 0) {
@@ -643,8 +677,12 @@ std::vector<uint8_t> keep_large_components(const std::vector<uint8_t>& mask,
     }
   }
   if (kept_component_count != nullptr) {
-    auto kept = label_components(output, rows, cols);
-    *kept_component_count = kept.count;
+    for (int component_size : labelled.sizes) {
+      if (component_size >= std::max(1, min_size)) {
+        ++kept_count;
+      }
+    }
+    *kept_component_count = kept_count;
   }
   return output;
 }
@@ -717,14 +755,15 @@ std::vector<uint8_t> binary_closing_rect(const std::vector<uint8_t>& mask,
 
 std::vector<uint8_t> binary_fill_holes(const std::vector<uint8_t>& mask, int rows, int cols) {
   std::vector<uint8_t> visited(mask.size(), 0);
-  std::queue<std::pair<int, int>> pending;
+  std::vector<int> pending;
+  pending.reserve(mask.size());
   auto maybe_enqueue = [&](int row, int col) {
     const size_t index = flat_index(cols, row, col);
     if (mask[index] || visited[index]) {
       return;
     }
     visited[index] = 1;
-    pending.push({row, col});
+    pending.push_back(static_cast<int>(index));
   };
 
   for (int row = 0; row < rows; ++row) {
@@ -738,9 +777,11 @@ std::vector<uint8_t> binary_fill_holes(const std::vector<uint8_t>& mask, int row
 
   constexpr std::array<int, 4> d_row = {-1, 0, 0, 1};
   constexpr std::array<int, 4> d_col = {0, -1, 1, 0};
-  while (!pending.empty()) {
-    const auto [row, col] = pending.front();
-    pending.pop();
+  size_t pending_head = 0;
+  while (pending_head < pending.size()) {
+    const int flat_index_value = pending[pending_head++];
+    const int row = flat_index_value / cols;
+    const int col = flat_index_value % cols;
     for (size_t index = 0; index < d_row.size(); ++index) {
       const int next_row = row + d_row[index];
       const int next_col = col + d_col[index];
@@ -765,7 +806,8 @@ std::vector<uint8_t> binary_propagation(const std::vector<uint8_t>& seed,
                                         int rows,
                                         int cols) {
   std::vector<uint8_t> output(seed.size(), 0);
-  std::queue<std::pair<int, int>> pending;
+  std::vector<int> pending;
+  pending.reserve(seed.size());
   constexpr std::array<int, 8> d_row = {-1, -1, -1, 0, 0, 1, 1, 1};
   constexpr std::array<int, 8> d_col = {-1, 0, 1, -1, 1, -1, 0, 1};
 
@@ -776,13 +818,15 @@ std::vector<uint8_t> binary_propagation(const std::vector<uint8_t>& seed,
         continue;
       }
       output[index] = 1;
-      pending.push({row, col});
+      pending.push_back(static_cast<int>(index));
     }
   }
 
-  while (!pending.empty()) {
-    const auto [row, col] = pending.front();
-    pending.pop();
+  size_t pending_head = 0;
+  while (pending_head < pending.size()) {
+    const int flat_index_value = pending[pending_head++];
+    const int row = flat_index_value / cols;
+    const int col = flat_index_value % cols;
     for (size_t index = 0; index < d_row.size(); ++index) {
       const int next_row = row + d_row[index];
       const int next_col = col + d_col[index];
@@ -794,7 +838,7 @@ std::vector<uint8_t> binary_propagation(const std::vector<uint8_t>& seed,
         continue;
       }
       output[next_flat] = 1;
-      pending.push({next_row, next_col});
+      pending.push_back(static_cast<int>(next_flat));
     }
   }
   return output;
@@ -825,6 +869,44 @@ float connected_fraction(const std::vector<uint8_t>& mask, const std::vector<uin
     return 0.0f;
   }
   return static_cast<float>(active) / static_cast<float>(valid);
+}
+
+HybridPostprocessResult finalize_residual_veto_hybrid(const std::vector<uint8_t>& seed_mask_input,
+                                                      const std::vector<uint8_t>& grow_mask_input,
+                                                      const std::vector<uint8_t>& combined_gate_mask,
+                                                      const std::vector<uint8_t>& valid_mask,
+                                                      int rows,
+                                                      int cols,
+                                                      float seed_freq_threshold,
+                                                      float seed_res_threshold,
+                                                      float grow_freq_threshold,
+                                                      float grow_res_threshold,
+                                                      float combined_threshold) {
+  HybridPostprocessResult result;
+  result.mask.assign(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
+  result.seed_freq_threshold = seed_freq_threshold;
+  result.seed_res_threshold = seed_res_threshold;
+  result.grow_freq_threshold = grow_freq_threshold;
+  result.grow_res_threshold = grow_res_threshold;
+  result.combined_threshold = combined_threshold;
+  if (seed_mask_input.size() != result.mask.size() || valid_mask.size() != result.mask.size()) {
+    return result;
+  }
+
+  (void)grow_mask_input;
+  (void)combined_gate_mask;
+
+  auto seed_mask = keep_large_components(seed_mask_input, rows, cols, 8);
+  std::vector<uint8_t> final_mask = std::move(seed_mask);
+  for (size_t index = 0; index < final_mask.size(); ++index) {
+    final_mask[index] = (final_mask[index] && valid_mask[index]) ? 1 : 0;
+  }
+  final_mask = keep_large_components(final_mask, rows, cols, 8, &result.component_count);
+
+  result.final_fraction = mean_mask_value(final_mask);
+  result.connected_fraction = connected_fraction(final_mask, valid_mask);
+  result.mask = std::move(final_mask);
+  return result;
 }
 
 HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& dino_score,
@@ -896,58 +978,24 @@ HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& dino_
 
   result.seed_freq_threshold = quantile_from_values(active_freq, 0.90, 1.0f);
   result.seed_res_threshold = quantile_from_values(active_res, 0.82, 1.0f);
-  result.grow_freq_threshold = quantile_from_values(active_freq, 0.74, 1.0f);
-  result.grow_res_threshold = quantile_from_values(active_res, 0.55, 1.0f);
+  result.grow_freq_threshold = result.seed_freq_threshold;
+  result.grow_res_threshold = result.seed_res_threshold;
   result.combined_threshold = quantile_from_values(active_combined, 0.78, 1.0f);
 
   std::vector<uint8_t> seed_mask(base_norm.size(), 0);
-  std::vector<uint8_t> grow_mask(base_norm.size(), 0);
   for (size_t index = 0; index < seed_mask.size(); ++index) {
     seed_mask[index] = (valid_mask[index] &&
                         keep_freq[index] >= result.seed_freq_threshold &&
                         keep_res[index] >= result.seed_res_threshold)
                            ? 1
                            : 0;
-    grow_mask[index] = (valid_mask[index] &&
-                        keep_freq[index] >= result.grow_freq_threshold &&
-                        keep_res[index] >= result.grow_res_threshold)
-                           ? 1
-                           : 0;
   }
 
-  seed_mask = keep_large_components(seed_mask, rows, cols, 8);
-  grow_mask = binary_closing_rect(grow_mask, rows, cols, 5, 3);
-  grow_mask = binary_fill_holes(grow_mask, rows, cols);
-
-  auto seed_components = label_components(seed_mask, rows, cols);
-  std::vector<uint8_t> final_mask(base_norm.size(), 0);
-  for (int label = 1; label <= seed_components.count; ++label) {
-    std::vector<uint8_t> seed_component(base_norm.size(), 0);
-    for (size_t index = 0; index < seed_component.size(); ++index) {
-      if (seed_components.labels[index] == label) {
-        seed_component[index] = 1;
-      }
-    }
-    auto grown_component = binary_propagation(seed_component, grow_mask, rows, cols);
-    if (std::count(grown_component.begin(), grown_component.end(), static_cast<uint8_t>(1)) < 12) {
-      continue;
-    }
-    for (size_t index = 0; index < final_mask.size(); ++index) {
-      final_mask[index] = final_mask[index] || grown_component[index];
-    }
-  }
-
-  final_mask = keep_large_components(final_mask, rows, cols, 18);
-  for (size_t index = 0; index < final_mask.size(); ++index) {
-    final_mask[index] = (final_mask[index] && combined_score[index] >= (result.combined_threshold * 0.85f)) ? 1 : 0;
-  }
-  final_mask = binary_closing_rect(final_mask, rows, cols, 7, 3);
-  final_mask = binary_fill_holes(final_mask, rows, cols);
-  final_mask = keep_large_components(final_mask, rows, cols, 24, &result.component_count);
+  std::vector<uint8_t> final_mask = keep_large_components(seed_mask, rows, cols, 8);
   for (size_t index = 0; index < final_mask.size(); ++index) {
     final_mask[index] = (final_mask[index] && valid_mask[index]) ? 1 : 0;
   }
-  final_mask = keep_large_components(final_mask, rows, cols, 24, &result.component_count);
+  final_mask = keep_large_components(final_mask, rows, cols, 8, &result.component_count);
 
   result.final_fraction = mean_mask_value(final_mask);
   result.connected_fraction = connected_fraction(final_mask, valid_mask);
@@ -997,6 +1045,11 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(patch_size_, "patch_size", "Patch size", "Patch size used for DINO-aligned input shaping.", 16);
   spec.param(emit_stride_, "emit_stride", "Emit stride", "Emit one output every N input frames per channel.", 1);
   spec.param(mask_threshold_db_, "mask_threshold_db", "Mask threshold (legacy)", "Legacy placeholder threshold retained for compatibility.", -20.0f);
+  spec.param(channel_filter_,
+             "channel_filter",
+             "Channel filter",
+             "Optional channel filter. When >= 0, process only that channel in this operator instance.",
+             -1);
   spec.param(log_detections_, "log_detections", "Log detections", "If true, logs detector execution details.", false);
   spec.param(backend_mode_, "backend_mode", "Backend mode", "Detector backend mode: reference or fast_gpu.", std::string("reference"));
   spec.param(enable_mask_save_, "enable_mask_save", "Enable mask save", "Enable writing detector masks to disk for debug runs.", false);
@@ -1052,10 +1105,14 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
 void DinoV3SignalDetector::initialize() {
   holoscan::Operator::initialize();
 
-  frame_count_.assign(num_channels_.get(), 0);
-  masks_saved_.assign(num_channels_.get(), 0);
-  timing_stats_.assign(num_channels_.get(), ChannelTimingStats {});
-  channel_buffers_.assign(num_channels_.get(), ChannelBuffers {});
+  const int configured_channels = std::max(1, num_channels_.get());
+  const int channel_filter = channel_filter_.get();
+  const size_t local_channel_count = channel_filter >= 0 ? 1u : static_cast<size_t>(configured_channels);
+
+  frame_count_.assign(local_channel_count, 0);
+  masks_saved_.assign(local_channel_count, 0);
+  timing_stats_.assign(local_channel_count, ChannelTimingStats {});
+  channel_buffers_.assign(local_channel_count, ChannelBuffers {});
 
   const auto cuda_result = cudaFree(nullptr);
   if (cuda_result != cudaSuccess) {
@@ -1073,6 +1130,37 @@ void DinoV3SignalDetector::initialize() {
 #ifdef HOLOHUB_HAS_TORCH
   if (use_pytorch_backend_.get()) {
     pytorch_runtime_ready_ = true;
+    if (inference_backend_.get() == "torchscript") {
+      DinoTorchRuntimeConfig runtime_config;
+      runtime_config.inference_backend = inference_backend_.get();
+      runtime_config.model_script_path = model_script_path_.get();
+      runtime_config.torchscript_init_mode = torchscript_init_mode_.get();
+      runtime_config.imagenet_mean = imagenet_mean_.get();
+      runtime_config.imagenet_std = imagenet_std_.get();
+      runtime_config.return_final_mask = false;
+      runtime_config.return_final_mask_device = false;
+      runtime_config.ignore_sideband_hz = ignore_sideband_hz_.get();
+      runtime_config.frontend_correction_enable = frontend_correction_enable_.get();
+      runtime_config.frontend_correction_row_q = frontend_correction_row_q_.get();
+      runtime_config.frontend_correction_smooth_sigma = frontend_correction_smooth_sigma_.get();
+      runtime_config.frontend_correction_reference_q = frontend_correction_reference_q_.get();
+      runtime_config.frontend_correction_max_boost_db = frontend_correction_max_boost_db_.get();
+      runtime_config.frontend_correction_soft_knee_db = frontend_correction_soft_knee_db_.get();
+      runtime_config.frontend_correction_edge_taper_fraction = frontend_correction_edge_taper_fraction_.get();
+      runtime_config.frontend_correction_edge_taper_sigma = frontend_correction_edge_taper_sigma_.get();
+      runtime_config.frontend_correction_edge_target_drop_db = frontend_correction_edge_target_drop_db_.get();
+      runtime_config.power_q = power_q_.get();
+      runtime_config.dino_group_score_q = dino_group_score_q_.get();
+      runtime_config.pipeline_final_threshold = pipeline_final_threshold_.get();
+      runtime_config.pipeline_gap_floor = pipeline_gap_floor_.get();
+      runtime_config.pipeline_power_rescue_floor = pipeline_power_rescue_floor_.get();
+      runtime_config.pipeline_power_rescue_gain = pipeline_power_rescue_gain_.get();
+
+      torch_runtime_->warmup(runtime_config,
+                            std::max(1, input_height_.get()),
+                            std::max(1, input_width_.get()),
+                            std::max(1, patch_size_.get()));
+    }
     HOLOSCAN_LOG_INFO(
         "DINO hybrid detector runtime enabled. model_name='{}' repo='{}' weights='{}' script='{}'",
         model_name_.get(),
@@ -1097,14 +1185,20 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
 
   auto meta = metadata();
   const uint16_t channel_number = meta->get<uint16_t>("channel_number", 0);
-  if (channel_number >= frame_count_.size()) {
+  const int channel_filter = channel_filter_.get();
+  if (channel_filter >= 0 && channel_number != static_cast<uint16_t>(channel_filter)) {
+    return;
+  }
+
+  const size_t local_channel_index = channel_filter >= 0 ? 0u : static_cast<size_t>(channel_number);
+  if (local_channel_index >= frame_count_.size()) {
     HOLOSCAN_LOG_WARN("DINO hybrid detector received out-of-range channel {} (configured channels: {}).",
                       channel_number,
                       frame_count_.size());
     return;
   }
 
-  const uint64_t frame_number = ++frame_count_[channel_number];
+  const uint64_t frame_number = ++frame_count_[local_channel_index];
   const int emit_stride = std::max(1, emit_stride_.get());
   if ((frame_number % static_cast<uint64_t>(emit_stride)) != 0) {
     return;
@@ -1130,7 +1224,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
   const bool timing_enabled = timing_summary_enable_.get();
   const bool should_save_mask = enable_mask_save_.get() &&
                                 (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
-                                (masks_saved_[channel_number] < max_masks_per_channel_.get());
+                                (masks_saved_[local_channel_index] < max_masks_per_channel_.get());
   const auto requested_backend_mode = backend_mode_.get();
   const bool requested_fast_backend = requested_backend_mode == "fast_gpu";
   const bool requested_reference_backend = requested_backend_mode == "reference";
@@ -1184,7 +1278,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - patch_size) / 2));
   }
 
-  auto& buffers = channel_buffers_[channel_number];
+  auto& buffers = channel_buffers_[local_channel_index];
 
   try {
     time_step_ms(kInputStage, [&] {
@@ -1440,7 +1534,8 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       runtime_config.torchscript_init_mode = torchscript_init_mode_.get();
       runtime_config.imagenet_mean = imagenet_mean_.get();
       runtime_config.imagenet_std = imagenet_std_.get();
-      runtime_config.return_final_mask = true;
+      runtime_config.return_final_mask = use_fast_backend;
+      runtime_config.return_final_mask_device = !use_fast_backend;
       runtime_config.ignore_sideband_hz = ignore_sideband_hz_.get();
       runtime_config.frontend_correction_enable = frontend_correction_enable_.get();
       runtime_config.frontend_correction_row_q = frontend_correction_row_q_.get();
@@ -1510,6 +1605,33 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         throw std::runtime_error(std::string("coherence gate staging synchronization failed: ") + cudaGetErrorString(sync_result));
       }
 
+      if (runtime_result.success && runtime_result.final_mask_device != nullptr && torch_runtime_ != nullptr) {
+        DinoHybridPostGpuInput hybrid_input;
+        hybrid_input.src_rows = src_rows;
+        hybrid_input.dst_rows = dst_rows;
+        hybrid_input.dst_cols = dst_cols;
+        hybrid_input.ignore_bins_per_side = ignore_bins_per_side;
+        hybrid_input.cuda_stream = stream;
+        hybrid_input.dino_score_device = runtime_result.final_mask_device;
+        hybrid_input.coherence_gate_device = buffers.coherence_gate_resized_device;
+
+        auto hybrid_gpu_result = torch_runtime_->run_hybrid_post_gpu(hybrid_input);
+        if (hybrid_gpu_result.success) {
+          hybrid_result = finalize_residual_veto_hybrid(hybrid_gpu_result.seed_mask,
+                                                        hybrid_gpu_result.grow_mask,
+                                                        hybrid_gpu_result.combined_gate_mask,
+                                                        valid_mask,
+                                                        dst_rows,
+                                                        dst_cols,
+                                                        hybrid_gpu_result.seed_freq_threshold,
+                                                        hybrid_gpu_result.seed_res_threshold,
+                                                        hybrid_gpu_result.grow_freq_threshold,
+                                                        hybrid_gpu_result.grow_res_threshold,
+                                                        hybrid_gpu_result.combined_threshold);
+          return;
+        }
+      }
+
       std::vector<float> coherence_gate_resized(buffers.coherence_gate_host,
                                                 buffers.coherence_gate_host + static_cast<std::ptrdiff_t>(dst_elements));
       std::vector<float> dino_score_map;
@@ -1537,7 +1659,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       if (!write_pgm(mask_path, image, dst_cols, dst_rows)) {
         HOLOSCAN_LOG_ERROR("Failed to write DINO hybrid mask image: {}", mask_path);
       } else {
-        ++masks_saved_[channel_number];
+        ++masks_saved_[local_channel_index];
         if (log_detections_.get()) {
           HOLOSCAN_LOG_INFO("Saved DINO hybrid mask for channel {} frame {} to {}",
                             channel_number,
@@ -1591,7 +1713,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     meta->set("dino_timing_summary_enabled", timing_enabled);
 
     if (timing_enabled) {
-      auto& timing = timing_stats_[channel_number];
+      auto& timing = timing_stats_[local_channel_index];
       ++timing.window_frames;
       for (size_t stage_index = 0; stage_index < kTimingStageCount; ++stage_index) {
         timing.total_ms[stage_index] += stage_ms[stage_index];

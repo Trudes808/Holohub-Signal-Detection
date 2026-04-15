@@ -68,7 +68,7 @@ advanced_network:
             - name: "Channel 1 data"
               id: 0
               cpu_core: 10
-              batch_size: 2048
+              batch_size: 1024
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
@@ -76,7 +76,7 @@ advanced_network:
             - name: "Channel 2 data"
               id: 1
               cpu_core: 11
-              batch_size: 2048
+              batch_size: 1024
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH2_CHDR_Headers_RX_CPU"
@@ -104,7 +104,7 @@ chdr_converter:
   interface_name: sdr_data
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 128
+  num_ffts_per_batch: 64
   num_simul_batches: 4
   num_channels: 2
   log_packets: false
@@ -112,20 +112,15 @@ chdr_converter:
 
 fft:
   burst_size: 20480
-  num_bursts: 128
+  num_bursts: 64
   num_channels: 2
   spectrum_type: 1
   averaging_type: 1
   window_time: 0
   window_type: 0
-  # FFT length in bins. For this path it should stay aligned with burst_size.
   transform_points: 20480
-  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
   window_points: 20480
-  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
   resolution: 24414
-  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
-  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
   span: 500000000
   weighting_factor: 0
   f1_index: -10240
@@ -134,7 +129,7 @@ fft:
 
 logger:
   num_channels: 2
-  log_interval: 10
+  log_interval: 5
 
 visualization:
   enable: false
@@ -172,7 +167,9 @@ dinov3_signal_detector:
   input_height: 256
   input_width: 512
   patch_size: 16
-  emit_stride: 6
+  # Guarded realtime pass: smaller upstream batches reduce packet retention,
+  # and a looser cadence adds headroom above the measured 24-28 ms detector cost.
+  emit_stride: 16
   mask_threshold_db: -20.0
   log_detections: false
   backend_mode: "reference"
@@ -223,7 +220,7 @@ dinov3_signal_detector:
   pipeline_texture_speckle_strong_threshold: 0.20
   timing_summary_enable: false
   timing_summary_every_n: 64
-  timing_summary_window: 8
+  timing_summary_window: 64
 
 coherent_power_signal_detector:
   num_channels: 2

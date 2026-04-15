@@ -119,6 +119,32 @@ struct ExtraRxPacketInfo {
   uint16_t flow_id;
 };
 
+static void release_partial_rx_burst(BurstParams* burst,
+                                     rte_mempool* burst_pool,
+                                     rte_mempool* flowid_pool,
+                                     rte_mempool* meta_pool,
+                                     int allocated_segs) {
+  if (burst == nullptr) {
+    return;
+  }
+
+  if (burst->pkt_extra_info != nullptr) {
+    rte_mempool_put(flowid_pool, static_cast<void*>(burst->pkt_extra_info));
+    burst->pkt_extra_info = nullptr;
+  }
+
+  const int seg_count = std::max(0, std::min(allocated_segs, static_cast<int>(burst->pkts.size())));
+  for (int seg = 0; seg < seg_count; ++seg) {
+    if (burst->pkts[seg] != nullptr) {
+      rte_mempool_put(burst_pool, static_cast<void*>(burst->pkts[seg]));
+      burst->pkts[seg] = nullptr;
+    }
+  }
+
+  burst->hdr.hdr.num_pkts = 0;
+  rte_mempool_put(meta_pool, burst);
+}
+
 /**
  * A map of log level to a tuple of the description and command strings.
  */
@@ -1416,19 +1442,43 @@ int DpdkMgr::rx_core_multi_q_worker(void* arg) {
       bursts[cur_idx]->hdr.hdr.port_id  = cur_port;
       bursts[cur_idx]->hdr.hdr.num_segs = cur_segs;
       bursts[cur_idx]->hdr.hdr.num_pkts = 0;
+      bursts[cur_idx]->pkt_extra_info = nullptr;
+      for (auto& pkts : bursts[cur_idx]->pkts) {
+        pkts = nullptr;
+      }
 
+      int allocated_segs = 0;
       for (int seg = 0; seg < cur_segs; seg++) {
         if (rte_mempool_get(tparams->burst_pool,
           reinterpret_cast<void**>(&bursts[cur_idx]->pkts[seg])) < 0) {
           HOLOSCAN_LOG_ERROR(
               "Processing function falling behind. No free RX bursts!");
-          continue;
+          release_partial_rx_burst(bursts[cur_idx],
+                                   tparams->burst_pool,
+                                   tparams->flowid_pool,
+                                   tparams->meta_pool,
+                                   allocated_segs);
+          bursts[cur_idx] = nullptr;
+          break;
         }
+        ++allocated_segs;
+      }
+
+      if (bursts[cur_idx] == nullptr) {
+        update_cur_idx();
+        continue;
       }
 
       if (rte_mempool_get(
             tparams->flowid_pool, reinterpret_cast<void**>(&bursts[cur_idx]->pkt_extra_info)) < 0) {
         HOLOSCAN_LOG_ERROR("Processing function falling behind. No free CPU buffers for packets!");
+        release_partial_rx_burst(bursts[cur_idx],
+                                 tparams->burst_pool,
+                                 tparams->flowid_pool,
+                                 tparams->meta_pool,
+                                 cur_segs);
+        bursts[cur_idx] = nullptr;
+        update_cur_idx();
         continue;
       }
     }
@@ -1566,18 +1616,40 @@ int DpdkMgr::rx_core_worker(void* arg) {
       burst->hdr.hdr.port_id  = tparams->port;
       burst->hdr.hdr.num_segs = tparams->num_segs;
       burst->hdr.hdr.num_pkts = 0;
+      burst->pkt_extra_info = nullptr;
+      for (auto& pkts : burst->pkts) {
+        pkts = nullptr;
+      }
 
+      int allocated_segs = 0;
       for (int seg = 0; seg < tparams->num_segs; seg++) {
         if (rte_mempool_get(tparams->burst_pool, reinterpret_cast<void**>(&burst->pkts[seg])) < 0) {
           HOLOSCAN_LOG_ERROR(
               "Processing function falling behind. No free RX bursts!");
-          continue;
+          release_partial_rx_burst(burst,
+                                   tparams->burst_pool,
+                                   tparams->flowid_pool,
+                                   tparams->meta_pool,
+                                   allocated_segs);
+          burst = nullptr;
+          break;
         }
+        ++allocated_segs;
+      }
+
+      if (burst == nullptr) {
+        continue;
       }
 
       if (rte_mempool_get(
             tparams->flowid_pool, reinterpret_cast<void**>(&burst->pkt_extra_info)) < 0) {
         HOLOSCAN_LOG_ERROR("Processing function falling behind. No free CPU buffers for packets!");
+        release_partial_rx_burst(burst,
+                                 tparams->burst_pool,
+                                 tparams->flowid_pool,
+                                 tparams->meta_pool,
+                                 tparams->num_segs);
+        burst = nullptr;
         continue;
       }
 

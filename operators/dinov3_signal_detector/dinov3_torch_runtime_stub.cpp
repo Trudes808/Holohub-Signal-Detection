@@ -29,4 +29,15 @@ DinoTorchRuntimeResult DinoTorchRuntime::run(const DinoTorchRuntimeConfig& confi
   return result;
 }
 
+DinoHybridPostGpuResult DinoTorchRuntime::run_hybrid_post_gpu(const DinoHybridPostGpuInput& input) {
+  DinoHybridPostGpuResult result;
+  result.success = false;
+  result.error_message = "Torch runtime is not available in this build";
+  result.error_detail = "Rebuild the container with the pinned Torch stack or fall back to the CPU hybrid postprocess";
+  result.seed_mask.assign(static_cast<size_t>(std::max(0, input.dst_rows * input.dst_cols)), 0);
+  result.grow_mask.assign(static_cast<size_t>(std::max(0, input.dst_rows * input.dst_cols)), 0);
+  result.combined_gate_mask.assign(static_cast<size_t>(std::max(0, input.dst_rows * input.dst_cols)), 0);
+  return result;
+}
+
 }  // namespace holoscan::ops

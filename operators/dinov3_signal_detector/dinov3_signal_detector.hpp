@@ -66,6 +66,7 @@ class DinoV3SignalDetector : public holoscan::Operator {
   holoscan::Parameter<int> input_height_;
   holoscan::Parameter<int> input_width_;
   holoscan::Parameter<int> patch_size_;
+  holoscan::Parameter<int> channel_filter_;
   holoscan::Parameter<int> emit_stride_;
   holoscan::Parameter<float> mask_threshold_db_;
   holoscan::Parameter<bool> log_detections_;

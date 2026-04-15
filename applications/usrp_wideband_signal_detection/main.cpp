@@ -140,15 +140,20 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     }
 
     std::shared_ptr<holoscan::Operator> spectrogramOp;
-    std::shared_ptr<holoscan::Operator> detectorOp;
+    std::vector<std::shared_ptr<holoscan::Operator>> dinoDetectorOps;
     std::vector<std::shared_ptr<holoscan::Operator>> coherentDetectorOps;
     if (enable_spectrogram) {
       spectrogramOp = make_operator<ops::Spectrogram>("spectrogramOp", from_config("spectrogram"));
     }
     if (enable_detector) {
       if (detector_type == "dinov3") {
-        detectorOp = make_operator<ops::DinoV3SignalDetector>("dinoV3SignalDetectorOp",
-                                                               from_config("dinov3_signal_detector"));
+        const int detector_channels = from_config("dinov3_signal_detector.num_channels").as<int>();
+        for (int channel_index = 0; channel_index < std::max(1, detector_channels); ++channel_index) {
+          dinoDetectorOps.push_back(make_operator<ops::DinoV3SignalDetector>(
+              std::string("dinoV3SignalDetectorOpCh") + std::to_string(channel_index),
+              from_config("dinov3_signal_detector"),
+              holoscan::Arg("channel_filter") = channel_index));
+        }
       } else {
         const int detector_channels = from_config("coherent_power_signal_detector.num_channels").as<int>();
         for (int channel_index = 0; channel_index < std::max(1, detector_channels); ++channel_index) {
@@ -194,7 +199,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           add_operator(op);
         }
       } else {
-        add_operator(detectorOp);
+        for (auto& op : dinoDetectorOps) {
+          add_operator(op);
+        }
       }
     }
     if (enable_visualization) {
@@ -213,7 +220,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           add_flow(spectrogramOp, op);
         }
       } else {
-        add_flow(spectrogramOp, detectorOp);
+        for (auto& op : dinoDetectorOps) {
+          add_flow(spectrogramOp, op);
+        }
       }
     }
     if (enable_visualization) {

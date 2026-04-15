@@ -200,6 +200,8 @@ endforeach()
     config_offline_replay.yaml
     config_cuda_fallback.yaml
     config_torchscript_performance.yaml
+    config_torchscript_performance_timing_debug.yaml
+    config_torchscript_realtime_guarded.yaml
     config_torchscript_performance_fft_only.yaml
     config_torchscript_performance_small_batches.yaml
     config_torchscript_performance_spectrogram_only.yaml

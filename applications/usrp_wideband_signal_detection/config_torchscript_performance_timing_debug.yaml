@@ -118,14 +118,9 @@ fft:
   averaging_type: 1
   window_time: 0
   window_type: 0
-  # FFT length in bins. For this path it should stay aligned with burst_size.
   transform_points: 20480
-  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
   window_points: 20480
-  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
   resolution: 24414
-  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
-  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
   span: 500000000
   weighting_factor: 0
   f1_index: -10240
@@ -134,7 +129,7 @@ fft:
 
 logger:
   num_channels: 2
-  log_interval: 10
+  log_interval: 5
 
 visualization:
   enable: false
@@ -172,7 +167,9 @@ dinov3_signal_detector:
   input_height: 256
   input_width: 512
   patch_size: 16
-  emit_stride: 6
+  # Debug-only: timing summaries synchronize the CUDA stream, so use a looser
+  # detector cadence to keep the graph alive long enough to expose hotspots.
+  emit_stride: 16
   mask_threshold_db: -20.0
   log_detections: false
   backend_mode: "reference"
@@ -221,9 +218,9 @@ dinov3_signal_detector:
   pipeline_strong_speckle_min_component: 10
   pipeline_texture_speckle_clean_threshold: 0.85
   pipeline_texture_speckle_strong_threshold: 0.20
-  timing_summary_enable: false
-  timing_summary_every_n: 64
-  timing_summary_window: 8
+  timing_summary_enable: true
+  timing_summary_every_n: 1
+  timing_summary_window: 4
 
 coherent_power_signal_detector:
   num_channels: 2

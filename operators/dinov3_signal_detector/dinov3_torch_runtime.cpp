@@ -98,6 +98,92 @@ torch::Tensor normalize_map01(const torch::Tensor& input, double low_q, double h
   return torch::clamp((input - lo) / scale, 0.0, 1.0);
 }
 
+torch::Tensor normalize_map01_masked_minmax(const torch::Tensor& input, const torch::Tensor& valid_mask) {
+  auto output = torch::zeros_like(input, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
+  auto active = input.masked_select(valid_mask);
+  if (active.numel() == 0) {
+    return output;
+  }
+
+  const double lo = active.min().item<double>();
+  const double hi = active.max().item<double>();
+  const double scale = std::max(hi - lo, 1e-6);
+  auto normalized = torch::clamp((input - lo) / scale, 0.0, 1.0).to(torch::kFloat32);
+  return torch::where(valid_mask, normalized, output);
+}
+
+torch::Tensor gaussian_kernel_tensor(double sigma, const c10::Device& device) {
+  if (sigma <= 0.0) {
+    return torch::ones({1}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  }
+
+  const auto radius = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(3.0 * sigma)));
+  auto x = torch::arange(-radius, radius + 1, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  auto kernel = torch::exp(-(x * x) / (2.0 * sigma * sigma));
+  kernel = kernel / kernel.sum();
+  return kernel.contiguous();
+}
+
+torch::Tensor gaussian_second_derivative_kernel_tensor(double sigma, const c10::Device& device) {
+  if (sigma <= 0.0) {
+    return torch::zeros({1}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  }
+
+  const auto radius = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(3.0 * sigma)));
+  auto x = torch::arange(-radius, radius + 1, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  const double sigma2 = sigma * sigma;
+  auto kernel = ((x * x - sigma2) / (sigma2 * sigma2)) * torch::exp(-(x * x) / (2.0 * sigma2));
+  return kernel.contiguous();
+}
+
+torch::Tensor convolve_rows_2d(const torch::Tensor& input, const torch::Tensor& kernel) {
+  const auto radius = kernel.size(0) / 2;
+  auto padded = torch::replication_pad2d(input.unsqueeze(0).unsqueeze(0), {0, 0, radius, radius});
+  return torch::conv2d(padded, kernel.view({1, 1, kernel.size(0), 1})).squeeze(0).squeeze(0);
+}
+
+torch::Tensor convolve_cols_2d(const torch::Tensor& input, const torch::Tensor& kernel) {
+  const auto radius = kernel.size(0) / 2;
+  auto padded = torch::replication_pad2d(input.unsqueeze(0).unsqueeze(0), {radius, radius, 0, 0});
+  return torch::conv2d(padded, kernel.view({1, 1, 1, kernel.size(0)})).squeeze(0).squeeze(0);
+}
+
+torch::Tensor gaussian_blur_2d(const torch::Tensor& input, double sigma_rows, double sigma_cols) {
+  auto row_kernel = gaussian_kernel_tensor(sigma_rows, input.device());
+  auto col_kernel = gaussian_kernel_tensor(sigma_cols, input.device());
+  return convolve_cols_2d(convolve_rows_2d(input, row_kernel), col_kernel).contiguous();
+}
+
+torch::Tensor gaussian_second_derivative_rows_2d(const torch::Tensor& input, double sigma) {
+  auto kernel = gaussian_second_derivative_kernel_tensor(sigma, input.device());
+  return convolve_rows_2d(input, kernel).contiguous();
+}
+
+torch::Tensor make_valid_mask_tensor(int src_rows, int dst_rows, int dst_cols, int ignore_bins_per_side, const c10::Device& device) {
+  auto dst_indices = torch::arange(dst_rows, torch::TensorOptions().dtype(torch::kInt64).device(device));
+  auto src_indices = torch::div(dst_indices * src_rows, std::max(dst_rows, 1), "floor");
+  auto valid_rows = torch::logical_and(src_indices >= ignore_bins_per_side,
+                                       src_indices < (src_rows - ignore_bins_per_side));
+  return valid_rows.unsqueeze(1).expand({dst_rows, dst_cols}).contiguous();
+}
+
+torch::Tensor binary_dilate_rect_tensor(const torch::Tensor& mask, int kernel_rows, int kernel_cols) {
+  auto mask_float = mask.to(torch::kFloat32);
+  const int row_radius = std::max(0, kernel_rows / 2);
+  const int col_radius = std::max(0, kernel_cols / 2);
+  auto padded = torch::replication_pad2d(mask_float.unsqueeze(0).unsqueeze(0), {col_radius, col_radius, row_radius, row_radius});
+  return torch::max_pool2d(padded, {kernel_rows, kernel_cols}, {1, 1}, {0, 0}).squeeze(0).squeeze(0) > 0.5;
+}
+
+torch::Tensor binary_erode_rect_tensor(const torch::Tensor& mask, int kernel_rows, int kernel_cols) {
+  auto inverted = torch::logical_not(mask);
+  return torch::logical_not(binary_dilate_rect_tensor(inverted, kernel_rows, kernel_cols));
+}
+
+torch::Tensor binary_closing_rect_tensor(const torch::Tensor& mask, int kernel_rows, int kernel_cols) {
+  return binary_erode_rect_tensor(binary_dilate_rect_tensor(mask, kernel_rows, kernel_cols), kernel_rows, kernel_cols);
+}
+
 torch::Tensor derive_dino_score_map(torch::Tensor model_output,
                                     int aligned_rows,
                                     int aligned_cols,
@@ -174,6 +260,7 @@ class DinoTorchRuntime::Impl {
     std::string failure_detail;
 
     try {
+      torch::InferenceMode inference_mode_guard(true);
       const size_t expected_bins = static_cast<size_t>(input.src_rows) * static_cast<size_t>(input.src_cols);
 
       failure_detail = std::string("channel=") + std::to_string(input.channel_number) +
@@ -390,6 +477,12 @@ class DinoTorchRuntime::Impl {
         final_score = dino_score.contiguous();
       });
 
+      if (config.return_final_mask_device) {
+        auto final_score_device = final_score.contiguous();
+        result.final_mask_device = final_score_device.data_ptr<float>();
+        result.final_mask_device_owner = std::make_shared<torch::Tensor>(final_score_device);
+      }
+
       if (config.return_final_mask) {
         failure_stage = "final_mask_to_cpu";
         auto final_mask_cpu = final_score.device().is_cuda() ? final_score.to(torch::kCPU) : final_score;
@@ -404,6 +497,119 @@ class DinoTorchRuntime::Impl {
       result.error_message = error.what();
       result.error_detail = failure_detail + (last_detail_.empty() ? std::string() : std::string(" detail=") + last_detail_);
       return result;
+    }
+  }
+
+  DinoHybridPostGpuResult run_hybrid_post_gpu(const DinoHybridPostGpuInput& input) {
+    DinoHybridPostGpuResult result;
+    if (input.dst_rows <= 0 || input.dst_cols <= 0 || input.src_rows <= 0 ||
+        input.dino_score_device == nullptr || input.coherence_gate_device == nullptr) {
+      result.error_message = "Invalid GPU hybrid postprocess input";
+      return result;
+    }
+
+    try {
+      torch::InferenceMode inference_mode_guard(true);
+      c10::Device compute_device(torch::kCUDA, 0);
+      const auto torch_stream = input.cuda_stream
+                                    ? c10::cuda::getStreamFromExternal(input.cuda_stream, compute_device.index())
+                                    : c10::cuda::getDefaultCUDAStream(compute_device.index());
+      c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
+
+      auto tensor_options = torch::TensorOptions().dtype(torch::kFloat32).device(compute_device);
+      auto dino_score = torch::from_blob(const_cast<float*>(input.dino_score_device),
+                                         {static_cast<int64_t>(input.dst_rows), static_cast<int64_t>(input.dst_cols)},
+                                         tensor_options);
+      auto coherence_gate = torch::from_blob(const_cast<float*>(input.coherence_gate_device),
+                                             {static_cast<int64_t>(input.dst_rows), static_cast<int64_t>(input.dst_cols)},
+                                             tensor_options);
+      auto valid_mask = make_valid_mask_tensor(input.src_rows,
+                                               input.dst_rows,
+                                               input.dst_cols,
+                                               input.ignore_bins_per_side,
+                                               compute_device);
+
+      auto base_map = dino_score * coherence_gate;
+      auto base_norm = normalize_map01_masked_minmax(base_map, valid_mask);
+      auto envelope_map = normalize_map01_masked_minmax(gaussian_blur_2d(base_norm, 6.0, 1.4), valid_mask);
+      auto base_blur = gaussian_blur_2d(base_norm, 4.0, 1.0);
+      auto residual_penalty = normalize_map01_masked_minmax(gaussian_blur_2d(torch::abs(base_norm - base_blur), 2.0, 0.8), valid_mask);
+      auto freq_curvature_penalty = normalize_map01_masked_minmax(torch::abs(gaussian_second_derivative_rows_2d(base_norm, 0.8)), valid_mask);
+
+      auto keep_freq = normalize_map01_masked_minmax(envelope_map - 0.90 * freq_curvature_penalty, valid_mask);
+      auto keep_res = normalize_map01_masked_minmax(envelope_map - 1.00 * residual_penalty, valid_mask);
+      auto active_freq = keep_freq.masked_select(valid_mask);
+      auto active_res = keep_res.masked_select(valid_mask);
+
+      result.seed_freq_threshold = static_cast<float>(scalar_quantile(active_freq, 0.90));
+      result.seed_res_threshold = static_cast<float>(scalar_quantile(active_res, 0.82));
+      result.grow_freq_threshold = result.seed_freq_threshold;
+      result.grow_res_threshold = result.seed_res_threshold;
+
+      auto residual_veto_gate = torch::clamp((keep_res - 0.30) / 0.70, 0.0, 1.0);
+      auto combined_score = normalize_map01_masked_minmax(keep_freq * (0.35 + 0.65 * residual_veto_gate), valid_mask);
+      auto active_combined = combined_score.masked_select(valid_mask);
+      result.combined_threshold = static_cast<float>(scalar_quantile(active_combined, 0.78));
+
+      auto seed_mask = torch::logical_and(valid_mask,
+                                          torch::logical_and(keep_freq >= result.seed_freq_threshold,
+                                                             keep_res >= result.seed_res_threshold));
+      auto combined_gate_mask = torch::logical_and(valid_mask, combined_score >= (result.combined_threshold * 0.85f));
+
+      auto seed_mask_cpu = seed_mask.to(torch::kCPU, torch::kUInt8).contiguous();
+      auto combined_gate_mask_cpu = combined_gate_mask.to(torch::kCPU, torch::kUInt8).contiguous();
+      const size_t elements = static_cast<size_t>(input.dst_rows) * static_cast<size_t>(input.dst_cols);
+      result.seed_mask.resize(elements);
+      result.combined_gate_mask.resize(elements);
+      std::memcpy(result.seed_mask.data(), seed_mask_cpu.data_ptr<uint8_t>(), elements * sizeof(uint8_t));
+      std::memcpy(result.combined_gate_mask.data(), combined_gate_mask_cpu.data_ptr<uint8_t>(), elements * sizeof(uint8_t));
+      result.success = true;
+      return result;
+    } catch (const std::exception& error) {
+      result.error_message = error.what();
+      return result;
+    }
+  }
+
+  void warmup(const DinoTorchRuntimeConfig& config, int dst_rows, int dst_cols, int patch_size, cudaStream_t cuda_stream) {
+    const auto init_mode = normalize_torchscript_init_mode(config.torchscript_init_mode);
+    if (config.inference_backend != "torchscript") {
+      return;
+    }
+
+    const bool use_cuda_torch = torchscript_init_moves_to_cuda(init_mode);
+    const c10::Device compute_device = use_cuda_torch ? c10::Device(torch::kCUDA, 0) : c10::Device(torch::kCPU);
+
+    torch::InferenceMode inference_mode_guard(true);
+    std::unique_ptr<c10::cuda::CUDAStreamGuard> stream_guard;
+    if (use_cuda_torch) {
+      const auto torch_stream = cuda_stream
+                                    ? c10::cuda::getStreamFromExternal(cuda_stream, compute_device.index())
+                                    : c10::cuda::getDefaultCUDAStream(compute_device.index());
+      stream_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(torch_stream);
+    }
+
+    ensure_loaded(config, compute_device);
+    if (!torchscript_forward_ready_ || !torchscript_module_) {
+      return;
+    }
+
+    const int safe_patch = std::max(1, patch_size);
+    const int aligned_rows = std::max(safe_patch, (std::max(1, dst_rows) / safe_patch) * safe_patch);
+    const int aligned_cols = std::max(safe_patch, (std::max(1, dst_cols) / safe_patch) * safe_patch);
+    auto warmup_input = torch::zeros({1, 3, aligned_rows, aligned_cols},
+                                     torch::TensorOptions().dtype(torch::kFloat32).device(compute_device));
+    auto warmup_output = torchscript_module_->forward({warmup_input});
+    if (!(warmup_output.isTensor() || warmup_output.isTuple())) {
+      throw std::runtime_error("TorchScript warmup returned non-tensor output");
+    }
+
+    if (use_cuda_torch) {
+      const auto sync_result = cudaDeviceSynchronize();
+      if (sync_result != cudaSuccess) {
+        throw std::runtime_error(std::string("TorchScript warmup synchronization failed: ") +
+                                 cudaGetErrorString(sync_result));
+      }
     }
   }
 
@@ -450,6 +656,18 @@ DinoTorchRuntime& DinoTorchRuntime::operator=(DinoTorchRuntime&&) noexcept = def
 
 DinoTorchRuntimeResult DinoTorchRuntime::run(const DinoTorchRuntimeConfig& config, const DinoTorchRuntimeInput& input) {
   return impl_->run(config, input);
+}
+
+DinoHybridPostGpuResult DinoTorchRuntime::run_hybrid_post_gpu(const DinoHybridPostGpuInput& input) {
+  return impl_->run_hybrid_post_gpu(input);
+}
+
+void DinoTorchRuntime::warmup(const DinoTorchRuntimeConfig& config,
+                              int dst_rows,
+                              int dst_cols,
+                              int patch_size,
+                              cudaStream_t cuda_stream) {
+  impl_->warmup(config, dst_rows, dst_cols, patch_size, cuda_stream);
 }
 
 }  // namespace holoscan::ops

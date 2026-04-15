@@ -67,6 +67,12 @@ Available configs copied into the build directory:
 	- two-channel throughput test mode
 	- disables spectrogram saves, detector mask saves, per-frame detection logging, and timing summaries to keep the data path as lean as possible
 	- keeps GPU RX pools at the known-safe `25000` buffers per channel to avoid GPUDirect BAR1 DMA-map failures, while reducing queue burst size and raising `num_simul_batches` so the graph can absorb more ingress jitter before dropping packets
+- `config_torchscript_performance_timing_debug.yaml`
+	- debug-only hotspot profiling mode for the two-channel TorchScript path
+	- re-enables detector timing summaries and raises `emit_stride` so the synchronized timing probe can print stage timings without immediately collapsing ingress
+- `config_torchscript_realtime_guarded.yaml`
+	- guarded two-channel realtime attempt for the notebook-faithful TorchScript reference backend
+	- uses smaller ingress/FFT batches plus a conservative detector cadence to reduce packet retention and create buffer headroom before re-tightening throughput knobs
 - `config_torchscript_performance_fft_only.yaml`
 	- ingress and FFT isolation mode
 	- bypasses both spectrogram and detector so the first throughput ceiling can be measured without downstream ML work
@@ -257,6 +263,8 @@ cd applications/usrp_wideband_signal_detection
 CONFIG_NAME=config_torchscript_performance_fft_only.yaml ./run_torchscript_performance_test.sh
 CONFIG_NAME=config_torchscript_performance_spectrogram_only.yaml ./run_torchscript_performance_test.sh
 CONFIG_NAME=config_torchscript_performance_small_batches.yaml ./run_torchscript_performance_test.sh
+CONFIG_NAME=config_torchscript_realtime_guarded.yaml ./run_torchscript_performance_test.sh
+CONFIG_NAME=config_torchscript_performance_timing_debug.yaml ./run_torchscript_performance_test.sh
 ```
 
 If you need to force a rebuild even when the targets look current:
