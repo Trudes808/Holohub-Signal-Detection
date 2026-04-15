@@ -46,8 +46,11 @@ class DinoV3SignalDetector : public holoscan::Operator {
       float* background_device = nullptr;
       float* box_filter_scratch_device = nullptr;
       float* coherence_gate_device = nullptr;
+      float* coherence_gate_resized_device = nullptr;
       float* coherence_gate_host = nullptr;
       uint8_t* mask_host = nullptr;
+      cudaStream_t staging_stream = nullptr;
+      cudaEvent_t coherence_gate_ready_event = nullptr;
       size_t frame_elements = 0;
       size_t row_elements = 0;
       size_t mask_elements = 0;
@@ -66,6 +69,7 @@ class DinoV3SignalDetector : public holoscan::Operator {
   holoscan::Parameter<int> emit_stride_;
   holoscan::Parameter<float> mask_threshold_db_;
   holoscan::Parameter<bool> log_detections_;
+  holoscan::Parameter<std::string> backend_mode_;
   holoscan::Parameter<bool> enable_mask_save_;
   holoscan::Parameter<int> save_every_n_frames_;
   holoscan::Parameter<int> max_masks_per_channel_;

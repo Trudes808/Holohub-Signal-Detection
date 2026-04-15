@@ -153,6 +153,7 @@ dinov3_signal_detector:
   emit_stride: 1
   mask_threshold_db: -20.0
   log_detections: true
+  backend_mode: "reference"
   enable_mask_save: false
   save_every_n_frames: 1
   max_masks_per_channel: 5

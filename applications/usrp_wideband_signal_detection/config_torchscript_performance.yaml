@@ -68,7 +68,7 @@ advanced_network:
             - name: "Channel 1 data"
               id: 0
               cpu_core: 10
-              batch_size: 2048
+              batch_size: 1024
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
@@ -76,7 +76,7 @@ advanced_network:
             - name: "Channel 2 data"
               id: 1
               cpu_core: 11
-              batch_size: 2048
+              batch_size: 1024
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH2_CHDR_Headers_RX_CPU"
@@ -104,7 +104,7 @@ chdr_converter:
   interface_name: sdr_data
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 250
+  num_ffts_per_batch: 64
   num_simul_batches: 4
   num_channels: 2
   log_packets: false
@@ -112,7 +112,7 @@ chdr_converter:
 
 fft:
   burst_size: 20480
-  num_bursts: 250
+  num_bursts: 64
   num_channels: 2
   spectrum_type: 1
   averaging_type: 1
@@ -172,9 +172,10 @@ dinov3_signal_detector:
   input_height: 256
   input_width: 512
   patch_size: 16
-  emit_stride: 1
+  emit_stride: 4
   mask_threshold_db: -20.0
   log_detections: false
+  backend_mode: "reference"
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0
@@ -203,6 +204,7 @@ dinov3_signal_detector:
   frontend_correction_edge_target_drop_db: 2.5
   frontend_edge_guard_floor: 0.35
   dino_coherence_gate_floor: 0.25
+  dino_coherence_gate_span_db: 3.0
   texture_q: 0.90
   texture_k: 6
   power_q: 0.90

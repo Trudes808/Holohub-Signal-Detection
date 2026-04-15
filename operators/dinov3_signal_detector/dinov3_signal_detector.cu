@@ -67,6 +67,87 @@ struct HybridPostprocessResult {
   int component_count = 0;
 };
 
+float quantile_from_values(std::vector<float> values, double q, float fallback);
+std::vector<uint8_t> keep_large_components(const std::vector<uint8_t>& mask,
+                                           int rows,
+                                           int cols,
+                                           int min_size,
+                                           int* component_count = nullptr);
+std::vector<uint8_t> binary_closing_rect(const std::vector<uint8_t>& mask,
+                                         int rows,
+                                         int cols,
+                                         int kernel_rows,
+                                         int kernel_cols);
+std::vector<uint8_t> binary_fill_holes(const std::vector<uint8_t>& mask, int rows, int cols);
+std::vector<uint8_t> binary_propagation(const std::vector<uint8_t>& seed,
+                                        const std::vector<uint8_t>& mask,
+                                        int rows,
+                                        int cols);
+float mean_mask_value(const std::vector<uint8_t>& mask);
+float connected_fraction(const std::vector<uint8_t>& mask, const std::vector<uint8_t>& valid_mask);
+
+HybridPostprocessResult run_fast_dino_postprocess(const std::vector<float>& dino_score,
+                                                  const std::vector<uint8_t>& valid_mask,
+                                                  int rows,
+                                                  int cols,
+                                                  float score_threshold,
+                                                  int min_component_size) {
+  HybridPostprocessResult result;
+  result.mask.assign(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
+  if (dino_score.size() != result.mask.size() || valid_mask.size() != result.mask.size()) {
+    return result;
+  }
+
+  const auto active_scores = [&]() {
+    std::vector<float> values;
+    values.reserve(dino_score.size());
+    for (size_t index = 0; index < dino_score.size(); ++index) {
+      if (valid_mask[index] && std::isfinite(dino_score[index])) {
+        values.push_back(dino_score[index]);
+      }
+    }
+    return values;
+  }();
+
+  const float fallback_threshold = quantile_from_values(active_scores, 0.85, 1.0f);
+  const float base_threshold = std::isfinite(score_threshold) && score_threshold > 0.0f
+                                   ? score_threshold
+                                   : fallback_threshold;
+  const float grow_threshold = std::max(0.0f, base_threshold * 0.92f);
+
+  std::vector<uint8_t> seed_mask(result.mask.size(), 0);
+  std::vector<uint8_t> grow_mask(result.mask.size(), 0);
+  for (size_t index = 0; index < result.mask.size(); ++index) {
+    if (!valid_mask[index]) {
+      continue;
+    }
+    seed_mask[index] = dino_score[index] >= base_threshold ? 1 : 0;
+    grow_mask[index] = dino_score[index] >= grow_threshold ? 1 : 0;
+  }
+
+  seed_mask = keep_large_components(seed_mask, rows, cols, std::max(8, min_component_size / 2));
+  grow_mask = binary_closing_rect(grow_mask, rows, cols, 5, 3);
+  grow_mask = binary_fill_holes(grow_mask, rows, cols);
+  auto final_mask = binary_propagation(seed_mask, grow_mask, rows, cols);
+  final_mask = binary_closing_rect(final_mask, rows, cols, 5, 3);
+  final_mask = binary_fill_holes(final_mask, rows, cols);
+  final_mask = keep_large_components(final_mask, rows, cols, std::max(12, min_component_size), &result.component_count);
+  for (size_t index = 0; index < final_mask.size(); ++index) {
+    final_mask[index] = (final_mask[index] && valid_mask[index]) ? 1 : 0;
+  }
+  final_mask = keep_large_components(final_mask, rows, cols, std::max(12, min_component_size), &result.component_count);
+
+  result.seed_freq_threshold = base_threshold;
+  result.seed_res_threshold = base_threshold;
+  result.grow_freq_threshold = grow_threshold;
+  result.grow_res_threshold = grow_threshold;
+  result.combined_threshold = grow_threshold;
+  result.final_fraction = mean_mask_value(final_mask);
+  result.connected_fraction = connected_fraction(final_mask, valid_mask);
+  result.mask = std::move(final_mask);
+  return result;
+}
+
 CanonicalTensorView canonical_tensor_view(int input_rows, int input_cols) {
   CanonicalTensorView view;
   view.transposed = input_rows < input_cols;
@@ -76,8 +157,8 @@ CanonicalTensorView canonical_tensor_view(int input_rows, int input_cols) {
 }
 
 template <typename T>
-T clamp_value(T value, T low, T high) {
-  return std::max(low, std::min(high, value));
+__host__ __device__ inline T clamp_value(T value, T low, T high) {
+  return value < low ? low : (value > high ? high : value);
 }
 
 __host__ __device__ inline size_t flat_index(int cols, int row, int col) {
@@ -321,6 +402,45 @@ __global__ void dino_coherence_gate_kernel(const float* time_mean,
                         1.0f);
 }
 
+__global__ void dino_resize_bilinear_kernel(const float* input,
+                                            int src_rows,
+                                            int src_cols,
+                                            float* output,
+                                            int dst_rows,
+                                            int dst_cols) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = dst_rows * dst_cols;
+  if (index >= total) {
+    return;
+  }
+
+  const int dst_row = index / dst_cols;
+  const int dst_col = index % dst_cols;
+  const float src_row_f = dst_rows > 1
+                              ? (static_cast<float>(dst_row) * static_cast<float>(src_rows - 1)) /
+                                    static_cast<float>(dst_rows - 1)
+                              : 0.0f;
+  const float src_col_f = dst_cols > 1
+                              ? (static_cast<float>(dst_col) * static_cast<float>(src_cols - 1)) /
+                                    static_cast<float>(dst_cols - 1)
+                              : 0.0f;
+
+  const int src_row0 = clamp_value(static_cast<int>(floorf(src_row_f)), 0, src_rows - 1);
+  const int src_col0 = clamp_value(static_cast<int>(floorf(src_col_f)), 0, src_cols - 1);
+  const int src_row1 = min(src_row0 + 1, src_rows - 1);
+  const int src_col1 = min(src_col0 + 1, src_cols - 1);
+  const float row_t = src_row_f - static_cast<float>(src_row0);
+  const float col_t = src_col_f - static_cast<float>(src_col0);
+
+  const float v00 = input[flat_index(src_cols, src_row0, src_col0)];
+  const float v01 = input[flat_index(src_cols, src_row0, src_col1)];
+  const float v10 = input[flat_index(src_cols, src_row1, src_col0)];
+  const float v11 = input[flat_index(src_cols, src_row1, src_col1)];
+  const float top = v00 + (v01 - v00) * col_t;
+  const float bottom = v10 + (v11 - v10) * col_t;
+  output[flat_index(dst_cols, dst_row, dst_col)] = top + (bottom - top) * row_t;
+}
+
 float quantile_from_values(std::vector<float> values, double q, float fallback = 1.0f) {
   values.erase(std::remove_if(values.begin(), values.end(), [](float value) {
                  return !std::isfinite(value);
@@ -461,41 +581,13 @@ std::vector<float> convolve_axis(const std::vector<float>& input,
   return output;
 }
 
-std::vector<float> gaussian_blur(const std::vector<float>& input,
-                                 int rows,
-                                 int cols,
-                                 double sigma_rows,
-                                 double sigma_cols) {
-  auto row_blur = convolve_axis(input, rows, cols, gaussian_kernel(sigma_rows), true);
-  return convolve_axis(row_blur, rows, cols, gaussian_kernel(sigma_cols), false);
-}
-
-std::vector<float> gaussian_second_derivative_rows(const std::vector<float>& input,
-                                                   int rows,
-                                                   int cols,
-                                                   double sigma) {
-  auto smooth = convolve_axis(input, rows, cols, gaussian_kernel(sigma), true);
-  std::vector<float> output(input.size(), 0.0f);
-  for (int row = 0; row < rows; ++row) {
-    const int prev_row = clamp_value(row - 1, 0, rows - 1);
-    const int next_row = clamp_value(row + 1, 0, rows - 1);
-    for (int col = 0; col < cols; ++col) {
-      output[flat_index(cols, row, col)] =
-          smooth[flat_index(cols, prev_row, col)] -
-          2.0f * smooth[flat_index(cols, row, col)] +
-          smooth[flat_index(cols, next_row, col)];
-    }
-  }
-  return output;
-}
-
 ComponentLabelling label_components(const std::vector<uint8_t>& mask, int rows, int cols) {
   ComponentLabelling result;
   result.labels.assign(mask.size(), 0);
+  int next_label = 0;
   constexpr std::array<int, 8> d_row = {-1, -1, -1, 0, 0, 1, 1, 1};
   constexpr std::array<int, 8> d_col = {-1, 0, 1, -1, 1, -1, 0, 1};
 
-  int next_label = 0;
   for (int row = 0; row < rows; ++row) {
     for (int col = 0; col < cols; ++col) {
       const size_t index = flat_index(cols, row, col);
@@ -538,7 +630,7 @@ std::vector<uint8_t> keep_large_components(const std::vector<uint8_t>& mask,
                                            int rows,
                                            int cols,
                                            int min_size,
-                                           int* kept_component_count = nullptr) {
+                                           int* kept_component_count) {
   auto labelled = label_components(mask, rows, cols);
   std::vector<uint8_t> output(mask.size(), 0);
   for (size_t index = 0; index < labelled.labels.size(); ++index) {
@@ -880,14 +972,24 @@ DinoV3SignalDetector::~DinoV3SignalDetector() {
     cudaFree(buffers.background_device);
     cudaFree(buffers.box_filter_scratch_device);
     cudaFree(buffers.coherence_gate_device);
+    cudaFree(buffers.coherence_gate_resized_device);
     cudaFreeHost(buffers.coherence_gate_host);
     cudaFreeHost(buffers.mask_host);
+    if (buffers.coherence_gate_ready_event != nullptr) {
+      cudaEventDestroy(buffers.coherence_gate_ready_event);
+    }
+    if (buffers.staging_stream != nullptr) {
+      cudaStreamDestroy(buffers.staging_stream);
+    }
     buffers = ChannelBuffers {};
   }
 }
 
 void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.input<dino_in_t>("in");
+
+  const std::vector<double> imagenet_mean_default{0.485, 0.456, 0.406};
+  const std::vector<double> imagenet_std_default{0.229, 0.224, 0.225};
 
   spec.param(num_channels_, "num_channels", "Number of channels", "Number of channels in the stream.", 1);
   spec.param(input_height_, "input_height", "Input height", "Detector output height.", 256);
@@ -896,6 +998,7 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(emit_stride_, "emit_stride", "Emit stride", "Emit one output every N input frames per channel.", 1);
   spec.param(mask_threshold_db_, "mask_threshold_db", "Mask threshold (legacy)", "Legacy placeholder threshold retained for compatibility.", -20.0f);
   spec.param(log_detections_, "log_detections", "Log detections", "If true, logs detector execution details.", false);
+  spec.param(backend_mode_, "backend_mode", "Backend mode", "Detector backend mode: reference or fast_gpu.", std::string("reference"));
   spec.param(enable_mask_save_, "enable_mask_save", "Enable mask save", "Enable writing detector masks to disk for debug runs.", false);
   spec.param(save_every_n_frames_, "save_every_n_frames", "Save stride", "Save one detector mask every N frames per channel.", 1);
   spec.param(max_masks_per_channel_, "max_masks_per_channel", "Max masks per channel", "Maximum number of detector masks to save per channel for a run.", 5);
@@ -908,8 +1011,8 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(model_script_path_, "model_script_path", "Model script path", "Path to TorchScript model for model-forward backend.", std::string("/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"));
   spec.param(torchscript_init_mode_, "torchscript_init_mode", "TorchScript init mode", "TorchScript initialization mode: load_only, load_cpu_eval, load_cuda_no_eval, or load_cuda_eval.", std::string("load_cuda_eval"));
   spec.param(strict_model_forward_, "strict_model_forward", "Strict model forward", "If true, drop frames when the DINO runtime fails instead of falling back.", false);
-  spec.param(imagenet_mean_, "imagenet_mean", "ImageNet mean", "Mean used for notebook-aligned model normalization.", std::vector<double>{0.485, 0.456, 0.406});
-  spec.param(imagenet_std_, "imagenet_std", "ImageNet std", "Standard deviation used for notebook-aligned model normalization.", std::vector<double>{0.229, 0.224, 0.225});
+  spec.param(imagenet_mean_, "imagenet_mean", "ImageNet mean", "Mean used for notebook-aligned model normalization.", imagenet_mean_default);
+  spec.param(imagenet_std_, "imagenet_std", "ImageNet std", "Standard deviation used for notebook-aligned model normalization.", imagenet_std_default);
   spec.param(fft_size_, "fft_size", "FFT size", "Notebook-derived FFT size constant for metadata and parity tracking.", 1024);
   spec.param(noverlap_, "noverlap", "FFT overlap", "Notebook-derived overlap constant for parity tracking.", 256);
   spec.param(ignore_sideband_hz_, "ignore_sideband_hz", "Ignore sideband Hz", "Frequency span to ignore on each side of the spectrum before DINO preprocessing.", 7.0e6);
@@ -1022,11 +1125,20 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
   const int patch_size = std::max(1, patch_size_.get());
   const int total_bins = src_rows * src_cols;
   const size_t frame_elements = static_cast<size_t>(total_bins);
-  const size_t frame_bytes = frame_elements * sizeof(float);
+  const size_t dst_elements = static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols);
+  const size_t dst_bytes = dst_elements * sizeof(float);
   const bool timing_enabled = timing_summary_enable_.get();
   const bool should_save_mask = enable_mask_save_.get() &&
                                 (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
                                 (masks_saved_[channel_number] < max_masks_per_channel_.get());
+  const auto requested_backend_mode = backend_mode_.get();
+  const bool requested_fast_backend = requested_backend_mode == "fast_gpu";
+  const bool requested_reference_backend = requested_backend_mode == "reference";
+  if (!requested_fast_backend && !requested_reference_backend) {
+    HOLOSCAN_LOG_WARN("Unsupported DINO backend_mode='{}'. Falling back to reference.", requested_backend_mode);
+  }
+  const bool use_fast_backend = requested_fast_backend && strict_model_forward_.get() && !should_save_mask;
+  const std::string effective_backend_mode = use_fast_backend ? std::string("fast_gpu") : std::string("reference");
   std::array<double, kTimingStageCount> stage_ms {};
   const auto total_start = std::chrono::steady_clock::now();
 
@@ -1084,6 +1196,21 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         }
       };
 
+      if (buffers.staging_stream == nullptr) {
+        const auto stream_result = cudaStreamCreateWithFlags(&buffers.staging_stream, cudaStreamNonBlocking);
+        if (stream_result != cudaSuccess) {
+          throw std::runtime_error(std::string("coherence staging stream creation failed: ") +
+                                   cudaGetErrorString(stream_result));
+        }
+      }
+      if (buffers.coherence_gate_ready_event == nullptr) {
+        const auto event_result = cudaEventCreateWithFlags(&buffers.coherence_gate_ready_event, cudaEventDisableTiming);
+        if (event_result != cudaSuccess) {
+          throw std::runtime_error(std::string("coherence staging event creation failed: ") +
+                                   cudaGetErrorString(event_result));
+        }
+      }
+
       if (buffers.frame_elements != frame_elements) {
         cudaFree(buffers.analysis_tensor_device);
         cudaFree(buffers.power_db_device);
@@ -1093,8 +1220,6 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         cudaFree(buffers.background_device);
         cudaFree(buffers.box_filter_scratch_device);
         cudaFree(buffers.coherence_gate_device);
-        cudaFreeHost(buffers.coherence_gate_host);
-        cudaFreeHost(buffers.mask_host);
 
         buffers.analysis_tensor_device = nullptr;
         buffers.power_db_device = nullptr;
@@ -1104,8 +1229,6 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         buffers.background_device = nullptr;
         buffers.box_filter_scratch_device = nullptr;
         buffers.coherence_gate_device = nullptr;
-        buffers.coherence_gate_host = nullptr;
-        buffers.mask_host = nullptr;
 
         const auto analysis_alloc = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
                                                frame_elements * sizeof(dino_complex));
@@ -1121,14 +1244,26 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         allocate_device_float(buffers.box_filter_scratch_device, frame_elements);
         allocate_device_float(buffers.coherence_gate_device, frame_elements);
 
-        const auto host_gate_alloc = cudaMallocHost(reinterpret_cast<void**>(&buffers.coherence_gate_host), frame_bytes);
+        buffers.frame_elements = frame_elements;
+      }
+
+      if (buffers.mask_elements != dst_elements) {
+        cudaFree(buffers.coherence_gate_resized_device);
+        cudaFreeHost(buffers.coherence_gate_host);
+        cudaFreeHost(buffers.mask_host);
+
+        buffers.coherence_gate_resized_device = nullptr;
+        buffers.coherence_gate_host = nullptr;
+        buffers.mask_host = nullptr;
+
+        allocate_device_float(buffers.coherence_gate_resized_device, dst_elements);
+        const auto host_gate_alloc = cudaMallocHost(reinterpret_cast<void**>(&buffers.coherence_gate_host), dst_bytes);
         if (host_gate_alloc != cudaSuccess) {
           throw std::runtime_error(std::string("coherence gate host allocation failed: ") +
                                    cudaGetErrorString(host_gate_alloc));
         }
 
-        buffers.frame_elements = frame_elements;
-        buffers.mask_elements = frame_elements;
+        buffers.mask_elements = dst_elements;
       }
 
       if (buffers.row_elements != static_cast<size_t>(src_rows)) {
@@ -1186,6 +1321,9 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     });
 
     time_step_ms(kFrontendStage, [&] {
+      if (use_fast_backend) {
+        return;
+      }
       constexpr int threads = 256;
       const int blocks = (total_bins + threads - 1) / threads;
       const int row_blocks = (src_rows + threads - 1) / threads;
@@ -1218,6 +1356,9 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     });
 
     time_step_ms(kCoherenceStage, [&] {
+      if (use_fast_backend) {
+        return;
+      }
       constexpr int threads = 256;
       const int blocks = (total_bins + threads - 1) / threads;
       dino_box_mean_cols_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
@@ -1251,6 +1392,36 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       const auto kernel_result = cudaGetLastError();
       if (kernel_result != cudaSuccess) {
         throw std::runtime_error(std::string("coherence gate kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+
+      const auto ready_result = cudaEventRecord(buffers.coherence_gate_ready_event, stream);
+      if (ready_result != cudaSuccess) {
+        throw std::runtime_error(std::string("coherence gate event record failed: ") + cudaGetErrorString(ready_result));
+      }
+      const auto wait_result = cudaStreamWaitEvent(buffers.staging_stream, buffers.coherence_gate_ready_event, 0);
+      if (wait_result != cudaSuccess) {
+        throw std::runtime_error(std::string("coherence gate staging wait failed: ") + cudaGetErrorString(wait_result));
+      }
+
+      const int resized_blocks = (static_cast<int>(dst_elements) + threads - 1) / threads;
+      dino_resize_bilinear_kernel<<<resized_blocks, threads, 0, buffers.staging_stream>>>(buffers.coherence_gate_device,
+                                                                                           src_rows,
+                                                                                           src_cols,
+                                                                                           buffers.coherence_gate_resized_device,
+                                                                                           dst_rows,
+                                                                                           dst_cols);
+      const auto resize_kernel_result = cudaGetLastError();
+      if (resize_kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("coherence gate resize kernel launch failed: ") + cudaGetErrorString(resize_kernel_result));
+      }
+
+      const auto copy_result = cudaMemcpyAsync(buffers.coherence_gate_host,
+                                               buffers.coherence_gate_resized_device,
+                                               dst_bytes,
+                                               cudaMemcpyDeviceToHost,
+                                               buffers.staging_stream);
+      if (copy_result != cudaSuccess) {
+        throw std::runtime_error(std::string("coherence gate resized copy failed: ") + cudaGetErrorString(copy_result));
       }
     });
 
@@ -1319,24 +1490,28 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
 
     HybridPostprocessResult hybrid_result;
     time_step_ms(kHybridStage, [&] {
-      const auto copy_result = cudaMemcpyAsync(buffers.coherence_gate_host,
-                                               buffers.coherence_gate_device,
-                                               frame_bytes,
-                                               cudaMemcpyDeviceToHost,
-                                               stream);
-      if (copy_result != cudaSuccess) {
-        throw std::runtime_error(std::string("coherence gate copy failed: ") + cudaGetErrorString(copy_result));
-      }
-      const auto sync_result = cudaStreamSynchronize(stream);
-      if (sync_result != cudaSuccess) {
-        throw std::runtime_error(std::string("coherence gate synchronization failed: ") + cudaGetErrorString(sync_result));
-      }
-
-      std::vector<float> coherence_gate_src(buffers.coherence_gate_host,
-                                            buffers.coherence_gate_host + static_cast<std::ptrdiff_t>(frame_elements));
-      auto coherence_gate_resized = resize_bilinear(coherence_gate_src, src_rows, src_cols, dst_rows, dst_cols);
       auto valid_mask = resize_valid_row_mask(src_rows, dst_rows, dst_cols, ignore_bins_per_side);
+      if (use_fast_backend) {
+        if (runtime_result.success &&
+            runtime_result.final_mask.size() == static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols)) {
+          hybrid_result = run_fast_dino_postprocess(runtime_result.final_mask,
+                                                    valid_mask,
+                                                    dst_rows,
+                                                    dst_cols,
+                                                    static_cast<float>(runtime_result.dino_threshold),
+                                                    std::max(12, pipeline_component_min_size_.get() * 4));
+          return;
+        }
+        throw std::runtime_error("fast_gpu backend requires a valid DINO score map from the runtime");
+      }
 
+      const auto sync_result = cudaStreamSynchronize(buffers.staging_stream);
+      if (sync_result != cudaSuccess) {
+        throw std::runtime_error(std::string("coherence gate staging synchronization failed: ") + cudaGetErrorString(sync_result));
+      }
+
+      std::vector<float> coherence_gate_resized(buffers.coherence_gate_host,
+                                                buffers.coherence_gate_host + static_cast<std::ptrdiff_t>(dst_elements));
       std::vector<float> dino_score_map;
       if (runtime_result.success &&
           runtime_result.final_mask.size() == static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols)) {
@@ -1383,6 +1558,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     meta->set("dino_mask_width", static_cast<uint32_t>(dst_cols));
     meta->set("dino_mask_threshold_db", mask_threshold_db_.get());
     meta->set("dino_backend", backend_used);
+    meta->set("dino_backend_mode", effective_backend_mode);
     meta->set("dino_model_name", model_name_.get());
     meta->set("dino_weights_path", weights_path_.get());
     meta->set("dino_model_script_path", model_script_path_.get());
@@ -1399,7 +1575,9 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     meta->set("dino_group_score_threshold", static_cast<double>(hybrid_result.combined_threshold));
     meta->set("dino_power_score_threshold", runtime_result.power_threshold);
     meta->set("dino_pipeline_final_threshold", static_cast<double>(hybrid_result.combined_threshold * 0.85f));
-    meta->set("dino_pipeline_variant", std::string("coherent_shell_residual_veto_hybrid_v1"));
+    meta->set("dino_pipeline_variant",
+          use_fast_backend ? std::string("dino_score_fast_mask_v1")
+                   : std::string("coherent_shell_residual_veto_hybrid_v1"));
     meta->set("dino_coherence_gate_floor", dino_coherence_gate_floor_.get());
     meta->set("dino_coherence_gate_span_db", dino_coherence_gate_span_db_.get());
     meta->set("dino_seed_freq_threshold", static_cast<double>(hybrid_result.seed_freq_threshold));

@@ -30,6 +30,7 @@ dinov3_signal_detector:
   emit_stride: 1
   mask_threshold_db: -20.0
   log_detections: true
+  backend_mode: "reference"
   enable_mask_save: false
   save_every_n_frames: 1
   max_masks_per_channel: 5
@@ -91,6 +92,7 @@ Metadata keys written:
 - `dino_mask_width`
 - `dino_mask_threshold_db`
 - `dino_backend`
+- `dino_backend_mode`
 - `dino_model_name`
 - `dino_weights_path`
 - `dino_model_script_path`
@@ -118,6 +120,10 @@ Metadata keys written:
 ## Current ML status
 
 - `use_pytorch_backend=true` activates the LibTorch runtime path when Torch is available at build/runtime.
+- `backend_mode` controls the operator-side postprocess path:
+  - `reference`: keep the notebook-faithful coherent-shell residual-veto hybrid path.
+  - `fast_gpu`: skip the operator-side frontend/coherence/reference hybrid stages and apply a lightweight DINO-score mask path intended for realtime profiling.
+- Validation and production parity requires `backend_mode=reference` everywhere that is intended to validate or represent production mask generation. `emit_stride` may change for throughput tuning, but `backend_mode` must not.
 - `inference_backend` controls behavior:
   - `torchscript`: attempts TorchScript model forward using `model_script_path`, then returns a DINO score map to the operator.
   - `pytorch_placeholder`: retains the runtime entry point but does not provide a production DINO score.
@@ -126,6 +132,7 @@ Metadata keys written:
   - coherent-style GPU preprocessing and gate generation live in the operator,
   - DINO model execution lives in the Torch runtime helper,
   - final hybrid mask generation lives in the operator.
+- `backend_mode=fast_gpu` remains an experimental throughput path only. It must not be used for production mask generation or validation intended to certify production behavior.
 - `frontend_correction_enable`, `ignore_sideband_hz`, `dino_coherence_gate_floor`, and `dino_coherence_gate_span_db` are the active controls for the coherent-shell hybrid path.
 - `timing_summary_enable=true` emits mean/max timing summaries for the major detector stages every `timing_summary_every_n` emitted frames.
 - `torchscript_init_mode` controls how far C++ initialization proceeds before compute begins:

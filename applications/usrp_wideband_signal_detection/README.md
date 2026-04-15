@@ -210,6 +210,8 @@ cd applications/usrp_wideband_signal_detection
 
 For the cleanest startup behavior, launch the app before starting the RF transmitter. The advanced-network DPDK workers are started during app initialization, before the Holoscan graph is fully active, so starting the transmitter first can produce a brief burst of startup-only drops even when steady-state throughput is healthy.
 
+Validation and production parity rule: for both the coherent-power and DINO detectors, any config intended to validate or represent production mask behavior must use the same `backend_mode`. The approved throughput knob is `emit_stride`; logs, saves, and timing summaries may differ, but the mask-generation backend must not.
+
 For a more conservative coherent real-time profile that prioritizes sustained ingest headroom while the coherent detector still contains host-side stages:
 
 ```bash
@@ -343,10 +345,11 @@ The next visualization step is to add a detector overlay postprocessor that emit
 ## Validation Notes
 
 - `config.yaml` is now the stable debug run configuration. It intentionally keeps `inference_backend: "pytorch_placeholder"` while saving the first 5 spectrograms and detector masks per channel.
+- Parity rule: validation and production/performance configs must keep the same detector `backend_mode` for mask creation. Use `emit_stride`, artifact saves, logging, and timing summaries as the tuning knobs; do not change the mask backend between validation and production.
 - `config_coherent_power_debug_capture.yaml` is the coherent-power frozen-input capture profile. It enables tensor snapshot saves, optional `power_db` snapshot saves, and final mask saves so notebook and offline C++ parity checks can run on the exact same detector input.
 - `config_cuda_fallback.yaml` is the debug configuration for the pure C++/CUDA detector path. It disables the PyTorch backend in operator logic and uses `cuda_threshold_fallback` while keeping artifact saves enabled.
 - `config_torchscript_validation.yaml` is the strict TorchScript bring-up configuration. Use it when you want the C++ TorchScript path to fail loudly.
-- `config_torchscript_performance.yaml` is the low-overhead throughput configuration for two-channel rate testing. It keeps the real TorchScript detector path but disables artifact saves, detailed detection logs, and timing summaries.
+- `config_torchscript_performance.yaml` is the low-overhead throughput configuration for two-channel rate testing. It keeps the same reference mask-generation backend as validation while disabling artifact saves, detailed detection logs, and timing summaries.
 - `config_torchscript_load_only.yaml` is the first diagnostic step for the C++ TorchScript path. It confirms whether `torch::jit::load(...)` itself is safe before the operator attempts CUDA transfer.
 - `config_torchscript_cpu_eval.yaml` is the second diagnostic step. It tests whether `eval()` is safe while staying entirely on CPU.
 - The CPU validation flow should use the CPU-exported artifact `dinov3_vitb16_pretrain_lvd1689m-73cec8be_cpu.ts`; the original `dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts` remains the CUDA-traced artifact.
