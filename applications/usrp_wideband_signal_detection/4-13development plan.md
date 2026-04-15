@@ -28,6 +28,15 @@ Current backend summary:
 - live coherent-power runs no longer default to the full host reference path when mask saving is disabled
 - performance tuning is now focused on GPU-side grouping/parity work rather than the entire detector hot path
 
+Latest validation/debug progress as of 2026-04-14:
+
+- FFT metadata now derives `span` and `resolution` from live metadata instead of stale config defaults, which fixed the earlier bad notebook-side sideband interpretation.
+- coherent debug snapshots now save canonical frequency-by-time tensors plus sidecar metadata that includes `tensor_axis_order`, `sample_rate_hz`, `span_hz`, original input shape, and the detector config used for the frame.
+- the offline validator now reads and reports the new snapshot metadata fields, and the coherent validation notebook now prefers sidecar `sample_rate_hz` and `span_hz` over fallback reconstruction.
+- fresh debug-capture artifacts were successfully written on host for both channels under `/tmp/coherent_power_snapshots` and `/tmp/coherent_power_masks`, including tensor snapshots, power-dB snapshots, masks, and JSON sidecars.
+- notebook replay against the new channel-0 snapshot is now working cleanly and is considered a good functional validation milestone for the reference path.
+- one follow-up semantic question remains open: the new sidecar is self-consistent at `128e6` span/sample-rate for the coherent stage, but we still need to decide whether and how the original `500e6` source rate should be propagated or represented in downstream metadata.
+
 Latest runtime evidence after the fast GPU backend landed:
 
 - coherent live runs now show a clear improvement over the earlier host-heavy path: the run can recover after a few startup `Fell behind in processing on GPU!` errors and then sustain several seconds in the roughly 337-409 MSps/channel range
@@ -78,6 +87,13 @@ The current implementation now has two coherent detector variants that must be e
 - `backend_mode: "reference"` is the notebook-faithful path and should be verified for algorithmic parity against `run_coherent_power_pipeline(...)` in `coherant_power_signal_detection_helpers.py`
 - `backend_mode: "fast_gpu"` is the realtime path and should be verified for operational usefulness, stability, and broad detection agreement rather than exact numeric parity with the notebook
 
+Current verification state as of 2026-04-14:
+
+- reference-backend frozen-snapshot replay is now in good shape on the notebook side
+- the snapshot capture path has been validated end-to-end with real artifacts from a new debug run
+- the remaining reference-path task is to complete the offline C++ validator replay on the same fresh snapshot and record the final notebook-vs-validator parity summary
+- the remaining realtime-path task is to rerun the coherent performance profile and confirm current throughput after the latest metadata/orientation/runtime fixes
+
 ### What Should Match The Notebook
 
 For the reference backend, these aspects should be treated as parity targets and verified directly:
@@ -121,6 +137,7 @@ These differences are expected today and should not be treated as bugs unless we
 1. Reference-backend parity on offline captures
    - Run `config_coherent_power_validation.yaml` with `backend_mode: "reference"` on fixed saved inputs used by the notebook.
    - Compare final masks, grouped box counts, `ignore_bins_per_side`, `merged_threshold`, and `seed_threshold` against notebook outputs.
+  - Status 2026-04-14: partially complete. Fresh frozen snapshots and notebook replay are working; offline C++ validator parity still needs one completed replay run on the new artifact set.
 
 2. Intermediate-stage parity checks
    - Add or reuse offline harness outputs so the reference backend can be compared against notebook intermediates for:
@@ -137,6 +154,7 @@ These differences are expected today and should not be treated as bugs unless we
 4. Fast-backend usefulness validation
    - Compare `backend_mode: "fast_gpu"` against the notebook/reference backend on the same fixed captures.
    - Verify that strong signals are still detected, false negatives remain acceptable, and mask morphology remains usable for the downstream task even though exact box parity is not expected.
+  - Status 2026-04-14: config review complete. `config_coherent_power_performance.yaml` is confirmed to point at the current coherent fast-GPU path and to retain the latest coherent thresholds/grouping settings while using throughput-oriented knobs (`emit_stride: 4`, no artifact saves, reduced batching).
 
 5. Realtime acceptance validation
    - Continue using `config_coherent_power_performance.yaml` for sustained-rate checks.
@@ -150,6 +168,26 @@ These differences are expected today and should not be treated as bugs unless we
 7. Outstanding parity gap review
    - Decide whether `grouping_time_continuity_ratio` and notebook reject-reason diagnostics need to be surfaced in the operator.
    - Decide whether the fast path must ever emit notebook-style grouped boxes, or whether its current mask-only contract is sufficient for realtime use.
+
+## Remaining 4/14 Follow-Ups
+
+1. Complete offline validator parity on the fresh debug snapshot
+  - Run `offline_coherent_power_validator` inside the demo container against `/tmp/coherent_power_snapshots/coherent_power_snapshot_ch0_f1_1776216376855_20480x250.json`.
+  - Rerun the coherent validation notebook comparison cell against the generated `offline_validation_summary.json` and record the final corrected-spectrogram and mask agreement numbers.
+
+2. Verify current throughput with the latest coherent fast path
+  - Rebuild/sync the runtime app using `rebuild_demo_container_app.sh`.
+  - Run `config_coherent_power_performance.yaml` through `run_coherent_power_performance.sh`.
+  - Record sustained per-channel MSps, whether startup-only `Fell behind in processing on GPU!` remains, and whether RX starvation stays at zero.
+
+3. Resolve the `500e6` metadata semantics question
+  - Decide whether the coherent snapshot sidecar should continue to describe the coherent-stage analyzed span (`128e6`) only, or whether it should additionally carry the original upstream capture rate/span (`500e6`) as a distinct field.
+  - Update notebook/validator expectations once that semantic contract is chosen.
+
+4. Capture the 4/14 validation milestone explicitly
+  - Reference snapshot save path is working.
+  - Notebook replay on the new snapshot looks good.
+  - Performance config is verified current and ready for the next throughput run.
 
 ## 4/14 Development Plan
 
