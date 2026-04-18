@@ -142,6 +142,7 @@ visualization:
 spectrogram:
   num_channels: 2
   enable_save: false
+  enable_tensor_save: false
   save_every_n_frames: 100
   max_images_per_channel: 0
   output_height: 256

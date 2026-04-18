@@ -261,7 +261,7 @@ int main(int argc, char** argv) {
   app->enable_metadata(true);
 
   if (argc < 2) {
-    HOLOSCAN_LOG_ERROR("Usage: {} [config.yaml]", argv[0]);
+    HOLOSCAN_LOG_ERROR("Usage: {} [config-path]", argv[0]);
     return -1;
   }
 

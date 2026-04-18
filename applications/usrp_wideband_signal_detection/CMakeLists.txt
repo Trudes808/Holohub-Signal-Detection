@@ -191,29 +191,32 @@ foreach(MGR IN LISTS ANO_MGR_LIST)
     target_compile_definitions(${PROJECT_NAME} PUBLIC "ANO_MGR_${MGR}=1")
 endforeach()
 
+  file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/old_configs)
+
   set(USRP_WIDEBAND_CONFIG_FILES
-    config.yaml
-    config_coherent_power_debug_capture.yaml
+    old_configs/config.yaml
+    old_configs/config_coherent_power_debug_capture.yaml
     config_coherent_power_performance.yaml
-    config_coherent_power_realtime_guarded.yaml
+    old_configs/config_coherent_power_realtime_guarded.yaml
     config_coherent_power_validation.yaml
-    config_offline_replay.yaml
-    config_cuda_fallback.yaml
+    old_configs/config_offline_replay.yaml
+    old_configs/config_cuda_fallback.yaml
     config_torchscript_performance.yaml
-    config_torchscript_performance_timing_debug.yaml
-    config_torchscript_performance_timing_debug_fast_post.yaml
-    config_torchscript_performance_timing_debug_small_input.yaml
-    config_torchscript_performance_timing_debug_fp16.yaml
-    config_torchscript_realtime_guarded.yaml
-    config_torchscript_performance_fft_only_matched.yaml
-    config_torchscript_performance_fft_only.yaml
-    config_torchscript_performance_small_batches.yaml
-    config_torchscript_performance_spectrogram_only.yaml
-    config_torchscript_validation_single_channel.yaml
-    config_torchscript_cpu_eval.yaml
-    config_torchscript_cuda_no_eval.yaml
-    config_torchscript_validation.yaml
-    config_torchscript_load_only.yaml
+    config_torchscript_validation_spectrogram_only.yaml
+    old_configs/config_torchscript_performance_timing_debug.yaml
+    old_configs/config_torchscript_performance_timing_debug_fast_post.yaml
+    old_configs/config_torchscript_performance_timing_debug_small_input.yaml
+    old_configs/config_torchscript_performance_timing_debug_fp16.yaml
+    old_configs/config_torchscript_realtime_guarded.yaml
+    old_configs/config_torchscript_performance_fft_only_matched.yaml
+    old_configs/config_torchscript_performance_fft_only.yaml
+    old_configs/config_torchscript_performance_small_batches.yaml
+    old_configs/config_torchscript_performance_spectrogram_only.yaml
+    old_configs/config_torchscript_validation_single_channel.yaml
+    old_configs/config_torchscript_cpu_eval.yaml
+    old_configs/config_torchscript_cuda_no_eval.yaml
+    old_configs/config_torchscript_validation.yaml
+    old_configs/config_torchscript_load_only.yaml
   )
 
   set(USRP_WIDEBAND_CONFIG_OUTPUTS)

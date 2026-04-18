@@ -67,7 +67,7 @@ Primary algorithm source:
 Primary app integration points:
 
 - `applications/usrp_wideband_signal_detection/main.cpp`
-- `applications/usrp_wideband_signal_detection/config.yaml`
+- `applications/usrp_wideband_signal_detection/old_configs/config.yaml`
 - `applications/usrp_wideband_signal_detection/config_*.yaml`
 - `applications/usrp_wideband_signal_detection/CMakeLists.txt`
 - `applications/usrp_wideband_signal_detection/README.md`
@@ -230,7 +230,7 @@ Recommended flow:
 
 1. debug capture run
   - run the normal app with a debug config that saves a bounded number of golden tensor snapshots, power-dB snapshots, final masks, and sidecar metadata
-  - keep this path off by default and enable it only with a dedicated config such as `config_coherent_power_debug_capture.yaml`
+  - keep this path off by default and enable it only with a dedicated config such as `old_configs/config_coherent_power_debug_capture.yaml`
 
 2. notebook replay
   - load the saved complex tensor snapshot in the notebook using the existing `tensor_npy` input path
@@ -373,7 +373,7 @@ Only split if needed. Start with one `.cu` implementation file and extract later
 
 ### Configs
 
-- `applications/usrp_wideband_signal_detection/config.yaml`
+- `applications/usrp_wideband_signal_detection/old_configs/config.yaml`
 - every `applications/usrp_wideband_signal_detection/config_*.yaml`
   - add `pipeline.detector_type`
   - keep the existing `dinov3_signal_detector` block intact
@@ -817,7 +817,7 @@ Start by reading these files in this order:
 2. `operators/dinov3_signal_detector/dinov3_signal_detector.hpp`
 3. `operators/dinov3_signal_detector/dinov3_signal_detector.cu`
 4. `applications/usrp_wideband_signal_detection/main.cpp`
-5. `applications/usrp_wideband_signal_detection/config.yaml`
+5. `applications/usrp_wideband_signal_detection/old_configs/config.yaml`
 6. `applications/usrp_wideband_signal_detection/CMakeLists.txt`
 
 That sequence gives the algorithm first, then the operator pattern, then the app integration points.
