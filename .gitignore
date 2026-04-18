@@ -57,4 +57,4 @@ tmp/
 rti_license.dat
 
 # Notebook-generated validator artifacts
-notebooks/validator_artifacts/**/*.sigmf-data
+notebooks/validator_artifacts/
