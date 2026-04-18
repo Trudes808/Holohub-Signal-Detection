@@ -83,6 +83,26 @@ Available configs copied into the build directory:
 
 Use the same external USRP stream command used by `usrp_freq_detection`.
 
+## Stream Alignment
+
+This app does not currently receive `sample_rate_hz` metadata from `rx_to_remote_udp.py`.
+In practice, the receive side falls back to the local FFT config, so the sender and receiver settings must match.
+
+For the current X410 flow, keep these aligned:
+
+- sender `rx_to_remote_udp.py --rate 500e6`
+- receiver `fft.span: 500000000` in the selected `config*.yaml`
+- receiver `fft.transform_points: 20480`
+
+Notes:
+
+- `master_clock_rate=500e6` in the USRP device args does not propagate into Holoscan operator metadata.
+- The FFT operator will use upstream metadata only if some earlier operator explicitly sets `sample_rate_hz` or `bandwidth_hz`.
+- If no upstream rate metadata exists, the FFT operator derives downstream `span` and `resolution` from the selected config file.
+- With `transform_points: 20480` and `span: 500000000`, the effective FFT bin width is about `24414 Hz`, so the fallback `resolution` values in the configs are set to `24414` for consistency.
+
+If these values do not match, saved spectrograms, detector metadata, notebook validation, and offline replay can all appear frequency-calibrated while still being calibrated to the wrong span.
+
 ## Host Workflow
 
 The container workflow is now organized around four primary host-side scripts:

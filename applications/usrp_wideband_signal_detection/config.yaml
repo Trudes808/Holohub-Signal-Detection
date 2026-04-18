@@ -118,10 +118,15 @@ fft:
   averaging_type: 1
   window_time: 0
   window_type: 0
+  # FFT length in bins. For this path it should stay aligned with burst_size.
   transform_points: 20480
+  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
   window_points: 20480
-  resolution: 1250
-  span: 128000000
+  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
+  resolution: 24414
+  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
+  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
+  span: 500000000
   weighting_factor: 0
   f1_index: -10240
   f2_index: 10239
@@ -198,6 +203,7 @@ dinov3_signal_detector:
   frontend_correction_edge_target_drop_db: 2.5
   frontend_edge_guard_floor: 0.35
   dino_coherence_gate_floor: 0.25
+  dino_coherence_gate_span_db: 3.0
   texture_q: 0.90
   texture_k: 6
   power_q: 0.90

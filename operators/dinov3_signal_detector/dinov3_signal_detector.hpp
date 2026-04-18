@@ -6,15 +6,12 @@
 #include "dinov3_torch_runtime.hpp"
 
 #include <array>
-#include <chrono>
 #include <cuda/std/complex>
 #include <holoscan/holoscan.hpp>
 #include <matx.h>
 #include <memory>
 #include <string>
 #include <vector>
-
-using namespace matx;
 
 namespace holoscan::ops {
 
@@ -25,9 +22,10 @@ class DinoV3SignalDetector : public holoscan::Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(DinoV3SignalDetector)
 
-  static constexpr size_t kTimingStageCount = 12;
+    static constexpr size_t kTimingStageCount = 8;
 
   DinoV3SignalDetector() = default;
+    ~DinoV3SignalDetector() override;
 
   void setup(holoscan::OperatorSpec& spec) override;
   void initialize() override;
@@ -36,6 +34,25 @@ class DinoV3SignalDetector : public holoscan::Operator {
                holoscan::ExecutionContext& context) override;
 
  private:
+    struct ChannelBuffers {
+      dino_complex* analysis_tensor_device = nullptr;
+      float* power_db_device = nullptr;
+      float* corrected_db_device = nullptr;
+      float* row_stat_device = nullptr;
+      float* row_smooth_device = nullptr;
+      float* frontend_reference_device = nullptr;
+      float* time_mean_device = nullptr;
+      float* freq_mean_device = nullptr;
+      float* background_device = nullptr;
+      float* box_filter_scratch_device = nullptr;
+      float* coherence_gate_device = nullptr;
+      float* coherence_gate_host = nullptr;
+      uint8_t* mask_host = nullptr;
+      size_t frame_elements = 0;
+      size_t row_elements = 0;
+      size_t mask_elements = 0;
+    };
+
   struct ChannelTimingStats {
     uint64_t window_frames = 0;
     std::array<double, kTimingStageCount> total_ms {};
@@ -77,6 +94,7 @@ class DinoV3SignalDetector : public holoscan::Operator {
   holoscan::Parameter<double> frontend_correction_edge_target_drop_db_;
   holoscan::Parameter<double> frontend_edge_guard_floor_;
   holoscan::Parameter<double> dino_coherence_gate_floor_;
+  holoscan::Parameter<double> dino_coherence_gate_span_db_;
   holoscan::Parameter<double> texture_q_;
   holoscan::Parameter<int> texture_k_;
   holoscan::Parameter<double> power_q_;
@@ -100,12 +118,9 @@ class DinoV3SignalDetector : public holoscan::Operator {
   std::vector<uint64_t> frame_count_;
   std::vector<int> masks_saved_;
   std::vector<ChannelTimingStats> timing_stats_;
-  matx::tensor_t<float, 3> detection_masks_;
-  std::vector<float*> power_db_device_buffers_;
-  std::vector<size_t> power_db_device_buffer_sizes_;
+  std::vector<ChannelBuffers> channel_buffers_;
   bool pytorch_runtime_ready_ = false;
   bool pytorch_warning_emitted_ = false;
-  bool torchscript_forward_trace_emitted_ = false;
 
   std::unique_ptr<DinoTorchRuntime> torch_runtime_;
 };

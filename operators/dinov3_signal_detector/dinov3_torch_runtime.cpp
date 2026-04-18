@@ -282,14 +282,14 @@ class DinoTorchRuntime::Impl {
 
       failure_stage = "crop_align";
       result.timing.crop_align_ms = measure_ms([&] {
-        result.freq_bin_hz = input.resolution_hz > 0.0 ? input.resolution_hz : (input.span_hz > 0.0 ? input.span_hz / static_cast<double>(input.src_cols) : 0.0);
+        result.freq_bin_hz = input.resolution_hz > 0.0 ? input.resolution_hz : (input.span_hz > 0.0 ? input.span_hz / static_cast<double>(input.src_rows) : 0.0);
         if (config.ignore_sideband_hz > 0.0 && result.freq_bin_hz > 0.0) {
           const int requested_bins = static_cast<int>(std::ceil(config.ignore_sideband_hz / result.freq_bin_hz));
-          const int max_ignore_bins = std::max(0, (input.src_cols - input.patch_size) / 2);
+          const int max_ignore_bins = std::max(0, (input.src_rows - input.patch_size) / 2);
           result.ignore_bins_per_side = std::min(requested_bins, max_ignore_bins);
         }
-        if (result.ignore_bins_per_side > 0 && (2 * result.ignore_bins_per_side) < input.src_cols) {
-          corrected_db = corrected_db.index({torch::indexing::Slice(), torch::indexing::Slice(result.ignore_bins_per_side, input.src_cols - result.ignore_bins_per_side)});
+        if (result.ignore_bins_per_side > 0 && (2 * result.ignore_bins_per_side) < corrected_db.size(0)) {
+          corrected_db = corrected_db.index({torch::indexing::Slice(result.ignore_bins_per_side, corrected_db.size(0) - result.ignore_bins_per_side), torch::indexing::Slice()});
         }
       });
 
@@ -382,25 +382,17 @@ class DinoTorchRuntime::Impl {
         result.power_threshold = scalar_quantile(power_score, std::clamp(config.power_q, 0.0, 1.0));
       });
 
-      torch::Tensor final_mask;
+      torch::Tensor final_score;
       failure_stage = "fusion";
       result.timing.fusion_ms = measure_ms([&] {
         result.dino_threshold = scalar_quantile(dino_score, std::clamp(config.dino_group_score_q, 0.0, 1.0));
-        auto dino_mask = dino_score.ge(result.dino_threshold).to(torch::kFloat32);
-        auto power_mask = power_score.ge(result.power_threshold).to(torch::kFloat32);
-        auto agreement_map = 0.5f * (dino_mask + power_mask);
-        auto rescue = torch::clamp((power_score - config.pipeline_power_rescue_floor) /
-                                       std::max(1.0 - config.pipeline_power_rescue_floor, 1e-6),
-                                   0.0,
-                                   1.0) * config.pipeline_power_rescue_gain;
-        auto gap_weight = torch::clamp(dino_score - config.pipeline_gap_floor, 0.0, 1.0);
-        auto final_score = torch::maximum(agreement_map, rescue * gap_weight);
-        final_mask = final_score.ge(config.pipeline_final_threshold).to(torch::kFloat32).contiguous();
+        result.final_threshold = result.dino_threshold;
+        final_score = dino_score.contiguous();
       });
 
       if (config.return_final_mask) {
         failure_stage = "final_mask_to_cpu";
-        auto final_mask_cpu = final_mask.device().is_cuda() ? final_mask.to(torch::kCPU) : final_mask;
+        auto final_mask_cpu = final_score.device().is_cuda() ? final_score.to(torch::kCPU) : final_score;
         result.final_mask.resize(static_cast<size_t>(input.dst_rows) * static_cast<size_t>(input.dst_cols));
         std::memcpy(result.final_mask.data(), final_mask_cpu.data_ptr<float>(), result.final_mask.size() * sizeof(float));
       }
