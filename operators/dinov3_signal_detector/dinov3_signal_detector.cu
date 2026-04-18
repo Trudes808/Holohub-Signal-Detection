@@ -1063,6 +1063,7 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(weights_path_, "weights_path", "Weights path", "Path to model weights.", std::string("/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"));
   spec.param(model_script_path_, "model_script_path", "Model script path", "Path to TorchScript model for model-forward backend.", std::string("/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"));
   spec.param(torchscript_init_mode_, "torchscript_init_mode", "TorchScript init mode", "TorchScript initialization mode: load_only, load_cpu_eval, load_cuda_no_eval, or load_cuda_eval.", std::string("load_cuda_eval"));
+  spec.param(torch_dtype_, "torch_dtype", "Torch dtype", "Torch inference precision: fp32 or fp16.", std::string("fp32"));
   spec.param(strict_model_forward_, "strict_model_forward", "Strict model forward", "If true, drop frames when the DINO runtime fails instead of falling back.", false);
   spec.param(imagenet_mean_, "imagenet_mean", "ImageNet mean", "Mean used for notebook-aligned model normalization.", imagenet_mean_default);
   spec.param(imagenet_std_, "imagenet_std", "ImageNet std", "Standard deviation used for notebook-aligned model normalization.", imagenet_std_default);
@@ -1135,6 +1136,7 @@ void DinoV3SignalDetector::initialize() {
       runtime_config.inference_backend = inference_backend_.get();
       runtime_config.model_script_path = model_script_path_.get();
       runtime_config.torchscript_init_mode = torchscript_init_mode_.get();
+      runtime_config.torch_dtype = torch_dtype_.get();
       runtime_config.imagenet_mean = imagenet_mean_.get();
       runtime_config.imagenet_std = imagenet_std_.get();
       runtime_config.return_final_mask = false;
@@ -1532,10 +1534,12 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       runtime_config.inference_backend = inference_backend_.get();
       runtime_config.model_script_path = model_script_path_.get();
       runtime_config.torchscript_init_mode = torchscript_init_mode_.get();
+      runtime_config.torch_dtype = torch_dtype_.get();
       runtime_config.imagenet_mean = imagenet_mean_.get();
       runtime_config.imagenet_std = imagenet_std_.get();
-      runtime_config.return_final_mask = use_fast_backend;
-      runtime_config.return_final_mask_device = !use_fast_backend;
+      runtime_config.return_final_mask = false;
+      runtime_config.return_final_mask_device = true;
+      runtime_config.compute_power_score = false;
       runtime_config.ignore_sideband_hz = ignore_sideband_hz_.get();
       runtime_config.frontend_correction_enable = frontend_correction_enable_.get();
       runtime_config.frontend_correction_row_q = frontend_correction_row_q_.get();
@@ -1565,6 +1569,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       runtime_input.resolution_hz = resolution_hz;
       runtime_input.span_hz = span_hz;
       runtime_input.power_db_device = buffers.power_db_device;
+      runtime_input.corrected_db_device = buffers.corrected_db_device;
 
       runtime_result = torch_runtime_->run(runtime_config, runtime_input);
       backend_used = runtime_result.backend_used;
@@ -1587,14 +1592,16 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     time_step_ms(kHybridStage, [&] {
       auto valid_mask = resize_valid_row_mask(src_rows, dst_rows, dst_cols, ignore_bins_per_side);
       if (use_fast_backend) {
-        if (runtime_result.success &&
-            runtime_result.final_mask.size() == static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols)) {
-          hybrid_result = run_fast_dino_postprocess(runtime_result.final_mask,
-                                                    valid_mask,
-                                                    dst_rows,
-                                                    dst_cols,
-                                                    static_cast<float>(runtime_result.dino_threshold),
-                                                    std::max(12, pipeline_component_min_size_.get() * 4));
+        if (runtime_result.success && runtime_result.final_mask_device != nullptr) {
+          hybrid_result.seed_freq_threshold = static_cast<float>(runtime_result.dino_threshold);
+          hybrid_result.seed_res_threshold = static_cast<float>(runtime_result.dino_threshold);
+          hybrid_result.grow_freq_threshold = static_cast<float>(runtime_result.dino_threshold);
+          hybrid_result.grow_res_threshold = static_cast<float>(runtime_result.dino_threshold);
+          hybrid_result.combined_threshold = static_cast<float>(runtime_result.dino_threshold);
+          hybrid_result.final_fraction = 0.0f;
+          hybrid_result.connected_fraction = 0.0f;
+          hybrid_result.component_count = 0;
+          hybrid_result.mask.assign(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols), 0);
           return;
         }
         throw std::runtime_error("fast_gpu backend requires a valid DINO score map from the runtime");

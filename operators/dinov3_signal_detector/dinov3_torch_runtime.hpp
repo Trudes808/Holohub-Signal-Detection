@@ -15,10 +15,12 @@ struct DinoTorchRuntimeConfig {
   std::string inference_backend;
   std::string model_script_path;
   std::string torchscript_init_mode;
+  std::string torch_dtype = "fp32";
   std::vector<double> imagenet_mean;
   std::vector<double> imagenet_std;
   bool return_final_mask = true;
   bool return_final_mask_device = false;
+  bool compute_power_score = true;
   double ignore_sideband_hz = 0.0;
   bool frontend_correction_enable = true;
   double frontend_correction_row_q = 25.0;
@@ -50,6 +52,7 @@ struct DinoTorchRuntimeInput {
   double span_hz = 0.0;
   const std::vector<float>* power_db = nullptr;
   const float* power_db_device = nullptr;
+  const float* corrected_db_device = nullptr;
 };
 
 struct DinoTorchRuntimeTiming {

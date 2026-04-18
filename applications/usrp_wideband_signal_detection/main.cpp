@@ -127,6 +127,10 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     const bool enable_detector = from_config("pipeline.enable_detector").as<bool>();
     const std::string detector_type = from_config("pipeline.detector_type").as<std::string>();
     const bool log_from_spectrogram = from_config("pipeline.log_from_spectrogram").as<bool>();
+    const bool spectrogram_save_enabled =
+      enable_spectrogram ? from_config("spectrogram.enable_save").as<bool>() : false;
+    const bool spectrogram_tensor_save_enabled =
+      enable_spectrogram ? from_config("spectrogram.enable_tensor_save").as<bool>() : false;
 
     if (enable_detector && !enable_spectrogram) {
       HOLOSCAN_LOG_ERROR("pipeline.enable_detector=true requires pipeline.enable_spectrogram=true");
@@ -170,6 +174,15 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       HOLOSCAN_LOG_ERROR("visualization.enable=true requires pipeline.enable_spectrogram=true");
       exit(1);
     }
+    const bool bypass_spectrogram_passthrough =
+        enable_spectrogram && enable_detector && !log_from_spectrogram && !enable_visualization &&
+        !spectrogram_save_enabled && !spectrogram_tensor_save_enabled;
+
+    if (bypass_spectrogram_passthrough) {
+      HOLOSCAN_LOG_INFO(
+          "Bypassing spectrogramOp in lean performance mode; detector will consume FFT output directly.");
+    }
+
     std::shared_ptr<holoscan::Operator> spectrogramVisualizerOp;
     std::shared_ptr<holoscan::Operator> holovizOp;
     if (enable_visualization) {
@@ -190,7 +203,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     add_operator(chdrConverterOp);
     add_operator(fftOp);
-    if (enable_spectrogram) {
+    if (enable_spectrogram && !bypass_spectrogram_passthrough) {
       add_operator(spectrogramOp);
     }
     if (enable_detector) {
@@ -211,17 +224,18 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     add_operator(logOp);
 
     add_flow(chdrConverterOp, fftOp);
-    if (enable_spectrogram) {
+    if (enable_spectrogram && !bypass_spectrogram_passthrough) {
       add_flow(fftOp, spectrogramOp);
     }
     if (enable_detector) {
+      auto detector_source = bypass_spectrogram_passthrough ? fftOp : spectrogramOp;
       if (detector_type == "coherent_power") {
         for (auto& op : coherentDetectorOps) {
-          add_flow(spectrogramOp, op);
+          add_flow(detector_source, op);
         }
       } else {
         for (auto& op : dinoDetectorOps) {
-          add_flow(spectrogramOp, op);
+          add_flow(detector_source, op);
         }
       }
     }

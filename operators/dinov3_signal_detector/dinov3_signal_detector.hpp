@@ -82,6 +82,7 @@ class DinoV3SignalDetector : public holoscan::Operator {
   holoscan::Parameter<std::string> weights_path_;
   holoscan::Parameter<std::string> model_script_path_;
   holoscan::Parameter<std::string> torchscript_init_mode_;
+  holoscan::Parameter<std::string> torch_dtype_;
   holoscan::Parameter<bool> strict_model_forward_;
   holoscan::Parameter<std::vector<double>> imagenet_mean_;
   holoscan::Parameter<std::vector<double>> imagenet_std_;

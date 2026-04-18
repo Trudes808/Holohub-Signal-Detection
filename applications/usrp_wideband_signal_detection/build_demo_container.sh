@@ -27,6 +27,7 @@ MATX_VERSION=${MATX_VERSION:-0.9.2}
 BUILD_APP_IN_CONTAINER=${BUILD_APP_IN_CONTAINER:-1}
 INSTALL_PYTHON_DEPS=${INSTALL_PYTHON_DEPS:-1}
 SKIP_IMAGE_BUILD=${SKIP_IMAGE_BUILD:-0}
+ENSURE_VULKAN_RUNTIME=${ENSURE_VULKAN_RUNTIME:-1}
 DISPLAY_VALUE=${DISPLAY:-}
 XAUTHORITY_VALUE=${XAUTHORITY:-}
 X11_SOCKET_DIR=/tmp/.X11-unix
@@ -211,7 +212,12 @@ print(f"cuda_device_name={torch.cuda.get_device_name(0)}")
 PY
 
 ensure_nvjitlink_symlink
-ensure_vulkan_runtime
+
+if [[ "${ENSURE_VULKAN_RUNTIME}" == "1" ]]; then
+	ensure_vulkan_runtime
+else
+	echo "Skipping Vulkan runtime installation check because ENSURE_VULKAN_RUNTIME=${ENSURE_VULKAN_RUNTIME}."
+fi
 
 if ! run_in_container 'test -f /usr/local/lib/cmake/matx/matx-config.cmake'; then
 	install_matx

@@ -172,10 +172,10 @@ dinov3_signal_detector:
   input_height: 256
   input_width: 512
   patch_size: 16
-  emit_stride: 6
+  emit_stride: 8
   mask_threshold_db: -20.0
   log_detections: false
-  backend_mode: "reference"
+  backend_mode: "fast_gpu"
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0

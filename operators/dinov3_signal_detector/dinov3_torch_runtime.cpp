@@ -51,6 +51,10 @@ bool torchscript_init_runs_eval(const std::string& init_mode) {
   return init_mode == "load_cpu_eval" || init_mode == "load_cuda_eval";
 }
 
+bool use_fp16_torch_dtype(const std::string& torch_dtype) {
+  return torch_dtype == "fp16" || torch_dtype == "half";
+}
+
 int64_t quantile_index(int64_t size, double q) {
   if (size <= 1) {
     return 0;
@@ -271,6 +275,7 @@ class DinoTorchRuntime::Impl {
 
       const auto init_mode = normalize_torchscript_init_mode(config.torchscript_init_mode);
       const bool use_cuda_torch = (config.inference_backend != "torchscript") || torchscript_init_moves_to_cuda(init_mode);
+      const bool use_fp16 = use_fp16_torch_dtype(config.torch_dtype) && use_cuda_torch;
       c10::Device compute_device = use_cuda_torch ? c10::Device(torch::kCUDA, 0) : c10::Device(torch::kCPU);
       std::unique_ptr<c10::cuda::CUDAStreamGuard> stream_guard;
       if (use_cuda_torch) {
@@ -315,57 +320,65 @@ class DinoTorchRuntime::Impl {
           backend = "pytorch_placeholder";
         }
       }
-
       torch::Tensor corrected_db;
-      failure_stage = "frontend_correction";
-      result.timing.frontend_correction_ms = measure_ms([&] {
-        corrected_db = power_db.contiguous();
-        if (!config.frontend_correction_enable) {
-          return;
-        }
-        auto col_activity = select_quantile_along_dim(corrected_db, 0.85, 0);
-        const double quiet_threshold = scalar_quantile(col_activity, 0.70);
-        auto quiet_mask = col_activity.le(quiet_threshold);
-        auto quiet_indices = torch::nonzero(quiet_mask).reshape({-1});
-        const auto min_quiet_cols = std::max<int64_t>(16, corrected_db.size(1) / 8);
-        torch::Tensor quiet_view = corrected_db;
-        if (quiet_indices.numel() >= min_quiet_cols) {
-          quiet_view = corrected_db.index({torch::indexing::Slice(), quiet_indices});
-        }
+      if (use_cuda_torch && input.corrected_db_device) {
+        auto device_float_options = torch::TensorOptions().dtype(torch::kFloat32).device(compute_device);
+        corrected_db = torch::from_blob(const_cast<float*>(input.corrected_db_device),
+                                        {static_cast<int64_t>(input.src_rows), static_cast<int64_t>(input.src_cols)},
+                                        device_float_options)
+                           .contiguous();
+        result.timing.frontend_correction_ms = 0.0;
+      } else {
+        failure_stage = "frontend_correction";
+        result.timing.frontend_correction_ms = measure_ms([&] {
+          corrected_db = power_db.contiguous();
+          if (!config.frontend_correction_enable) {
+            return;
+          }
+          auto col_activity = select_quantile_along_dim(corrected_db, 0.85, 0);
+          const double quiet_threshold = scalar_quantile(col_activity, 0.70);
+          auto quiet_mask = col_activity.le(quiet_threshold);
+          auto quiet_indices = torch::nonzero(quiet_mask).reshape({-1});
+          const auto min_quiet_cols = std::max<int64_t>(16, corrected_db.size(1) / 8);
+          torch::Tensor quiet_view = corrected_db;
+          if (quiet_indices.numel() >= min_quiet_cols) {
+            quiet_view = corrected_db.index({torch::indexing::Slice(), quiet_indices});
+          }
 
-        auto row_floor = select_quantile_along_dim(quiet_view, config.frontend_correction_row_q / 100.0, 1);
-        auto response = gaussian_filter1d(row_floor, config.frontend_correction_smooth_sigma);
-        const int64_t num_rows = response.size(0);
-        const int64_t inner_span = std::min<int64_t>(num_rows, std::max<int64_t>(8, static_cast<int64_t>(std::llround(0.65 * static_cast<double>(num_rows)))));
-        const int64_t inner_start = std::max<int64_t>(0, (num_rows - inner_span) / 2);
-        const int64_t inner_stop = std::min<int64_t>(num_rows, inner_start + inner_span);
-        auto inner_response = response.index({torch::indexing::Slice(inner_start, inner_stop)});
-        if (inner_response.numel() == 0) {
-          inner_response = response;
-        }
+          auto row_floor = select_quantile_along_dim(quiet_view, config.frontend_correction_row_q / 100.0, 1);
+          auto response = gaussian_filter1d(row_floor, config.frontend_correction_smooth_sigma);
+          const int64_t num_rows = response.size(0);
+          const int64_t inner_span = std::min<int64_t>(num_rows, std::max<int64_t>(8, static_cast<int64_t>(std::llround(0.65 * static_cast<double>(num_rows)))));
+          const int64_t inner_start = std::max<int64_t>(0, (num_rows - inner_span) / 2);
+          const int64_t inner_stop = std::min<int64_t>(num_rows, inner_start + inner_span);
+          auto inner_response = response.index({torch::indexing::Slice(inner_start, inner_stop)});
+          if (inner_response.numel() == 0) {
+            inner_response = response;
+          }
 
-        const double reference_level = scalar_quantile(inner_response, config.frontend_correction_reference_q / 100.0);
-        auto edge_profile = torch::zeros({num_rows}, torch::TensorOptions().dtype(torch::kFloat32).device(corrected_db.device()));
-        const int64_t edge_rows = std::min<int64_t>(std::max<int64_t>(1, num_rows / 2),
-                                                    std::max<int64_t>(8, static_cast<int64_t>(std::llround(config.frontend_correction_edge_taper_fraction * static_cast<double>(num_rows)))));
-        if (edge_rows > 0) {
-          auto ramp = torch::linspace(1.0, 0.0, edge_rows, edge_profile.options());
-          edge_profile.index_put_({torch::indexing::Slice(0, edge_rows)}, ramp);
-          edge_profile.index_put_({torch::indexing::Slice(num_rows - edge_rows, num_rows)},
-                                  torch::maximum(edge_profile.index({torch::indexing::Slice(num_rows - edge_rows, num_rows)}),
-                                                 torch::linspace(0.0, 1.0, edge_rows, edge_profile.options())));
-        }
-        edge_profile = gaussian_filter1d(edge_profile, config.frontend_correction_edge_taper_sigma);
-        edge_profile = edge_profile / torch::clamp(edge_profile.max(), 1e-6);
-        auto target_response = reference_level - config.frontend_correction_edge_target_drop_db * edge_profile;
-        auto target_deficit = torch::clamp_min(target_response - response, 0.0);
-        const double soft_knee = std::max(config.frontend_correction_soft_knee_db, 1e-3);
-        auto soft_boost = config.frontend_correction_max_boost_db * (1.0 - torch::exp(-target_deficit / soft_knee));
-        soft_boost = torch::minimum(soft_boost, target_deficit);
-        auto boost_db = gaussian_filter1d(soft_boost, std::max(1.0, config.frontend_correction_smooth_sigma / 2.0));
-        boost_db = torch::minimum(boost_db, target_deficit);
-        corrected_db = corrected_db + boost_db.unsqueeze(1);
-      });
+          const double reference_level = scalar_quantile(inner_response, config.frontend_correction_reference_q / 100.0);
+          auto edge_profile = torch::zeros({num_rows}, torch::TensorOptions().dtype(torch::kFloat32).device(corrected_db.device()));
+          const int64_t edge_rows = std::min<int64_t>(std::max<int64_t>(1, num_rows / 2),
+                                                      std::max<int64_t>(8, static_cast<int64_t>(std::llround(config.frontend_correction_edge_taper_fraction * static_cast<double>(num_rows)))));
+          if (edge_rows > 0) {
+            auto ramp = torch::linspace(1.0, 0.0, edge_rows, edge_profile.options());
+            edge_profile.index_put_({torch::indexing::Slice(0, edge_rows)}, ramp);
+            edge_profile.index_put_({torch::indexing::Slice(num_rows - edge_rows, num_rows)},
+                                    torch::maximum(edge_profile.index({torch::indexing::Slice(num_rows - edge_rows, num_rows)}),
+                                                   torch::linspace(0.0, 1.0, edge_rows, edge_profile.options())));
+          }
+          edge_profile = gaussian_filter1d(edge_profile, config.frontend_correction_edge_taper_sigma);
+          edge_profile = edge_profile / torch::clamp(edge_profile.max(), 1e-6);
+          auto target_response = reference_level - config.frontend_correction_edge_target_drop_db * edge_profile;
+          auto target_deficit = torch::clamp_min(target_response - response, 0.0);
+          const double soft_knee = std::max(config.frontend_correction_soft_knee_db, 1e-3);
+          auto soft_boost = config.frontend_correction_max_boost_db * (1.0 - torch::exp(-target_deficit / soft_knee));
+          soft_boost = torch::minimum(soft_boost, target_deficit);
+          auto boost_db = gaussian_filter1d(soft_boost, std::max(1.0, config.frontend_correction_smooth_sigma / 2.0));
+          boost_db = torch::minimum(boost_db, target_deficit);
+          corrected_db = corrected_db + boost_db.unsqueeze(1);
+        });
+      }
 
       failure_stage = "crop_align";
       result.timing.crop_align_ms = measure_ms([&] {
@@ -412,6 +425,9 @@ class DinoTorchRuntime::Impl {
                        torch::TensorOptions().dtype(torch::kFloat32).device(compute_device))
                        .view({1, 3, 1, 1});
         model_input = (rgb - mean) / std;
+        if (use_fp16) {
+          model_input = model_input.to(torch::kHalf);
+        }
       });
 
       torch::Tensor dino_score;
@@ -453,21 +469,23 @@ class DinoTorchRuntime::Impl {
         result.backend_used = "pytorch_placeholder";
       }
 
-      torch::Tensor power_score;
-      failure_stage = "power_score";
-      result.timing.power_score_ms = measure_ms([&] {
-        auto resized_power = torch::nn::functional::interpolate(
-                                 corrected_db.unsqueeze(0).unsqueeze(0),
-                                 torch::nn::functional::InterpolateFuncOptions()
-                                     .size(std::vector<int64_t>{static_cast<int64_t>(input.dst_rows), static_cast<int64_t>(input.dst_cols)})
-                                     .mode(torch::kBilinear)
-                                     .align_corners(false))
-                                 .squeeze(0)
-                                 .squeeze(0)
-                                 .contiguous();
-        power_score = normalize_map01(resized_power, 0.05, 0.95).contiguous();
-        result.power_threshold = scalar_quantile(power_score, std::clamp(config.power_q, 0.0, 1.0));
-      });
+      if (config.compute_power_score) {
+        torch::Tensor power_score;
+        failure_stage = "power_score";
+        result.timing.power_score_ms = measure_ms([&] {
+          auto resized_power = torch::nn::functional::interpolate(
+                                   corrected_db.unsqueeze(0).unsqueeze(0),
+                                   torch::nn::functional::InterpolateFuncOptions()
+                                       .size(std::vector<int64_t>{static_cast<int64_t>(input.dst_rows), static_cast<int64_t>(input.dst_cols)})
+                                       .mode(torch::kBilinear)
+                                       .align_corners(false))
+                                   .squeeze(0)
+                                   .squeeze(0)
+                                   .contiguous();
+          power_score = normalize_map01(resized_power, 0.05, 0.95).contiguous();
+          result.power_threshold = scalar_quantile(power_score, std::clamp(config.power_q, 0.0, 1.0));
+        });
+      }
 
       torch::Tensor final_score;
       failure_stage = "fusion";
@@ -545,24 +563,16 @@ class DinoTorchRuntime::Impl {
       result.seed_res_threshold = static_cast<float>(scalar_quantile(active_res, 0.82));
       result.grow_freq_threshold = result.seed_freq_threshold;
       result.grow_res_threshold = result.seed_res_threshold;
-
-      auto residual_veto_gate = torch::clamp((keep_res - 0.30) / 0.70, 0.0, 1.0);
-      auto combined_score = normalize_map01_masked_minmax(keep_freq * (0.35 + 0.65 * residual_veto_gate), valid_mask);
-      auto active_combined = combined_score.masked_select(valid_mask);
-      result.combined_threshold = static_cast<float>(scalar_quantile(active_combined, 0.78));
+      result.combined_threshold = result.seed_freq_threshold;
 
       auto seed_mask = torch::logical_and(valid_mask,
                                           torch::logical_and(keep_freq >= result.seed_freq_threshold,
                                                              keep_res >= result.seed_res_threshold));
-      auto combined_gate_mask = torch::logical_and(valid_mask, combined_score >= (result.combined_threshold * 0.85f));
 
       auto seed_mask_cpu = seed_mask.to(torch::kCPU, torch::kUInt8).contiguous();
-      auto combined_gate_mask_cpu = combined_gate_mask.to(torch::kCPU, torch::kUInt8).contiguous();
       const size_t elements = static_cast<size_t>(input.dst_rows) * static_cast<size_t>(input.dst_cols);
       result.seed_mask.resize(elements);
-      result.combined_gate_mask.resize(elements);
       std::memcpy(result.seed_mask.data(), seed_mask_cpu.data_ptr<uint8_t>(), elements * sizeof(uint8_t));
-      std::memcpy(result.combined_gate_mask.data(), combined_gate_mask_cpu.data_ptr<uint8_t>(), elements * sizeof(uint8_t));
       result.success = true;
       return result;
     } catch (const std::exception& error) {
@@ -578,6 +588,7 @@ class DinoTorchRuntime::Impl {
     }
 
     const bool use_cuda_torch = torchscript_init_moves_to_cuda(init_mode);
+    const bool use_fp16 = use_fp16_torch_dtype(config.torch_dtype) && use_cuda_torch;
     const c10::Device compute_device = use_cuda_torch ? c10::Device(torch::kCUDA, 0) : c10::Device(torch::kCPU);
 
     torch::InferenceMode inference_mode_guard(true);
@@ -597,8 +608,9 @@ class DinoTorchRuntime::Impl {
     const int safe_patch = std::max(1, patch_size);
     const int aligned_rows = std::max(safe_patch, (std::max(1, dst_rows) / safe_patch) * safe_patch);
     const int aligned_cols = std::max(safe_patch, (std::max(1, dst_cols) / safe_patch) * safe_patch);
+    auto warmup_dtype = use_fp16 ? torch::kHalf : torch::kFloat32;
     auto warmup_input = torch::zeros({1, 3, aligned_rows, aligned_cols},
-                                     torch::TensorOptions().dtype(torch::kFloat32).device(compute_device));
+                     torch::TensorOptions().dtype(warmup_dtype).device(compute_device));
     auto warmup_output = torchscript_module_->forward({warmup_input});
     if (!(warmup_output.isTensor() || warmup_output.isTuple())) {
       throw std::runtime_error("TorchScript warmup returned non-tensor output");
@@ -623,15 +635,19 @@ class DinoTorchRuntime::Impl {
     const auto init_mode = normalize_torchscript_init_mode(config.torchscript_init_mode);
     const bool load_on_cuda = torchscript_init_moves_to_cuda(init_mode);
     const auto load_device = load_on_cuda ? device : c10::Device(torch::kCPU);
+    const bool use_fp16 = use_fp16_torch_dtype(config.torch_dtype) && load_on_cuda;
     try {
       torchscript_module_ = std::make_unique<torch::jit::script::Module>(torch::jit::load(config.model_script_path, load_device));
+      if (use_fp16) {
+        torchscript_module_->to(load_device, torch::kHalf, false);
+      }
       if (torchscript_init_runs_eval(init_mode)) {
         torchscript_module_->eval();
       }
       torchscript_model_loaded_ = true;
       torchscript_load_failed_ = false;
       torchscript_forward_ready_ = true;
-      last_detail_ = std::string("loaded script=") + config.model_script_path + " mode=" + init_mode;
+      last_detail_ = std::string("loaded script=") + config.model_script_path + " mode=" + init_mode + " dtype=" + (use_fp16 ? "fp16" : "fp32");
     } catch (...) {
       torchscript_module_.reset();
       torchscript_model_loaded_ = false;

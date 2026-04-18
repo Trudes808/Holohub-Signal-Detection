@@ -66,10 +66,21 @@ Available configs copied into the build directory:
 - `config_torchscript_performance.yaml`
 	- two-channel throughput test mode
 	- disables spectrogram saves, detector mask saves, per-frame detection logging, and timing summaries to keep the data path as lean as possible
+	- when spectrogram save, tensor save, visualization, and post-spectrogram logging are all disabled, the app now bypasses the pass-through `spectrogramOp` and feeds FFT output directly into the detector to remove one graph hop from the hot path
+	- now uses `backend_mode: "fast_gpu"` with `emit_stride: 8` at the full `256x512` detector input so the default non-debug throughput path reflects the measured fast-post floor rather than the notebook-faithful reference cleanup path
 	- keeps GPU RX pools at the known-safe `25000` buffers per channel to avoid GPUDirect BAR1 DMA-map failures, while reducing queue burst size and raising `num_simul_batches` so the graph can absorb more ingress jitter before dropping packets
 - `config_torchscript_performance_timing_debug.yaml`
 	- debug-only hotspot profiling mode for the two-channel TorchScript path
 	- re-enables detector timing summaries and raises `emit_stride` so the synchronized timing probe can print stage timings without immediately collapsing ingress
+- `config_torchscript_performance_timing_debug_fast_post.yaml`
+	- debug-only throughput probe that switches DINO to `backend_mode: "fast_gpu"`
+	- use this to estimate how much of the remaining detector cost is tied to the notebook-faithful hybrid postprocess rather than model forward
+- `config_torchscript_performance_timing_debug_small_input.yaml`
+	- debug-only reduced-token-count probe
+	- changes detector and spectrogram output from `256x512` to `192x384` so you can measure how much Torch runtime scales with patch count
+- `config_torchscript_performance_timing_debug_fp16.yaml`
+	- debug-only lower-precision inference probe
+	- keeps the same `256x512` input size but requests `torch_dtype: "fp16"` to estimate how much speedup half-precision TorchScript can provide on this GPU
 - `config_torchscript_realtime_guarded.yaml`
 	- guarded two-channel realtime attempt for the notebook-faithful TorchScript reference backend
 	- uses smaller ingress/FFT batches plus a conservative detector cadence to reduce packet retention and create buffer headroom before re-tightening throughput knobs
@@ -77,6 +88,9 @@ Available configs copied into the build directory:
 	- ingress and FFT isolation mode
 	- bypasses both spectrogram and detector so the first throughput ceiling can be measured without downstream ML work
 	- uses legacy-style large ingress batches (`12500` packets / `625` FFTs, `2` simultaneous batches) to mirror the older PSD path more closely
+- `config_torchscript_performance_fft_only_matched.yaml`
+	- ingress and FFT isolation mode using the same `2048` queue batches and `128` FFT batches as the current fast DINO performance profile
+	- use this together with `config_torchscript_performance_spectrogram_only.yaml` and `config_torchscript_performance.yaml` to pinpoint whether drops begin in FFT, spectrogram, or only once the fast DINO stage is added
 - `config_torchscript_performance_spectrogram_only.yaml`
 	- ingress, FFT, and spectrogram isolation mode
 	- bypasses the detector while logging from the post-spectrogram path to prove whether `spectrogramOp` is still throughput-safe when save is disabled
@@ -216,6 +230,39 @@ cd applications/usrp_wideband_signal_detection
 
 For the cleanest startup behavior, launch the app before starting the RF transmitter. The advanced-network DPDK workers are started during app initialization, before the Holoscan graph is fully active, so starting the transmitter first can produce a brief burst of startup-only drops even when steady-state throughput is healthy.
 
+To quantify the three remaining DINO optimization levers with the same helper script:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+CONFIG_NAME=config_torchscript_performance_timing_debug_fast_post.yaml ./run_torchscript_performance_test.sh
+CONFIG_NAME=config_torchscript_performance_timing_debug_small_input.yaml ./run_torchscript_performance_test.sh
+CONFIG_NAME=config_torchscript_performance_timing_debug_fp16.yaml ./run_torchscript_performance_test.sh
+```
+
+Compare these fields across runs:
+
+- `torch_runtime_ms`
+- `hybrid_post_ms`
+- `total_ms`
+- `RX out of buffers`
+- `rx_mbuf_allocation_errors`
+- `rx_q0_errors` and `rx_q1_errors`
+
+To bisect the current live throughput bottleneck with matched configs, run these three in order:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+CONFIG_NAME=config_torchscript_performance_fft_only_matched.yaml ./run_torchscript_performance_test.sh
+CONFIG_NAME=config_torchscript_performance_spectrogram_only.yaml ./run_torchscript_performance_test.sh
+CONFIG_NAME=config_torchscript_performance.yaml ./run_torchscript_performance_test.sh
+```
+
+Interpretation:
+
+- if `fft_only_matched` already drops badly, the problem is upstream of spectrogram and DINO
+- if `fft_only_matched` is clean but `spectrogram_only` drops, spectrogram is the first unstable stage
+- if both are clean but `config_torchscript_performance.yaml` drops, the remaining gap is in the fast DINO stage or graph scheduling around it
+
 Validation and production parity rule: for both the coherent-power and DINO detectors, any config intended to validate or represent production mask behavior must use the same `backend_mode`. The approved throughput knob is `emit_stride`; logs, saves, and timing summaries may differ, but the mask-generation backend must not.
 
 For a more conservative coherent real-time profile that prioritizes sustained ingest headroom while the coherent detector still contains host-side stages:
@@ -353,11 +400,11 @@ The next visualization step is to add a detector overlay postprocessor that emit
 ## Validation Notes
 
 - `config.yaml` is now the stable debug run configuration. It intentionally keeps `inference_backend: "pytorch_placeholder"` while saving the first 5 spectrograms and detector masks per channel.
-- Parity rule: validation and production/performance configs must keep the same detector `backend_mode` for mask creation. Use `emit_stride`, artifact saves, logging, and timing summaries as the tuning knobs; do not change the mask backend between validation and production.
+- Parity rule: validation and any config intended to represent production mask behavior must keep the same detector `backend_mode` for mask creation. Throughput-only profiles may intentionally switch to `fast_gpu`, but those runs are no longer notebook-faithful mask-generation comparisons.
 - `config_coherent_power_debug_capture.yaml` is the coherent-power frozen-input capture profile. It enables tensor snapshot saves, optional `power_db` snapshot saves, and final mask saves so notebook and offline C++ parity checks can run on the exact same detector input.
 - `config_cuda_fallback.yaml` is the debug configuration for the pure C++/CUDA detector path. It disables the PyTorch backend in operator logic and uses `cuda_threshold_fallback` while keeping artifact saves enabled.
 - `config_torchscript_validation.yaml` is the strict TorchScript bring-up configuration. Use it when you want the C++ TorchScript path to fail loudly.
-- `config_torchscript_performance.yaml` is the low-overhead throughput configuration for two-channel rate testing. It keeps the same reference mask-generation backend as validation while disabling artifact saves, detailed detection logs, and timing summaries.
+- `config_torchscript_performance.yaml` is the low-overhead throughput configuration for two-channel rate testing. It now uses the `fast_gpu` backend with `emit_stride: 8` at full `256x512` input size so throughput runs measure the fast-post floor rather than the notebook-faithful reference cleanup path.
 - `config_torchscript_load_only.yaml` is the first diagnostic step for the C++ TorchScript path. It confirms whether `torch::jit::load(...)` itself is safe before the operator attempts CUDA transfer.
 - `config_torchscript_cpu_eval.yaml` is the second diagnostic step. It tests whether `eval()` is safe while staying entirely on CPU.
 - The CPU validation flow should use the CPU-exported artifact `dinov3_vitb16_pretrain_lvd1689m-73cec8be_cpu.ts`; the original `dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts` remains the CUDA-traced artifact.
