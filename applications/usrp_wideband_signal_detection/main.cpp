@@ -47,7 +47,10 @@ class LogOp: public holoscan::Operator {
   LogOp() = default;
 
   void setup(holoscan::OperatorSpec& spec) override {
-    spec.input<in_t>("in");
+    auto& input_port = spec.input<in_t>("in", holoscan::IOSpec::IOSize{8});
+    input_port.conditions().emplace_back(
+        holoscan::ConditionType::kMessageAvailable,
+        std::make_shared<holoscan::MessageAvailableCondition>(size_t{1}));
     spec.param(num_channels_,
                "num_channels",
                "Number of Channels",
@@ -88,12 +91,13 @@ class LogOp: public holoscan::Operator {
 
     auto seconds = std::chrono::duration<double>(elapsed_[channel_num]).count();
     if (total_samples_[channel_num] > 0 && seconds >= log_interval_) {
-      auto duration = std::chrono::duration<double>(interval).count();
+      const double samples_per_second = static_cast<double>(total_samples_[channel_num]) / seconds;
+      const double bits_per_second = static_cast<double>(total_samples_[channel_num]) * sizeof(int16_t) * 2 * 8 / seconds;
       HOLOSCAN_LOG_INFO("Processed {} samples from channel {} at {:.2f} MSps ({:.2f} Gbps)",
                         total_samples_[channel_num],
                         channel_num,
-                        num_samples / duration / 1e6,
-                        num_bits / duration / 1e9);
+                        samples_per_second / 1e6,
+                        bits_per_second / 1e9);
       total_samples_[channel_num] = 0;
       elapsed_[channel_num] = std::chrono::steady_clock::duration::zero();
     }
@@ -120,17 +124,37 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     HOLOSCAN_LOG_INFO("Configured the Advanced Network manager");
 
     auto chdrConverterOp = make_operator<ops::ChdrConverterOpRx>("chdrConverterOp", from_config("chdr_converter"));
-
-    auto fftOp = make_operator<ops::FFT>("fftOp", from_config("fft"));
+    const int pipeline_channels = std::max(1, from_config("chdr_converter.num_channels").as<int>());
 
     const bool enable_spectrogram = from_config("pipeline.enable_spectrogram").as<bool>();
     const bool enable_detector = from_config("pipeline.enable_detector").as<bool>();
     const std::string detector_type = from_config("pipeline.detector_type").as<std::string>();
     const bool log_from_spectrogram = from_config("pipeline.log_from_spectrogram").as<bool>();
+    const bool enable_visualization = from_config("visualization.enable").as<bool>();
     const bool spectrogram_save_enabled =
       enable_spectrogram ? from_config("spectrogram.enable_save").as<bool>() : false;
     const bool spectrogram_tensor_save_enabled =
       enable_spectrogram ? from_config("spectrogram.enable_tensor_save").as<bool>() : false;
+    const bool bypass_spectrogram_passthrough =
+        enable_spectrogram && enable_detector && !log_from_spectrogram && !enable_visualization &&
+        !spectrogram_save_enabled && !spectrogram_tensor_save_enabled;
+    const bool enable_logger_branch = !bypass_spectrogram_passthrough;
+    const int configured_dino_emit_stride =
+        (enable_detector && detector_type == "dinov3")
+            ? std::max(1, from_config("dinov3_signal_detector.emit_stride").as<int>())
+            : 1;
+    const bool enable_fft_emit_stride =
+        bypass_spectrogram_passthrough && enable_detector && detector_type == "dinov3" &&
+        configured_dino_emit_stride > 1;
+
+    std::vector<std::shared_ptr<holoscan::Operator>> fftOps;
+    fftOps.reserve(static_cast<size_t>(pipeline_channels));
+    for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+      fftOps.push_back(make_operator<ops::FFT>(
+        std::string("fftOpCh") + std::to_string(channel_index),
+        from_config("fft"),
+        holoscan::Arg("emit_stride") = (enable_fft_emit_stride ? configured_dino_emit_stride : 1)));
+    }
 
     if (enable_detector && !enable_spectrogram) {
       HOLOSCAN_LOG_ERROR("pipeline.enable_detector=true requires pipeline.enable_spectrogram=true");
@@ -143,23 +167,41 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       exit(1);
     }
 
-    std::shared_ptr<holoscan::Operator> spectrogramOp;
+    std::vector<std::shared_ptr<holoscan::Operator>> spectrogramOps;
     std::vector<std::shared_ptr<holoscan::Operator>> dinoDetectorOps;
     std::vector<std::shared_ptr<holoscan::Operator>> coherentDetectorOps;
     if (enable_spectrogram) {
-      spectrogramOp = make_operator<ops::Spectrogram>("spectrogramOp", from_config("spectrogram"));
+      spectrogramOps.reserve(static_cast<size_t>(pipeline_channels));
+      for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+        spectrogramOps.push_back(make_operator<ops::Spectrogram>(
+            std::string("spectrogramOpCh") + std::to_string(channel_index),
+            from_config("spectrogram")));
+      }
     }
     if (enable_detector) {
       if (detector_type == "dinov3") {
         const int detector_channels = from_config("dinov3_signal_detector.num_channels").as<int>();
+        if (detector_channels != pipeline_channels) {
+          HOLOSCAN_LOG_ERROR("dinov3_signal_detector.num_channels={} must match chdr_converter.num_channels={} for one-to-one channel routing.",
+                             detector_channels,
+                             pipeline_channels);
+          exit(1);
+        }
         for (int channel_index = 0; channel_index < std::max(1, detector_channels); ++channel_index) {
           dinoDetectorOps.push_back(make_operator<ops::DinoV3SignalDetector>(
               std::string("dinoV3SignalDetectorOpCh") + std::to_string(channel_index),
               from_config("dinov3_signal_detector"),
-              holoscan::Arg("channel_filter") = channel_index));
+              holoscan::Arg("channel_filter") = channel_index,
+              holoscan::Arg("emit_stride") = (enable_fft_emit_stride ? 1 : configured_dino_emit_stride)));
         }
       } else {
         const int detector_channels = from_config("coherent_power_signal_detector.num_channels").as<int>();
+        if (detector_channels != pipeline_channels) {
+          HOLOSCAN_LOG_ERROR("coherent_power_signal_detector.num_channels={} must match chdr_converter.num_channels={} for one-to-one channel routing.",
+                             detector_channels,
+                             pipeline_channels);
+          exit(1);
+        }
         for (int channel_index = 0; channel_index < std::max(1, detector_channels); ++channel_index) {
           coherentDetectorOps.push_back(make_operator<ops::CoherentPowerSignalDetector>(
               std::string("coherentPowerSignalDetectorOpCh") + std::to_string(channel_index),
@@ -169,18 +211,21 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       }
     }
 
-    const bool enable_visualization = from_config("visualization.enable").as<bool>();
     if (enable_visualization && !enable_spectrogram) {
       HOLOSCAN_LOG_ERROR("visualization.enable=true requires pipeline.enable_spectrogram=true");
       exit(1);
     }
-    const bool bypass_spectrogram_passthrough =
-        enable_spectrogram && enable_detector && !log_from_spectrogram && !enable_visualization &&
-        !spectrogram_save_enabled && !spectrogram_tensor_save_enabled;
 
     if (bypass_spectrogram_passthrough) {
       HOLOSCAN_LOG_INFO(
           "Bypassing spectrogramOp in lean performance mode; detector will consume FFT output directly.");
+      HOLOSCAN_LOG_INFO(
+        "Disabling FFT logger branch in lean performance mode to keep the hot path single-consumer.");
+      if (enable_fft_emit_stride) {
+        HOLOSCAN_LOG_INFO(
+            "Enabling FFT-side emit_stride={} so skipped batches are dropped before any downstream queueing.",
+            configured_dino_emit_stride);
+      }
     }
 
     std::shared_ptr<holoscan::Operator> spectrogramVisualizerOp;
@@ -195,16 +240,25 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         from_config("visualization.holoviz"),
         holoscan::Arg("tensors") = ops::make_spectrogram_input_specs(tensor_name));
     }
-
-    auto logOp = make_operator<LogOp>(
-        "logOp",
-        from_config("logger"),
-        make_condition<CountCondition>(from_config("num_runs").as<int64_t>()));
+    std::vector<std::shared_ptr<holoscan::Operator>> logOps;
+    if (enable_logger_branch) {
+      logOps.reserve(static_cast<size_t>(pipeline_channels));
+      for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+        logOps.push_back(make_operator<LogOp>(
+            std::string("logOpCh") + std::to_string(channel_index),
+            from_config("logger"),
+            make_condition<CountCondition>(from_config("num_runs").as<int64_t>())));
+      }
+    }
 
     add_operator(chdrConverterOp);
-    add_operator(fftOp);
+    for (auto& op : fftOps) {
+      add_operator(op);
+    }
     if (enable_spectrogram && !bypass_spectrogram_passthrough) {
-      add_operator(spectrogramOp);
+      for (auto& op : spectrogramOps) {
+        add_operator(op);
+      }
     }
     if (enable_detector) {
       if (detector_type == "coherent_power") {
@@ -221,36 +275,47 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       add_operator(spectrogramVisualizerOp);
       add_operator(holovizOp);
     }
-    add_operator(logOp);
+    for (auto& op : logOps) {
+      add_operator(op);
+    }
 
-    add_flow(chdrConverterOp, fftOp);
-    if (enable_spectrogram && !bypass_spectrogram_passthrough) {
-      add_flow(fftOp, spectrogramOp);
-    }
-    if (enable_detector) {
-      auto detector_source = bypass_spectrogram_passthrough ? fftOp : spectrogramOp;
-      if (detector_type == "coherent_power") {
-        for (auto& op : coherentDetectorOps) {
-          add_flow(detector_source, op);
-        }
-      } else {
-        for (auto& op : dinoDetectorOps) {
-          add_flow(detector_source, op);
+    for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+      const char* chdr_port = channel_index == 0 ? "out0" : "out1";
+      auto& fftOp = fftOps[static_cast<size_t>(channel_index)];
+      add_flow(chdrConverterOp, fftOp, {{chdr_port, "in"}});
+
+      std::shared_ptr<holoscan::Operator> detector_source = fftOp;
+      if (enable_spectrogram && !bypass_spectrogram_passthrough) {
+        auto& spectrogramOp = spectrogramOps[static_cast<size_t>(channel_index)];
+        add_flow(fftOp, spectrogramOp);
+        detector_source = spectrogramOp;
+
+        if (enable_visualization) {
+          add_flow(spectrogramOp, spectrogramVisualizerOp);
         }
       }
+
+      if (enable_detector) {
+        if (detector_type == "coherent_power") {
+          add_flow(detector_source, coherentDetectorOps[static_cast<size_t>(channel_index)]);
+        } else {
+          add_flow(detector_source, dinoDetectorOps[static_cast<size_t>(channel_index)]);
+        }
+      }
+
+      if (enable_logger_branch && log_from_spectrogram) {
+        if (!enable_spectrogram) {
+          HOLOSCAN_LOG_ERROR("pipeline.log_from_spectrogram=true requires pipeline.enable_spectrogram=true");
+          exit(1);
+        }
+        add_flow(detector_source, logOps[static_cast<size_t>(channel_index)]);
+      } else if (enable_logger_branch) {
+        add_flow(fftOp, logOps[static_cast<size_t>(channel_index)]);
+      }
     }
+
     if (enable_visualization) {
-      add_flow(spectrogramOp, spectrogramVisualizerOp);
       add_flow(spectrogramVisualizerOp, holovizOp, {{"outputs", "receivers"}});
-    }
-    if (log_from_spectrogram) {
-      if (!enable_spectrogram) {
-        HOLOSCAN_LOG_ERROR("pipeline.log_from_spectrogram=true requires pipeline.enable_spectrogram=true");
-        exit(1);
-      }
-      add_flow(spectrogramOp, logOp);
-    } else {
-      add_flow(fftOp, logOp);
     }
   }
 };

@@ -29,6 +29,7 @@ class DinoV3SignalDetector : public holoscan::Operator {
 
   void setup(holoscan::OperatorSpec& spec) override;
   void initialize() override;
+  void stop() override;
   void compute(holoscan::InputContext& op_input,
                holoscan::OutputContext&,
                holoscan::ExecutionContext& context) override;
@@ -49,7 +50,9 @@ class DinoV3SignalDetector : public holoscan::Operator {
       float* coherence_gate_resized_device = nullptr;
       float* coherence_gate_host = nullptr;
       uint8_t* mask_host = nullptr;
+      cudaStream_t processing_stream = nullptr;
       cudaStream_t staging_stream = nullptr;
+      cudaEvent_t analysis_ready_event = nullptr;
       cudaEvent_t coherence_gate_ready_event = nullptr;
       size_t frame_elements = 0;
       size_t row_elements = 0;
@@ -60,6 +63,26 @@ class DinoV3SignalDetector : public holoscan::Operator {
     uint64_t window_frames = 0;
     std::array<double, kTimingStageCount> total_ms {};
     std::array<double, kTimingStageCount> max_ms {};
+  };
+
+  struct ChannelIngressStats {
+    uint64_t samples = 0;
+    double total_chdr_to_dino_ms = 0.0;
+    double max_chdr_to_dino_ms = 0.0;
+    double total_fft_to_dino_ms = 0.0;
+    double max_fft_to_dino_ms = 0.0;
+  };
+
+  struct ChannelServiceStats {
+    uint64_t samples = 0;
+    double total_wall_ms = 0.0;
+    double max_wall_ms = 0.0;
+    double total_runtime_call_ms = 0.0;
+    double max_runtime_call_ms = 0.0;
+    double total_hybrid_call_ms = 0.0;
+    double max_hybrid_call_ms = 0.0;
+    std::array<double, 7> total_runtime_stage_ms {};
+    std::array<double, 7> max_runtime_stage_ms {};
   };
 
   holoscan::Parameter<int> num_channels_;
@@ -124,6 +147,8 @@ class DinoV3SignalDetector : public holoscan::Operator {
   std::vector<uint64_t> frame_count_;
   std::vector<int> masks_saved_;
   std::vector<ChannelTimingStats> timing_stats_;
+  std::vector<ChannelIngressStats> ingress_stats_;
+  std::vector<ChannelServiceStats> service_stats_;
   std::vector<ChannelBuffers> channel_buffers_;
   bool pytorch_runtime_ready_ = false;
   bool pytorch_warning_emitted_ = false;

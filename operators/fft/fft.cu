@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "fft.hpp"
 
+#include <chrono>
 #include <cmath>
 
 using in_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
@@ -10,13 +11,35 @@ using out_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
 
 namespace holoscan::ops {
 
+namespace {
+
+uint64_t steady_time_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
+
+double elapsed_ms(uint64_t start_ns, uint64_t end_ns) {
+    if (start_ns == 0 || end_ns <= start_ns) {
+        return 0.0;
+    }
+    return static_cast<double>(end_ns - start_ns) / 1.0e6;
+}
+
+}  // namespace
+
 void FFT::setup(OperatorSpec& spec) {
     spec.input<in_t>("in");
-    spec.output<out_t>("out");
+    spec.output<out_t>("out", holoscan::IOSpec::IOSize{8});
     spec.param(burst_size,
         "burst_size",
         "Burst size"
         "Number of samples to process in each burst");
+    spec.param(emit_stride,
+        "emit_stride",
+        "Emit stride",
+        "Emit one FFT output every N input batches.",
+        1);
     spec.param(num_bursts,
         "num_bursts",
         "Number of bursts"
@@ -84,16 +107,38 @@ void FFT::initialize() {
     make_tensor(outputs,
                 {num_channels.get(), num_bursts.get(), burst_size.get()},
                 MATX_DEVICE_MEMORY);
+    ingress_stats.assign(static_cast<size_t>(std::max<uint16_t>(1, num_channels.get())), ChannelIngressStats {});
+    output_frame_count.assign(static_cast<size_t>(std::max<uint16_t>(1, num_channels.get())), 0);
 }
 
 void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) {
     auto input = op_input.receive<in_t>("in").value();
     auto meta = metadata();
     auto channel_num = meta->get<uint16_t>("channel_number", 0);
+    const uint64_t fft_enter_ns = steady_time_ns();
+    if (channel_num < ingress_stats.size()) {
+        const uint64_t chdr_emit_ns = meta->get<uint64_t>("chdr_emit_ts_ns", 0);
+        auto& stats = ingress_stats[channel_num];
+        const double chdr_to_fft_ms = elapsed_ms(chdr_emit_ns, fft_enter_ns);
+        stats.samples++;
+        stats.total_chdr_to_fft_ms += chdr_to_fft_ms;
+        stats.max_chdr_to_fft_ms = std::max(stats.max_chdr_to_fft_ms, chdr_to_fft_ms);
+    }
+    meta->set("fft_enter_ts_ns", fft_enter_ns);
     auto out = slice<2>(outputs, {static_cast<index_t>(channel_num), 0, 0},
             {matxDropDim, matxEnd, matxEnd});
 
     (out = fftshift1D(fft(std::get<0>(input)))).run(std::get<1>(input));
+
+    const int configured_emit_stride = std::max(1, emit_stride.get());
+    uint64_t frame_number = 0;
+    if (channel_num < output_frame_count.size()) {
+        frame_number = ++output_frame_count[channel_num];
+    }
+    if (configured_emit_stride > 1 &&
+        (frame_number % static_cast<uint64_t>(configured_emit_stride)) != 0) {
+        return;
+    }
 
     if (spectrum_type.has_value())
         meta->set("spectrum_type", spectrum_type.get());
@@ -144,6 +189,9 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
         meta->set("f2_index", f2_index.get());
     if (window_time_delta.has_value())
         meta->set("window_time_delta", window_time_delta.get());
+    meta->set("fft_emit_stride", configured_emit_stride);
+    meta->set("fft_emitted_frame_number", frame_number);
+    meta->set("fft_emit_ts_ns", steady_time_ns());
 
     op_output.emit(
         out_t {
@@ -151,5 +199,18 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
             std::get<1>(input)
         },
         "out");
+}
+
+void FFT::stop() {
+    for (size_t channel_index = 0; channel_index < ingress_stats.size(); ++channel_index) {
+        const auto& stats = ingress_stats[channel_index];
+        HOLOSCAN_LOG_INFO(
+            "FFT ingress latency ch={} samples={} mean_chdr_to_fft_ms={:.3f} max_chdr_to_fft_ms={:.3f}",
+            channel_index,
+            stats.samples,
+            stats.samples == 0 ? 0.0 : stats.total_chdr_to_fft_ms / static_cast<double>(stats.samples),
+            stats.max_chdr_to_fft_ms);
+    }
+    holoscan::Operator::stop();
 }
 }  // namespace holoscan::ops

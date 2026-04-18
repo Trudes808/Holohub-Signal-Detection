@@ -70,6 +70,7 @@ class ChdrConverterOpRx : public Operator {
     int batch_idx;
     cudaStream_t stream;
     cudaEvent_t evt;
+    uint64_t queued_ns = 0;
   };
 
   struct Channel {
@@ -85,6 +86,13 @@ class ChdrConverterOpRx : public Operator {
     uint64_t ttl_bytes_recv = 0;
     uint64_t ttl_pkts_recv = 0;
     uint64_t aggr_pkts_recv = 0;
+    uint64_t completed_batches_queued = 0;
+    uint64_t completed_batches_emitted = 0;
+    uint64_t backlog_events = 0;
+    size_t max_out_q_depth = 0;
+    uint64_t release_samples = 0;
+    double total_release_latency_ms = 0.0;
+    double max_release_latency_ms = 0.0;
   };
 
   std::vector<std::shared_ptr<struct Channel>> channel_list;

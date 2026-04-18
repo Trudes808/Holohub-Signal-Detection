@@ -1007,6 +1007,33 @@ HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& dino_
 
 namespace holoscan::ops {
 
+namespace {
+
+constexpr std::array<const char*, 7> kRuntimeStageNames = {
+  "frontend",
+  "crop_align",
+  "resize",
+  "model_prep",
+  "torch_forward",
+  "dino_score",
+  "fusion",
+};
+
+uint64_t steady_time_ns() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+
+double elapsed_ms(uint64_t start_ns, uint64_t end_ns) {
+  if (start_ns == 0 || end_ns <= start_ns) {
+    return 0.0;
+  }
+  return static_cast<double>(end_ns - start_ns) / 1.0e6;
+}
+
+}  // namespace
+
 DinoV3SignalDetector::~DinoV3SignalDetector() {
   for (auto& buffers : channel_buffers_) {
     cudaFree(buffers.analysis_tensor_device);
@@ -1023,8 +1050,14 @@ DinoV3SignalDetector::~DinoV3SignalDetector() {
     cudaFree(buffers.coherence_gate_resized_device);
     cudaFreeHost(buffers.coherence_gate_host);
     cudaFreeHost(buffers.mask_host);
+    if (buffers.analysis_ready_event != nullptr) {
+      cudaEventDestroy(buffers.analysis_ready_event);
+    }
     if (buffers.coherence_gate_ready_event != nullptr) {
       cudaEventDestroy(buffers.coherence_gate_ready_event);
+    }
+    if (buffers.processing_stream != nullptr) {
+      cudaStreamDestroy(buffers.processing_stream);
     }
     if (buffers.staging_stream != nullptr) {
       cudaStreamDestroy(buffers.staging_stream);
@@ -1034,7 +1067,10 @@ DinoV3SignalDetector::~DinoV3SignalDetector() {
 }
 
 void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
-  spec.input<dino_in_t>("in");
+  auto& input_port = spec.input<dino_in_t>("in", holoscan::IOSpec::IOSize{8});
+  input_port.conditions().emplace_back(
+      holoscan::ConditionType::kMessageAvailable,
+      std::make_shared<holoscan::MessageAvailableCondition>(size_t{1}));
 
   const std::vector<double> imagenet_mean_default{0.485, 0.456, 0.406};
   const std::vector<double> imagenet_std_default{0.229, 0.224, 0.225};
@@ -1113,6 +1149,8 @@ void DinoV3SignalDetector::initialize() {
   frame_count_.assign(local_channel_count, 0);
   masks_saved_.assign(local_channel_count, 0);
   timing_stats_.assign(local_channel_count, ChannelTimingStats {});
+  ingress_stats_.assign(local_channel_count, ChannelIngressStats {});
+  service_stats_.assign(local_channel_count, ChannelServiceStats {});
   channel_buffers_.assign(local_channel_count, ChannelBuffers {});
 
   const auto cuda_result = cudaFree(nullptr);
@@ -1178,6 +1216,39 @@ void DinoV3SignalDetector::initialize() {
 #endif
 }
 
+void DinoV3SignalDetector::stop() {
+  for (size_t channel_index = 0; channel_index < ingress_stats_.size(); ++channel_index) {
+    const auto& stats = ingress_stats_[channel_index];
+    HOLOSCAN_LOG_INFO(
+        "DINO ingress latency ch={} samples={} mean_chdr_to_dino_ms={:.3f} max_chdr_to_dino_ms={:.3f} mean_fft_to_dino_ms={:.3f} max_fft_to_dino_ms={:.3f}",
+        channel_index,
+        stats.samples,
+        stats.samples == 0 ? 0.0 : stats.total_chdr_to_dino_ms / static_cast<double>(stats.samples),
+        stats.max_chdr_to_dino_ms,
+        stats.samples == 0 ? 0.0 : stats.total_fft_to_dino_ms / static_cast<double>(stats.samples),
+        stats.max_fft_to_dino_ms);
+  }
+  for (size_t channel_index = 0; channel_index < service_stats_.size(); ++channel_index) {
+    const auto& stats = service_stats_[channel_index];
+    std::ostringstream summary;
+    summary << "DINO service timing ch=" << channel_index
+            << " samples=" << stats.samples
+            << " mean_wall_ms=" << (stats.samples == 0 ? 0.0 : stats.total_wall_ms / static_cast<double>(stats.samples))
+            << " max_wall_ms=" << stats.max_wall_ms
+            << " mean_runtime_call_ms=" << (stats.samples == 0 ? 0.0 : stats.total_runtime_call_ms / static_cast<double>(stats.samples))
+            << " max_runtime_call_ms=" << stats.max_runtime_call_ms
+            << " mean_hybrid_call_ms=" << (stats.samples == 0 ? 0.0 : stats.total_hybrid_call_ms / static_cast<double>(stats.samples))
+            << " max_hybrid_call_ms=" << stats.max_hybrid_call_ms;
+    for (size_t stage_index = 0; stage_index < kRuntimeStageNames.size(); ++stage_index) {
+      const double mean_stage_ms = stats.samples == 0 ? 0.0 : stats.total_runtime_stage_ms[stage_index] / static_cast<double>(stats.samples);
+      summary << " " << kRuntimeStageNames[stage_index] << "(mean=" << mean_stage_ms
+              << ",max=" << stats.max_runtime_stage_ms[stage_index] << ")";
+    }
+    HOLOSCAN_LOG_INFO(summary.str());
+  }
+  holoscan::Operator::stop();
+}
+
 void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
                                    holoscan::OutputContext&,
                                    holoscan::ExecutionContext&) {
@@ -1186,6 +1257,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
   auto stream = std::get<1>(input);
 
   auto meta = metadata();
+  const uint64_t dino_enter_ns = steady_time_ns();
   const uint16_t channel_number = meta->get<uint16_t>("channel_number", 0);
   const int channel_filter = channel_filter_.get();
   if (channel_filter >= 0 && channel_number != static_cast<uint16_t>(channel_filter)) {
@@ -1199,6 +1271,21 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
                       frame_count_.size());
     return;
   }
+
+  {
+    auto& ingress = ingress_stats_[local_channel_index];
+    const uint64_t chdr_emit_ns = meta->get<uint64_t>("chdr_emit_ts_ns", 0);
+    const uint64_t fft_emit_ns = meta->get<uint64_t>("fft_emit_ts_ns", 0);
+    const double chdr_to_dino_ms = elapsed_ms(chdr_emit_ns, dino_enter_ns);
+    const double fft_to_dino_ms = elapsed_ms(fft_emit_ns, dino_enter_ns);
+    ingress.samples++;
+    ingress.total_chdr_to_dino_ms += chdr_to_dino_ms;
+    ingress.max_chdr_to_dino_ms = std::max(ingress.max_chdr_to_dino_ms, chdr_to_dino_ms);
+    ingress.total_fft_to_dino_ms += fft_to_dino_ms;
+    ingress.max_fft_to_dino_ms = std::max(ingress.max_fft_to_dino_ms, fft_to_dino_ms);
+  }
+  meta->set("dino_enter_ts_ns", dino_enter_ns);
+  const auto compute_wall_start = std::chrono::steady_clock::now();
 
   const uint64_t frame_number = ++frame_count_[local_channel_index];
   const int emit_stride = std::max(1, emit_stride_.get());
@@ -1238,25 +1325,6 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
   std::array<double, kTimingStageCount> stage_ms {};
   const auto total_start = std::chrono::steady_clock::now();
 
-  auto time_step_ms = [&](size_t stage_index, auto&& fn) {
-    if (!timing_enabled) {
-      fn();
-      return;
-    }
-
-    const auto stage_start = std::chrono::steady_clock::now();
-    fn();
-    const auto sync_result = cudaStreamSynchronize(stream);
-    if (sync_result != cudaSuccess) {
-      throw std::runtime_error(std::string("timing synchronization failed at ") +
-                               kTimingStageNames[stage_index] + ": " +
-                               cudaGetErrorString(sync_result));
-    }
-    stage_ms[stage_index] = std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - stage_start)
-                                .count();
-  };
-
   double span_hz = 0.0;
   if (meta->has_key("sample_rate_hz")) {
     span_hz = meta->get<double>("sample_rate_hz");
@@ -1282,6 +1350,30 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
 
   auto& buffers = channel_buffers_[local_channel_index];
 
+  auto time_step_ms = [&](size_t stage_index, auto&& fn) {
+    if (!timing_enabled) {
+      fn();
+      return;
+    }
+
+    const auto stage_start = std::chrono::steady_clock::now();
+    fn();
+    const auto sync_stream = buffers.processing_stream != nullptr ? buffers.processing_stream : stream;
+    const auto sync_result = cudaStreamSynchronize(sync_stream);
+    if (sync_result != cudaSuccess) {
+      throw std::runtime_error(std::string("timing synchronization failed at ") +
+                               kTimingStageNames[stage_index] + ": " +
+                               cudaGetErrorString(sync_result));
+    }
+    stage_ms[stage_index] = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - stage_start)
+                                .count();
+  };
+
+  const auto work_stream = [&]() -> cudaStream_t {
+    return buffers.processing_stream != nullptr ? buffers.processing_stream : stream;
+  };
+
   try {
     time_step_ms(kInputStage, [&] {
       auto allocate_device_float = [](float*& pointer, size_t requested_elements) {
@@ -1297,6 +1389,20 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         if (stream_result != cudaSuccess) {
           throw std::runtime_error(std::string("coherence staging stream creation failed: ") +
                                    cudaGetErrorString(stream_result));
+        }
+      }
+      if (buffers.processing_stream == nullptr) {
+        const auto stream_result = cudaStreamCreateWithFlags(&buffers.processing_stream, cudaStreamNonBlocking);
+        if (stream_result != cudaSuccess) {
+          throw std::runtime_error(std::string("processing stream creation failed: ") +
+                                   cudaGetErrorString(stream_result));
+        }
+      }
+      if (buffers.analysis_ready_event == nullptr) {
+        const auto event_result = cudaEventCreateWithFlags(&buffers.analysis_ready_event, cudaEventDisableTiming);
+        if (event_result != cudaSuccess) {
+          throw std::runtime_error(std::string("analysis ready event creation failed: ") +
+                                   cudaGetErrorString(event_result));
         }
       }
       if (buffers.coherence_gate_ready_event == nullptr) {
@@ -1401,12 +1507,21 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
           throw std::runtime_error(std::string("analysis tensor copy failed: ") + cudaGetErrorString(copy_result));
         }
       }
+
+      const auto ready_result = cudaEventRecord(buffers.analysis_ready_event, stream);
+      if (ready_result != cudaSuccess) {
+        throw std::runtime_error(std::string("analysis ready event record failed: ") + cudaGetErrorString(ready_result));
+      }
+      const auto wait_result = cudaStreamWaitEvent(buffers.processing_stream, buffers.analysis_ready_event, 0);
+      if (wait_result != cudaSuccess) {
+        throw std::runtime_error(std::string("processing stream wait failed: ") + cudaGetErrorString(wait_result));
+      }
     });
 
     time_step_ms(kPowerDbStage, [&] {
       constexpr int threads = 256;
       const int blocks = (total_bins + threads - 1) / threads;
-      dino_power_db_kernel<<<blocks, threads, 0, stream>>>(buffers.analysis_tensor_device,
+      dino_power_db_kernel<<<blocks, threads, 0, work_stream()>>>(buffers.analysis_tensor_device,
                                                             src_rows,
                                                             src_cols,
                                                             buffers.power_db_device);
@@ -1425,20 +1540,20 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       const int row_blocks = (src_rows + threads - 1) / threads;
       const int smooth_radius = std::max(1, static_cast<int>(std::ceil(std::max(frontend_correction_smooth_sigma_.get(), 1.0) * 1.5)));
 
-      dino_row_mean_kernel<<<src_rows, threads, 0, stream>>>(buffers.power_db_device,
+      dino_row_mean_kernel<<<src_rows, threads, 0, work_stream()>>>(buffers.power_db_device,
                                                               src_rows,
                                                               src_cols,
                                                               buffers.row_stat_device);
-      dino_gaussian_smooth_rows_kernel<<<row_blocks, threads, 0, stream>>>(buffers.row_stat_device,
+      dino_gaussian_smooth_rows_kernel<<<row_blocks, threads, 0, work_stream()>>>(buffers.row_stat_device,
                                                                             src_rows,
                                                                             smooth_radius,
                                                                             static_cast<float>(std::max(frontend_correction_smooth_sigma_.get(), 1.0)),
                                                                             buffers.row_smooth_device);
-      dino_frontend_reference_kernel<<<1, threads, 0, stream>>>(buffers.row_smooth_device,
+      dino_frontend_reference_kernel<<<1, threads, 0, work_stream()>>>(buffers.row_smooth_device,
                                                                  src_rows,
                                                                  static_cast<float>(frontend_correction_reference_q_.get() / 100.0),
                                                                  buffers.frontend_reference_device);
-      dino_frontend_correction_kernel<<<blocks, threads, 0, stream>>>(buffers.power_db_device,
+      dino_frontend_correction_kernel<<<blocks, threads, 0, work_stream()>>>(buffers.power_db_device,
                                                                        src_rows,
                                                                        src_cols,
                                                                        buffers.row_smooth_device,
@@ -1457,27 +1572,27 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       }
       constexpr int threads = 256;
       const int blocks = (total_bins + threads - 1) / threads;
-      dino_box_mean_cols_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+      dino_box_mean_cols_kernel<<<blocks, threads, 0, work_stream()>>>(buffers.corrected_db_device,
                                                                  src_rows,
                                                                  src_cols,
                                                                  4,
                                                                  buffers.time_mean_device);
-      dino_box_mean_rows_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+      dino_box_mean_rows_kernel<<<blocks, threads, 0, work_stream()>>>(buffers.corrected_db_device,
                                                                  src_rows,
                                                                  src_cols,
                                                                  3,
                                                                  buffers.freq_mean_device);
-      dino_box_mean_cols_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+      dino_box_mean_cols_kernel<<<blocks, threads, 0, work_stream()>>>(buffers.corrected_db_device,
                                                                  src_rows,
                                                                  src_cols,
                                                                  10,
                                                                  buffers.box_filter_scratch_device);
-      dino_box_mean_rows_kernel<<<blocks, threads, 0, stream>>>(buffers.box_filter_scratch_device,
+      dino_box_mean_rows_kernel<<<blocks, threads, 0, work_stream()>>>(buffers.box_filter_scratch_device,
                                                                  src_rows,
                                                                  src_cols,
                                                                  8,
                                                                  buffers.background_device);
-      dino_coherence_gate_kernel<<<blocks, threads, 0, stream>>>(buffers.time_mean_device,
+      dino_coherence_gate_kernel<<<blocks, threads, 0, work_stream()>>>(buffers.time_mean_device,
                                                                   buffers.freq_mean_device,
                                                                   src_rows,
                                                                   src_cols,
@@ -1490,7 +1605,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         throw std::runtime_error(std::string("coherence gate kernel launch failed: ") + cudaGetErrorString(kernel_result));
       }
 
-      const auto ready_result = cudaEventRecord(buffers.coherence_gate_ready_event, stream);
+      const auto ready_result = cudaEventRecord(buffers.coherence_gate_ready_event, work_stream());
       if (ready_result != cudaSuccess) {
         throw std::runtime_error(std::string("coherence gate event record failed: ") + cudaGetErrorString(ready_result));
       }
@@ -1525,10 +1640,13 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     runtime_result.aligned_rows = dst_rows;
     runtime_result.aligned_cols = dst_cols;
     std::string backend_used = "cuda_threshold_fallback";
+    double runtime_call_wall_ms = 0.0;
     time_step_ms(kTorchRuntimeStage, [&] {
       if (!use_pytorch_backend_.get() || !torch_runtime_) {
         return;
       }
+
+      const auto runtime_call_start = std::chrono::steady_clock::now();
 
       DinoTorchRuntimeConfig runtime_config;
       runtime_config.inference_backend = inference_backend_.get();
@@ -1565,13 +1683,16 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       runtime_input.dst_rows = dst_rows;
       runtime_input.dst_cols = dst_cols;
       runtime_input.patch_size = patch_size;
-      runtime_input.cuda_stream = stream;
+      runtime_input.cuda_stream = work_stream();
       runtime_input.resolution_hz = resolution_hz;
       runtime_input.span_hz = span_hz;
       runtime_input.power_db_device = buffers.power_db_device;
       runtime_input.corrected_db_device = buffers.corrected_db_device;
 
       runtime_result = torch_runtime_->run(runtime_config, runtime_input);
+  runtime_call_wall_ms = std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - runtime_call_start)
+             .count();
       backend_used = runtime_result.backend_used;
       if (!runtime_result.success) {
         if (strict_model_forward_.get()) {
@@ -1589,7 +1710,9 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     });
 
     HybridPostprocessResult hybrid_result;
+    double hybrid_call_wall_ms = 0.0;
     time_step_ms(kHybridStage, [&] {
+      const auto hybrid_call_start = std::chrono::steady_clock::now();
       auto valid_mask = resize_valid_row_mask(src_rows, dst_rows, dst_cols, ignore_bins_per_side);
       if (use_fast_backend) {
         if (runtime_result.success && runtime_result.final_mask_device != nullptr) {
@@ -1602,6 +1725,9 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
           hybrid_result.connected_fraction = 0.0f;
           hybrid_result.component_count = 0;
           hybrid_result.mask.assign(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols), 0);
+          hybrid_call_wall_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - hybrid_call_start)
+                                     .count();
           return;
         }
         throw std::runtime_error("fast_gpu backend requires a valid DINO score map from the runtime");
@@ -1618,7 +1744,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         hybrid_input.dst_rows = dst_rows;
         hybrid_input.dst_cols = dst_cols;
         hybrid_input.ignore_bins_per_side = ignore_bins_per_side;
-        hybrid_input.cuda_stream = stream;
+        hybrid_input.cuda_stream = work_stream();
         hybrid_input.dino_score_device = runtime_result.final_mask_device;
         hybrid_input.coherence_gate_device = buffers.coherence_gate_resized_device;
 
@@ -1635,6 +1761,9 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
                                                         hybrid_gpu_result.grow_freq_threshold,
                                                         hybrid_gpu_result.grow_res_threshold,
                                                         hybrid_gpu_result.combined_threshold);
+          hybrid_call_wall_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - hybrid_call_start)
+                                     .count();
           return;
         }
       }
@@ -1651,6 +1780,9 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       }
 
       hybrid_result = run_residual_veto_hybrid(dino_score_map, coherence_gate_resized, valid_mask, dst_rows, dst_cols);
+      hybrid_call_wall_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - hybrid_call_start)
+                                 .count();
     });
 
     time_step_ms(kMaskSaveStage, [&] {
@@ -1680,6 +1812,34 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       stage_ms[kTotalStage] = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - total_start)
                                   .count();
+    }
+
+    {
+      auto& service = service_stats_[local_channel_index];
+      const double wall_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - compute_wall_start)
+                                 .count();
+      service.samples++;
+      service.total_wall_ms += wall_ms;
+      service.max_wall_ms = std::max(service.max_wall_ms, wall_ms);
+      service.total_runtime_call_ms += runtime_call_wall_ms;
+      service.max_runtime_call_ms = std::max(service.max_runtime_call_ms, runtime_call_wall_ms);
+      service.total_hybrid_call_ms += hybrid_call_wall_ms;
+      service.max_hybrid_call_ms = std::max(service.max_hybrid_call_ms, hybrid_call_wall_ms);
+      service.total_runtime_stage_ms[0] += runtime_result.timing.frontend_correction_ms;
+      service.total_runtime_stage_ms[1] += runtime_result.timing.crop_align_ms;
+      service.total_runtime_stage_ms[2] += runtime_result.timing.resize_ms;
+      service.total_runtime_stage_ms[3] += runtime_result.timing.model_prep_ms;
+      service.total_runtime_stage_ms[4] += runtime_result.timing.torch_forward_ms;
+      service.total_runtime_stage_ms[5] += runtime_result.timing.dino_score_ms;
+      service.total_runtime_stage_ms[6] += runtime_result.timing.fusion_ms;
+      service.max_runtime_stage_ms[0] = std::max(service.max_runtime_stage_ms[0], runtime_result.timing.frontend_correction_ms);
+      service.max_runtime_stage_ms[1] = std::max(service.max_runtime_stage_ms[1], runtime_result.timing.crop_align_ms);
+      service.max_runtime_stage_ms[2] = std::max(service.max_runtime_stage_ms[2], runtime_result.timing.resize_ms);
+      service.max_runtime_stage_ms[3] = std::max(service.max_runtime_stage_ms[3], runtime_result.timing.model_prep_ms);
+      service.max_runtime_stage_ms[4] = std::max(service.max_runtime_stage_ms[4], runtime_result.timing.torch_forward_ms);
+      service.max_runtime_stage_ms[5] = std::max(service.max_runtime_stage_ms[5], runtime_result.timing.dino_score_ms);
+      service.max_runtime_stage_ms[6] = std::max(service.max_runtime_stage_ms[6], runtime_result.timing.fusion_ms);
     }
 
     meta->set("dino_frame_number", frame_number);
