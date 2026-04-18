@@ -45,7 +45,9 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 25000
+        # With 1024 FFTs per batch and up to 4 live batches, the larger no-skip
+        # test can retain far more packet buffers than the original pool size.
+        num_bufs: 26624
         buf_size: 4096
       - name: "CH2_CHDR_Headers_RX_CPU"
         kind: "huge"
@@ -59,7 +61,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 25000
+        num_bufs: 26624
         buf_size: 4096
 
     interfaces:
@@ -109,9 +111,9 @@ chdr_converter:
   interface_name: sdr_data
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  # Reduce per-batch retention versus the original 128-burst profile so packets
-  # are released back to the GPU pool sooner when the detector stalls.
-  num_ffts_per_batch: 64
+  # Increase the batch depth to test whether a much longer accumulation window
+  # can keep the no-skip detector path from falling behind.
+  num_ffts_per_batch: 1024
   num_simul_batches: 4
   num_channels: 2
   log_packets: false
@@ -119,7 +121,7 @@ chdr_converter:
 
 fft:
   burst_size: 20480
-  num_bursts: 64
+  num_bursts: 1024
   num_channels: 2
   spectrum_type: 1
   averaging_type: 1
@@ -180,10 +182,10 @@ dinov3_signal_detector:
   input_height: 256
   input_width: 512
   patch_size: 16
-  # The measured Torch runtime call is about 37 ms per emitted frame per
-  # channel, so the previous stride of 16 still drove the two-channel detector
-  # path close enough to saturation that frames accumulated in front of DINO.
-  emit_stride: 32
+  # Stress-test realtime capacity with no frame skipping. This remains a
+  # throughput experiment because backend_mode=fast_gpu is not the notebook-
+  # faithful validation path for final mask generation.
+  emit_stride: 1
   mask_threshold_db: -20.0
   log_detections: false
   backend_mode: "fast_gpu"

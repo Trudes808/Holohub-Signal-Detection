@@ -68,7 +68,7 @@ Available configs copied into the build directory:
 	- disables spectrogram saves, detector mask saves, per-frame detection logging, and timing summaries to keep the data path as lean as possible
 	- when spectrogram save, tensor save, visualization, and post-spectrogram logging are all disabled, the app now bypasses the pass-through `spectrogramOp` and feeds FFT output directly into the detector to remove one graph hop from the hot path
 	- now uses `backend_mode: "fast_gpu"` with `emit_stride: 8` at the full `256x512` detector input so the default non-debug throughput path reflects the measured fast-post floor rather than the notebook-faithful reference cleanup path
-	- keeps GPU RX pools at the known-safe `25000` buffers per channel to avoid GPUDirect BAR1 DMA-map failures, while reducing queue burst size and raising `num_simul_batches` so the graph can absorb more ingress jitter before dropping packets
+	- keeps GPU RX pools at the current highest known-good `26624` buffers per channel; larger values can fail during DPDK startup when mlx5 attempts to DMA-map both GPU RX regions for GPUDirect RDMA
 - `old_configs/config_torchscript_performance_timing_debug.yaml`
 	- debug-only hotspot profiling mode for the two-channel TorchScript path
 	- re-enables detector timing summaries and raises `emit_stride` so the synchronized timing probe can print stage timings without immediately collapsing ingress
@@ -102,6 +102,28 @@ Available configs copied into the build directory:
 	- loads the TorchScript artifact without moving it to CUDA or attempting `eval()`, then falls back to placeholder inference during compute
 
 Use the same external USRP stream command used by `usrp_freq_detection`.
+
+## Platform Notes
+
+The current host has two verified GPUDirect constraints that matter for this application:
+
+- `sudo ./operators/advanced_network/python/tune_system.py --check bar1-size`
+	- reports GPU BAR1 size `256 MiB`
+	- the advanced-network guide recommends `1 GiB` or higher for GPUDirect-heavy workloads
+- `sudo ./operators/advanced_network/python/tune_system.py --check topo`
+	- reports the GPU-to-NIC path as non-ideal for this setup
+	- `nvidia-smi topo -m` shows the active Mellanox NIC function used by the app is connected to the GPU through `SYS`, not `PIX` or `PXB`
+
+Observed impact on `config_torchscript_performance.yaml`:
+
+- dual-channel GPU RX pools at `26624` buffers per channel start and run successfully
+- dual-channel GPU RX pools at `27648` buffers per channel fail during DPDK startup with `mlx5_common: Fail to create MR` and `Could not DMA map EXT memory`
+- this failure occurs in GPUDirect DMA registration, not because of framebuffer memory exhaustion
+
+Practical guidance:
+
+- treat `26624` as the current best known two-channel operating point on this host unless BAR1 size or PCIe topology changes
+- if the machine is reconfigured, re-check BAR1 size and `nvidia-smi topo -m` before assuming larger GPU RX pools should work
 
 ## Stream Alignment
 
