@@ -20,6 +20,7 @@ struct DinoTorchRuntimeConfig {
   std::vector<double> imagenet_std;
   bool return_final_mask = true;
   bool return_final_mask_device = false;
+  bool compute_dino_threshold = true;
   bool compute_power_score = true;
   double ignore_sideband_hz = 0.0;
   bool frontend_correction_enable = true;

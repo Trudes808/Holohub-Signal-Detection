@@ -72,10 +72,14 @@ torch::Tensor select_quantile_along_dim(const torch::Tensor& input, double q, in
   return std::get<0>(torch::kthvalue(input, k, dim, false));
 }
 
-double scalar_quantile(const torch::Tensor& input, double q) {
+torch::Tensor scalar_quantile_tensor(const torch::Tensor& input, double q) {
   auto flat = input.reshape({-1});
   const auto k = quantile_kth(flat.size(0), q);
-  return std::get<0>(torch::kthvalue(flat, k, 0, false)).item<double>();
+  return std::get<0>(torch::kthvalue(flat, k, 0, false));
+}
+
+double scalar_quantile(const torch::Tensor& input, double q) {
+  return scalar_quantile_tensor(input, q).item<double>();
 }
 
 torch::Tensor gaussian_filter1d(const torch::Tensor& input, double sigma) {
@@ -96,9 +100,9 @@ torch::Tensor gaussian_filter1d(const torch::Tensor& input, double sigma) {
 }
 
 torch::Tensor normalize_map01(const torch::Tensor& input, double low_q, double high_q) {
-  const double lo = scalar_quantile(input, low_q);
-  const double hi = scalar_quantile(input, high_q);
-  const double scale = std::max(hi - lo, 1e-6);
+  auto lo = scalar_quantile_tensor(input, low_q);
+  auto hi = scalar_quantile_tensor(input, high_q);
+  auto scale = torch::clamp_min(hi - lo, 1e-6);
   return torch::clamp((input - lo) / scale, 0.0, 1.0);
 }
 
@@ -410,21 +414,10 @@ class DinoTorchRuntime::Impl {
       torch::Tensor model_input;
       failure_stage = "model_prep";
       result.timing.model_prep_ms = measure_ms([&] {
-        auto grayscale = normalize_map01(resized_db, 0.01, 0.99).to(torch::kFloat32);
-        auto rgb = torch::stack({grayscale, grayscale, grayscale}, 0).unsqueeze(0).contiguous();
-        auto mean = torch::tensor(
-                        std::vector<float>{static_cast<float>(resolve_stat_value(config.imagenet_mean, 0, 0.485)),
-                                           static_cast<float>(resolve_stat_value(config.imagenet_mean, 1, 0.456)),
-                                           static_cast<float>(resolve_stat_value(config.imagenet_mean, 2, 0.406))},
-                        torch::TensorOptions().dtype(torch::kFloat32).device(compute_device))
-                        .view({1, 3, 1, 1});
-        auto std = torch::tensor(
-                       std::vector<float>{static_cast<float>(resolve_stat_value(config.imagenet_std, 0, 0.229)),
-                                          static_cast<float>(resolve_stat_value(config.imagenet_std, 1, 0.224)),
-                                          static_cast<float>(resolve_stat_value(config.imagenet_std, 2, 0.225))},
-                       torch::TensorOptions().dtype(torch::kFloat32).device(compute_device))
-                       .view({1, 3, 1, 1});
-        model_input = (rgb - mean) / std;
+        auto grayscale = normalize_map01(resized_db, 0.01, 0.99).to(torch::kFloat32).unsqueeze(0).unsqueeze(0);
+        auto rgb = grayscale.expand({1, 3, grayscale.size(2), grayscale.size(3)});
+        const auto [mean, std] = get_normalization_tensors(config, compute_device);
+        model_input = ((rgb - mean) / std).contiguous();
         if (use_fp16) {
           model_input = model_input.to(torch::kHalf);
         }
@@ -490,7 +483,11 @@ class DinoTorchRuntime::Impl {
       torch::Tensor final_score;
       failure_stage = "fusion";
       result.timing.fusion_ms = measure_ms([&] {
-        result.dino_threshold = scalar_quantile(dino_score, std::clamp(config.dino_group_score_q, 0.0, 1.0));
+        if (config.compute_dino_threshold) {
+          result.dino_threshold = scalar_quantile(dino_score, std::clamp(config.dino_group_score_q, 0.0, 1.0));
+        } else {
+          result.dino_threshold = config.pipeline_final_threshold;
+        }
         result.final_threshold = result.dino_threshold;
         final_score = dino_score.contiguous();
       });
@@ -605,15 +602,39 @@ class DinoTorchRuntime::Impl {
       return;
     }
 
+    // Materialize normalization tensors ahead of live frames so model_prep can
+    // reuse them without paying a first-frame allocation penalty.
+    (void)get_normalization_tensors(config, compute_device);
+
     const int safe_patch = std::max(1, patch_size);
     const int aligned_rows = std::max(safe_patch, (std::max(1, dst_rows) / safe_patch) * safe_patch);
     const int aligned_cols = std::max(safe_patch, (std::max(1, dst_cols) / safe_patch) * safe_patch);
     auto warmup_dtype = use_fp16 ? torch::kHalf : torch::kFloat32;
     auto warmup_input = torch::zeros({1, 3, aligned_rows, aligned_cols},
                      torch::TensorOptions().dtype(warmup_dtype).device(compute_device));
-    auto warmup_output = torchscript_module_->forward({warmup_input});
-    if (!(warmup_output.isTensor() || warmup_output.isTuple())) {
-      throw std::runtime_error("TorchScript warmup returned non-tensor output");
+    for (int iteration = 0; iteration < 2; ++iteration) {
+      auto warmup_output = torchscript_module_->forward({warmup_input});
+      torch::Tensor warmup_tensor;
+      if (warmup_output.isTensor()) {
+        warmup_tensor = warmup_output.toTensor();
+      } else if (warmup_output.isTuple()) {
+        auto tuple_ptr = warmup_output.toTuple();
+        if (tuple_ptr && !tuple_ptr->elements().empty() && tuple_ptr->elements()[0].isTensor()) {
+          warmup_tensor = tuple_ptr->elements()[0].toTensor();
+        }
+      }
+      if (!warmup_tensor.defined()) {
+        throw std::runtime_error("TorchScript warmup returned non-tensor output");
+      }
+      auto warmup_score = derive_dino_score_map(warmup_tensor,
+                                                aligned_rows,
+                                                aligned_cols,
+                                                safe_patch,
+                                                std::max(1, dst_rows),
+                                                std::max(1, dst_cols));
+      if (!warmup_score.defined()) {
+        throw std::runtime_error("TorchScript warmup failed to derive DINO score map");
+      }
     }
 
     if (use_cuda_torch) {
@@ -626,6 +647,53 @@ class DinoTorchRuntime::Impl {
   }
 
  private:
+  struct NormalizationTensorCache {
+    bool valid = false;
+    c10::Device device = c10::Device(torch::kCPU);
+    std::array<float, 3> mean_values{0.485f, 0.456f, 0.406f};
+    std::array<float, 3> std_values{0.229f, 0.224f, 0.225f};
+    torch::Tensor mean_tensor;
+    torch::Tensor std_tensor;
+  };
+
+  std::pair<torch::Tensor, torch::Tensor> get_normalization_tensors(const DinoTorchRuntimeConfig& config,
+                                                                    const c10::Device& device) {
+    std::lock_guard<std::mutex> lock(normalization_cache_mutex_);
+
+    const std::array<float, 3> mean_values{
+        static_cast<float>(resolve_stat_value(config.imagenet_mean, 0, 0.485)),
+        static_cast<float>(resolve_stat_value(config.imagenet_mean, 1, 0.456)),
+        static_cast<float>(resolve_stat_value(config.imagenet_mean, 2, 0.406)),
+    };
+    const std::array<float, 3> std_values{
+        static_cast<float>(resolve_stat_value(config.imagenet_std, 0, 0.229)),
+        static_cast<float>(resolve_stat_value(config.imagenet_std, 1, 0.224)),
+        static_cast<float>(resolve_stat_value(config.imagenet_std, 2, 0.225)),
+    };
+
+    const bool cache_matches = normalization_cache_.valid &&
+                               normalization_cache_.device == device &&
+                               normalization_cache_.mean_values == mean_values &&
+                               normalization_cache_.std_values == std_values;
+    if (!cache_matches) {
+      auto cpu_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+      normalization_cache_.valid = true;
+      normalization_cache_.device = device;
+      normalization_cache_.mean_values = mean_values;
+      normalization_cache_.std_values = std_values;
+      normalization_cache_.mean_tensor = torch::from_blob(const_cast<float*>(mean_values.data()), {3}, cpu_options)
+                                            .clone()
+                                            .to(device)
+                                            .view({1, 3, 1, 1});
+      normalization_cache_.std_tensor = torch::from_blob(const_cast<float*>(std_values.data()), {3}, cpu_options)
+                                           .clone()
+                                           .to(device)
+                                           .view({1, 3, 1, 1});
+    }
+
+    return {normalization_cache_.mean_tensor, normalization_cache_.std_tensor};
+  }
+
   void ensure_loaded(const DinoTorchRuntimeConfig& config, const c10::Device& device) {
     std::lock_guard<std::mutex> lock(torchscript_load_mutex_);
     if (torchscript_model_loaded_ || torchscript_load_failed_) {
@@ -658,6 +726,8 @@ class DinoTorchRuntime::Impl {
   }
 
   std::mutex torchscript_load_mutex_;
+  std::mutex normalization_cache_mutex_;
+  NormalizationTensorCache normalization_cache_;
   std::unique_ptr<torch::jit::script::Module> torchscript_module_;
   bool torchscript_model_loaded_ = false;
   bool torchscript_load_failed_ = false;

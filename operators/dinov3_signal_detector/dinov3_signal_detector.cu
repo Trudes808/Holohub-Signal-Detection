@@ -1657,6 +1657,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       runtime_config.imagenet_std = imagenet_std_.get();
       runtime_config.return_final_mask = false;
       runtime_config.return_final_mask_device = true;
+      runtime_config.compute_dino_threshold = !use_fast_backend;
       runtime_config.compute_power_score = false;
       runtime_config.ignore_sideband_hz = ignore_sideband_hz_.get();
       runtime_config.frontend_correction_enable = frontend_correction_enable_.get();
