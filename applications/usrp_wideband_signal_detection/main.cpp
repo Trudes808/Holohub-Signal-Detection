@@ -111,6 +111,28 @@ class LogOp: public holoscan::Operator {
   std::vector<std::chrono::steady_clock::duration> elapsed_;
 };
 
+class DropOp: public holoscan::Operator {
+ public:
+  HOLOSCAN_OPERATOR_FORWARD_ARGS(DropOp)
+
+  using in_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
+
+  DropOp() = default;
+
+  void setup(holoscan::OperatorSpec& spec) override {
+    auto& input_port = spec.input<in_t>("in", holoscan::IOSpec::IOSize{8});
+    input_port.conditions().emplace_back(
+        holoscan::ConditionType::kMessageAvailable,
+        std::make_shared<holoscan::MessageAvailableCondition>(size_t{1}));
+  }
+
+  void compute(holoscan::InputContext& op_input,
+               holoscan::OutputContext&,
+               holoscan::ExecutionContext&) override {
+    static_cast<void>(op_input.receive<in_t>("in"));
+  }
+};
+
 class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
  public:
   void compose() override {
@@ -250,6 +272,10 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
             make_condition<CountCondition>(from_config("num_runs").as<int64_t>())));
       }
     }
+    std::shared_ptr<holoscan::Operator> unusedChdrOutputDropOp;
+    if (pipeline_channels < 2) {
+      unusedChdrOutputDropOp = make_operator<DropOp>("unusedChdrOutputDropOp");
+    }
 
     add_operator(chdrConverterOp);
     for (auto& op : fftOps) {
@@ -277,6 +303,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     }
     for (auto& op : logOps) {
       add_operator(op);
+    }
+    if (unusedChdrOutputDropOp) {
+      add_operator(unusedChdrOutputDropOp);
     }
 
     for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
@@ -312,6 +341,10 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       } else if (enable_logger_branch) {
         add_flow(fftOp, logOps[static_cast<size_t>(channel_index)]);
       }
+    }
+
+    if (unusedChdrOutputDropOp) {
+      add_flow(chdrConverterOp, unusedChdrOutputDropOp, {{"out1", "in"}});
     }
 
     if (enable_visualization) {

@@ -118,6 +118,10 @@ add_executable(offline_coherent_power_validator
   offline_coherent_power_validator.cpp
 )
 
+add_executable(offline_dino_validator
+  offline_dino_validator.cpp
+)
+
 target_link_libraries(offline_spectrogram_visualizer
   PRIVATE
   CUDA::cudart
@@ -129,6 +133,12 @@ target_link_libraries(offline_spectrogram_visualizer
 target_link_libraries(offline_coherent_power_validator
   PRIVATE
   holoscan::ops::coherent_power_signal_detector
+)
+
+target_link_libraries(offline_dino_validator
+  PRIVATE
+  CUDA::cudart
+  holoscan::ops::dinov3_signal_detector
 )
 
 if(APP_VULKAN_LINK_ITEM)
@@ -145,12 +155,15 @@ endforeach()
 
 if(APP_NVJITLINK_LINK_ITEM)
   target_link_libraries(usrp_wideband_signal_detection PRIVATE ${APP_NVJITLINK_LINK_ITEM})
+  target_link_libraries(offline_dino_validator PRIVATE ${APP_NVJITLINK_LINK_ITEM})
 endif()
 
 target_link_directories(usrp_wideband_signal_detection PRIVATE ${CUDA_LINK_DIRS})
+target_link_directories(offline_dino_validator PRIVATE ${CUDA_LINK_DIRS})
 foreach(CUDA_LINK_DIR IN LISTS CUDA_LINK_DIRS)
   if(EXISTS "${CUDA_LINK_DIR}")
     target_link_options(usrp_wideband_signal_detection PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
+    target_link_options(offline_dino_validator PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
   endif()
 endforeach()
 
@@ -170,6 +183,12 @@ target_include_directories(offline_coherent_power_validator
   ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/coherent_power_signal_detector
 )
 
+target_include_directories(offline_dino_validator
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/dinov3_signal_detector
+)
+
 target_compile_definitions(usrp_wideband_signal_detection
   PRIVATE
   USRP_WIDEBAND_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
@@ -181,6 +200,7 @@ target_compile_definitions(offline_spectrogram_visualizer
 )
 
 target_compile_features(offline_coherent_power_validator PRIVATE cxx_std_17)
+target_compile_features(offline_dino_validator PRIVATE cxx_std_17)
 
 if(NOT DEFINED ANO_MGR)
     set(ANO_MGR "dpdk gpunetio" CACHE STRING "Manager type(s) list")
@@ -199,6 +219,7 @@ endforeach()
     config_coherent_power_performance.yaml
     old_configs/config_coherent_power_realtime_guarded.yaml
     config_coherent_power_validation.yaml
+    config_torchscript_validation_capture_single_channel.yaml
     old_configs/config_offline_replay.yaml
     old_configs/config_cuda_fallback.yaml
     config_torchscript_debug_timing_fast_gpu.yaml
@@ -235,3 +256,4 @@ endforeach()
   add_custom_target(usrp_wideband_configs DEPENDS ${USRP_WIDEBAND_CONFIG_OUTPUTS})
   add_dependencies(usrp_wideband_signal_detection usrp_wideband_configs)
   add_dependencies(offline_coherent_power_validator usrp_wideband_configs)
+  add_dependencies(offline_dino_validator usrp_wideband_configs)

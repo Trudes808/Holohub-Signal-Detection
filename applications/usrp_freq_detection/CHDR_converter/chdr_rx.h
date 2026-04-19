@@ -93,6 +93,9 @@ class ChdrConverterOpRx : public Operator {
     uint64_t release_samples = 0;
     double total_release_latency_ms = 0.0;
     double max_release_latency_ms = 0.0;
+    bool first_receive_logged = false;
+    uint64_t first_receive_ns = 0;
+    uint64_t last_receive_ns = 0;
   };
 
   std::vector<std::shared_ptr<struct Channel>> channel_list;

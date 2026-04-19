@@ -417,6 +417,18 @@ void ChdrConverterOpRx::process_channel_data(
   auto channel = channel_list.at(channel_num);
 
   const int burst_packets = get_num_packets(burst);
+  const uint64_t receive_ts_ns = steady_time_ns();
+
+  if (!channel->first_receive_logged && burst_packets > 0) {
+    channel->first_receive_logged = true;
+    channel->first_receive_ns = receive_ts_ns;
+    HOLOSCAN_LOG_INFO("Begin receiving samples on channel {} (first burst packets={})",
+                      channel->channel_num,
+                      burst_packets);
+  }
+  if (burst_packets > 0) {
+    channel->last_receive_ns = receive_ts_ns;
+  }
 
   // Log packet details for debugging
   if (log_packets_) {
@@ -508,11 +520,26 @@ void ChdrConverterOpRx::stop() {
   HOLOSCAN_LOG_INFO("ChdrConverterOpRx exit report:");
   for (uint16_t channel_num = 0; channel_num < num_channels_.get(); channel_num++) {
     auto channel = channel_list.at(channel_num);
+  const uint64_t duration_ns =
+    (channel->first_receive_ns != 0 && channel->last_receive_ns >= channel->first_receive_ns)
+      ? (channel->last_receive_ns - channel->first_receive_ns)
+      : 0;
+  const double duration_s = static_cast<double>(duration_ns) / 1.0e9;
+  const double processed_samples =
+    static_cast<double>(channel->ttl_pkts_recv) * static_cast<double>(num_complex_samples_per_packet_.get());
+  const double avg_msps =
+    (duration_s > 0.0) ? (processed_samples / duration_s / 1.0e6) : 0.0;
+  const double avg_gbps =
+    (duration_s > 0.0)
+      ? (processed_samples * sizeof(int16_t) * 2 * 8 / duration_s / 1.0e9)
+      : 0.0;
     HOLOSCAN_LOG_INFO(
         "\n"
         "------- CH {} --------\n"
         "   Processed bytes: {}\n"
         " Processed packets: {}\n"
+    " Active receive sec: {:.3f}\n"
+    " Average throughput: {:.2f} MSps ({:.2f} Gbps)\n"
         " Completed batches queued: {}\n"
         "Completed batches emitted: {}\n"
         "         Backlog events: {}\n"
@@ -522,6 +549,9 @@ void ChdrConverterOpRx::stop() {
         channel->channel_num,
         channel->ttl_bytes_recv,
         channel->ttl_pkts_recv,
+        duration_s,
+        avg_msps,
+        avg_gbps,
         channel->completed_batches_queued,
         channel->completed_batches_emitted,
         channel->backlog_events,

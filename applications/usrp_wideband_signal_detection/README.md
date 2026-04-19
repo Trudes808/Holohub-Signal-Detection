@@ -67,8 +67,12 @@ Available configs copied into the build directory:
 	- two-channel throughput test mode
 	- disables spectrogram saves, detector mask saves, per-frame detection logging, and timing summaries to keep the data path as lean as possible
 	- when spectrogram save, tensor save, visualization, and post-spectrogram logging are all disabled, the app now bypasses the pass-through `spectrogramOp` and feeds FFT output directly into the detector to remove one graph hop from the hot path
-	- now uses `backend_mode: "fast_gpu"` with `emit_stride: 8` at the full `256x512` detector input so the default non-debug throughput path reflects the measured fast-post floor rather than the notebook-faithful reference cleanup path
+	- now uses `backend_mode: "fast_gpu"` with `emit_stride: 1` at the full `256x512` detector input so the default non-debug throughput path stress-tests the no-skip fast-path detector rather than the notebook-faithful reference cleanup path
 	- keeps GPU RX pools at the current highest known-good `26624` buffers per channel; larger values can fail during DPDK startup when mlx5 attempts to DMA-map both GPU RX regions for GPUDirect RDMA
+- `config_torchscript_performance_single_channel.yaml`
+	- single-channel throughput test mode for finding the highest realtime sender rate the current BAR1/topology-limited host can support with one active RF channel
+	- keeps the same large `1024`-FFT batch geometry and `emit_stride: 1` fast-path detector settings as the main performance config, but reduces the pipeline, network queues, and operators to channel 0 only
+	- uses a larger single GPU RX pool (`49152` buffers) because only one GPUDirect RX region is mapped in this mode
 - `old_configs/config_torchscript_performance_timing_debug.yaml`
 	- debug-only hotspot profiling mode for the two-channel TorchScript path
 	- re-enables detector timing summaries and raises `emit_stride` so the synchronized timing probe can print stage timings without immediately collapsing ingress
@@ -242,6 +246,15 @@ For the two-channel performance pass with the real TorchScript detector path and
 cd applications/usrp_wideband_signal_detection
 ./run_torchscript_performance_test.sh
 ```
+
+For the one-channel performance pass:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+./run_torchscript_performance_single_channel.sh
+```
+
+Use the sender with only channel 0 and only UDP destination port `1234` when exercising the one-channel config.
 
 For the two-channel coherent-power real-time path with the coherent detector selected and debug outputs disabled:
 
