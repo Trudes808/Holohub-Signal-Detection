@@ -7,9 +7,12 @@ USRP_WIDEBAND_CONTAINER_REPO_GUARD_SH=1
 
 canon_dir() {
   local target_dir=$1
-  (
-    cd "${target_dir}" && pwd -P
-  )
+  python3 - "$target_dir" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
 }
 
 expected_repo_root_from_script_dir() {
