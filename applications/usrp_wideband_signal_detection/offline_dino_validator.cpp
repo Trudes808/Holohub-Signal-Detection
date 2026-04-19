@@ -433,6 +433,14 @@ std::vector<float> box_mean_rows(const std::vector<float>& input, int rows, int 
   return output;
 }
 
+std::vector<float> box_mean_2d(const std::vector<float>& input,
+                               int rows,
+                               int cols,
+                               int radius_rows,
+                               int radius_cols) {
+  return box_mean_rows(box_mean_cols(input, rows, cols, radius_cols), rows, cols, radius_rows);
+}
+
 std::vector<float> coherence_gate(const std::vector<float>& corrected,
                                   int rows,
                                   int cols,
@@ -587,6 +595,42 @@ std::vector<float> gaussian_second_derivative_rows(const std::vector<float>& inp
   return convolve_axis(input, rows, cols, kernel, true);
 }
 
+std::vector<float> gaussian_first_derivative_rows(const std::vector<float>& input,
+                                                  int rows,
+                                                  int cols,
+                                                  double sigma) {
+  if (sigma <= 0.0) {
+    return std::vector<float>(input.size(), 0.0f);
+  }
+  const int radius = std::max(1, static_cast<int>(std::ceil(3.0 * sigma)));
+  std::vector<float> kernel(static_cast<size_t>(2 * radius + 1), 0.0f);
+  const double sigma2 = sigma * sigma;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const double x = static_cast<double>(offset);
+    kernel[static_cast<size_t>(offset + radius)] =
+        static_cast<float>((-x / sigma2) * std::exp(-(x * x) / (2.0 * sigma2)));
+  }
+  return convolve_axis(input, rows, cols, kernel, true);
+}
+
+std::vector<float> gaussian_first_derivative_cols(const std::vector<float>& input,
+                                                  int rows,
+                                                  int cols,
+                                                  double sigma) {
+  if (sigma <= 0.0) {
+    return std::vector<float>(input.size(), 0.0f);
+  }
+  const int radius = std::max(1, static_cast<int>(std::ceil(3.0 * sigma)));
+  std::vector<float> kernel(static_cast<size_t>(2 * radius + 1), 0.0f);
+  const double sigma2 = sigma * sigma;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const double x = static_cast<double>(offset);
+    kernel[static_cast<size_t>(offset + radius)] =
+        static_cast<float>((-x / sigma2) * std::exp(-(x * x) / (2.0 * sigma2)));
+  }
+  return convolve_axis(input, rows, cols, kernel, false);
+}
+
 std::vector<float> normalize01_masked_minmax(const std::vector<float>& input,
                                              const std::vector<uint8_t>& mask) {
   std::vector<float> output(input.size(), 0.0f);
@@ -610,6 +654,117 @@ std::vector<float> normalize01_masked_minmax(const std::vector<float>& input,
     output[index] = clamp_value((input[index] - low) / scale, 0.0f, 1.0f);
   }
   return output;
+}
+
+std::vector<float> normalize01_quantile(const std::vector<float>& input,
+                                        double low_q,
+                                        double high_q) {
+  std::vector<float> values;
+  values.reserve(input.size());
+  for (float value : input) {
+    if (std::isfinite(value)) {
+      values.push_back(value);
+    }
+  }
+
+  std::vector<float> output(input.size(), 0.0f);
+  if (values.empty()) {
+    return output;
+  }
+
+  const auto select_quantile = [](std::vector<float> quantile_values, double q, float fallback) {
+    quantile_values.erase(std::remove_if(quantile_values.begin(), quantile_values.end(), [](float value) {
+                           return !std::isfinite(value);
+                         }),
+                         quantile_values.end());
+    if (quantile_values.empty()) {
+      return fallback;
+    }
+    q = clamp_value(q, 0.0, 1.0);
+    const size_t quantile_index = static_cast<size_t>(std::llround(q * static_cast<double>(quantile_values.size() - 1)));
+    std::nth_element(quantile_values.begin(),
+                     quantile_values.begin() + static_cast<std::ptrdiff_t>(quantile_index),
+                     quantile_values.end());
+    return quantile_values[quantile_index];
+  };
+
+  const float low = select_quantile(values, clamp_value(low_q / 100.0, 0.0, 1.0), 0.0f);
+  const float high = select_quantile(values, clamp_value(high_q / 100.0, 0.0, 1.0), 1.0f);
+  const float scale = std::max(high - low, 1.0e-6f);
+  for (size_t index = 0; index < input.size(); ++index) {
+    if (!std::isfinite(input[index])) {
+      continue;
+    }
+    output[index] = clamp_value((input[index] - low) / scale, 0.0f, 1.0f);
+  }
+  return output;
+}
+
+std::vector<float> structure_tensor_gate(const std::vector<float>& corrected_resized,
+                                         int rows,
+                                         int cols,
+                                         const std::vector<uint8_t>& valid_mask) {
+  const int bg_freq = std::max(9, 2 * std::max(1, rows / 24) + 1);
+  const int bg_time = std::max(9, 2 * std::max(1, cols / 24) + 1);
+  const auto background = box_mean_2d(corrected_resized,
+                                      rows,
+                                      cols,
+                                      std::max(1, bg_freq / 2),
+                                      std::max(1, bg_time / 2));
+
+  std::vector<float> residual_db(corrected_resized.size(), 0.0f);
+  for (size_t index = 0; index < residual_db.size(); ++index) {
+    residual_db[index] = std::max(corrected_resized[index] - background[index], 0.0f);
+  }
+  const auto residual_n = normalize01_quantile(residual_db, 5.0, 99.0);
+
+  const std::array<double, 3> scales = {0.8, 1.6, 3.2};
+  std::vector<float> gate_max(corrected_resized.size(), 0.0f);
+  for (double grad_sigma : scales) {
+    const double integ_sigma = std::max(1.0, 1.8 * grad_sigma);
+    const auto grad_f = gaussian_first_derivative_rows(residual_n, rows, cols, grad_sigma);
+    const auto grad_t = gaussian_first_derivative_cols(residual_n, rows, cols, grad_sigma);
+
+    std::vector<float> grad_ff(corrected_resized.size(), 0.0f);
+    std::vector<float> grad_ft(corrected_resized.size(), 0.0f);
+    std::vector<float> grad_tt(corrected_resized.size(), 0.0f);
+    for (size_t index = 0; index < corrected_resized.size(); ++index) {
+      grad_ff[index] = grad_f[index] * grad_f[index];
+      grad_ft[index] = grad_f[index] * grad_t[index];
+      grad_tt[index] = grad_t[index] * grad_t[index];
+    }
+
+    const auto j_ff = gaussian_blur(grad_ff, rows, cols, integ_sigma, integ_sigma);
+    const auto j_ft = gaussian_blur(grad_ft, rows, cols, integ_sigma, integ_sigma);
+    const auto j_tt = gaussian_blur(grad_tt, rows, cols, integ_sigma, integ_sigma);
+
+    std::vector<float> coherence(corrected_resized.size(), 0.0f);
+    std::vector<float> energy(corrected_resized.size(), 0.0f);
+    for (size_t index = 0; index < corrected_resized.size(); ++index) {
+      const float delta = std::sqrt(std::max((j_ff[index] - j_tt[index]) * (j_ff[index] - j_tt[index]) +
+                                                4.0f * (j_ft[index] * j_ft[index]),
+                                            0.0f));
+      const float lambda1 = 0.5f * (j_ff[index] + j_tt[index] + delta);
+      const float lambda2 = 0.5f * (j_ff[index] + j_tt[index] - delta);
+      coherence[index] = (lambda1 - lambda2) / std::max(lambda1 + lambda2, 1.0e-6f);
+      energy[index] = lambda1 + lambda2;
+    }
+
+    const auto coherence_n = normalize01_quantile(coherence, 5.0, 99.0);
+    const auto energy_n = normalize01_quantile(energy, 5.0, 99.0);
+    for (size_t index = 0; index < gate_max.size(); ++index) {
+      const float gate_value = coherence_n[index] * std::sqrt(std::max(energy_n[index], 0.0f));
+      gate_max[index] = std::max(gate_max[index], gate_value);
+    }
+  }
+
+  auto gate_px = normalize01_quantile(gate_max, 5.0, 99.0);
+  for (size_t index = 0; index < gate_px.size() && index < valid_mask.size(); ++index) {
+    if (!valid_mask[index]) {
+      gate_px[index] = 0.0f;
+    }
+  }
+  return gate_px;
 }
 
 struct ComponentLabelling {
@@ -690,6 +845,120 @@ std::vector<uint8_t> keep_large_components(const std::vector<uint8_t>& mask,
   return output;
 }
 
+std::vector<uint8_t> binary_dilate_rect(const std::vector<uint8_t>& mask,
+                                        int rows,
+                                        int cols,
+                                        int kernel_rows,
+                                        int kernel_cols) {
+  const int row_radius = std::max(0, kernel_rows / 2);
+  const int col_radius = std::max(0, kernel_cols / 2);
+  std::vector<uint8_t> output(mask.size(), 0);
+  for (int row = 0; row < rows; ++row) {
+    for (int col = 0; col < cols; ++col) {
+      bool active = false;
+      for (int d_row = -row_radius; d_row <= row_radius && !active; ++d_row) {
+        const int src_row = clamp_value(row + d_row, 0, rows - 1);
+        for (int d_col = -col_radius; d_col <= col_radius; ++d_col) {
+          const int src_col = clamp_value(col + d_col, 0, cols - 1);
+          if (mask[flat_index(cols, src_row, src_col)]) {
+            active = true;
+            break;
+          }
+        }
+      }
+      output[flat_index(cols, row, col)] = active ? 1 : 0;
+    }
+  }
+  return output;
+}
+
+std::vector<uint8_t> binary_erode_rect(const std::vector<uint8_t>& mask,
+                                       int rows,
+                                       int cols,
+                                       int kernel_rows,
+                                       int kernel_cols) {
+  const int row_radius = std::max(0, kernel_rows / 2);
+  const int col_radius = std::max(0, kernel_cols / 2);
+  std::vector<uint8_t> output(mask.size(), 0);
+  for (int row = 0; row < rows; ++row) {
+    for (int col = 0; col < cols; ++col) {
+      bool active = true;
+      for (int d_row = -row_radius; d_row <= row_radius && active; ++d_row) {
+        const int src_row = clamp_value(row + d_row, 0, rows - 1);
+        for (int d_col = -col_radius; d_col <= col_radius; ++d_col) {
+          const int src_col = clamp_value(col + d_col, 0, cols - 1);
+          if (!mask[flat_index(cols, src_row, src_col)]) {
+            active = false;
+            break;
+          }
+        }
+      }
+      output[flat_index(cols, row, col)] = active ? 1 : 0;
+    }
+  }
+  return output;
+}
+
+std::vector<uint8_t> binary_closing_rect(const std::vector<uint8_t>& mask,
+                                         int rows,
+                                         int cols,
+                                         int kernel_rows,
+                                         int kernel_cols) {
+  return binary_erode_rect(binary_dilate_rect(mask, rows, cols, kernel_rows, kernel_cols),
+                           rows,
+                           cols,
+                           kernel_rows,
+                           kernel_cols);
+}
+
+std::vector<uint8_t> binary_fill_holes(const std::vector<uint8_t>& mask, int rows, int cols) {
+  std::vector<uint8_t> visited(mask.size(), 0);
+  std::vector<int> pending;
+  pending.reserve(mask.size());
+  auto maybe_enqueue = [&](int row, int col) {
+    const size_t index = flat_index(cols, row, col);
+    if (mask[index] || visited[index]) {
+      return;
+    }
+    visited[index] = 1;
+    pending.push_back(static_cast<int>(index));
+  };
+
+  for (int row = 0; row < rows; ++row) {
+    maybe_enqueue(row, 0);
+    maybe_enqueue(row, cols - 1);
+  }
+  for (int col = 0; col < cols; ++col) {
+    maybe_enqueue(0, col);
+    maybe_enqueue(rows - 1, col);
+  }
+
+  constexpr std::array<int, 4> d_row = {-1, 0, 0, 1};
+  constexpr std::array<int, 4> d_col = {0, -1, 1, 0};
+  size_t pending_head = 0;
+  while (pending_head < pending.size()) {
+    const int flat_index_value = pending[pending_head++];
+    const int row = flat_index_value / cols;
+    const int col = flat_index_value % cols;
+    for (size_t index = 0; index < d_row.size(); ++index) {
+      const int next_row = row + d_row[index];
+      const int next_col = col + d_col[index];
+      if (next_row < 0 || next_row >= rows || next_col < 0 || next_col >= cols) {
+        continue;
+      }
+      maybe_enqueue(next_row, next_col);
+    }
+  }
+
+  std::vector<uint8_t> output = mask;
+  for (size_t index = 0; index < output.size(); ++index) {
+    if (!output[index] && !visited[index]) {
+      output[index] = 1;
+    }
+  }
+  return output;
+}
+
 float mean_mask_value(const std::vector<uint8_t>& mask) {
   if (mask.empty()) {
     return 0.0f;
@@ -717,23 +986,17 @@ float connected_fraction(const std::vector<uint8_t>& mask, const std::vector<uin
   return static_cast<float>(active) / static_cast<float>(valid);
 }
 
-HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& dino_score,
-                                                 const std::vector<float>& coherence_gate_map,
+HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& hybrid_dino_contrib,
                                                  const std::vector<uint8_t>& valid_mask,
                                                  int rows,
                                                  int cols) {
   HybridPostprocessResult result;
   result.mask.assign(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
-  if (dino_score.size() != result.mask.size() ||
-      coherence_gate_map.size() != result.mask.size() ||
-      valid_mask.size() != result.mask.size()) {
+  if (hybrid_dino_contrib.size() != result.mask.size() || valid_mask.size() != result.mask.size()) {
     return result;
   }
 
-  std::vector<float> base_map(result.mask.size(), 0.0f);
-  for (size_t index = 0; index < base_map.size(); ++index) {
-    base_map[index] = dino_score[index] * coherence_gate_map[index];
-  }
+  const auto& base_map = hybrid_dino_contrib;
   const auto base_norm = normalize01_masked_minmax(base_map, valid_mask);
   const auto envelope_map = normalize01_masked_minmax(gaussian_blur(base_norm, rows, cols, 6.0, 1.4), valid_mask);
   const auto base_blur = gaussian_blur(base_norm, rows, cols, 4.0, 1.0);
@@ -787,11 +1050,22 @@ HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& dino_
   for (size_t index = 0; index < seed_mask.size(); ++index) {
     seed_mask[index] = (valid_mask[index] && keep_freq[index] >= result.seed_freq_threshold && keep_res[index] >= result.seed_res_threshold) ? 1 : 0;
   }
-  auto final_mask = keep_large_components(seed_mask, rows, cols, 8);
+
+  std::vector<uint8_t> final_mask(seed_mask.size(), 0);
+  for (size_t index = 0; index < final_mask.size(); ++index) {
+    final_mask[index] = (seed_mask[index] &&
+                         valid_mask[index] &&
+                         combined_score[index] >= result.combined_threshold * 0.85f)
+                            ? 1
+                            : 0;
+  }
+
+  final_mask = binary_closing_rect(final_mask, rows, cols, 7, 3);
+  final_mask = binary_fill_holes(final_mask, rows, cols);
   for (size_t index = 0; index < final_mask.size(); ++index) {
     final_mask[index] = (final_mask[index] && valid_mask[index]) ? 1 : 0;
   }
-  final_mask = keep_large_components(final_mask, rows, cols, 8, &result.component_count);
+  final_mask = keep_large_components(final_mask, rows, cols, 24, &result.component_count);
   result.final_fraction = mean_mask_value(final_mask);
   result.connected_fraction = connected_fraction(final_mask, valid_mask);
   result.mask = std::move(final_mask);
@@ -905,8 +1179,6 @@ int main(int argc, char** argv) {
       ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (tensor.rows - config.patch_size) / 2));
     }
 
-    const auto coherence_gate_full = coherence_gate(corrected_db, tensor.rows, tensor.cols, ignore_bins_per_side, config);
-    const auto coherence_gate_resized = resize_bilinear(coherence_gate_full, tensor.rows, tensor.cols, config.input_height, config.input_width);
     const auto valid_mask = resize_valid_row_mask(tensor.rows, config.input_height, config.input_width, ignore_bins_per_side);
 
     float* power_db_device = nullptr;
@@ -973,17 +1245,36 @@ int main(int argc, char** argv) {
       throw std::runtime_error("unexpected DINO score map size returned from runtime");
     }
 
-    const auto hybrid_result = run_residual_veto_hybrid(runtime_result.final_mask,
-                                                        coherence_gate_resized,
+    const auto& dino_score_map = runtime_result.final_mask;
+
+    const auto corrected_resized = resize_bilinear(corrected_db, tensor.rows, tensor.cols, config.input_height, config.input_width);
+    const auto coherence_gate_resized = structure_tensor_gate(corrected_resized,
+                                  config.input_height,
+                                  config.input_width,
+                                  valid_mask);
+    // Previous faster approximation kept for future performance comparison:
+    // const auto coherence_gate_full = coherence_gate(corrected_db, tensor.rows, tensor.cols, ignore_bins_per_side, config);
+    // const auto coherence_gate_resized = resize_bilinear(coherence_gate_full, tensor.rows, tensor.cols, config.input_height, config.input_width);
+    const auto dino_score_norm = normalize01_quantile(dino_score_map, 5.0, 95.0);
+    const auto coherence_gate_norm = normalize01_quantile(coherence_gate_resized, 5.0, 99.0);
+
+    std::vector<float> hybrid_contrib(dino_score_map.size(), 0.0f);
+    for (size_t index = 0; index < hybrid_contrib.size(); ++index) {
+      hybrid_contrib[index] = dino_score_norm[index] * coherence_gate_norm[index];
+      // Previous faster approximation kept for future performance comparison:
+      // hybrid_contrib[index] = dino_score_map[index] * coherence_gate_resized[index];
+    }
+
+    const auto hybrid_result = run_residual_veto_hybrid(hybrid_contrib,
                                                         valid_mask,
                                                         config.input_height,
                                                         config.input_width);
-
-    const auto corrected_resized = resize_bilinear(corrected_db, tensor.rows, tensor.cols, config.input_height, config.input_width);
-    std::vector<float> hybrid_contrib(runtime_result.final_mask.size(), 0.0f);
-    for (size_t index = 0; index < hybrid_contrib.size(); ++index) {
-      hybrid_contrib[index] = runtime_result.final_mask[index] * coherence_gate_resized[index];
-    }
+    // Previous faster approximation kept for future performance comparison:
+    // const auto hybrid_result = run_residual_veto_hybrid(dino_score_map,
+    //                                                     coherence_gate_resized,
+    //                                                     valid_mask,
+    //                                                     config.input_height,
+    //                                                     config.input_width);
 
     const auto power_db_path = options.output_dir / "offline_power_db.npy";
     const auto corrected_path = options.output_dir / "offline_corrected_db.npy";
@@ -998,7 +1289,7 @@ int main(int argc, char** argv) {
     write_npy_2d(power_db_path, power_db.data(), power_db.size() * sizeof(float), tensor.rows, tensor.cols, "<f4");
     write_npy_2d(corrected_path, corrected_db.data(), corrected_db.size() * sizeof(float), tensor.rows, tensor.cols, "<f4");
     write_npy_2d(corrected_resized_path, corrected_resized.data(), corrected_resized.size() * sizeof(float), config.input_height, config.input_width, "<f4");
-    write_npy_2d(dino_score_path, runtime_result.final_mask.data(), runtime_result.final_mask.size() * sizeof(float), config.input_height, config.input_width, "<f4");
+    write_npy_2d(dino_score_path, dino_score_map.data(), dino_score_map.size() * sizeof(float), config.input_height, config.input_width, "<f4");
     write_npy_2d(coherence_gate_path, coherence_gate_resized.data(), coherence_gate_resized.size() * sizeof(float), config.input_height, config.input_width, "<f4");
     write_npy_2d(hybrid_contrib_path, hybrid_contrib.data(), hybrid_contrib.size() * sizeof(float), config.input_height, config.input_width, "<f4");
     std::vector<float> final_mask_float(hybrid_result.mask.size(), 0.0f);
