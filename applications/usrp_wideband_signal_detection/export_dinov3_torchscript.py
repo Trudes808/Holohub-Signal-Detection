@@ -15,10 +15,32 @@ class DinoV3ExportAdapter(nn.Module):
         self.model = model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = self.model(x)
-        tensor = self._extract_tensor(output)
+        tensor = self._extract_patch_tensor(x)
         if tensor.dim() == 0:
             return tensor.unsqueeze(0)
+        return tensor.contiguous()
+
+    def _extract_patch_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.model, "get_intermediate_layers"):
+            output = self.model.get_intermediate_layers(x, n=1, reshape=True, norm=True)
+            tensor = self._extract_tensor(output)
+            if torch.is_tensor(tensor):
+                return tensor
+
+        if hasattr(self.model, "forward_features"):
+            output = self.model.forward_features(x)
+            if isinstance(output, dict):
+                patch_tokens = output.get("x_norm_patchtokens")
+                if torch.is_tensor(patch_tokens):
+                    return patch_tokens
+
+        output = self.model(x)
+        tensor = self._extract_tensor(output)
+        if tensor.dim() <= 2:
+            raise RuntimeError(
+                "Export produced a non-spatial tensor. Expected patch features, got "
+                f"shape={tuple(tensor.shape)}."
+            )
         return tensor
 
     def _extract_tensor(self, output):

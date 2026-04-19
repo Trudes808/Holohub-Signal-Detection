@@ -198,35 +198,49 @@ torch::Tensor derive_dino_score_map(torch::Tensor model_output,
                                     int patch_size,
                                     int dst_rows,
                                     int dst_cols) {
+  const int patch_rows = std::max(1, aligned_rows / std::max(1, patch_size));
+  const int patch_cols = std::max(1, aligned_cols / std::max(1, patch_size));
+  const int64_t patch_count = static_cast<int64_t>(patch_rows) * static_cast<int64_t>(patch_cols);
+
   if (model_output.dim() == 4 && model_output.size(0) == 1) {
     model_output = model_output.squeeze(0);
   }
 
   torch::Tensor base_map;
   if (model_output.dim() == 3) {
-    if (model_output.size(0) > 1 && model_output.size(1) > 1 && model_output.size(2) > 1) {
+    if (model_output.size(0) == 1) {
+      model_output = model_output.squeeze(0);
+    } else if ((model_output.size(1) == patch_rows && model_output.size(2) == patch_cols) ||
+               (model_output.size(1) == dst_rows && model_output.size(2) == dst_cols) ||
+               (model_output.size(1) == aligned_rows && model_output.size(2) == aligned_cols)) {
       base_map = torch::sqrt(torch::mean(model_output * model_output, 0) + 1e-6);
-    } else if (model_output.size(0) == 1) {
-      base_map = model_output.squeeze(0);
+    } else if ((model_output.size(0) == patch_rows && model_output.size(1) == patch_cols) ||
+               (model_output.size(0) == dst_rows && model_output.size(1) == dst_cols) ||
+               (model_output.size(0) == aligned_rows && model_output.size(1) == aligned_cols)) {
+      base_map = torch::sqrt(torch::mean(model_output * model_output, -1) + 1e-6);
     }
-  } else if (model_output.dim() == 2) {
-    const int patch_rows = std::max(1, aligned_rows / std::max(1, patch_size));
-    const int patch_cols = std::max(1, aligned_cols / std::max(1, patch_size));
-    const int64_t patch_count = static_cast<int64_t>(patch_rows) * static_cast<int64_t>(patch_cols);
+  }
+
+  if (!base_map.defined() && model_output.dim() == 2) {
     if (model_output.size(0) == patch_count) {
       base_map = torch::sqrt(torch::mean(model_output * model_output, 1) + 1e-6).view({patch_rows, patch_cols});
     } else if (model_output.size(1) == patch_count) {
       auto transposed = model_output.transpose(0, 1);
       base_map = torch::sqrt(torch::mean(transposed * transposed, 1) + 1e-6).view({patch_rows, patch_cols});
-    } else {
+    } else if ((model_output.size(0) == patch_rows && model_output.size(1) == patch_cols) ||
+               (model_output.size(0) == dst_rows && model_output.size(1) == dst_cols) ||
+               (model_output.size(0) == aligned_rows && model_output.size(1) == aligned_cols)) {
       base_map = model_output;
     }
-  } else if (model_output.dim() == 1) {
-    base_map = model_output.view({1, -1});
+  } else if (!base_map.defined() && model_output.dim() == 1 && model_output.numel() == patch_count) {
+    base_map = model_output.view({patch_rows, patch_cols});
   }
 
   if (!base_map.defined()) {
-    throw std::runtime_error("TorchScript forward returned an unsupported tensor shape for DINO scoring");
+    std::ostringstream error;
+    error << "TorchScript forward returned an unsupported tensor shape for DINO scoring: "
+          << model_output.sizes();
+    throw std::runtime_error(error.str());
   }
   if (base_map.dim() == 1) {
     base_map = base_map.view({1, -1});
