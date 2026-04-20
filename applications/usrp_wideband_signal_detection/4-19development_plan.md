@@ -1,5 +1,12 @@
 # DINO Retry Chunk-Merge Port Plan
 
+## Progress Update 2026-04-20T14:42:37-05:00
+
+- Exact pre-model grayscale parity is now in place in the validator notebook path. The C++ runtime dump and the Python reference pre-model input now agree when compared against the Python-defined crop and patch truncation semantics.
+- The notebook helper was corrected so the exact input panel is Python-first. It now compares the C++ runtime dump against the Python-expected pre-model grayscale instead of forcing Python to mirror the C++ artifact shape.
+- Current focus has moved to the structure-tensor coherence gate. The remaining visible mismatch is that the C++ gate still looks slightly higher-contrast than Python.
+- Current leading hypothesis: the C++ structure-tensor gradient step is sharper than SciPy because it was taking the derivative along one axis without the matching Gaussian smoothing on the orthogonal axis. The next parity patch is to make the validator gradient path match Python `ndimage.gaussian_filter(..., order=[1, 0])` and `order=[0, 1]` behavior more closely.
+
 ## Objective
 
 Port the retry-hybrid DINO subsection behavior from the Python validation flow into the C++ offline detector, while preserving the wideband subsection planning and merge behavior from the coherent-power pipeline.
