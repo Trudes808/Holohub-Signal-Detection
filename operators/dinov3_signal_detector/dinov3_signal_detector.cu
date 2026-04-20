@@ -1716,7 +1716,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       const auto hybrid_call_start = std::chrono::steady_clock::now();
       auto valid_mask = resize_valid_row_mask(src_rows, dst_rows, dst_cols, ignore_bins_per_side);
       if (use_fast_backend) {
-        if (runtime_result.success && runtime_result.final_mask_device != nullptr) {
+        if (runtime_result.success && runtime_result.score_map_device != nullptr) {
           hybrid_result.seed_freq_threshold = static_cast<float>(runtime_result.dino_threshold);
           hybrid_result.seed_res_threshold = static_cast<float>(runtime_result.dino_threshold);
           hybrid_result.grow_freq_threshold = static_cast<float>(runtime_result.dino_threshold);
@@ -1739,14 +1739,14 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         throw std::runtime_error(std::string("coherence gate staging synchronization failed: ") + cudaGetErrorString(sync_result));
       }
 
-      if (runtime_result.success && runtime_result.final_mask_device != nullptr && torch_runtime_ != nullptr) {
+      if (runtime_result.success && runtime_result.score_map_device != nullptr && torch_runtime_ != nullptr) {
         DinoHybridPostGpuInput hybrid_input;
         hybrid_input.src_rows = src_rows;
         hybrid_input.dst_rows = dst_rows;
         hybrid_input.dst_cols = dst_cols;
         hybrid_input.ignore_bins_per_side = ignore_bins_per_side;
         hybrid_input.cuda_stream = work_stream();
-        hybrid_input.dino_score_device = runtime_result.final_mask_device;
+        hybrid_input.dino_score_device = runtime_result.score_map_device;
         hybrid_input.coherence_gate_device = buffers.coherence_gate_resized_device;
 
         auto hybrid_gpu_result = torch_runtime_->run_hybrid_post_gpu(hybrid_input);
@@ -1773,8 +1773,8 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
                                                 buffers.coherence_gate_host + static_cast<std::ptrdiff_t>(dst_elements));
       std::vector<float> dino_score_map;
       if (runtime_result.success &&
-          runtime_result.final_mask.size() == static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols)) {
-        dino_score_map = runtime_result.final_mask;
+          runtime_result.score_map.size() == static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols)) {
+        dino_score_map = runtime_result.score_map;
       } else {
         dino_score_map = coherence_gate_resized;
         backend_used = runtime_result.success ? std::string("coherence_gate_fallback") : std::string("dino_runtime_fallback");

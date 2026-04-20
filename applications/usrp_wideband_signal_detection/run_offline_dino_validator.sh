@@ -49,6 +49,7 @@ tensor_path=${TENSOR_PATH:-}
 config_path=${CONFIG_PATH:-${DEFAULT_CONFIG}}
 live_mask_path=${LIVE_MASK_PATH:-}
 output_dir=${OUTPUT_DIR:-}
+debug_chunk_index=${DEBUG_CHUNK_INDEX:-13}
 verbose=0
 
 while [[ $# -gt 0 ]]; do
@@ -69,12 +70,16 @@ while [[ $# -gt 0 ]]; do
       output_dir=$2
       shift 2
       ;;
+    --debug-chunk-index)
+      debug_chunk_index=$2
+      shift 2
+      ;;
     --verbose)
       verbose=1
       shift
       ;;
     *)
-      echo "Usage: $0 --tensor-npy PATH [--config PATH] [--live-mask PATH] [--output-dir DIR] [--verbose]" >&2
+      echo "Usage: $0 --tensor-npy PATH [--config PATH] [--live-mask PATH] [--output-dir DIR] [--debug-chunk-index N] [--verbose]" >&2
       exit 1
       ;;
   esac
@@ -122,6 +127,7 @@ exec sudo docker exec -it \
   -e CONFIG_PATH="${container_config_path}" \
   -e OUTPUT_DIR="${container_output_dir}" \
   -e LIVE_MASK_PATH="${container_live_mask_path}" \
+  -e DEBUG_CHUNK_INDEX="${debug_chunk_index}" \
   -e VERBOSE_FLAG="${verbose}" \
   "${CONTAINER_NAME}" \
   bash -lc '
@@ -159,6 +165,7 @@ cmd=(
   "--tensor-npy" "${TENSOR_PATH}"
   "--config" "${CONFIG_PATH}"
   "--output-dir" "${OUTPUT_DIR}"
+  "--debug-chunk-index" "${DEBUG_CHUNK_INDEX}"
 )
 if [[ -n "${LIVE_MASK_PATH}" ]]; then
   cmd+=("--live-mask" "${LIVE_MASK_PATH}")

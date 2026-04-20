@@ -1,0 +1,480 @@
+# DINO Retry Chunk-Merge Port Plan
+
+## Objective
+
+Port the retry-hybrid DINO subsection behavior from the Python validation flow into the C++ offline detector, while preserving the wideband subsection planning and merge behavior from the coherent-power pipeline.
+
+The target behavior is:
+
+1. Apply the wideband frontend correction once on the full spectrogram.
+2. Split the corrected spectrogram into overlapping frequency subsections using the coherent-power chunk planner.
+3. Run the retry-hybrid DINO logic independently on each subsection.
+4. Project subsection-local detections back into the full spectrogram frame.
+5. Merge subsection detections into one final wideband mask using the coherent-power merge and grouping rules.
+
+This plan is written so work can continue incrementally even if the chat or runtime session crashes.
+
+## Source Of Truth
+
+The implementation should be anchored to these existing references.
+
+Wideband chunking and merge behavior:
+
+- `/home/sat3737/holoscan_demo_workspace/holohub-dev/notebooks/coherant_power_signal_detection_helpers.py`
+- `build_frequency_chunks(...)`
+- `merge_chunk_results(...)`
+- `_merge_projected_subsection_boxes(...)`
+- `group_signal_mask_regions(...)`
+
+Per-subsection retry-hybrid DINO behavior:
+
+- `/home/sat3737/holoscan_demo_workspace/Dinov3-RF-Signal-Detection/signal_detection_holoscan_retry_dino.ipynb`
+- `/home/sat3737/holoscan_demo_workspace/holohub-dev/notebooks/torchscript_dino_signal_detector_validation.ipynb`
+- `run_subsection_dino_texture_experiment(...)`
+- `build_python_retry_hybrid_products(...)`
+- `build_retry_frequency_support_mask(...)`
+
+Current offline C++ implementation to evolve:
+
+- `/home/sat3737/holoscan_demo_workspace/holohub-dev/applications/usrp_wideband_signal_detection/offline_dino_validator.cpp`
+- `/home/sat3737/holoscan_demo_workspace/holohub-dev/operators/dinov3_signal_detector/dinov3_torch_runtime.cpp`
+- `/home/sat3737/holoscan_demo_workspace/holohub-dev/operators/dinov3_signal_detector/dinov3_torch_runtime.hpp`
+
+## Current Gap
+
+The current offline validator does not implement wideband subsection planning or merging.
+
+Today it does this:
+
+1. Load the full tensor snapshot.
+2. Compute full-frame `power_db` and frontend-corrected `corrected_db`.
+3. Run one full-frame DINO inference through `DinoTorchRuntime` at `input_height x input_width`.
+4. Build one full-frame coherence gate from the resized corrected spectrogram.
+5. Form `hybrid_contrib = normalize(dino_score) * normalize(coherence_gate)`.
+6. Run one full-frame residual-veto postprocess.
+7. Write one final mask.
+
+That is not equivalent to the Python retry behavior the user wants, because the Python target flow is chunked and merged:
+
+1. Chunk-local DINO logic runs on subsection views, not on one global resized frame.
+2. Each subsection has its own valid-row mask, coherence gate, texture policy, hybrid mask, and retry-support mask.
+3. Final detections are produced after projecting subsection results back into the global frame and merging them.
+
+## Target C++ Reference Behavior
+
+The first C++ target should be a notebook-faithful reference path inside `offline_dino_validator.cpp`.
+
+Reference behavior requirements:
+
+1. Full-frame frontend correction must run once before chunking.
+2. Chunk planning must match the coherent-power helper semantics for:
+   - chunk width in frequency bins
+   - overlap width in frequency bins
+   - sideband ignore behavior
+   - valid-row clipping
+3. Each chunk must run the retry-hybrid DINO logic independently.
+4. Each chunk must emit enough metadata to be projected and merged in global coordinates.
+5. The final global mask must come from subsection merge behavior, not from naive OR over subsection masks.
+6. The validator must keep exporting intermediate artifacts so parity can be measured stage by stage.
+
+## Recommended Work Split
+
+Do this in two layers.
+
+### Layer 1: Validator-Faithful Reference Port
+
+Goal: produce a correct offline C++ implementation that matches the Python reference behavior closely enough to debug differences.
+
+Characteristics:
+
+- correctness first
+- may use host-side bookkeeping for chunk plans, grouping, and merge metadata
+- reuses the existing Torch runtime for per-subsection DINO inference
+- exports intermediate arrays and JSON summaries for parity analysis
+
+### Layer 2: Efficient Runtime Port
+
+Goal: once validator parity is stable, move the same chunked behavior into the operator/runtime path with fewer copies and better GPU residency.
+
+Characteristics:
+
+- keep corrected spectrogram and subsection views on device where practical
+- reuse buffers across chunks
+- avoid repeated allocations and model reloads
+- preserve the same algorithmic steps as the reference path
+
+Do not start with the efficient path. First freeze the validator-faithful reference behavior.
+
+## Phase Plan
+
+## Phase 0: Freeze The Python Reference
+
+Before more C++ work, freeze one unambiguous Python reference implementation for the desired subsection behavior.
+
+Tasks:
+
+1. Promote the last-cell retry logic into stable helper functions if any steps still live only in notebook cells.
+2. Define one Python reference entry point with this signature in spirit:
+   - `run_retry_dino_chunk_pipeline(input_record, cfg, dino_cfg) -> pipeline_result`
+3. Ensure it returns:
+   - `chunk_plan`
+   - `chunk_results`
+   - per-chunk retry-hybrid intermediates
+   - projected subsection masks
+   - merged score or merged grouping inputs
+   - `merged_boxes`
+   - `merged_mask`
+4. Save one golden artifact set for at least one known tensor snapshot.
+
+Exit criteria:
+
+- there is one stable Python reference pipeline to compare against
+- notebook parity no longer depends on manually rerunning ad hoc cells
+
+## Phase 1: Add Chunk Planning To The Offline Validator
+
+Extend `offline_dino_validator.cpp` so it plans subsection slices from the full corrected spectrogram before any DINO postprocess is run.
+
+Tasks:
+
+1. Add a `ChunkPlanEntry` struct carrying at least:
+   - `chunk_index`
+   - `row_start`
+   - `row_stop`
+   - `freq_start_hz` if available
+   - `freq_stop_hz` if available
+2. Port or reimplement coherent-power chunk planning semantics in C++.
+3. Build the plan from the original frequency axis resolution, not from the final DINO output height.
+4. Derive a chunk-local valid-row mask from the global valid-row mask.
+
+Important design rule:
+
+The chunk plan must live in source spectrogram coordinates. DINO resizing happens inside each chunk evaluation, not before chunk planning.
+
+Exit criteria:
+
+- validator prints chunk count and row spans
+- chunk plan matches the Python reference on the same input
+
+## Phase 2: Add Per-Chunk DINO Retry Execution
+
+Replace the current whole-frame retry-hybrid path with per-subsection execution.
+
+Per chunk, the C++ flow should be:
+
+1. Extract `corrected_chunk = corrected_db[row_start:row_stop, :]` in source coordinates.
+2. Run DINO inference for that chunk through `DinoTorchRuntime`.
+3. Resize DINO outputs back to the chunk pixel grid if the runtime operates on fixed `input_height x input_width`.
+4. Build chunk-local structure-tensor coherence gate from `corrected_chunk`.
+5. Reproduce the Python retry hybrid products:
+   - normalized DINO score
+   - coherence region threshold and mask
+   - texture score and top-texture mask
+   - texture passthrough policy
+   - hybrid DINO mask
+   - texture union mask
+   - hybrid mask
+   - hybrid DINO contribution
+6. Reproduce the Python retry frequency-support mask:
+   - `base_norm`
+   - `envelope_map`
+   - `residual_penalty`
+   - `freq_curvature_penalty`
+   - `keep_freq`
+   - `keep_res`
+   - `residual_veto_gate`
+   - `combined_score`
+   - `seed_mask`
+   - `final_mask`
+
+Recommended C++ data structure:
+
+- `ChunkRetryResult`
+  - chunk metadata
+  - local valid mask
+  - local DINO score map
+  - local coherence gate
+  - local hybrid contribution
+  - local support or final score map
+  - local final mask
+  - local grouped mask
+  - local grouped boxes
+  - thresholds used
+  - timing fields
+
+Exit criteria:
+
+- validator can emit one `ChunkRetryResult` per subsection
+- local outputs match the Python reference for a chosen subsection within tolerance
+
+## Phase 3: Add Chunk-Local Grouping
+
+Each subsection needs local grouping before global merge so that the merged wideband path can project chunk-local boxes back into the full frame.
+
+Tasks:
+
+1. Port or reimplement `group_signal_mask_regions(...)` semantics in C++.
+2. Group each chunk-local final mask using the chunk-local score map and valid-row mask.
+3. Preserve box fields needed by the Python merge logic, including:
+   - freq and time extents
+   - density
+   - filled area
+   - score mean
+   - score peak
+   - split-role metadata if implemented
+
+Recommendation:
+
+For the first milestone, a simpler grouping path is acceptable if it preserves the same final grouped mask and projected boxes for the validation cases. Split-role bookkeeping can be added after base parity is established.
+
+Exit criteria:
+
+- each subsection emits grouped boxes and grouped mask
+- projected local boxes can be compared against the Python subsection output
+
+## Phase 4: Add Global Projection And Merge
+
+After chunk-local results exist, add the coherent-power global merge behavior.
+
+Tasks:
+
+1. Project subsection-local grouped masks into the global frame.
+2. Project subsection-local grouped boxes into global coordinates.
+3. Blend overlapping subsections with the same chunk weighting policy used by the coherent-power pipeline.
+4. Build global merged score support arrays as needed for the final merge stage.
+5. Merge projected subsection boxes using the coherent-power merge logic.
+6. Build the final global binary mask from merged grouped regions or merged boxes.
+
+Do not simplify this into a raw OR unless the Python reference proves that OR is equivalent for the target cases.
+
+Exit criteria:
+
+- validator writes one merged global mask and one merged box set
+- final mask shape matches the source wideband spectrogram grid or the explicitly chosen output contract
+
+## Phase 5: Define The Output Contract Clearly
+
+We need one explicit answer for the output space.
+
+Recommended contract:
+
+1. The reference validator should operate in source spectrogram coordinates for chunk planning and merge.
+2. Per-subsection DINO inference may internally resize to the model input size.
+3. DINO outputs must be resized back to chunk-local source coordinates before chunk-local retry logic and before global merge.
+4. The final merged mask should therefore be expressed in the same coordinates as the corrected wideband spectrogram.
+
+If a second, reduced-resolution output is still needed for compatibility, export it as a derived artifact, not as the primary reference mask.
+
+## Phase 6: Promote Into Shared Runtime Or Operator Code
+
+Only after the validator path is stable should we move the chunked retry pipeline into reusable C++ runtime code.
+
+Recommended direction:
+
+1. Extract shared helpers from `offline_dino_validator.cpp` into reusable files.
+2. Keep the offline validator as the reference harness.
+3. Reuse the same per-chunk retry implementation from the live operator path where possible.
+4. Keep the live path configurable so the old global path and the new chunked retry path can be compared during rollout.
+
+## Required Code Changes
+
+## A. `offline_dino_validator.cpp`
+
+This file should become the first reference implementation.
+
+Changes needed:
+
+1. Replace the single whole-frame `run_residual_veto_hybrid(...)` call with a chunked pipeline.
+2. Add chunk planner helpers and chunk result structs.
+3. Add per-chunk DINO runtime invocation.
+4. Add chunk-local retry-hybrid reconstruction.
+5. Add chunk-local grouping.
+6. Add projection and merge.
+7. Expand JSON summary output with chunk and merge metadata.
+
+## B. `dinov3_torch_runtime.hpp` and `dinov3_torch_runtime.cpp`
+
+These files likely need interface cleanup.
+
+Important issue:
+
+- current `DinoTorchRuntimeResult.final_mask` is used by the offline validator as a DINO score map, not as a postprocessed binary mask
+
+Recommended cleanup:
+
+1. Add explicit result fields for score maps versus binary masks.
+2. Stop depending on the misleading `final_mask` name for raw DINO score output.
+3. Make it easy to run the runtime repeatedly on chunk-local source windows without repeated setup cost.
+
+## C. Validation notebook support
+
+The notebook side should gain a stable apples-to-apples comparison harness.
+
+Needed artifacts:
+
+1. chunk plan JSON or table
+2. per-chunk thresholds
+3. per-chunk grouped boxes
+4. projected global boxes
+5. merged global mask
+6. optional per-stage `.npy` outputs for one debug chunk
+
+## Efficiency Plan For The Final C++ Implementation
+
+The efficient scheme should preserve the validator-faithful algorithm while reducing unnecessary copies.
+
+Recommended scheme:
+
+1. Keep full-frame `power_db` and `corrected_db` in device memory after frontend correction.
+2. Build the chunk plan on host once per frame. The plan is small.
+3. For each chunk, pass a view or compact staging buffer for the chunk into the DINO runtime.
+4. Reuse one set of device buffers for chunk-local resized inputs and outputs.
+5. Reuse the loaded DINO model across all chunks.
+6. Resize DINO score outputs back into chunk-local source coordinates immediately after inference.
+7. Keep chunk-local coherence gate and retry-support operations on device where practical.
+8. Move only compact metadata back to host for grouping if grouping remains host-side initially.
+9. Once parity is stable, consider moving grouping and merge to GPU if runtime throughput requires it.
+
+Practical note:
+
+Chunk planning and box bookkeeping are not the expensive parts. DINO inference, resizing, and repeated temporary allocation are the likely hotspots. Optimize those first.
+
+## Validation And Parity Checklist
+
+Each phase should be closed with explicit comparisons against the Python reference.
+
+### Per-subsection parity
+
+For one chosen subsection, compare:
+
+1. corrected chunk after resize mapping
+2. DINO score map
+3. coherence gate
+4. texture score map
+5. hybrid DINO contribution
+6. `keep_freq`
+7. `keep_res`
+8. `combined_score`
+9. seed mask
+10. final chunk mask
+
+### Global parity
+
+Compare:
+
+1. chunk count and row spans
+2. projected chunk boxes
+3. merged box count
+4. merged mask
+5. final mask pixel agreement and IoU
+
+### Minimum acceptance target for the reference path
+
+1. chunk plan identical to Python
+2. final merged mask visually and numerically aligned with Python on frozen captures
+3. any remaining differences localized to known floating-point or interpolation details
+
+## Crash-Resistant Working Order
+
+Follow this order in future requests so work can resume cleanly after interruption.
+
+1. Freeze the Python reference helpers.
+2. Add chunk planner structs and summary output in C++.
+3. Implement one-chunk C++ retry evaluation and verify one subsection.
+4. Loop over all chunks and write per-chunk artifacts.
+5. Add chunk-local grouping.
+6. Add global projection and merge.
+7. Add final parity notebook cells and summary report.
+8. Only then optimize for runtime efficiency.
+
+## Immediate Next Tasks
+
+These are the first concrete implementation tasks to take after this plan.
+
+1. Decide and document the primary output coordinate system.
+   - recommended answer: source spectrogram coordinates
+2. Freeze the Python reference as helper functions instead of notebook-only code.
+3. Add chunk-plan generation to `offline_dino_validator.cpp` and export it in the summary.
+4. Refactor the current whole-frame retry path into a reusable `run_retry_chunk(...)` helper.
+5. Validate one subsection end to end against the Python notebook before adding merge.
+
+## Progress Log
+
+### 2026-04-20 Progress
+
+Completed so far:
+
+1. Ran the scripted subsection validator flow on chunk 13 with:
+   - `sudo PYTHON_BIN=/home/sat3737/holoscan_demo_workspace/.venv/bin/python3 ./validate_offline_dino_subsection.sh --tensor-npy /tmp/usrp_spectrograms/tensors/spectrogram_tensor_ch0_f1_1776619958065_1024x20480.npy --config /home/sat3737/holoscan_demo_workspace/holohub-dev/applications/usrp_wideband_signal_detection/config_torchscript_validation_capture_single_channel.yaml --debug-chunk-index 13`
+2. Confirmed the chunk-debug artifacts were updated under `/tmp/usrp_spectrograms/dino_validator_artifacts/spectrogram_tensor_ch0_f1_1776619958065_1024x20480/chunk_debug/`.
+3. Captured the latest chunk 13 comparison report:
+   - chunk plan row match: `True / True`
+   - grouped mask agreement: `0.976395`
+   - grouped mask IoU: `0.768413`
+   - box counts cpp/python: `5 / 6`
+   - exact box signature match: `False`
+4. This is directionally better than the earlier chunk-local grouping baseline and is good enough to justify deeper stage-by-stage visual inspection instead of only summary metrics.
+5. Added a new crash-resistant validation helper module at `/home/sat3737/holoscan_demo_workspace/holohub-dev/notebooks/torchscript_dino_signal_detector_validation_v2_helpers.py`.
+6. Added a new notebook at `/home/sat3737/holoscan_demo_workspace/holohub-dev/notebooks/torchscript_dino_signal_detector_validation_v2.ipynb`.
+7. The v2 notebook is intentionally thin: it loads the existing offline C++ validator artifacts, reconstructs the selected Python reference chunk through helper code, maps the Python intermediates into the C++ chunk grid, and renders per-stage comparisons for corrected spectrogram, coherence gate, DINO score, hybrid contribution, combined score, final mask, grouped masks, and grouped boxes.
+8. The old notebook remains available for reference, but the new helper-backed notebook should be the primary debugging surface going forward because it minimizes notebook-only logic and keeps recovery simpler after crashes.
+9. Confirmed the coherence mismatch was mostly an order-of-operations issue: Python computed structure-tensor coherence on the source-resolution chunk and then mapped it to the C++ grid, while the C++ validator had been computing coherence directly on the resized chunk.
+10. Switched the validator coherence path to the Python order for both the chunk-local debug artifact and the legacy full-frame artifact export.
+11. Identified a separate DINO-score parity gap: the Python notebook `dino_score_px` is a grouped affinity/seed score produced by `dino_region_grouping_mask(...)`, while the current C++ runtime `score_map` is a normalized raw feature-energy map derived in `derive_dino_score_map(...)`.
+12. That means the current DINO panel is not apples-to-apples. The next parity step must compare the C++ `score_map` against a Python raw feature-energy score derived from the same patch feature tensor before trying to match the higher-level Python grouped DINO score.
+13. Updated the offline validator chunk path so DINO inference runs on the source chunk resolution aligned to patch size, then resizes the resulting C++ score map back into the existing debug grid. This should eliminate the largest remaining input-resolution mismatch between the chunked C++ path and the Python reference.
+
+### 2026-04-19 Progress
+
+Completed so far:
+
+1. Copied this plan into the dated working document.
+2. Added source-coordinate chunk planning to `offline_dino_validator.cpp`.
+3. Exported `offline_chunk_plan.json` so subsection scheduling survives crashes and can be compared against Python.
+4. Added reusable per-chunk execution scaffolding with `run_retry_chunk(...)`.
+5. Wired chunk-local DINO retry execution across all planned subsections.
+6. Exported `offline_chunk_results.json` with per-chunk thresholds and mask statistics.
+7. Exported one representative debug subsection artifact set under `chunk_debug/`.
+8. Added a first C++ chunk-local grouping path for subsection masks.
+9. Added projected global boxes and an initial merged global mask path.
+10. Exported projected and merged global artifacts for inspection after each run.
+11. Added explicit `score_map` fields to the DINO runtime result and switched the validator/operator call sites away from the misleading `final_mask` name.
+12. Added a projected grouped score-map artifact in source coordinates so the next merge pass can use averaged subsection scores instead of box overlap alone.
+13. Switched the validator toward score-driven global regrouping and richer box metadata so subsection and merge validation can inspect the same fields the Python path uses.
+14. Added selectable debug-chunk export so one subsection can be validated repeatedly without editing the source.
+15. Added a host-side subsection comparison script and a wrapper flow so rebuild, validator run, and Python grouping comparison can be driven from app-local scripts.
+
+Current implementation state:
+
+- full-frame legacy retry output still exists and remains the current validator-level final mask
+- chunk-local retry execution now exists in C++
+- chunk-local grouping now exists in a simplified C++ form
+- global projection and merge now exist in an initial box-based form
+- the runtime result contract now distinguishes raw DINO score output from the legacy `final_mask` alias
+- the validator now exports a projected grouped score map in source coordinates for score-aware merge work
+- grouped box artifacts now carry score and source-chunk metadata needed for subsection validation
+- the validator runner now accepts a selected debug chunk and the app has a chunk-level Python comparison entry point
+- coherence export order now matches the cleaner Python source-resolution path, but the remaining DINO score comparison still mixes raw C++ feature-energy output with a higher-level Python grouped score map
+- the validator chunk DINO runtime now evaluates the full source chunk resolution before resizing the exported score map back into the debug grid, reducing the prior DINO input-resolution mismatch
+- the remaining gap is to replace the simplified grouping and merge with notebook-faithful scoring, region grouping, and final mask selection
+
+Immediate next slice:
+
+1. rerun the chunk comparison notebook after the source-resolution DINO runtime change and check whether the C++ score map now aligns better with the Python raw feature-energy score
+2. verify the TorchScript runtime still returns spatial patch features with the expected patch grid, rather than a class-token or otherwise mis-shaped output
+3. decide whether to port the higher-level Python grouped DINO score semantics into C++ or treat that as a later stage that should be compared after raw score parity is established
+4. refine chunk-local grouping to better match `group_signal_mask_regions(...)`
+5. replace simple overlap-only global box merging with notebook-style merged-score-aware grouping
+6. decide when the projected global mask becomes the primary validator final mask instead of a side artifact
+7. use the new explicit runtime `score_map` contract as the base for merged-score-aware global projection and mask selection
+8. use `torchscript_dino_signal_detector_validation_v2.ipynb` as the stepwise visual debugger for the current chunk 13 artifact set and the next selected chunks
+
+## Definition Of Done
+
+This task is done when all of the following are true.
+
+1. The offline C++ DINO validator subdivides the wideband spectrogram into overlapping frequency chunks.
+2. Each chunk runs the retry-hybrid DINO subsection behavior that matches the Python reference.
+3. Chunk-local detections are grouped, projected, and merged back into one global mask.
+4. The final global mask matches the Python chunked retry reference on frozen validation captures within agreed tolerance.
+5. The implementation path is structured so the same logic can later be moved into the live operator without changing the algorithm.

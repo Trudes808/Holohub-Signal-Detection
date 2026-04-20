@@ -82,8 +82,11 @@ struct DinoTorchRuntimeResult {
   double power_threshold = 0.0;
   double final_threshold = 0.0;
   DinoTorchRuntimeTiming timing;
+  std::vector<float> score_map;
   std::vector<float> final_mask;
+  const float* score_map_device = nullptr;
   const float* final_mask_device = nullptr;
+  std::shared_ptr<void> score_map_device_owner;
   std::shared_ptr<void> final_mask_device_owner;
 };
 

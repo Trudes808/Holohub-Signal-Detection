@@ -42,9 +42,10 @@ advanced_network:
         affinity: 0
         access:
           - local
-        # Dual-channel probing showed mlx5 could DMA-map one region at this size
-        # even though two regions exceeded the current BAR1/topology limits.
-        num_bufs: 49152
+        # With BAR1 expanded well beyond the old 256 MiB ceiling, single-channel
+        # performance mode can provision enough GPU RX buffers to cover the
+        # configured multi-batch live set plus headroom for burst absorption.
+        num_bufs: 131072
         buf_size: 4096
 
     interfaces:

@@ -508,15 +508,19 @@ class DinoTorchRuntime::Impl {
 
       if (config.return_final_mask_device) {
         auto final_score_device = final_score.contiguous();
+        result.score_map_device = final_score_device.data_ptr<float>();
+        result.score_map_device_owner = std::make_shared<torch::Tensor>(final_score_device);
         result.final_mask_device = final_score_device.data_ptr<float>();
-        result.final_mask_device_owner = std::make_shared<torch::Tensor>(final_score_device);
+        result.final_mask_device_owner = result.score_map_device_owner;
       }
 
       if (config.return_final_mask) {
         failure_stage = "final_mask_to_cpu";
         auto final_mask_cpu = final_score.device().is_cuda() ? final_score.to(torch::kCPU) : final_score;
+        result.score_map.resize(static_cast<size_t>(input.dst_rows) * static_cast<size_t>(input.dst_cols));
         result.final_mask.resize(static_cast<size_t>(input.dst_rows) * static_cast<size_t>(input.dst_cols));
-        std::memcpy(result.final_mask.data(), final_mask_cpu.data_ptr<float>(), result.final_mask.size() * sizeof(float));
+        std::memcpy(result.score_map.data(), final_mask_cpu.data_ptr<float>(), result.score_map.size() * sizeof(float));
+        result.final_mask = result.score_map;
       }
       result.torchscript_forward_ready = torchscript_forward_ready_;
       result.success = true;

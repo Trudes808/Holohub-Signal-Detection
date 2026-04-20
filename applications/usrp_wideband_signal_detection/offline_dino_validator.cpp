@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -33,6 +34,7 @@ struct ValidatorOptions {
   std::filesystem::path config_path;
   std::optional<std::filesystem::path> live_mask_path;
   std::filesystem::path output_dir;
+  int debug_chunk_index = 13;
   bool verbose = false;
 };
 
@@ -42,6 +44,10 @@ struct ValidatorConfig {
   int patch_size = 16;
   double resolution_hz = 0.0;
   double span_hz = 0.0;
+  double chunk_bandwidth_hz = 25.0e6;
+  double chunk_overlap_hz = 6.25e6;
+  double uncalibrated_chunk_fraction = 0.40;
+  double uncalibrated_overlap_fraction = 0.20;
   double ignore_sideband_hz = 7.0e6;
   bool frontend_correction_enable = true;
   double frontend_correction_row_q = 25.0;
@@ -102,6 +108,94 @@ struct HybridPostprocessResult {
   int component_count = 0;
 };
 
+struct IgnoreSidebandInfo {
+  double requested_percent = 0.0;
+  double applied_percent = 0.0;
+  double requested_hz = 0.0;
+  int requested_bins = 0;
+  double applied_hz = 0.0;
+  int applied_bins = 0;
+  double bin_hz = 0.0;
+  std::vector<uint8_t> valid_row_mask;
+};
+
+struct ChunkPlanEntry {
+  int chunk_index = 0;
+  int row_start = 0;
+  int row_stop = 0;
+  double freq_start_hz = 0.0;
+  double freq_stop_hz = 0.0;
+};
+
+struct DetectionBox {
+  int freq_start = 0;
+  int freq_stop = 0;
+  int time_start = 0;
+  int time_stop = 0;
+  int filled_area = 0;
+  float density = 0.0f;
+  float bbox_density = 0.0f;
+  float envelope_density = 0.0f;
+  float score_mean = 0.0f;
+  float score_peak = 0.0f;
+  std::string split_role = "unsplit";
+  bool split_applied = false;
+  int parent_component_id = -1;
+  int source_box_count = 1;
+  std::vector<int> source_chunk_indices;
+  std::vector<int> parent_component_ids;
+};
+
+struct GroupingResult {
+  std::vector<uint8_t> seed_mask;
+  std::vector<uint8_t> bridged_mask;
+  std::vector<int> component_labels;
+  std::vector<uint8_t> grouped_mask;
+  std::vector<DetectionBox> boxes;
+  float peak_score_floor = 0.0f;
+};
+
+struct ChunkRetryResult {
+  int chunk_index = 0;
+  int row_start = 0;
+  int row_stop = 0;
+  int src_rows = 0;
+  int src_cols = 0;
+  int dst_rows = 0;
+  int dst_cols = 0;
+  double freq_start_hz = 0.0;
+  double freq_stop_hz = 0.0;
+  double span_hz = 0.0;
+  int ignore_bins_per_side = 0;
+  double dino_threshold = 0.0;
+  double runtime_final_threshold = 0.0;
+  float seed_freq_threshold = 1.0f;
+  float seed_res_threshold = 1.0f;
+  float combined_threshold = 1.0f;
+  float final_fraction = 0.0f;
+  float connected_fraction = 0.0f;
+  int component_count = 0;
+  int grouped_box_count = 0;
+  std::vector<float> corrected_resized;
+  std::vector<float> dino_score_map;
+  std::vector<float> coherence_gate;
+  std::vector<float> hybrid_contrib;
+  std::vector<uint8_t> valid_mask;
+  std::vector<uint8_t> final_mask;
+  std::vector<uint8_t> grouped_mask;
+  std::vector<uint8_t> bridged_mask;
+  std::vector<float> combined_score;
+  std::vector<DetectionBox> grouped_boxes;
+};
+
+struct GlobalMergedResult {
+  std::vector<uint8_t> projected_grouped_mask;
+  std::vector<float> projected_grouped_score;
+  std::vector<uint8_t> merged_box_mask;
+  std::vector<DetectionBox> projected_boxes;
+  std::vector<DetectionBox> merged_boxes;
+};
+
 template <typename T>
 T clamp_value(T value, T low, T high) {
   return value < low ? low : (value > high ? high : value);
@@ -154,6 +248,10 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.patch_size = extract_number<int>(text, "patch_size").value_or(config.patch_size);
   config.resolution_hz = extract_number<double>(text, "resolution").value_or(config.resolution_hz);
   config.span_hz = extract_number<double>(text, "span").value_or(config.span_hz);
+  config.chunk_bandwidth_hz = extract_number<double>(text, "chunk_bandwidth_hz").value_or(config.chunk_bandwidth_hz);
+  config.chunk_overlap_hz = extract_number<double>(text, "chunk_overlap_hz").value_or(config.chunk_overlap_hz);
+  config.uncalibrated_chunk_fraction = extract_number<double>(text, "uncalibrated_chunk_fraction").value_or(config.uncalibrated_chunk_fraction);
+  config.uncalibrated_overlap_fraction = extract_number<double>(text, "uncalibrated_overlap_fraction").value_or(config.uncalibrated_overlap_fraction);
   config.ignore_sideband_hz = extract_number<double>(text, "ignore_sideband_hz").value_or(config.ignore_sideband_hz);
   config.frontend_correction_row_q = extract_number<double>(text, "frontend_correction_row_q").value_or(config.frontend_correction_row_q);
   config.frontend_correction_smooth_sigma = extract_number<double>(text, "frontend_correction_smooth_sigma").value_or(config.frontend_correction_smooth_sigma);
@@ -395,6 +493,203 @@ std::vector<float> frontend_corrected_db(const std::vector<float>& power_db,
     }
   }
   return corrected;
+}
+
+std::vector<float> slice_rows(const std::vector<float>& input,
+                              int rows,
+                              int cols,
+                              int row_start,
+                              int row_stop) {
+  row_start = clamp_value(row_start, 0, rows);
+  row_stop = clamp_value(row_stop, row_start, rows);
+  const int out_rows = row_stop - row_start;
+  std::vector<float> output(static_cast<size_t>(out_rows) * static_cast<size_t>(cols), 0.0f);
+  for (int row = 0; row < out_rows; ++row) {
+    const size_t src_offset = flat_index(cols, row_start + row, 0);
+    const size_t dst_offset = flat_index(cols, row, 0);
+    std::memcpy(output.data() + dst_offset, input.data() + src_offset, static_cast<size_t>(cols) * sizeof(float));
+  }
+  return output;
+}
+
+std::vector<uint8_t> resize_row_valid_mask(const std::vector<uint8_t>& src_valid_rows,
+                                           int dst_rows,
+                                           int dst_cols) {
+  std::vector<uint8_t> output(static_cast<size_t>(std::max(dst_rows, 0)) * static_cast<size_t>(std::max(dst_cols, 0)), 0);
+  if (src_valid_rows.empty() || dst_rows <= 0 || dst_cols <= 0) {
+    return output;
+  }
+  const int src_rows = static_cast<int>(src_valid_rows.size());
+  for (int dst_row = 0; dst_row < dst_rows; ++dst_row) {
+    const int src_row = std::min(src_rows - 1,
+                                 static_cast<int>((static_cast<int64_t>(dst_row) * static_cast<int64_t>(src_rows)) /
+                                                  static_cast<int64_t>(std::max(dst_rows, 1))));
+    if (!src_valid_rows[static_cast<size_t>(src_row)]) {
+      continue;
+    }
+    const size_t offset = static_cast<size_t>(dst_row) * static_cast<size_t>(dst_cols);
+    std::fill(output.begin() + static_cast<std::ptrdiff_t>(offset),
+              output.begin() + static_cast<std::ptrdiff_t>(offset + static_cast<size_t>(dst_cols)),
+              static_cast<uint8_t>(1));
+  }
+  return output;
+}
+
+IgnoreSidebandInfo compute_ignore_sideband_rows(int num_rows,
+                                                double bin_hz,
+                                                double ignore_sideband_percent,
+                                                int min_keep_rows,
+                                                std::optional<double> ignore_sideband_hz) {
+  IgnoreSidebandInfo info;
+  info.valid_row_mask.assign(static_cast<size_t>(std::max(num_rows, 0)), 1);
+  info.requested_percent = clamp_value(ignore_sideband_percent, 0.0, 0.49);
+  info.requested_hz = std::max(0.0, ignore_sideband_hz.value_or(0.0));
+  if (num_rows < 2 || !std::isfinite(bin_hz) || bin_hz <= 0.0) {
+    return info;
+  }
+
+  info.bin_hz = bin_hz;
+  const int max_bins = std::max(0, (num_rows - std::max(1, min_keep_rows)) / 2);
+  if (info.requested_percent > 0.0) {
+    info.requested_bins = static_cast<int>(std::ceil(static_cast<double>(num_rows) * info.requested_percent));
+    info.requested_hz = static_cast<double>(info.requested_bins) * bin_hz;
+  } else if (info.requested_hz > 0.0) {
+    info.requested_bins = static_cast<int>(std::ceil(info.requested_hz / bin_hz));
+  }
+
+  info.applied_bins = clamp_value(info.requested_bins, 0, max_bins);
+  info.applied_hz = static_cast<double>(info.applied_bins) * bin_hz;
+  info.applied_percent = static_cast<double>(info.applied_bins) / static_cast<double>(std::max(num_rows, 1));
+  if (info.applied_bins > 0) {
+    std::fill(info.valid_row_mask.begin(), info.valid_row_mask.begin() + info.applied_bins, static_cast<uint8_t>(0));
+    std::fill(info.valid_row_mask.end() - info.applied_bins, info.valid_row_mask.end(), static_cast<uint8_t>(0));
+  }
+  return info;
+}
+
+std::vector<double> build_frequency_axis_hz(int num_rows, double resolution_hz) {
+  std::vector<double> axis(static_cast<size_t>(std::max(num_rows, 0)), 0.0);
+  const bool calibrated = std::isfinite(resolution_hz) && resolution_hz > 0.0;
+  for (int row = 0; row < num_rows; ++row) {
+    axis[static_cast<size_t>(row)] = calibrated ? static_cast<double>(row) * resolution_hz : static_cast<double>(row);
+  }
+  return axis;
+}
+
+std::vector<ChunkPlanEntry> build_frequency_chunks(const std::vector<double>& freq_axis_hz,
+                                                   double chunk_bandwidth_hz,
+                                                   double chunk_overlap_hz,
+                                                   int min_rows,
+                                                   const std::vector<uint8_t>& valid_row_mask,
+                                                   double uncalibrated_chunk_fraction,
+                                                   double uncalibrated_overlap_fraction) {
+  std::vector<ChunkPlanEntry> chunks;
+  if (freq_axis_hz.empty()) {
+    return chunks;
+  }
+  if (valid_row_mask.size() != freq_axis_hz.size()) {
+    throw std::runtime_error("valid_row_mask length must match frequency axis length");
+  }
+
+  std::vector<int> valid_idx;
+  valid_idx.reserve(valid_row_mask.size());
+  for (size_t index = 0; index < valid_row_mask.size(); ++index) {
+    if (valid_row_mask[index]) {
+      valid_idx.push_back(static_cast<int>(index));
+    }
+  }
+  if (valid_idx.empty()) {
+    return chunks;
+  }
+  if (!(std::isfinite(chunk_bandwidth_hz) && chunk_bandwidth_hz > 0.0)) {
+    throw std::runtime_error("chunk_bandwidth_hz must be positive");
+  }
+  const double step_hz = chunk_bandwidth_hz - chunk_overlap_hz;
+  if (!(std::isfinite(step_hz) && step_hz > 0.0)) {
+    throw std::runtime_error("chunk_bandwidth_hz must be larger than chunk_overlap_hz");
+  }
+
+  double freq_min = freq_axis_hz[static_cast<size_t>(valid_idx.front())];
+  double freq_max = freq_axis_hz[static_cast<size_t>(valid_idx.front())];
+  for (int index : valid_idx) {
+    freq_min = std::min(freq_min, freq_axis_hz[static_cast<size_t>(index)]);
+    freq_max = std::max(freq_max, freq_axis_hz[static_cast<size_t>(index)]);
+  }
+  const double freq_span = freq_max - freq_min;
+
+  if (!(std::isfinite(freq_span)) || freq_span <= 0.0 || chunk_bandwidth_hz >= freq_span) {
+    const int valid_count = static_cast<int>(valid_idx.size());
+    const double chunk_fraction = clamp_value(uncalibrated_chunk_fraction, 0.10, 1.0);
+    const double overlap_fraction = clamp_value(uncalibrated_overlap_fraction, 0.0, 0.95);
+    const int chunk_rows = clamp_value(static_cast<int>(std::llround(static_cast<double>(valid_count) * chunk_fraction)),
+                                       min_rows,
+                                       valid_count);
+    if (chunk_rows >= valid_count) {
+      chunks.push_back(ChunkPlanEntry {
+          .chunk_index = 0,
+          .row_start = valid_idx.front(),
+          .row_stop = valid_idx.back() + 1,
+          .freq_start_hz = freq_axis_hz[static_cast<size_t>(valid_idx.front())],
+          .freq_stop_hz = freq_axis_hz[static_cast<size_t>(valid_idx.back())],
+      });
+      return chunks;
+    }
+
+    const int overlap_rows = clamp_value(static_cast<int>(std::llround(static_cast<double>(chunk_rows) * overlap_fraction)),
+                                         0,
+                                         chunk_rows - 1);
+    const int step_rows = std::max(1, chunk_rows - overlap_rows);
+    int chunk_index = 0;
+    for (int start_pos = 0; start_pos < valid_count; start_pos += step_rows) {
+      const int stop_pos = std::min(start_pos + chunk_rows, valid_count);
+      if ((stop_pos - start_pos) < min_rows) {
+        if (stop_pos >= valid_count) {
+          break;
+        }
+        continue;
+      }
+      chunks.push_back(ChunkPlanEntry {
+          .chunk_index = chunk_index++,
+          .row_start = valid_idx[static_cast<size_t>(start_pos)],
+          .row_stop = valid_idx[static_cast<size_t>(stop_pos - 1)] + 1,
+          .freq_start_hz = freq_axis_hz[static_cast<size_t>(valid_idx[static_cast<size_t>(start_pos)])],
+          .freq_stop_hz = freq_axis_hz[static_cast<size_t>(valid_idx[static_cast<size_t>(stop_pos - 1)])],
+      });
+      if (stop_pos >= valid_count) {
+        break;
+      }
+    }
+    return chunks;
+  }
+
+  int chunk_index = 0;
+  for (double chunk_start_hz = freq_min; chunk_start_hz < freq_max + 1.0e-6; chunk_start_hz += step_hz) {
+    const double chunk_stop_hz = std::min(chunk_start_hz + chunk_bandwidth_hz, freq_max);
+    int row_start = -1;
+    int row_stop = -1;
+    for (int index : valid_idx) {
+      const double value = freq_axis_hz[static_cast<size_t>(index)];
+      if (value >= chunk_start_hz && value <= chunk_stop_hz) {
+        if (row_start < 0) {
+          row_start = index;
+        }
+        row_stop = index + 1;
+      }
+    }
+    if (row_start >= 0 && row_stop > row_start && (row_stop - row_start) >= min_rows) {
+      chunks.push_back(ChunkPlanEntry {
+          .chunk_index = chunk_index++,
+          .row_start = row_start,
+          .row_stop = row_stop,
+          .freq_start_hz = freq_axis_hz[static_cast<size_t>(row_start)],
+          .freq_stop_hz = freq_axis_hz[static_cast<size_t>(row_stop - 1)],
+      });
+    }
+    if (chunk_stop_hz >= freq_max) {
+      break;
+    }
+  }
+  return chunks;
 }
 
 std::vector<float> box_mean_cols(const std::vector<float>& input, int rows, int cols, int radius_cols) {
@@ -959,6 +1254,454 @@ std::vector<uint8_t> binary_fill_holes(const std::vector<uint8_t>& mask, int row
   return output;
 }
 
+std::vector<uint8_t> fill_nearly_continuous_time_gaps(const std::vector<uint8_t>& mask,
+                                                      int rows,
+                                                      int cols,
+                                                      int max_gap_px,
+                                                      float min_continuity_ratio = 0.85f) {
+  std::vector<uint8_t> output = mask;
+  max_gap_px = std::max(0, max_gap_px);
+  min_continuity_ratio = clamp_value(min_continuity_ratio, 0.0f, 1.0f);
+  if (max_gap_px <= 0) {
+    return output;
+  }
+
+  for (int row = 0; row < rows; ++row) {
+    std::vector<int> active_cols;
+    for (int col = 0; col < cols; ++col) {
+      if (output[flat_index(cols, row, col)]) {
+        active_cols.push_back(col);
+      }
+    }
+    if (active_cols.size() < 2) {
+      continue;
+    }
+
+    std::vector<int> run_starts;
+    std::vector<int> run_stops;
+    run_starts.push_back(active_cols.front());
+    int previous = active_cols.front();
+    for (size_t index = 1; index < active_cols.size(); ++index) {
+      const int current = active_cols[index];
+      if (current != previous + 1) {
+        run_stops.push_back(previous + 1);
+        run_starts.push_back(current);
+      }
+      previous = current;
+    }
+    run_stops.push_back(previous + 1);
+
+    for (size_t run_index = 0; run_index + 1 < run_starts.size(); ++run_index) {
+      const int left_start = run_starts[run_index];
+      const int left_stop = run_stops[run_index];
+      const int right_start = run_starts[run_index + 1];
+      const int right_stop = run_stops[run_index + 1];
+      const int gap_width = right_start - left_stop;
+      if (gap_width <= 0 || gap_width > max_gap_px) {
+        continue;
+      }
+      const int left_width = left_stop - left_start;
+      const int right_width = right_stop - right_start;
+      const float continuity_ratio = static_cast<float>(left_width + right_width) /
+                                     static_cast<float>(std::max(1, left_width + gap_width + right_width));
+      if (continuity_ratio >= min_continuity_ratio) {
+        for (int fill_col = left_stop; fill_col < right_start; ++fill_col) {
+          output[flat_index(cols, row, fill_col)] = 1;
+        }
+      }
+    }
+  }
+  return output;
+}
+
+int component_envelope_area(const std::vector<uint8_t>& mask, int rows, int cols) {
+  int area = 0;
+  for (int col = 0; col < cols; ++col) {
+    int min_row = rows;
+    int max_row = -1;
+    for (int row = 0; row < rows; ++row) {
+      if (!mask[flat_index(cols, row, col)]) {
+        continue;
+      }
+      min_row = std::min(min_row, row);
+      max_row = std::max(max_row, row);
+    }
+    if (max_row >= min_row) {
+      area += (max_row - min_row + 1);
+    }
+  }
+  return area;
+}
+
+GroupingResult group_mask_regions(const std::vector<uint8_t>& mask,
+                                  const std::vector<float>& score_map,
+                                  const std::vector<uint8_t>& valid_mask,
+                                  int rows,
+                                  int cols,
+                                  int bridge_freq_px,
+                                  int bridge_time_px,
+                                  int min_component_size,
+                                  int min_freq_span_px,
+                                  int min_time_span_px,
+                                  float min_density,
+                                  float time_continuity_ratio) {
+  GroupingResult result;
+  if (rows <= 0 || cols <= 0 || mask.size() != static_cast<size_t>(rows) * static_cast<size_t>(cols)) {
+    return result;
+  }
+
+  result.seed_mask = mask;
+  for (size_t index = 0; index < result.seed_mask.size() && index < valid_mask.size(); ++index) {
+    if (!valid_mask[index]) {
+      result.seed_mask[index] = 0;
+    }
+  }
+
+  result.bridged_mask = result.seed_mask;
+  if (bridge_freq_px > 1 || bridge_time_px > 1) {
+    result.bridged_mask = binary_closing_rect(result.bridged_mask, rows, cols, std::max(1, bridge_freq_px), std::max(1, bridge_time_px));
+  }
+  result.bridged_mask = fill_nearly_continuous_time_gaps(result.bridged_mask, rows, cols, bridge_time_px, time_continuity_ratio);
+
+  const auto labelled = label_components(result.bridged_mask, rows, cols);
+  result.component_labels.assign(labelled.labels.begin(), labelled.labels.end());
+  std::vector<float> active_scores;
+  active_scores.reserve(score_map.size());
+  for (size_t index = 0; index < score_map.size() && index < result.seed_mask.size(); ++index) {
+    if (result.seed_mask[index]) {
+      active_scores.push_back(score_map[index]);
+    }
+  }
+  result.peak_score_floor = quantile_from_values(active_scores, 0.50, 0.0f);
+
+  result.grouped_mask.assign(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
+
+  for (size_t label_index = 0; label_index < labelled.sizes.size(); ++label_index) {
+    const int component_id = static_cast<int>(label_index) + 1;
+    int min_row = rows;
+    int max_row = -1;
+    int min_col = cols;
+    int max_col = -1;
+    int filled_area = 0;
+    std::vector<float> component_scores;
+    std::vector<uint8_t> component_local_mask;
+
+    for (int row = 0; row < rows; ++row) {
+      for (int col = 0; col < cols; ++col) {
+        const size_t flat = flat_index(cols, row, col);
+        if (labelled.labels[flat] != component_id) {
+          continue;
+        }
+        min_row = std::min(min_row, row);
+        max_row = std::max(max_row, row);
+        min_col = std::min(min_col, col);
+        max_col = std::max(max_col, col);
+        ++filled_area;
+      }
+    }
+    if (filled_area <= 0 || max_row < min_row || max_col < min_col) {
+      continue;
+    }
+
+    const int freq_start = min_row;
+    const int freq_stop = max_row + 1;
+    const int time_start = min_col;
+    const int time_stop = max_col + 1;
+    const int freq_span = freq_stop - freq_start;
+    const int time_span = time_stop - time_start;
+    const int local_rows = freq_span;
+    const int local_cols = time_span;
+    component_local_mask.assign(static_cast<size_t>(local_rows) * static_cast<size_t>(local_cols), 0);
+    for (int row = freq_start; row < freq_stop; ++row) {
+      for (int col = time_start; col < time_stop; ++col) {
+        const size_t src_flat = flat_index(cols, row, col);
+        if (labelled.labels[src_flat] != component_id) {
+          continue;
+        }
+        const size_t dst_flat = flat_index(local_cols, row - freq_start, col - time_start);
+        component_local_mask[dst_flat] = 1;
+        if (src_flat < score_map.size()) {
+          component_scores.push_back(score_map[src_flat]);
+        }
+      }
+    }
+
+    const int bbox_area = std::max(1, freq_span * time_span);
+    const int envelope_area = std::max(1, component_envelope_area(component_local_mask, local_rows, local_cols));
+    const float bbox_density = static_cast<float>(filled_area) / static_cast<float>(bbox_area);
+    const float envelope_density = static_cast<float>(filled_area) / static_cast<float>(envelope_area);
+    const float density = envelope_density;
+    const float score_peak = component_scores.empty() ? 0.0f : *std::max_element(component_scores.begin(), component_scores.end());
+    const float score_mean = component_scores.empty() ? 0.0f : std::accumulate(component_scores.begin(), component_scores.end(), 0.0f) /
+                                                        static_cast<float>(component_scores.size());
+
+    const bool keep = filled_area >= std::max(1, min_component_size) &&
+                      freq_span >= std::max(1, min_freq_span_px) &&
+                      time_span >= std::max(1, min_time_span_px) &&
+                      density >= min_density &&
+                      score_peak >= result.peak_score_floor;
+    if (!keep) {
+      continue;
+    }
+
+    for (int row = freq_start; row < freq_stop; ++row) {
+      for (int col = time_start; col < time_stop; ++col) {
+        const size_t src_flat = flat_index(cols, row, col);
+        if (labelled.labels[src_flat] == component_id) {
+          result.grouped_mask[src_flat] = 1;
+        }
+      }
+    }
+    DetectionBox box;
+    box.freq_start = freq_start;
+    box.freq_stop = freq_stop;
+    box.time_start = time_start;
+    box.time_stop = time_stop;
+    box.filled_area = filled_area;
+    box.density = density;
+    box.bbox_density = bbox_density;
+    box.envelope_density = envelope_density;
+    box.score_mean = score_mean;
+    box.score_peak = score_peak;
+    box.parent_component_id = component_id;
+    box.parent_component_ids = {component_id};
+    result.boxes.push_back(std::move(box));
+  }
+  return result;
+}
+
+void group_chunk_mask_regions(ChunkRetryResult& chunk,
+                              int bridge_freq_px,
+                              int bridge_time_px,
+                              int min_component_size,
+                              int min_freq_span_px,
+                              int min_time_span_px,
+                              float min_density,
+                              float time_continuity_ratio) {
+  const auto grouping = group_mask_regions(chunk.final_mask,
+                                           chunk.combined_score,
+                                           chunk.valid_mask,
+                                           chunk.dst_rows,
+                                           chunk.dst_cols,
+                                           bridge_freq_px,
+                                           bridge_time_px,
+                                           min_component_size,
+                                           min_freq_span_px,
+                                           min_time_span_px,
+                                           min_density,
+                                           time_continuity_ratio);
+  chunk.bridged_mask = grouping.bridged_mask;
+  chunk.grouped_mask = grouping.grouped_mask;
+  chunk.grouped_boxes = grouping.boxes;
+  chunk.grouped_box_count = static_cast<int>(chunk.grouped_boxes.size());
+}
+
+bool boxes_overlap(const DetectionBox& box_a, const DetectionBox& box_b) {
+  return box_a.freq_start < box_b.freq_stop && box_b.freq_start < box_a.freq_stop &&
+         box_a.time_start < box_b.time_stop && box_b.time_start < box_a.time_stop;
+}
+
+bool boxes_should_merge(const DetectionBox& box_a, const DetectionBox& box_b) {
+  if (!boxes_overlap(box_a, box_b)) {
+    return false;
+  }
+  const bool carrier_burst_pair =
+      (box_a.split_role == "persistent_carrier" && box_b.split_role == "transient_wideband_burst") ||
+      (box_b.split_role == "persistent_carrier" && box_a.split_role == "transient_wideband_burst");
+  return !carrier_burst_pair;
+}
+
+DetectionBox merge_box_cluster(const std::vector<DetectionBox>& cluster) {
+  DetectionBox merged;
+  merged.freq_start = cluster.front().freq_start;
+  merged.freq_stop = cluster.front().freq_stop;
+  merged.time_start = cluster.front().time_start;
+  merged.time_stop = cluster.front().time_stop;
+  int weighted_area = 0;
+  float weighted_score_sum = 0.0f;
+  std::vector<std::string> split_roles;
+  std::vector<int> source_chunk_indices;
+  std::vector<int> parent_component_ids;
+  for (const auto& box : cluster) {
+    merged.freq_start = std::min(merged.freq_start, box.freq_start);
+    merged.freq_stop = std::max(merged.freq_stop, box.freq_stop);
+    merged.time_start = std::min(merged.time_start, box.time_start);
+    merged.time_stop = std::max(merged.time_stop, box.time_stop);
+    merged.filled_area += box.filled_area;
+    weighted_area += std::max(1, box.filled_area);
+    weighted_score_sum += box.score_mean * static_cast<float>(std::max(1, box.filled_area));
+    merged.score_peak = std::max(merged.score_peak, box.score_peak);
+    merged.split_applied = merged.split_applied || box.split_applied;
+    split_roles.push_back(box.split_role);
+    source_chunk_indices.insert(source_chunk_indices.end(), box.source_chunk_indices.begin(), box.source_chunk_indices.end());
+    parent_component_ids.insert(parent_component_ids.end(), box.parent_component_ids.begin(), box.parent_component_ids.end());
+  }
+  const int bbox_area = std::max(1, (merged.freq_stop - merged.freq_start) * (merged.time_stop - merged.time_start));
+  merged.density = static_cast<float>(merged.filled_area) / static_cast<float>(bbox_area);
+  merged.score_mean = weighted_area > 0 ? weighted_score_sum / static_cast<float>(weighted_area) : 0.0f;
+  std::sort(split_roles.begin(), split_roles.end());
+  split_roles.erase(std::unique(split_roles.begin(), split_roles.end()), split_roles.end());
+  merged.split_role = split_roles.size() == 1 ? split_roles.front() : "mixed";
+  std::sort(source_chunk_indices.begin(), source_chunk_indices.end());
+  source_chunk_indices.erase(std::unique(source_chunk_indices.begin(), source_chunk_indices.end()), source_chunk_indices.end());
+  std::sort(parent_component_ids.begin(), parent_component_ids.end());
+  parent_component_ids.erase(std::unique(parent_component_ids.begin(), parent_component_ids.end()), parent_component_ids.end());
+  merged.source_chunk_indices = std::move(source_chunk_indices);
+  merged.parent_component_ids = std::move(parent_component_ids);
+  merged.source_box_count = static_cast<int>(cluster.size());
+  return merged;
+}
+
+std::vector<uint8_t> boxes_to_mask(const std::vector<DetectionBox>& boxes,
+                                   int rows,
+                                   int cols,
+                                   const std::vector<uint8_t>& valid_row_mask) {
+  std::vector<uint8_t> mask(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
+  for (const auto& box : boxes) {
+    const int freq_start = clamp_value(box.freq_start, 0, rows);
+    const int freq_stop = clamp_value(box.freq_stop, freq_start, rows);
+    const int time_start = clamp_value(box.time_start, 0, cols);
+    const int time_stop = clamp_value(box.time_stop, time_start, cols);
+    for (int row = freq_start; row < freq_stop; ++row) {
+      for (int col = time_start; col < time_stop; ++col) {
+        mask[flat_index(cols, row, col)] = 1;
+      }
+    }
+  }
+  for (int row = 0; row < rows; ++row) {
+    const bool row_valid = row < static_cast<int>(valid_row_mask.size()) ? static_cast<bool>(valid_row_mask[static_cast<size_t>(row)]) : true;
+    if (row_valid) {
+      continue;
+    }
+    for (int col = 0; col < cols; ++col) {
+      mask[flat_index(cols, row, col)] = 0;
+    }
+  }
+  return mask;
+}
+
+GlobalMergedResult build_global_merged_result(const std::vector<ChunkRetryResult>& chunk_results,
+                                              int global_rows,
+                                              int global_cols,
+                                              const std::vector<uint8_t>& source_valid_row_mask) {
+  GlobalMergedResult result;
+  result.projected_grouped_mask.assign(static_cast<size_t>(global_rows) * static_cast<size_t>(global_cols), 0);
+  result.projected_grouped_score.assign(static_cast<size_t>(global_rows) * static_cast<size_t>(global_cols), 0.0f);
+  std::vector<float> projected_score_weight(static_cast<size_t>(global_rows) * static_cast<size_t>(global_cols), 0.0f);
+  for (const auto& chunk : chunk_results) {
+    for (size_t box_index = 0; box_index < chunk.grouped_boxes.size(); ++box_index) {
+      const auto& box = chunk.grouped_boxes[box_index];
+      DetectionBox projected_box = box;
+      projected_box.freq_start = chunk.row_start + box.freq_start;
+      projected_box.freq_stop = chunk.row_start + box.freq_stop;
+      projected_box.source_chunk_indices = {chunk.chunk_index};
+      result.projected_boxes.push_back(projected_box);
+    }
+    for (int row = 0; row < chunk.dst_rows; ++row) {
+      const int global_row_start = chunk.row_start + static_cast<int>((static_cast<int64_t>(row) * static_cast<int64_t>(chunk.src_rows)) /
+                                                                      static_cast<int64_t>(std::max(chunk.dst_rows, 1)));
+      const int global_row_stop = chunk.row_start + static_cast<int>((static_cast<int64_t>(row + 1) * static_cast<int64_t>(chunk.src_rows)) /
+                                                                     static_cast<int64_t>(std::max(chunk.dst_rows, 1)));
+      for (int col = 0; col < chunk.dst_cols; ++col) {
+        const size_t src_flat = flat_index(chunk.dst_cols, row, col);
+        if (src_flat >= chunk.grouped_mask.size() || !chunk.grouped_mask[src_flat]) {
+          continue;
+        }
+        const float grouped_score = src_flat < chunk.combined_score.size() ? chunk.combined_score[src_flat] : 0.0f;
+        const int global_col_start = static_cast<int>((static_cast<int64_t>(col) * static_cast<int64_t>(global_cols)) /
+                                                      static_cast<int64_t>(std::max(chunk.dst_cols, 1)));
+        const int global_col_stop = static_cast<int>((static_cast<int64_t>(col + 1) * static_cast<int64_t>(global_cols)) /
+                                                     static_cast<int64_t>(std::max(chunk.dst_cols, 1)));
+        for (int gr = clamp_value(global_row_start, 0, global_rows); gr < clamp_value(std::max(global_row_stop, global_row_start + 1), 0, global_rows); ++gr) {
+          for (int gc = clamp_value(global_col_start, 0, global_cols); gc < clamp_value(std::max(global_col_stop, global_col_start + 1), 0, global_cols); ++gc) {
+            const size_t global_flat = flat_index(global_cols, gr, gc);
+            result.projected_grouped_mask[global_flat] = 1;
+            result.projected_grouped_score[global_flat] += grouped_score;
+            projected_score_weight[global_flat] += 1.0f;
+          }
+        }
+      }
+    }
+  }
+
+  for (size_t index = 0; index < result.projected_grouped_score.size(); ++index) {
+    if (projected_score_weight[index] > 0.0f) {
+      result.projected_grouped_score[index] /= projected_score_weight[index];
+    }
+  }
+  for (int row = 0; row < global_rows; ++row) {
+    const bool row_valid = row < static_cast<int>(source_valid_row_mask.size()) ? static_cast<bool>(source_valid_row_mask[static_cast<size_t>(row)]) : true;
+    if (row_valid) {
+      continue;
+    }
+    for (int col = 0; col < global_cols; ++col) {
+      const size_t global_flat = flat_index(global_cols, row, col);
+      result.projected_grouped_mask[global_flat] = 0;
+      result.projected_grouped_score[global_flat] = 0.0f;
+    }
+  }
+
+  std::vector<uint8_t> visited(result.projected_boxes.size(), 0);
+  const bool has_split_applied = std::any_of(result.projected_boxes.begin(), result.projected_boxes.end(), [](const DetectionBox& box) {
+    return box.split_applied;
+  });
+  if (has_split_applied) {
+    for (size_t start_index = 0; start_index < result.projected_boxes.size(); ++start_index) {
+      if (visited[start_index]) {
+        continue;
+      }
+      visited[start_index] = 1;
+      std::vector<size_t> pending = {start_index};
+      std::vector<DetectionBox> cluster;
+      while (!pending.empty()) {
+        const size_t current = pending.back();
+        pending.pop_back();
+        cluster.push_back(result.projected_boxes[current]);
+        for (size_t other_index = 0; other_index < result.projected_boxes.size(); ++other_index) {
+          if (visited[other_index]) {
+            continue;
+          }
+          if (boxes_should_merge(result.projected_boxes[current], result.projected_boxes[other_index])) {
+            visited[other_index] = 1;
+            pending.push_back(other_index);
+          }
+        }
+      }
+      result.merged_boxes.push_back(merge_box_cluster(cluster));
+    }
+    result.merged_box_mask = boxes_to_mask(result.merged_boxes, global_rows, global_cols, source_valid_row_mask);
+    return result;
+  }
+
+  const auto grouping = group_mask_regions(result.projected_grouped_mask,
+                                           result.projected_grouped_score,
+                                           source_valid_row_mask,
+                                           global_rows,
+                                           global_cols,
+                                           33,
+                                           5,
+                                           24,
+                                           18,
+                                           2,
+                                           0.06f,
+                                           0.85f);
+  result.merged_boxes = grouping.boxes;
+  for (auto& merged_box : result.merged_boxes) {
+    std::vector<int> source_chunk_indices;
+    for (const auto& source_box : result.projected_boxes) {
+      if (!boxes_overlap(merged_box, source_box)) {
+        continue;
+      }
+      source_chunk_indices.insert(source_chunk_indices.end(), source_box.source_chunk_indices.begin(), source_box.source_chunk_indices.end());
+    }
+    std::sort(source_chunk_indices.begin(), source_chunk_indices.end());
+    source_chunk_indices.erase(std::unique(source_chunk_indices.begin(), source_chunk_indices.end()), source_chunk_indices.end());
+    merged_box.source_chunk_indices = std::move(source_chunk_indices);
+  }
+  result.merged_box_mask = grouping.grouped_mask;
+  return result;
+}
+
 float mean_mask_value(const std::vector<uint8_t>& mask) {
   if (mask.empty()) {
     return 0.0f;
@@ -1072,6 +1815,135 @@ HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& hybri
   return result;
 }
 
+ChunkRetryResult run_retry_chunk(holoscan::ops::DinoTorchRuntime& runtime,
+                                 const holoscan::ops::DinoTorchRuntimeConfig& runtime_config,
+                                 const ValidatorConfig& config,
+                                 const ChunkPlanEntry& chunk,
+                                 const std::vector<float>& power_db,
+                                 const std::vector<float>& corrected_db,
+                                 int full_rows,
+                                 int full_cols,
+                                 double resolution_hz,
+                                 const std::vector<uint8_t>& source_valid_row_mask) {
+  ChunkRetryResult result;
+  result.chunk_index = chunk.chunk_index;
+  result.row_start = chunk.row_start;
+  result.row_stop = chunk.row_stop;
+  result.src_rows = std::max(0, chunk.row_stop - chunk.row_start);
+  result.src_cols = full_cols;
+  result.dst_rows = config.input_height;
+  result.dst_cols = config.input_width;
+  result.freq_start_hz = chunk.freq_start_hz;
+  result.freq_stop_hz = chunk.freq_stop_hz;
+  result.span_hz = std::max(0.0, chunk.freq_stop_hz - chunk.freq_start_hz);
+
+  if (result.src_rows <= 0 || result.src_cols <= 0) {
+    return result;
+  }
+
+  const auto power_chunk = slice_rows(power_db, full_rows, full_cols, chunk.row_start, chunk.row_stop);
+  const auto corrected_chunk = slice_rows(corrected_db, full_rows, full_cols, chunk.row_start, chunk.row_stop);
+  std::vector<uint8_t> source_chunk_valid_rows(static_cast<size_t>(result.src_rows), 1);
+  for (int row = 0; row < result.src_rows; ++row) {
+    const int src_row = chunk.row_start + row;
+    if (src_row >= 0 && src_row < static_cast<int>(source_valid_row_mask.size())) {
+      source_chunk_valid_rows[static_cast<size_t>(row)] = source_valid_row_mask[static_cast<size_t>(src_row)];
+    }
+  }
+
+  result.valid_mask = resize_row_valid_mask(source_chunk_valid_rows, result.dst_rows, result.dst_cols);
+  const int runtime_rows = std::max(config.patch_size,
+                                    (std::max(1, result.src_rows) / std::max(1, config.patch_size)) * std::max(1, config.patch_size));
+  const int runtime_cols = std::max(config.patch_size,
+                                    (std::max(1, result.src_cols) / std::max(1, config.patch_size)) * std::max(1, config.patch_size));
+  int source_ignore_bins = 0;
+  while (source_ignore_bins < result.src_rows && !source_chunk_valid_rows[static_cast<size_t>(source_ignore_bins)]) {
+    ++source_ignore_bins;
+  }
+  result.ignore_bins_per_side = std::min(result.dst_rows / 2, static_cast<int>(std::llround(
+      static_cast<double>(source_ignore_bins) * static_cast<double>(result.dst_rows) / static_cast<double>(std::max(result.src_rows, 1)))));
+
+  float* power_chunk_device = nullptr;
+  float* corrected_chunk_device = nullptr;
+  const size_t chunk_bytes = power_chunk.size() * sizeof(float);
+  if (cudaMalloc(reinterpret_cast<void**>(&power_chunk_device), chunk_bytes) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&corrected_chunk_device), chunk_bytes) != cudaSuccess) {
+    if (power_chunk_device != nullptr) {
+      cudaFree(power_chunk_device);
+    }
+    if (corrected_chunk_device != nullptr) {
+      cudaFree(corrected_chunk_device);
+    }
+    throw std::runtime_error("failed to allocate chunk GPU buffers for offline DINO validator");
+  }
+  if (cudaMemcpy(power_chunk_device, power_chunk.data(), chunk_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(corrected_chunk_device, corrected_chunk.data(), chunk_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(power_chunk_device);
+    cudaFree(corrected_chunk_device);
+    throw std::runtime_error("failed to upload chunk tensors for offline DINO validator");
+  }
+
+  holoscan::ops::DinoTorchRuntimeInput runtime_input;
+  runtime_input.src_rows = result.src_rows;
+  runtime_input.src_cols = result.src_cols;
+  runtime_input.dst_rows = runtime_rows;
+  runtime_input.dst_cols = runtime_cols;
+  runtime_input.patch_size = config.patch_size;
+  runtime_input.cuda_stream = nullptr;
+  runtime_input.resolution_hz = resolution_hz;
+  runtime_input.span_hz = result.span_hz;
+  runtime_input.power_db_device = power_chunk_device;
+  runtime_input.corrected_db_device = corrected_chunk_device;
+
+  const auto runtime_result = runtime.run(runtime_config, runtime_input);
+  cudaFree(power_chunk_device);
+  cudaFree(corrected_chunk_device);
+
+  if (!runtime_result.success) {
+    throw std::runtime_error("chunk DINO runtime failed at " + runtime_result.error_stage + ": " + runtime_result.error_message + " (" + runtime_result.error_detail + ")");
+  }
+  if (runtime_result.score_map.size() != static_cast<size_t>(runtime_rows) * static_cast<size_t>(runtime_cols)) {
+    throw std::runtime_error("unexpected chunk DINO score map size returned from runtime");
+  }
+
+  result.dino_threshold = runtime_result.dino_threshold;
+  result.runtime_final_threshold = runtime_result.final_threshold;
+  result.dino_score_map = resize_bilinear(runtime_result.score_map,
+                                          runtime_rows,
+                                          runtime_cols,
+                                          result.dst_rows,
+                                          result.dst_cols);
+  result.corrected_resized = resize_bilinear(corrected_chunk, result.src_rows, result.src_cols, result.dst_rows, result.dst_cols);
+  const auto source_chunk_valid_mask = resize_row_valid_mask(source_chunk_valid_rows, result.src_rows, result.src_cols);
+  const auto source_chunk_coherence_gate = structure_tensor_gate(corrected_chunk,
+                                                                 result.src_rows,
+                                                                 result.src_cols,
+                                                                 source_chunk_valid_mask);
+  result.coherence_gate = resize_bilinear(source_chunk_coherence_gate,
+                                          result.src_rows,
+                                          result.src_cols,
+                                          result.dst_rows,
+                                          result.dst_cols);
+
+  const auto dino_score_norm = normalize01_quantile(result.dino_score_map, 5.0, 95.0);
+  const auto coherence_gate_norm = normalize01_quantile(result.coherence_gate, 5.0, 99.0);
+  result.hybrid_contrib.assign(result.dino_score_map.size(), 0.0f);
+  for (size_t index = 0; index < result.hybrid_contrib.size(); ++index) {
+    result.hybrid_contrib[index] = dino_score_norm[index] * coherence_gate_norm[index];
+  }
+
+  const auto hybrid_result = run_residual_veto_hybrid(result.hybrid_contrib, result.valid_mask, result.dst_rows, result.dst_cols);
+  result.seed_freq_threshold = hybrid_result.seed_freq_threshold;
+  result.seed_res_threshold = hybrid_result.seed_res_threshold;
+  result.combined_threshold = hybrid_result.combined_threshold;
+  result.final_fraction = hybrid_result.final_fraction;
+  result.connected_fraction = hybrid_result.connected_fraction;
+  result.component_count = hybrid_result.component_count;
+  result.final_mask = hybrid_result.mask;
+  result.combined_score = result.hybrid_contrib;
+  return result;
+}
+
 std::vector<uint8_t> mask_to_u8(const std::vector<uint8_t>& mask) {
   std::vector<uint8_t> image(mask.size(), 0);
   for (size_t index = 0; index < mask.size(); ++index) {
@@ -1134,10 +2006,12 @@ ValidatorOptions parse_arguments(int argc, char** argv) {
       options.live_mask_path = std::filesystem::path(argv[++index]);
     } else if (arg == "--output-dir" && index + 1 < argc) {
       options.output_dir = argv[++index];
+    } else if (arg == "--debug-chunk-index" && index + 1 < argc) {
+      options.debug_chunk_index = std::stoi(argv[++index]);
     } else if (arg == "--verbose") {
       options.verbose = true;
     } else if (arg == "--help") {
-      std::cout << "Usage: " << argv[0] << " --tensor-npy PATH --config FILE [--live-mask PATH] [--output-dir DIR] [--verbose]\n";
+      std::cout << "Usage: " << argv[0] << " --tensor-npy PATH --config FILE [--live-mask PATH] [--output-dir DIR] [--debug-chunk-index N] [--verbose]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unrecognized argument: " + arg);
@@ -1173,11 +2047,25 @@ int main(int argc, char** argv) {
     if ((!std::isfinite(resolution_hz) || resolution_hz <= 0.0) && config.span_hz > 0.0 && tensor.rows > 0) {
       resolution_hz = config.span_hz / static_cast<double>(tensor.rows);
     }
-    int ignore_bins_per_side = 0;
-    if (resolution_hz > 0.0 && config.ignore_sideband_hz > 0.0) {
-      ignore_bins_per_side = static_cast<int>(std::ceil(config.ignore_sideband_hz / resolution_hz));
-      ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (tensor.rows - config.patch_size) / 2));
-    }
+    const double chunk_bin_hz = (std::isfinite(resolution_hz) && resolution_hz > 0.0) ? resolution_hz : 1.0;
+    const auto source_ignore_info = compute_ignore_sideband_rows(
+        tensor.rows,
+        chunk_bin_hz,
+        0.0,
+        16,
+        (std::isfinite(resolution_hz) && resolution_hz > 0.0 && config.ignore_sideband_hz > 0.0)
+            ? std::optional<double>(config.ignore_sideband_hz)
+            : std::nullopt);
+    const int ignore_bins_per_side = source_ignore_info.applied_bins;
+    const auto source_freq_axis_hz = build_frequency_axis_hz(tensor.rows, resolution_hz);
+    const auto chunk_plan = build_frequency_chunks(
+        source_freq_axis_hz,
+        config.chunk_bandwidth_hz,
+        config.chunk_overlap_hz,
+        16,
+        source_ignore_info.valid_row_mask,
+        config.uncalibrated_chunk_fraction,
+        config.uncalibrated_overlap_fraction);
 
     const auto valid_mask = resize_valid_row_mask(tensor.rows, config.input_height, config.input_width, ignore_bins_per_side);
 
@@ -1235,23 +2123,61 @@ int main(int argc, char** argv) {
     runtime_input.corrected_db_device = corrected_db_device;
 
     const auto runtime_result = runtime.run(runtime_config, runtime_input);
+
+    std::vector<ChunkRetryResult> chunk_results;
+    chunk_results.reserve(chunk_plan.size());
+    for (const auto& chunk : chunk_plan) {
+      chunk_results.push_back(run_retry_chunk(
+          runtime,
+          runtime_config,
+          config,
+          chunk,
+          power_db,
+          corrected_db,
+          tensor.rows,
+          tensor.cols,
+          resolution_hz,
+          source_ignore_info.valid_row_mask));
+    }
+    for (auto& chunk_result : chunk_results) {
+      group_chunk_mask_regions(
+          chunk_result,
+          33,
+          5,
+          24,
+          18,
+          2,
+          0.06f,
+          0.85f);
+    }
+    const auto global_merged = build_global_merged_result(
+        chunk_results,
+        tensor.rows,
+        tensor.cols,
+        source_ignore_info.valid_row_mask);
     cudaFree(power_db_device);
     cudaFree(corrected_db_device);
 
     if (!runtime_result.success) {
       throw std::runtime_error("offline DINO runtime failed at " + runtime_result.error_stage + ": " + runtime_result.error_message + " (" + runtime_result.error_detail + ")");
     }
-    if (runtime_result.final_mask.size() != static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width)) {
+    if (runtime_result.score_map.size() != static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width)) {
       throw std::runtime_error("unexpected DINO score map size returned from runtime");
     }
 
-    const auto& dino_score_map = runtime_result.final_mask;
+    const auto& dino_score_map = runtime_result.score_map;
 
     const auto corrected_resized = resize_bilinear(corrected_db, tensor.rows, tensor.cols, config.input_height, config.input_width);
-    const auto coherence_gate_resized = structure_tensor_gate(corrected_resized,
-                                  config.input_height,
-                                  config.input_width,
-                                  valid_mask);
+    const auto source_valid_mask = resize_row_valid_mask(source_ignore_info.valid_row_mask, tensor.rows, tensor.cols);
+    const auto coherence_gate_source = structure_tensor_gate(corrected_db,
+                                 tensor.rows,
+                                 tensor.cols,
+                                 source_valid_mask);
+    const auto coherence_gate_resized = resize_bilinear(coherence_gate_source,
+                              tensor.rows,
+                              tensor.cols,
+                              config.input_height,
+                              config.input_width);
     // Previous faster approximation kept for future performance comparison:
     // const auto coherence_gate_full = coherence_gate(corrected_db, tensor.rows, tensor.cols, ignore_bins_per_side, config);
     // const auto coherence_gate_resized = resize_bilinear(coherence_gate_full, tensor.rows, tensor.cols, config.input_height, config.input_width);
@@ -1284,6 +2210,16 @@ int main(int argc, char** argv) {
     const auto hybrid_contrib_path = options.output_dir / "offline_hybrid_contrib.npy";
     const auto final_mask_path = options.output_dir / "offline_final_mask.npy";
     const auto final_mask_pgm = options.output_dir / "offline_final_mask.pgm";
+    const auto chunk_plan_path = options.output_dir / "offline_chunk_plan.json";
+    const auto chunk_results_path = options.output_dir / "offline_chunk_results.json";
+    const auto chunk_debug_dir = options.output_dir / "chunk_debug";
+    const auto projected_grouped_mask_path = options.output_dir / "offline_projected_grouped_mask.npy";
+    const auto projected_grouped_mask_pgm = options.output_dir / "offline_projected_grouped_mask.pgm";
+    const auto projected_grouped_score_path = options.output_dir / "offline_projected_grouped_score.npy";
+    const auto merged_box_mask_path = options.output_dir / "offline_merged_box_mask.npy";
+    const auto merged_box_mask_pgm = options.output_dir / "offline_merged_box_mask.pgm";
+    const auto projected_boxes_path = options.output_dir / "offline_projected_boxes.json";
+    const auto merged_boxes_path = options.output_dir / "offline_merged_boxes.json";
     const auto summary_path = options.output_dir / "offline_validation_summary.json";
 
     write_npy_2d(power_db_path, power_db.data(), power_db.size() * sizeof(float), tensor.rows, tensor.cols, "<f4");
@@ -1298,6 +2234,355 @@ int main(int argc, char** argv) {
     }
     write_npy_2d(final_mask_path, final_mask_float.data(), final_mask_float.size() * sizeof(float), config.input_height, config.input_width, "<f4");
     write_pgm(final_mask_pgm, mask_to_u8(hybrid_result.mask), config.input_width, config.input_height);
+    std::vector<float> projected_grouped_mask_float(global_merged.projected_grouped_mask.size(), 0.0f);
+    for (size_t index = 0; index < global_merged.projected_grouped_mask.size(); ++index) {
+      projected_grouped_mask_float[index] = global_merged.projected_grouped_mask[index] ? 1.0f : 0.0f;
+    }
+    write_npy_2d(projected_grouped_mask_path,
+                 projected_grouped_mask_float.data(),
+                 projected_grouped_mask_float.size() * sizeof(float),
+                 tensor.rows,
+                 tensor.cols,
+                 "<f4");
+    write_pgm(projected_grouped_mask_pgm, mask_to_u8(global_merged.projected_grouped_mask), tensor.cols, tensor.rows);
+    write_npy_2d(projected_grouped_score_path,
+           global_merged.projected_grouped_score.data(),
+           global_merged.projected_grouped_score.size() * sizeof(float),
+           tensor.rows,
+           tensor.cols,
+           "<f4");
+
+    std::vector<float> merged_box_mask_float(global_merged.merged_box_mask.size(), 0.0f);
+    for (size_t index = 0; index < global_merged.merged_box_mask.size(); ++index) {
+      merged_box_mask_float[index] = global_merged.merged_box_mask[index] ? 1.0f : 0.0f;
+    }
+    write_npy_2d(merged_box_mask_path,
+                 merged_box_mask_float.data(),
+                 merged_box_mask_float.size() * sizeof(float),
+                 tensor.rows,
+                 tensor.cols,
+                 "<f4");
+    write_pgm(merged_box_mask_pgm, mask_to_u8(global_merged.merged_box_mask), tensor.cols, tensor.rows);
+
+    std::filesystem::create_directories(chunk_debug_dir);
+    if (!chunk_results.empty()) {
+      const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_results.size() - 1)));
+      const auto& debug_chunk = chunk_results[debug_chunk_index];
+      const auto debug_chunk_summary = chunk_debug_dir / "chunk_debug_summary.json";
+      const auto debug_corrected_path = chunk_debug_dir / "chunk_corrected_resized.npy";
+      const auto debug_dino_score_path = chunk_debug_dir / "chunk_dino_score.npy";
+      const auto debug_coherence_gate_path = chunk_debug_dir / "chunk_coherence_gate.npy";
+      const auto debug_hybrid_contrib_path = chunk_debug_dir / "chunk_hybrid_contrib.npy";
+      const auto debug_combined_score_path = chunk_debug_dir / "chunk_combined_score.npy";
+      const auto debug_valid_mask_path = chunk_debug_dir / "chunk_valid_mask.npy";
+      const auto debug_bridged_mask_path = chunk_debug_dir / "chunk_bridged_mask.npy";
+      const auto debug_grouped_mask_path = chunk_debug_dir / "chunk_grouped_mask.npy";
+      const auto debug_grouped_mask_pgm = chunk_debug_dir / "chunk_grouped_mask.pgm";
+      const auto debug_final_mask_path = chunk_debug_dir / "chunk_final_mask.npy";
+      const auto debug_final_mask_pgm = chunk_debug_dir / "chunk_final_mask.pgm";
+      const auto debug_grouped_boxes_path = chunk_debug_dir / "chunk_grouped_boxes.json";
+
+      write_npy_2d(debug_corrected_path,
+                   debug_chunk.corrected_resized.data(),
+                   debug_chunk.corrected_resized.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_npy_2d(debug_dino_score_path,
+                   debug_chunk.dino_score_map.data(),
+                   debug_chunk.dino_score_map.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_npy_2d(debug_coherence_gate_path,
+                   debug_chunk.coherence_gate.data(),
+                   debug_chunk.coherence_gate.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_npy_2d(debug_hybrid_contrib_path,
+                   debug_chunk.hybrid_contrib.data(),
+                   debug_chunk.hybrid_contrib.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_npy_2d(debug_combined_score_path,
+                   debug_chunk.combined_score.data(),
+                   debug_chunk.combined_score.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      std::vector<float> debug_valid_mask_float(debug_chunk.valid_mask.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.valid_mask.size(); ++index) {
+        debug_valid_mask_float[index] = debug_chunk.valid_mask[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_valid_mask_path,
+                   debug_valid_mask_float.data(),
+                   debug_valid_mask_float.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      std::vector<float> debug_bridged_mask_float(debug_chunk.bridged_mask.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.bridged_mask.size(); ++index) {
+        debug_bridged_mask_float[index] = debug_chunk.bridged_mask[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_bridged_mask_path,
+                   debug_bridged_mask_float.data(),
+                   debug_bridged_mask_float.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      std::vector<float> debug_grouped_mask_float(debug_chunk.grouped_mask.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.grouped_mask.size(); ++index) {
+        debug_grouped_mask_float[index] = debug_chunk.grouped_mask[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_grouped_mask_path,
+                   debug_grouped_mask_float.data(),
+                   debug_grouped_mask_float.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_pgm(debug_grouped_mask_pgm, mask_to_u8(debug_chunk.grouped_mask), debug_chunk.dst_cols, debug_chunk.dst_rows);
+      std::vector<float> debug_final_mask_float(debug_chunk.final_mask.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.final_mask.size(); ++index) {
+        debug_final_mask_float[index] = debug_chunk.final_mask[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_final_mask_path,
+                   debug_final_mask_float.data(),
+                   debug_final_mask_float.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_pgm(debug_final_mask_pgm, mask_to_u8(debug_chunk.final_mask), debug_chunk.dst_cols, debug_chunk.dst_rows);
+
+      {
+        std::ofstream debug_grouped_boxes_out(debug_grouped_boxes_path, std::ios::binary);
+        if (!debug_grouped_boxes_out.is_open()) {
+          throw std::runtime_error("failed to open chunk grouped boxes output");
+        }
+        debug_grouped_boxes_out << std::fixed << std::setprecision(6);
+        debug_grouped_boxes_out << "{\n  \"box_count\": " << debug_chunk.grouped_boxes.size() << ",\n  \"boxes\": [\n";
+        for (size_t index = 0; index < debug_chunk.grouped_boxes.size(); ++index) {
+          const auto& box = debug_chunk.grouped_boxes[index];
+          debug_grouped_boxes_out << "    {\"freq_start\": " << box.freq_start
+                                  << ", \"freq_stop\": " << box.freq_stop
+                                  << ", \"time_start\": " << box.time_start
+                                  << ", \"time_stop\": " << box.time_stop
+                                  << ", \"filled_area\": " << box.filled_area
+                                  << ", \"density\": " << box.density
+                                  << ", \"score_mean\": " << box.score_mean
+                                  << ", \"score_peak\": " << box.score_peak
+                                  << ", \"split_role\": \"" << json_escape(box.split_role) << "\""
+                                  << ", \"split_applied\": " << (box.split_applied ? "true" : "false")
+                                  << ", \"parent_component_id\": " << box.parent_component_id
+                                  << "}";
+          if (index + 1 != debug_chunk.grouped_boxes.size()) {
+            debug_grouped_boxes_out << ",";
+          }
+          debug_grouped_boxes_out << "\n";
+        }
+        debug_grouped_boxes_out << "  ]\n}\n";
+      }
+
+      std::ofstream debug_summary_out(debug_chunk_summary, std::ios::binary);
+      if (!debug_summary_out.is_open()) {
+        throw std::runtime_error("failed to open chunk debug summary output");
+      }
+      debug_summary_out << std::fixed << std::setprecision(6);
+      debug_summary_out << "{\n";
+      debug_summary_out << "  \"chunk_index\": " << debug_chunk.chunk_index << ",\n";
+      debug_summary_out << "  \"row_start\": " << debug_chunk.row_start << ",\n";
+      debug_summary_out << "  \"row_stop\": " << debug_chunk.row_stop << ",\n";
+      debug_summary_out << "  \"src_rows\": " << debug_chunk.src_rows << ",\n";
+      debug_summary_out << "  \"src_cols\": " << debug_chunk.src_cols << ",\n";
+      debug_summary_out << "  \"freq_start_hz\": " << debug_chunk.freq_start_hz << ",\n";
+      debug_summary_out << "  \"freq_stop_hz\": " << debug_chunk.freq_stop_hz << ",\n";
+      debug_summary_out << "  \"ignore_bins_per_side\": " << debug_chunk.ignore_bins_per_side << ",\n";
+      debug_summary_out << "  \"dino_threshold\": " << debug_chunk.dino_threshold << ",\n";
+      debug_summary_out << "  \"runtime_final_threshold\": " << debug_chunk.runtime_final_threshold << ",\n";
+      debug_summary_out << "  \"seed_freq_threshold\": " << debug_chunk.seed_freq_threshold << ",\n";
+      debug_summary_out << "  \"seed_res_threshold\": " << debug_chunk.seed_res_threshold << ",\n";
+      debug_summary_out << "  \"combined_threshold\": " << debug_chunk.combined_threshold << ",\n";
+      debug_summary_out << "  \"final_fraction\": " << debug_chunk.final_fraction << ",\n";
+      debug_summary_out << "  \"connected_fraction\": " << debug_chunk.connected_fraction << ",\n";
+      debug_summary_out << "  \"component_count\": " << debug_chunk.component_count << ",\n";
+      debug_summary_out << "  \"grouped_box_count\": " << debug_chunk.grouped_box_count << ",\n";
+      debug_summary_out << "  \"corrected_resized_npy\": \"" << json_escape(debug_corrected_path.string()) << "\",\n";
+      debug_summary_out << "  \"dino_score_npy\": \"" << json_escape(debug_dino_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"coherence_gate_npy\": \"" << json_escape(debug_coherence_gate_path.string()) << "\",\n";
+      debug_summary_out << "  \"hybrid_contrib_npy\": \"" << json_escape(debug_hybrid_contrib_path.string()) << "\",\n";
+      debug_summary_out << "  \"combined_score_npy\": \"" << json_escape(debug_combined_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"valid_mask_npy\": \"" << json_escape(debug_valid_mask_path.string()) << "\",\n";
+      debug_summary_out << "  \"bridged_mask_npy\": \"" << json_escape(debug_bridged_mask_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_mask_npy\": \"" << json_escape(debug_grouped_mask_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_mask_pgm\": \"" << json_escape(debug_grouped_mask_pgm.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_boxes_json\": \"" << json_escape(debug_grouped_boxes_path.string()) << "\",\n";
+      debug_summary_out << "  \"final_mask_npy\": \"" << json_escape(debug_final_mask_path.string()) << "\",\n";
+      debug_summary_out << "  \"final_mask_pgm\": \"" << json_escape(debug_final_mask_pgm.string()) << "\"\n";
+      debug_summary_out << "}\n";
+    }
+
+    {
+      std::ofstream chunk_plan_out(chunk_plan_path, std::ios::binary);
+      if (!chunk_plan_out.is_open()) {
+        throw std::runtime_error("failed to open chunk plan output");
+      }
+      chunk_plan_out << std::fixed << std::setprecision(6);
+      chunk_plan_out << "{\n";
+      chunk_plan_out << "  \"chunk_count\": " << chunk_plan.size() << ",\n";
+      chunk_plan_out << "  \"rows\": " << tensor.rows << ",\n";
+      chunk_plan_out << "  \"cols\": " << tensor.cols << ",\n";
+      chunk_plan_out << "  \"resolution_hz\": " << resolution_hz << ",\n";
+      chunk_plan_out << "  \"ignore_bins_per_side\": " << ignore_bins_per_side << ",\n";
+      chunk_plan_out << "  \"chunk_bandwidth_hz\": " << config.chunk_bandwidth_hz << ",\n";
+      chunk_plan_out << "  \"chunk_overlap_hz\": " << config.chunk_overlap_hz << ",\n";
+      chunk_plan_out << "  \"uncalibrated_chunk_fraction\": " << config.uncalibrated_chunk_fraction << ",\n";
+      chunk_plan_out << "  \"uncalibrated_overlap_fraction\": " << config.uncalibrated_overlap_fraction << ",\n";
+      chunk_plan_out << "  \"chunks\": [\n";
+      for (size_t index = 0; index < chunk_plan.size(); ++index) {
+        const auto& chunk = chunk_plan[index];
+        chunk_plan_out << "    {\"chunk_index\": " << chunk.chunk_index
+                       << ", \"row_start\": " << chunk.row_start
+                       << ", \"row_stop\": " << chunk.row_stop
+                       << ", \"freq_start_hz\": " << chunk.freq_start_hz
+                       << ", \"freq_stop_hz\": " << chunk.freq_stop_hz << "}";
+        if (index + 1 != chunk_plan.size()) {
+          chunk_plan_out << ",";
+        }
+        chunk_plan_out << "\n";
+      }
+      chunk_plan_out << "  ]\n";
+      chunk_plan_out << "}\n";
+    }
+
+    {
+      std::ofstream chunk_results_out(chunk_results_path, std::ios::binary);
+      if (!chunk_results_out.is_open()) {
+        throw std::runtime_error("failed to open chunk results output");
+      }
+      chunk_results_out << std::fixed << std::setprecision(6);
+      chunk_results_out << "{\n";
+      chunk_results_out << "  \"chunk_count\": " << chunk_results.size() << ",\n";
+      chunk_results_out << "  \"chunks\": [\n";
+      for (size_t index = 0; index < chunk_results.size(); ++index) {
+        const auto& chunk = chunk_results[index];
+        chunk_results_out << "    {"
+                          << "\"chunk_index\": " << chunk.chunk_index
+                          << ", \"row_start\": " << chunk.row_start
+                          << ", \"row_stop\": " << chunk.row_stop
+                          << ", \"src_rows\": " << chunk.src_rows
+                          << ", \"src_cols\": " << chunk.src_cols
+                          << ", \"freq_start_hz\": " << chunk.freq_start_hz
+                          << ", \"freq_stop_hz\": " << chunk.freq_stop_hz
+                          << ", \"ignore_bins_per_side\": " << chunk.ignore_bins_per_side
+                          << ", \"dino_threshold\": " << chunk.dino_threshold
+                          << ", \"runtime_final_threshold\": " << chunk.runtime_final_threshold
+                          << ", \"seed_freq_threshold\": " << chunk.seed_freq_threshold
+                          << ", \"seed_res_threshold\": " << chunk.seed_res_threshold
+                          << ", \"combined_threshold\": " << chunk.combined_threshold
+                          << ", \"final_fraction\": " << chunk.final_fraction
+                          << ", \"connected_fraction\": " << chunk.connected_fraction
+                          << ", \"component_count\": " << chunk.component_count
+                          << ", \"grouped_box_count\": " << chunk.grouped_box_count
+                          << ", \"grouped_boxes\": [";
+        for (size_t box_index = 0; box_index < chunk.grouped_boxes.size(); ++box_index) {
+          const auto& box = chunk.grouped_boxes[box_index];
+          chunk_results_out << "{\"freq_start\": " << box.freq_start
+                            << ", \"freq_stop\": " << box.freq_stop
+                            << ", \"time_start\": " << box.time_start
+                            << ", \"time_stop\": " << box.time_stop
+                            << ", \"filled_area\": " << box.filled_area
+                            << ", \"density\": " << box.density
+                            << ", \"score_mean\": " << box.score_mean
+                            << ", \"score_peak\": " << box.score_peak
+                            << ", \"split_role\": \"" << json_escape(box.split_role) << "\""
+                            << ", \"split_applied\": " << (box.split_applied ? "true" : "false")
+                            << ", \"parent_component_id\": " << box.parent_component_id
+                            << "}";
+          if (box_index + 1 != chunk.grouped_boxes.size()) {
+            chunk_results_out << ", ";
+          }
+        }
+        chunk_results_out << "]"
+                          << "}";
+        if (index + 1 != chunk_results.size()) {
+          chunk_results_out << ",";
+        }
+        chunk_results_out << "\n";
+      }
+      chunk_results_out << "  ]\n";
+      chunk_results_out << "}\n";
+    }
+
+    {
+      std::ofstream projected_boxes_out(projected_boxes_path, std::ios::binary);
+      if (!projected_boxes_out.is_open()) {
+        throw std::runtime_error("failed to open projected boxes output");
+      }
+      projected_boxes_out << "{\n  \"box_count\": " << global_merged.projected_boxes.size() << ",\n  \"boxes\": [\n";
+      for (size_t index = 0; index < global_merged.projected_boxes.size(); ++index) {
+        const auto& box = global_merged.projected_boxes[index];
+        projected_boxes_out << "    {\"freq_start\": " << box.freq_start
+                            << ", \"freq_stop\": " << box.freq_stop
+                            << ", \"time_start\": " << box.time_start
+                            << ", \"time_stop\": " << box.time_stop
+                            << ", \"filled_area\": " << box.filled_area
+                            << ", \"density\": " << box.density
+                            << ", \"score_mean\": " << box.score_mean
+                            << ", \"score_peak\": " << box.score_peak
+                            << ", \"split_role\": \"" << json_escape(box.split_role) << "\""
+                            << ", \"split_applied\": " << (box.split_applied ? "true" : "false")
+                            << ", \"source_box_count\": " << box.source_box_count
+                            << ", \"source_chunk_indices\": [";
+        for (size_t chunk_index = 0; chunk_index < box.source_chunk_indices.size(); ++chunk_index) {
+          projected_boxes_out << box.source_chunk_indices[chunk_index];
+          if (chunk_index + 1 != box.source_chunk_indices.size()) {
+            projected_boxes_out << ", ";
+          }
+        }
+        projected_boxes_out << "]}";
+        if (index + 1 != global_merged.projected_boxes.size()) {
+          projected_boxes_out << ",";
+        }
+        projected_boxes_out << "\n";
+      }
+      projected_boxes_out << "  ]\n}\n";
+    }
+
+    {
+      std::ofstream merged_boxes_out(merged_boxes_path, std::ios::binary);
+      if (!merged_boxes_out.is_open()) {
+        throw std::runtime_error("failed to open merged boxes output");
+      }
+      merged_boxes_out << "{\n  \"box_count\": " << global_merged.merged_boxes.size() << ",\n  \"boxes\": [\n";
+      for (size_t index = 0; index < global_merged.merged_boxes.size(); ++index) {
+        const auto& box = global_merged.merged_boxes[index];
+        merged_boxes_out << "    {\"freq_start\": " << box.freq_start
+                         << ", \"freq_stop\": " << box.freq_stop
+                         << ", \"time_start\": " << box.time_start
+                         << ", \"time_stop\": " << box.time_stop
+                         << ", \"filled_area\": " << box.filled_area
+                         << ", \"density\": " << box.density
+                         << ", \"score_mean\": " << box.score_mean
+                         << ", \"score_peak\": " << box.score_peak
+                         << ", \"split_role\": \"" << json_escape(box.split_role) << "\""
+                         << ", \"split_applied\": " << (box.split_applied ? "true" : "false")
+                         << ", \"source_box_count\": " << box.source_box_count
+                         << ", \"source_chunk_indices\": [";
+        for (size_t chunk_index = 0; chunk_index < box.source_chunk_indices.size(); ++chunk_index) {
+          merged_boxes_out << box.source_chunk_indices[chunk_index];
+          if (chunk_index + 1 != box.source_chunk_indices.size()) {
+            merged_boxes_out << ", ";
+          }
+        }
+        merged_boxes_out << "]}";
+        if (index + 1 != global_merged.merged_boxes.size()) {
+          merged_boxes_out << ",";
+        }
+        merged_boxes_out << "\n";
+      }
+      merged_boxes_out << "  ]\n}\n";
+    }
 
     MaskComparison live_comparison;
     if (options.live_mask_path.has_value()) {
@@ -1331,6 +2616,14 @@ int main(int argc, char** argv) {
     summary << "  \"resolution_hz\": " << resolution_hz << ",\n";
     summary << "  \"span_hz\": " << config.span_hz << ",\n";
     summary << "  \"ignore_bins_per_side\": " << ignore_bins_per_side << ",\n";
+    summary << "  \"chunk_count\": " << chunk_plan.size() << ",\n";
+    summary << "  \"chunk_plan_json\": \"" << json_escape(chunk_plan_path.string()) << "\",\n";
+    summary << "  \"chunk_results_json\": \"" << json_escape(chunk_results_path.string()) << "\",\n";
+    summary << "  \"chunk_debug_dir\": \"" << json_escape(chunk_debug_dir.string()) << "\",\n";
+    summary << "  \"projected_boxes_json\": \"" << json_escape(projected_boxes_path.string()) << "\",\n";
+    summary << "  \"merged_boxes_json\": \"" << json_escape(merged_boxes_path.string()) << "\",\n";
+    summary << "  \"chunk_bandwidth_hz\": " << config.chunk_bandwidth_hz << ",\n";
+    summary << "  \"chunk_overlap_hz\": " << config.chunk_overlap_hz << ",\n";
     summary << "  \"frontend_reference_level\": " << frontend_reference_level << ",\n";
     summary << "  \"runtime_backend_used\": \"" << json_escape(runtime_result.backend_used) << "\",\n";
     summary << "  \"runtime_dino_threshold\": " << runtime_result.dino_threshold << ",\n";
@@ -1341,12 +2634,30 @@ int main(int argc, char** argv) {
     summary << "  \"hybrid_final_fraction\": " << hybrid_result.final_fraction << ",\n";
     summary << "  \"hybrid_connected_fraction\": " << hybrid_result.connected_fraction << ",\n";
     summary << "  \"hybrid_component_count\": " << hybrid_result.component_count << ",\n";
+    if (!chunk_results.empty()) {
+      const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_results.size() - 1)));
+      const auto& debug_chunk = chunk_results[debug_chunk_index];
+      summary << "  \"debug_chunk_index\": " << debug_chunk.chunk_index << ",\n";
+      summary << "  \"debug_chunk_seed_freq_threshold\": " << debug_chunk.seed_freq_threshold << ",\n";
+      summary << "  \"debug_chunk_seed_res_threshold\": " << debug_chunk.seed_res_threshold << ",\n";
+      summary << "  \"debug_chunk_combined_threshold\": " << debug_chunk.combined_threshold << ",\n";
+      summary << "  \"debug_chunk_final_fraction\": " << debug_chunk.final_fraction << ",\n";
+      summary << "  \"debug_chunk_component_count\": " << debug_chunk.component_count << ",\n";
+      summary << "  \"debug_chunk_grouped_box_count\": " << debug_chunk.grouped_box_count << ",\n";
+    }
+    summary << "  \"projected_grouped_box_count\": " << global_merged.projected_boxes.size() << ",\n";
+    summary << "  \"merged_grouped_box_count\": " << global_merged.merged_boxes.size() << ",\n";
     summary << "  \"power_db_npy\": \"" << json_escape(power_db_path.string()) << "\",\n";
     summary << "  \"corrected_db_npy\": \"" << json_escape(corrected_path.string()) << "\",\n";
     summary << "  \"corrected_resized_npy\": \"" << json_escape(corrected_resized_path.string()) << "\",\n";
     summary << "  \"dino_score_npy\": \"" << json_escape(dino_score_path.string()) << "\",\n";
     summary << "  \"coherence_gate_npy\": \"" << json_escape(coherence_gate_path.string()) << "\",\n";
     summary << "  \"hybrid_contrib_npy\": \"" << json_escape(hybrid_contrib_path.string()) << "\",\n";
+    summary << "  \"projected_grouped_mask_npy\": \"" << json_escape(projected_grouped_mask_path.string()) << "\",\n";
+    summary << "  \"projected_grouped_mask_pgm\": \"" << json_escape(projected_grouped_mask_pgm.string()) << "\",\n";
+    summary << "  \"projected_grouped_score_npy\": \"" << json_escape(projected_grouped_score_path.string()) << "\",\n";
+    summary << "  \"merged_box_mask_npy\": \"" << json_escape(merged_box_mask_path.string()) << "\",\n";
+    summary << "  \"merged_box_mask_pgm\": \"" << json_escape(merged_box_mask_pgm.string()) << "\",\n";
     summary << "  \"final_mask_npy\": \"" << json_escape(final_mask_path.string()) << "\",\n";
     summary << "  \"final_mask_pgm\": \"" << json_escape(final_mask_pgm.string()) << "\"";
     if (options.live_mask_path.has_value()) {
@@ -1366,6 +2677,19 @@ int main(int argc, char** argv) {
       std::cout << "  config: " << options.config_path << "\n";
       std::cout << "  runtime backend: " << runtime_result.backend_used << "\n";
       std::cout << "  ignore bins/side: " << ignore_bins_per_side << "\n";
+      std::cout << "  chunk count: " << chunk_plan.size() << "\n";
+      std::cout << "  projected grouped boxes: " << global_merged.projected_boxes.size() << "\n";
+      std::cout << "  merged grouped boxes: " << global_merged.merged_boxes.size() << "\n";
+      if (!chunk_results.empty()) {
+        const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_results.size() - 1)));
+        const auto& debug_chunk = chunk_results[debug_chunk_index];
+        std::cout << "  debug chunk: " << debug_chunk.chunk_index
+                  << " rows=(" << debug_chunk.row_start << ", " << debug_chunk.row_stop << ")\n";
+        std::cout << "  debug chunk thresholds: freq=" << debug_chunk.seed_freq_threshold
+                  << " res=" << debug_chunk.seed_res_threshold
+                  << " combined=" << debug_chunk.combined_threshold << "\n";
+        std::cout << "  debug chunk grouped boxes: " << debug_chunk.grouped_box_count << "\n";
+      }
       std::cout << "  dino threshold: " << runtime_result.dino_threshold << "\n";
       std::cout << "  hybrid seed thresholds: freq=" << hybrid_result.seed_freq_threshold
                 << " res=" << hybrid_result.seed_res_threshold << "\n";
