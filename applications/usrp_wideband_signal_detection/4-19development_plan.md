@@ -20,6 +20,8 @@
 - Subsection validation does not need that full-frame grouped patch path. The validator now supports `--subsection-only-validation`, which keeps the global correction, chunk planning, debug chunk execution, and chunk-to-full-frame merge outputs, but skips full-frame patch-feature export and skips `offline_full_frame_grouped_patch` entirely.
 - `validate_offline_dino_subsection.sh` now enables subsection-only validation automatically so the parity workflow can get back to comparing the selected C++ subsection against Python instead of building an unnecessary full-frame grouped patch surface.
 - After this patch, the next offline-validator check is whether the grouped patch-feature DINO surface now diverges from the raw feature-energy proxy in the same way as Python. If it still does not, the remaining work is inside the grouped-score port rather than the crop contract.
+- Added a new `filter_detection_mask` config switch for the post-final-mask boxing stage. When true, the existing bridging and component filtering path remains active. When false, the detector skips that filtering and emits simple rectangular boxes around each connected mask region so notebook parity can isolate grouping effects directly.
+- Offline validation has now converged far enough that the next active milestone is porting the validated chunked/offline behavior into the live running operator instead of continuing to reshape the notebook reference.
 
 ## Objective
 

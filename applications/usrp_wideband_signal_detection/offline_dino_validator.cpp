@@ -69,6 +69,7 @@ struct ValidatorConfig {
   double dino_group_spatial_weight = 0.35;
   double dino_group_score_q = 0.60;
   int min_component_size = 6;
+  bool filter_detection_mask = true;
   double pipeline_final_threshold = 0.20;
   double pipeline_gap_floor = 0.10;
   double pipeline_power_rescue_floor = 0.10;
@@ -277,6 +278,19 @@ std::optional<std::string> extract_yaml_string(const std::string& text, const st
   return match[2].str();
 }
 
+std::optional<bool> extract_bool(const std::string& text, const std::string& key) {
+  const std::regex pattern("(^|\\n)\\s*" + key + "\\s*:\\s*(true|false)", std::regex_constants::icase);
+  std::smatch match;
+  if (!std::regex_search(text, match, pattern)) {
+    return std::nullopt;
+  }
+  std::string value = match[2].str();
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return value == "true";
+}
+
 std::string read_text_file(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in.is_open()) {
@@ -315,6 +329,7 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.dino_group_spatial_weight = extract_number<double>(text, "dino_group_spatial_weight").value_or(config.dino_group_spatial_weight);
   config.dino_group_score_q = extract_number<double>(text, "dino_group_score_q").value_or(config.dino_group_score_q);
   config.min_component_size = extract_number<int>(text, "min_component_size").value_or(config.min_component_size);
+  config.filter_detection_mask = extract_bool(text, "filter_detection_mask").value_or(config.filter_detection_mask);
   config.pipeline_final_threshold = extract_number<double>(text, "pipeline_final_threshold").value_or(config.pipeline_final_threshold);
   config.pipeline_gap_floor = extract_number<double>(text, "pipeline_gap_floor").value_or(config.pipeline_gap_floor);
   config.pipeline_power_rescue_floor = extract_number<double>(text, "pipeline_power_rescue_floor").value_or(config.pipeline_power_rescue_floor);
@@ -2489,6 +2504,7 @@ GroupingResult group_mask_regions(const std::vector<uint8_t>& mask,
                                   const std::vector<uint8_t>& valid_mask,
                                   int rows,
                                   int cols,
+                                  bool filter_detection_mask,
                                   int bridge_freq_px,
                                   int bridge_time_px,
                                   int min_component_size,
@@ -2506,6 +2522,60 @@ GroupingResult group_mask_regions(const std::vector<uint8_t>& mask,
     if (!valid_mask[index]) {
       result.seed_mask[index] = 0;
     }
+  }
+
+  if (!filter_detection_mask) {
+    result.bridged_mask = result.seed_mask;
+    const auto labelled = label_components(result.bridged_mask, rows, cols);
+    result.component_labels.assign(labelled.labels.begin(), labelled.labels.end());
+    result.grouped_mask = result.seed_mask;
+    for (size_t label_index = 0; label_index < labelled.sizes.size(); ++label_index) {
+      const int component_id = static_cast<int>(label_index) + 1;
+      int min_row = rows;
+      int max_row = -1;
+      int min_col = cols;
+      int max_col = -1;
+      int filled_area = 0;
+      float score_peak = 0.0f;
+      float score_sum = 0.0f;
+      for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+          const size_t flat = flat_index(cols, row, col);
+          if (labelled.labels[flat] != component_id) {
+            continue;
+          }
+          min_row = std::min(min_row, row);
+          max_row = std::max(max_row, row);
+          min_col = std::min(min_col, col);
+          max_col = std::max(max_col, col);
+          ++filled_area;
+          if (flat < score_map.size()) {
+            const float score = score_map[flat];
+            score_sum += score;
+            score_peak = std::max(score_peak, score);
+          }
+        }
+      }
+      if (filled_area <= 0 || max_row < min_row || max_col < min_col) {
+        continue;
+      }
+      DetectionBox box;
+      box.freq_start = min_row;
+      box.freq_stop = max_row + 1;
+      box.time_start = min_col;
+      box.time_stop = max_col + 1;
+      box.filled_area = filled_area;
+      const int bbox_area = std::max(1, (box.freq_stop - box.freq_start) * (box.time_stop - box.time_start));
+      box.bbox_density = static_cast<float>(filled_area) / static_cast<float>(bbox_area);
+      box.envelope_density = box.bbox_density;
+      box.density = box.bbox_density;
+      box.score_mean = filled_area > 0 ? score_sum / static_cast<float>(filled_area) : 0.0f;
+      box.score_peak = score_peak;
+      box.parent_component_id = component_id;
+      box.parent_component_ids = {component_id};
+      result.boxes.push_back(std::move(box));
+    }
+    return result;
   }
 
   result.bridged_mask = result.seed_mask;
@@ -2622,6 +2692,7 @@ GroupingResult group_mask_regions(const std::vector<uint8_t>& mask,
 }
 
 void group_chunk_mask_regions(ChunkRetryResult& chunk,
+                              bool filter_detection_mask,
                               int bridge_freq_px,
                               int bridge_time_px,
                               int min_component_size,
@@ -2638,6 +2709,7 @@ void group_chunk_mask_regions(ChunkRetryResult& chunk,
                                            chunk.valid_mask,
                                            chunk.dst_rows,
                                            chunk.dst_cols,
+                                           filter_detection_mask,
                                            bridge_freq_px,
                                            bridge_time_px,
                                            min_component_size,
@@ -2833,6 +2905,7 @@ GlobalMergedResult build_global_merged_result(const std::vector<ChunkRetryResult
                                            source_valid_row_mask,
                                            global_rows,
                                            global_cols,
+                                           true,
                                            33,
                                            5,
                                            24,
@@ -3213,6 +3286,7 @@ ChunkRetryResult run_retry_chunk(holoscan::ops::DinoTorchRuntime& runtime,
                                                   source_chunk_valid_mask,
                                                   result.src_rows,
                                                   result.src_cols,
+                                                  config.filter_detection_mask,
                                                   33,
                                                   5,
                                                   24,
@@ -3488,6 +3562,7 @@ int main(int argc, char** argv) {
           options.verbose);
       group_chunk_mask_regions(
           chunk_result,
+          config.filter_detection_mask,
           33,
           5,
           24,

@@ -1267,6 +1267,7 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
                                          int rows,
                                          int cols,
                                          const std::vector<uint8_t>& valid_row_mask,
+                                         bool filter_detection_mask,
                                          int bridge_freq_px,
                                          int bridge_time_px,
                                          int min_component_size,
@@ -1292,6 +1293,74 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
     }
   }
   const float peak_score_floor = active_scores.empty() ? 0.0f : quantile_from_values(std::move(active_scores), 0.50f);
+
+  if (!filter_detection_mask) {
+    std::vector<uint8_t> grouped_mask = working_mask;
+    std::vector<uint8_t> visited(mask.size(), 0);
+    std::vector<DetectionBox> boxes;
+    const std::array<std::pair<int, int>, 4> neighbors{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
+    for (int row = 0; row < rows; ++row) {
+      for (int col = 0; col < cols; ++col) {
+        const size_t seed = flat_index(rows, cols, row, col);
+        if (!grouped_mask[seed] || visited[seed]) {
+          continue;
+        }
+        std::queue<std::pair<int, int>> queue;
+        queue.push({row, col});
+        visited[seed] = 1;
+        int min_row = row;
+        int max_row = row;
+        int min_col = col;
+        int max_col = col;
+        int filled_area = 0;
+        float score_peak = 0.0f;
+        float score_sum = 0.0f;
+        while (!queue.empty()) {
+          const auto [current_row, current_col] = queue.front();
+          queue.pop();
+          const size_t current_index = flat_index(rows, cols, current_row, current_col);
+          ++filled_area;
+          min_row = std::min(min_row, current_row);
+          max_row = std::max(max_row, current_row);
+          min_col = std::min(min_col, current_col);
+          max_col = std::max(max_col, current_col);
+          const float score = score_map[current_index];
+          score_sum += score;
+          score_peak = std::max(score_peak, score);
+          for (const auto& [delta_row, delta_col] : neighbors) {
+            const int next_row = current_row + delta_row;
+            const int next_col = current_col + delta_col;
+            if (next_row < 0 || next_row >= rows || next_col < 0 || next_col >= cols) {
+              continue;
+            }
+            const size_t next_index = flat_index(rows, cols, next_row, next_col);
+            if (!grouped_mask[next_index] || visited[next_index]) {
+              continue;
+            }
+            visited[next_index] = 1;
+            queue.push({next_row, next_col});
+          }
+        }
+        DetectionBox box;
+        box.freq_start = min_row;
+        box.freq_stop = max_row + 1;
+        box.time_start = min_col;
+        box.time_stop = max_col + 1;
+        box.freq_span = box.freq_stop - box.freq_start;
+        box.time_span = box.time_stop - box.time_start;
+        box.filled_area = filled_area;
+        const int bbox_area = std::max(box.freq_span * box.time_span, 1);
+        box.bbox_density = static_cast<float>(filled_area) / static_cast<float>(bbox_area);
+        box.envelope_density = box.bbox_density;
+        box.density = box.bbox_density;
+        box.score_mean = filled_area > 0 ? score_sum / static_cast<float>(filled_area) : 0.0f;
+        box.score_peak = score_peak;
+        box.parent_component_id = static_cast<int>(boxes.size()) + 1;
+        boxes.push_back(std::move(box));
+      }
+    }
+    return {grouped_mask, boxes, peak_score_floor};
+  }
 
   std::vector<uint8_t> bridged_mask = working_mask;
   binary_close_freq(bridged_mask, rows, cols, bridge_freq_px);
@@ -1578,6 +1647,7 @@ GroupingResult merge_projected_subsection_boxes(int rows,
                                                 const std::vector<DetectionChunkResult>& chunk_results,
                                                 const std::vector<float>& merged_score,
                                                 const std::vector<uint8_t>& valid_row_mask,
+                                                bool filter_detection_mask,
                                                 int bridge_freq_px,
                                                 int bridge_time_px,
                                                 int min_component_size,
@@ -1650,6 +1720,7 @@ GroupingResult merge_projected_subsection_boxes(int rows,
       rows,
       cols,
       valid_row_mask,
+      filter_detection_mask,
       bridge_freq_px,
       bridge_time_px,
       min_component_size,
@@ -1776,6 +1847,7 @@ DetectionChunkResult detect_chunk_coherent_power(const std::vector<float>& corre
                                                  double support_q,
                                                  double final_q,
                                                  int min_component_size,
+                                                 bool filter_detection_mask,
                                                  int grouping_bridge_freq_px,
                                                  int grouping_bridge_time_px,
                                                  int grouping_min_component_size,
@@ -1848,6 +1920,7 @@ DetectionChunkResult detect_chunk_coherent_power(const std::vector<float>& corre
                                                   rows,
                                                   cols,
                                                   chunk_valid_row_mask,
+                                                  filter_detection_mask,
                                                   grouping_bridge_freq_px,
                                                   grouping_bridge_time_px,
                                                   std::max(grouping_min_component_size, min_component_size),
@@ -1878,6 +1951,7 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                        double coherence_power_support_q,
                                        double coherence_power_q,
                                        int min_component_size,
+                                       bool filter_detection_mask,
                                        double grouping_seed_score_q,
                                        int grouping_bridge_freq_px,
                                        int grouping_bridge_time_px,
@@ -1942,6 +2016,7 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                                         coherence_power_support_q,
                                                         coherence_power_q,
                                                         min_component_size,
+                                                        filter_detection_mask,
                                                         grouping_bridge_freq_px,
                                                         grouping_bridge_time_px,
                                                         grouping_min_component_size,
@@ -2030,6 +2105,7 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                                                 chunk_results,
                                                                 merged_score,
                                                                 valid_row_mask,
+                                                                filter_detection_mask,
                                                                 grouping_bridge_freq_px,
                                                                 grouping_bridge_time_px,
                                                                 std::max(grouping_min_component_size, min_component_size),
@@ -2126,6 +2202,7 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
                                               config.coherence_power_support_q,
                                               config.coherence_power_q,
                                               config.min_component_size,
+                                              config.filter_detection_mask,
                                               config.grouping_seed_score_q,
                                               config.grouping_bridge_freq_px,
                                               config.grouping_bridge_time_px,
@@ -2197,6 +2274,7 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(coherence_power_support_q_, "coherence_power_support_q", "Support quantile", "Notebook-derived support quantile.", 0.82);
   spec.param(coherence_power_q_, "coherence_power_q", "Final quantile", "Notebook-derived final score quantile.", 0.92);
   spec.param(min_component_size_, "min_component_size", "Minimum component size", "Notebook-derived minimum component size.", 6);
+  spec.param(filter_detection_mask_, "filter_detection_mask", "Filter detection mask", "If true, apply bridging and component filtering before boxing. If false, box raw connected mask regions directly.", true);
   spec.param(fast_power_floor_db_, "fast_power_floor_db", "Fast path power floor", "Support floor in dB for the fast GPU detector path.", 1.5);
   spec.param(fast_power_span_db_, "fast_power_span_db", "Fast path power span", "Support normalization span in dB for the fast GPU detector path.", 8.0);
   spec.param(fast_coherence_floor_db_, "fast_coherence_floor_db", "Fast path coherence floor", "Coherence floor in dB for the fast GPU detector path.", 0.4);
@@ -2731,6 +2809,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                                 coherence_power_support_q_.get(),
                                                 coherence_power_q_.get(),
                                                 min_component_size_.get(),
+                                                filter_detection_mask_.get(),
                                                 grouping_seed_score_q_.get(),
                                                 grouping_bridge_freq_px_.get(),
                                                 grouping_bridge_time_px_.get(),

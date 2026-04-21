@@ -34,6 +34,7 @@ struct CoherentPowerReferenceConfig {
   double coherence_power_support_q = 0.82;
   double coherence_power_q = 0.92;
   int min_component_size = 6;
+  bool filter_detection_mask = true;
   double grouping_seed_score_q = 0.72;
   int grouping_bridge_freq_px = 33;
   int grouping_bridge_time_px = 5;
@@ -142,6 +143,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<double> coherence_power_support_q_;
   holoscan::Parameter<double> coherence_power_q_;
   holoscan::Parameter<int> min_component_size_;
+  holoscan::Parameter<bool> filter_detection_mask_;
   holoscan::Parameter<double> fast_power_floor_db_;
   holoscan::Parameter<double> fast_power_span_db_;
   holoscan::Parameter<double> fast_coherence_floor_db_;
