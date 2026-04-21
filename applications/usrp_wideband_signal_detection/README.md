@@ -67,18 +67,18 @@ Available configs copied into the build directory:
 	- two-channel throughput test mode
 	- disables spectrogram saves, detector mask saves, per-frame detection logging, and timing summaries to keep the data path as lean as possible
 	- when spectrogram save, tensor save, visualization, and post-spectrogram logging are all disabled, the app now bypasses the pass-through `spectrogramOp` and feeds FFT output directly into the detector to remove one graph hop from the hot path
-	- now uses `backend_mode: "fast_gpu"` with `emit_stride: 1` at the full `256x512` detector input so the default non-debug throughput path stress-tests the no-skip fast-path detector rather than the notebook-faithful reference cleanup path
+	- now uses `backend_mode: "reference"` with `emit_stride: 1` at the full `256x512` detector input so the default non-debug throughput path exercises the validated live mask-generation path rather than a prototype-only backend split
 	- keeps GPU RX pools at the current highest known-good `26624` buffers per channel; larger values can fail during DPDK startup when mlx5 attempts to DMA-map both GPU RX regions for GPUDirect RDMA
 - `config_torchscript_performance_single_channel.yaml`
 	- single-channel throughput test mode for finding the highest realtime sender rate the current BAR1/topology-limited host can support with one active RF channel
-	- keeps the same large `1024`-FFT batch geometry and `emit_stride: 1` fast-path detector settings as the main performance config, but reduces the pipeline, network queues, and operators to channel 0 only
+	- keeps the same large `1024`-FFT batch geometry and `emit_stride: 1` validated detector settings as the main performance config, but reduces the pipeline, network queues, and operators to channel 0 only
 	- uses a larger single GPU RX pool (`49152` buffers) because only one GPUDirect RX region is mapped in this mode
 - `old_configs/config_torchscript_performance_timing_debug.yaml`
 	- debug-only hotspot profiling mode for the two-channel TorchScript path
 	- re-enables detector timing summaries and raises `emit_stride` so the synchronized timing probe can print stage timings without immediately collapsing ingress
 - `old_configs/config_torchscript_performance_timing_debug_fast_post.yaml`
-	- debug-only throughput probe that switches DINO to `backend_mode: "fast_gpu"`
-	- use this to estimate how much of the remaining detector cost is tied to the notebook-faithful hybrid postprocess rather than model forward
+	- legacy debug-only throughput probe from the prototype backend split era
+	- keep this only for historical comparison notes; active live-port work should stay on the validated `reference` backend
 - `old_configs/config_torchscript_performance_timing_debug_small_input.yaml`
 	- debug-only reduced-token-count probe
 	- changes detector and spectrogram output from `256x512` to `192x384` so you can measure how much Torch runtime scales with patch count
@@ -435,11 +435,11 @@ The next visualization step is to add a detector overlay postprocessor that emit
 ## Validation Notes
 
 - `old_configs/config.yaml` is now the stable debug run configuration. It intentionally keeps `inference_backend: "pytorch_placeholder"` while saving the first 5 spectrograms and detector masks per channel.
-- Parity rule: validation and any config intended to represent production mask behavior must keep the same detector `backend_mode` for mask creation. Throughput-only profiles may intentionally switch to `fast_gpu`, but those runs are no longer notebook-faithful mask-generation comparisons.
+- Parity rule: validation, performance bring-up, and any config intended to represent production mask behavior must keep the same detector `backend_mode` for mask creation. The validated live path is `backend_mode: "reference"`; throughput tuning should come from cadence and pipeline controls such as `emit_stride`, not from a separate backend.
 - `old_configs/config_coherent_power_debug_capture.yaml` is the coherent-power frozen-input capture profile. It enables tensor snapshot saves, optional `power_db` snapshot saves, and final mask saves so notebook and offline C++ parity checks can run on the exact same detector input.
 - `old_configs/config_cuda_fallback.yaml` is the debug configuration for the pure C++/CUDA detector path. It disables the PyTorch backend in operator logic and uses `cuda_threshold_fallback` while keeping artifact saves enabled.
 - `old_configs/config_torchscript_validation.yaml` is the strict TorchScript bring-up configuration. Use it when you want the C++ TorchScript path to fail loudly.
-- `config_torchscript_performance.yaml` is the low-overhead throughput configuration for two-channel rate testing. It now uses the `fast_gpu` backend with `emit_stride: 8` at full `256x512` input size so throughput runs measure the fast-post floor rather than the notebook-faithful reference cleanup path.
+- `config_torchscript_performance.yaml` is the low-overhead throughput configuration for two-channel rate testing. It now stays on the validated `reference` backend while using `emit_stride` and the lean graph path for throughput work.
 - `old_configs/config_torchscript_load_only.yaml` is the first diagnostic step for the C++ TorchScript path. It confirms whether `torch::jit::load(...)` itself is safe before the operator attempts CUDA transfer.
 - `old_configs/config_torchscript_cpu_eval.yaml` is the second diagnostic step. It tests whether `eval()` is safe while staying entirely on CPU.
 - The CPU validation flow should use the CPU-exported artifact `dinov3_vitb16_pretrain_lvd1689m-73cec8be_cpu.ts`; the original `dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts` remains the CUDA-traced artifact.

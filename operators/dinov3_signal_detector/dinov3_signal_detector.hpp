@@ -111,6 +111,10 @@ class DinoV3SignalDetector : public holoscan::Operator {
   holoscan::Parameter<std::vector<double>> imagenet_std_;
   holoscan::Parameter<int> fft_size_;
   holoscan::Parameter<int> noverlap_;
+  holoscan::Parameter<double> chunk_bandwidth_hz_;
+  holoscan::Parameter<double> chunk_overlap_hz_;
+  holoscan::Parameter<double> uncalibrated_chunk_fraction_;
+  holoscan::Parameter<double> uncalibrated_overlap_fraction_;
   holoscan::Parameter<double> ignore_sideband_hz_;
   holoscan::Parameter<bool> frontend_correction_enable_;
   holoscan::Parameter<double> frontend_correction_row_q_;
@@ -130,6 +134,14 @@ class DinoV3SignalDetector : public holoscan::Operator {
   holoscan::Parameter<int> dino_group_k_;
   holoscan::Parameter<double> dino_group_spatial_weight_;
   holoscan::Parameter<double> dino_group_score_q_;
+  holoscan::Parameter<bool> filter_detection_mask_;
+  holoscan::Parameter<int> grouping_bridge_freq_px_;
+  holoscan::Parameter<int> grouping_bridge_time_px_;
+  holoscan::Parameter<int> grouping_min_component_size_;
+  holoscan::Parameter<int> grouping_min_freq_span_px_;
+  holoscan::Parameter<int> grouping_min_time_span_px_;
+  holoscan::Parameter<double> grouping_min_density_;
+  holoscan::Parameter<double> grouping_time_continuity_ratio_;
   holoscan::Parameter<double> pipeline_final_threshold_;
   holoscan::Parameter<double> pipeline_final_threshold_no_speckle_;
   holoscan::Parameter<double> pipeline_gap_floor_;
@@ -152,6 +164,7 @@ class DinoV3SignalDetector : public holoscan::Operator {
   std::vector<ChannelBuffers> channel_buffers_;
   bool pytorch_runtime_ready_ = false;
   bool pytorch_warning_emitted_ = false;
+  bool backend_mode_warning_emitted_ = false;
 
   std::unique_ptr<DinoTorchRuntime> torch_runtime_;
 };

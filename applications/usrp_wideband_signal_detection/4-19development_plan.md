@@ -1,5 +1,17 @@
 # DINO Retry Chunk-Merge Port Plan
 
+## Progress Update 2026-04-20T20:08:53-05:00
+
+- Live-operator porting is now active. The immediate rollout target is the true DINO operator under the single-channel performance configuration before scaling back up to the 2-channel 500 MSps case.
+- The first live correction is to remove the stale `fast_gpu` mask-generation split. Live runs now need to follow the same validated residual-veto hybrid contract as offline validation, while still using the existing GPU-resident runtime score map and GPU hybrid helper wherever available.
+- `config_torchscript_performance_single_channel.yaml` is being aligned to `backend_mode: reference` so performance bring-up starts from the same backend contract used for validation.
+- The live operator now treats any non-`reference` backend request as deprecated and falls back to the validated reference path instead of preserving a separate prototype-mode branch in operator logic.
+- The active two-channel and single-channel performance configs now both advertise `backend_mode: reference` so live bring-up starts from the same mask-generation contract used by offline validation.
+- The live DINO operator now has a first reference-style chunked path wired in: it copies the full-frame `power_db` into the validator-style source-coordinate chunk planner, runs per-chunk Torch runtime calls on aligned source chunks, reconstructs source-grid coherence and residual-veto masks chunk by chunk, and regroups the projected chunk outputs back into one merged global mask.
+- The live reference path now saves and reports the DINO mask in source spectrogram coordinates instead of treating the old reduced detector grid as the primary output contract.
+- The old live whole-frame coherence-resize plus one-pass hybrid tail has been removed from the active reference backend path. The current live `reference` backend is now structurally much closer to the offline validator than the earlier single-frame operator path.
+- The preferred iteration loop for this phase is code edit -> `rebuild_demo_container_app.sh` -> rerun via the demo container run script with the single-channel performance config -> inspect live behavior and timing before expanding scope.
+
 ## Progress Update 2026-04-20T14:42:37-05:00
 
 - Exact pre-model grayscale parity is now in place in the validator notebook path. The C++ runtime dump and the Python reference pre-model input now agree when compared against the Python-defined crop and patch truncation semantics.

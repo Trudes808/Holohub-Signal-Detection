@@ -288,7 +288,7 @@ endforeach()
     config_torchscript_validation_capture_single_channel.yaml
     old_configs/config_offline_replay.yaml
     old_configs/config_cuda_fallback.yaml
-    config_torchscript_debug_timing_fast_gpu.yaml
+    config_torchscript_debug_timing_reference.yaml
     config_torchscript_performance.yaml
     config_torchscript_validation_spectrogram_only.yaml
     old_configs/config_torchscript_performance_timing_debug.yaml
