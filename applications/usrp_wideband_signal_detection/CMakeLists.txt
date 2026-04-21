@@ -56,6 +56,21 @@ if(NOT Torch_FOUND)
   find_package(Torch QUIET)
 endif()
 
+find_path(NVML_INCLUDE_DIR nvml.h
+  PATHS
+    /usr/include
+    /usr/local/cuda/include
+    /usr/include/nvidia/gdk
+)
+
+find_library(NVML_LIBRARY
+  NAMES nvidia-ml libnvidia-ml.so.1
+  PATHS
+    /usr/lib/x86_64-linux-gnu
+    /lib/x86_64-linux-gnu
+    /usr/local/cuda/lib64
+)
+
 find_library(APP_VULKAN_LINK_ITEM
   NAMES vulkan libvulkan.so.1
   PATHS
@@ -153,6 +168,14 @@ target_link_libraries(usrp_wideband_signal_detection
   CHDR_converter_wideband
 )
 
+if(NVML_INCLUDE_DIR AND NVML_LIBRARY)
+  target_include_directories(usrp_wideband_signal_detection PRIVATE ${NVML_INCLUDE_DIR})
+  target_link_libraries(usrp_wideband_signal_detection PRIVATE ${NVML_LIBRARY})
+  target_compile_definitions(usrp_wideband_signal_detection PRIVATE USRP_WIDEBAND_HAS_NVML=1)
+else()
+  message(WARNING "usrp_wideband_signal_detection: NVML not found; GPU utilization summaries will be disabled")
+endif()
+
 add_executable(offline_spectrogram_visualizer
   offline_spectrogram_replay.cpp
   spectrogram_visualization.cu
@@ -166,6 +189,10 @@ add_executable(offline_coherent_power_validator
 add_executable(offline_dino_validator
   offline_dino_validator.cpp
 )
+
+  add_executable(offline_dino_validator_performance
+    offline_dino_validator_performance.cpp
+  )
 
 target_link_libraries(offline_spectrogram_visualizer
   PRIVATE
@@ -186,11 +213,22 @@ target_link_libraries(offline_dino_validator
   holoscan::ops::dinov3_signal_detector
 )
 
+target_link_libraries(offline_dino_validator_performance
+  PRIVATE
+  CUDA::cudart
+  holoscan::ops::dinov3_signal_detector
+)
+
 if(NOT Torch_FOUND)
   message(FATAL_ERROR "offline_dino_validator requires LibTorch, but find_package(Torch) failed. Ensure Python torch is installed in the build environment.")
 endif()
 
 target_link_libraries(offline_dino_validator
+  PRIVATE
+  ${TORCH_LIBRARIES}
+)
+
+target_link_libraries(offline_dino_validator_performance
   PRIVATE
   ${TORCH_LIBRARIES}
 )
@@ -210,14 +248,17 @@ endforeach()
 if(APP_NVJITLINK_LINK_ITEM)
   target_link_libraries(usrp_wideband_signal_detection PRIVATE ${APP_NVJITLINK_LINK_ITEM})
   target_link_libraries(offline_dino_validator PRIVATE ${APP_NVJITLINK_LINK_ITEM})
+  target_link_libraries(offline_dino_validator_performance PRIVATE ${APP_NVJITLINK_LINK_ITEM})
 endif()
 
 target_link_directories(usrp_wideband_signal_detection PRIVATE ${CUDA_LINK_DIRS})
 target_link_directories(offline_dino_validator PRIVATE ${CUDA_LINK_DIRS})
+target_link_directories(offline_dino_validator_performance PRIVATE ${CUDA_LINK_DIRS})
 foreach(CUDA_LINK_DIR IN LISTS CUDA_LINK_DIRS)
   if(EXISTS "${CUDA_LINK_DIR}")
     target_link_options(usrp_wideband_signal_detection PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
     target_link_options(offline_dino_validator PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
+    target_link_options(offline_dino_validator_performance PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
   endif()
 endforeach()
 
@@ -243,12 +284,20 @@ target_include_directories(offline_dino_validator
   ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/dinov3_signal_detector
 )
 
+target_include_directories(offline_dino_validator_performance
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/dinov3_signal_detector
+)
+
 if(TORCH_INCLUDE_DIRS)
   target_include_directories(offline_dino_validator PRIVATE ${TORCH_INCLUDE_DIRS})
+  target_include_directories(offline_dino_validator_performance PRIVATE ${TORCH_INCLUDE_DIRS})
 endif()
 
 if(TORCH_INCLUDE_HINTS)
   target_include_directories(offline_dino_validator PRIVATE ${TORCH_INCLUDE_HINTS})
+  target_include_directories(offline_dino_validator_performance PRIVATE ${TORCH_INCLUDE_HINTS})
 endif()
 
 target_compile_definitions(usrp_wideband_signal_detection
@@ -263,9 +312,11 @@ target_compile_definitions(offline_spectrogram_visualizer
 
 target_compile_features(offline_coherent_power_validator PRIVATE cxx_std_17)
 target_compile_features(offline_dino_validator PRIVATE cxx_std_17)
+target_compile_features(offline_dino_validator_performance PRIVATE cxx_std_17)
 
 if(TORCH_CXX_FLAGS)
   target_compile_options(offline_dino_validator PRIVATE ${TORCH_CXX_FLAGS})
+  target_compile_options(offline_dino_validator_performance PRIVATE ${TORCH_CXX_FLAGS})
 endif()
 
 if(NOT DEFINED ANO_MGR)
@@ -323,3 +374,4 @@ endforeach()
   add_dependencies(usrp_wideband_signal_detection usrp_wideband_configs)
   add_dependencies(offline_coherent_power_validator usrp_wideband_configs)
   add_dependencies(offline_dino_validator usrp_wideband_configs)
+  add_dependencies(offline_dino_validator_performance usrp_wideband_configs)

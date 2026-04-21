@@ -772,6 +772,76 @@ std::vector<float> normalize01_quantile(const std::vector<float>& input,
   return output;
 }
 
+std::vector<float> embed_aligned_map_in_source_canvas(const std::vector<float>& aligned_map,
+                                                      int aligned_rows,
+                                                      int aligned_cols,
+                                                      int source_rows,
+                                                      int source_cols,
+                                                      int row_offset,
+                                                      int col_offset) {
+  std::vector<float> canvas(static_cast<size_t>(std::max(source_rows, 0)) * static_cast<size_t>(std::max(source_cols, 0)), 0.0f);
+  if (source_rows <= 0 || source_cols <= 0 || aligned_rows <= 0 || aligned_cols <= 0 ||
+      aligned_map.size() != static_cast<size_t>(aligned_rows) * static_cast<size_t>(aligned_cols)) {
+    return canvas;
+  }
+
+  const int clamped_row_offset = clamp_value(row_offset, 0, std::max(0, source_rows - 1));
+  const int clamped_col_offset = clamp_value(col_offset, 0, std::max(0, source_cols - 1));
+  const int copy_rows = std::min(aligned_rows, std::max(0, source_rows - clamped_row_offset));
+  const int copy_cols = std::min(aligned_cols, std::max(0, source_cols - clamped_col_offset));
+  for (int row = 0; row < copy_rows; ++row) {
+    const int dst_row = clamped_row_offset + row;
+    for (int col = 0; col < copy_cols; ++col) {
+      const int dst_col = clamped_col_offset + col;
+      canvas[flat_index(source_cols, dst_row, dst_col)] = aligned_map[flat_index(aligned_cols, row, col)];
+    }
+  }
+  return canvas;
+}
+
+std::vector<float> project_aligned_map_to_output(const std::vector<float>& aligned_map,
+                                                 int aligned_rows,
+                                                 int aligned_cols,
+                                                 int source_rows,
+                                                 int source_cols,
+                                                 int row_offset,
+                                                 int col_offset,
+                                                 int output_rows,
+                                                 int output_cols) {
+  const auto source_canvas = embed_aligned_map_in_source_canvas(aligned_map,
+                                                                aligned_rows,
+                                                                aligned_cols,
+                                                                source_rows,
+                                                                source_cols,
+                                                                row_offset,
+                                                                col_offset);
+  return resize_bilinear(source_canvas, source_rows, source_cols, output_rows, output_cols);
+}
+
+std::vector<uint8_t> resize_mask_nearest(const std::vector<uint8_t>& input,
+                                         int input_rows,
+                                         int input_cols,
+                                         int output_rows,
+                                         int output_cols) {
+  std::vector<uint8_t> output(static_cast<size_t>(std::max(output_rows, 0)) * static_cast<size_t>(std::max(output_cols, 0)), 0);
+  if (input_rows <= 0 || input_cols <= 0 || output_rows <= 0 || output_cols <= 0 ||
+      input.size() != static_cast<size_t>(input_rows) * static_cast<size_t>(input_cols)) {
+    return output;
+  }
+  for (int out_row = 0; out_row < output_rows; ++out_row) {
+    const int src_row = std::min(input_rows - 1,
+                                 static_cast<int>((static_cast<int64_t>(out_row) * static_cast<int64_t>(input_rows)) /
+                                                  static_cast<int64_t>(std::max(output_rows, 1))));
+    for (int out_col = 0; out_col < output_cols; ++out_col) {
+      const int src_col = std::min(input_cols - 1,
+                                   static_cast<int>((static_cast<int64_t>(out_col) * static_cast<int64_t>(input_cols)) /
+                                                    static_cast<int64_t>(std::max(output_cols, 1))));
+      output[flat_index(output_cols, out_row, out_col)] = input[flat_index(input_cols, src_row, src_col)];
+    }
+  }
+  return output;
+}
+
 ComponentLabelling label_components(const std::vector<uint8_t>& mask, int rows, int cols) {
   ComponentLabelling result;
   result.labels.assign(mask.size(), 0);
@@ -1522,28 +1592,48 @@ GroupingResult group_mask_regions(const std::vector<uint8_t>& mask,
 
 void accumulate_chunk_grouped_result(const std::vector<uint8_t>& chunk_grouped_mask,
                                      const std::vector<float>& chunk_combined_score,
-                                     int chunk_rows,
-                                     int chunk_cols,
+                                     int chunk_output_rows,
+                                     int chunk_output_cols,
+                                     int chunk_source_rows,
+                                     int chunk_source_cols,
                                      int global_row_start,
                                      std::vector<uint8_t>& projected_mask,
                                      std::vector<float>& projected_score_sum,
                                      std::vector<float>& projected_score_weight,
                                      int global_rows,
                                      int global_cols) {
-  for (int row = 0; row < chunk_rows; ++row) {
-    const int global_row = global_row_start + row;
-    if (global_row < 0 || global_row >= global_rows) {
+  for (int row = 0; row < chunk_output_rows; ++row) {
+    const int global_row_span_start = global_row_start + static_cast<int>((static_cast<int64_t>(row) * static_cast<int64_t>(chunk_source_rows)) /
+                                                                          static_cast<int64_t>(std::max(chunk_output_rows, 1)));
+    const int global_row_span_stop = global_row_start + static_cast<int>((static_cast<int64_t>(row + 1) * static_cast<int64_t>(chunk_source_rows)) /
+                                                                         static_cast<int64_t>(std::max(chunk_output_rows, 1)));
+    const int clamped_row_start = clamp_value(global_row_span_start, 0, global_rows);
+    const int clamped_row_stop = clamp_value(std::max(global_row_span_stop, global_row_span_start + 1), 0, global_rows);
+    if (clamped_row_start >= clamped_row_stop) {
       continue;
     }
-    for (int col = 0; col < chunk_cols && col < global_cols; ++col) {
-      const size_t chunk_flat = flat_index(chunk_cols, row, col);
-      if (chunk_grouped_mask[chunk_flat] == 0) {
+    for (int col = 0; col < chunk_output_cols; ++col) {
+      const size_t chunk_flat = flat_index(chunk_output_cols, row, col);
+      if (chunk_flat >= chunk_grouped_mask.size() || chunk_flat >= chunk_combined_score.size() || chunk_grouped_mask[chunk_flat] == 0) {
         continue;
       }
-      const size_t global_flat = flat_index(global_cols, global_row, col);
-      projected_mask[global_flat] = 1;
-      projected_score_sum[global_flat] += chunk_combined_score[chunk_flat];
-      projected_score_weight[global_flat] += 1.0f;
+      const int global_col_span_start = static_cast<int>((static_cast<int64_t>(col) * static_cast<int64_t>(chunk_source_cols)) /
+                                                         static_cast<int64_t>(std::max(chunk_output_cols, 1)));
+      const int global_col_span_stop = static_cast<int>((static_cast<int64_t>(col + 1) * static_cast<int64_t>(chunk_source_cols)) /
+                                                        static_cast<int64_t>(std::max(chunk_output_cols, 1)));
+      const int clamped_col_start = clamp_value(global_col_span_start, 0, global_cols);
+      const int clamped_col_stop = clamp_value(std::max(global_col_span_stop, global_col_span_start + 1), 0, global_cols);
+      if (clamped_col_start >= clamped_col_stop) {
+        continue;
+      }
+      for (int global_row = clamped_row_start; global_row < clamped_row_stop; ++global_row) {
+        for (int global_col = clamped_col_start; global_col < clamped_col_stop; ++global_col) {
+          const size_t global_flat = flat_index(global_cols, global_row, global_col);
+          projected_mask[global_flat] = 1;
+          projected_score_sum[global_flat] += chunk_combined_score[chunk_flat];
+          projected_score_weight[global_flat] += 1.0f;
+        }
+      }
     }
   }
 }
@@ -1776,6 +1866,18 @@ constexpr std::array<const char*, 7> kRuntimeStageNames = {
   "dino_score",
   "fusion",
 };
+
+constexpr std::array<const char*, holoscan::ops::DinoV3SignalDetector::kReferenceStageCount>
+    kReferenceStageNames = {
+        "host_copy",
+        "host_frontend",
+        "chunk_plan",
+        "chunk_upload",
+        "score_project",
+        "coherence_hybrid",
+        "chunk_group",
+        "global_merge",
+    };
 
 uint64_t steady_time_ns() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2012,12 +2114,19 @@ void DinoV3SignalDetector::stop() {
             << " mean_runtime_call_ms=" << (stats.samples == 0 ? 0.0 : stats.total_runtime_call_ms / static_cast<double>(stats.samples))
             << " max_runtime_call_ms=" << stats.max_runtime_call_ms
             << " mean_hybrid_call_ms=" << (stats.samples == 0 ? 0.0 : stats.total_hybrid_call_ms / static_cast<double>(stats.samples))
-            << " max_hybrid_call_ms=" << stats.max_hybrid_call_ms;
+          << " max_hybrid_call_ms=" << stats.max_hybrid_call_ms
+          << " mean_chunk_count=" << (stats.samples == 0 ? 0.0 : static_cast<double>(stats.total_chunk_count) / static_cast<double>(stats.samples))
+          << " max_chunk_count=" << stats.max_chunk_count;
     for (size_t stage_index = 0; stage_index < kRuntimeStageNames.size(); ++stage_index) {
       const double mean_stage_ms = stats.samples == 0 ? 0.0 : stats.total_runtime_stage_ms[stage_index] / static_cast<double>(stats.samples);
       summary << " " << kRuntimeStageNames[stage_index] << "(mean=" << mean_stage_ms
               << ",max=" << stats.max_runtime_stage_ms[stage_index] << ")";
     }
+        for (size_t stage_index = 0; stage_index < kReferenceStageNames.size(); ++stage_index) {
+          const double mean_stage_ms = stats.samples == 0 ? 0.0 : stats.total_reference_stage_ms[stage_index] / static_cast<double>(stats.samples);
+          summary << " " << kReferenceStageNames[stage_index] << "(mean=" << mean_stage_ms
+            << ",max=" << stats.max_reference_stage_ms[stage_index] << ")";
+        }
     HOLOSCAN_LOG_INFO(summary.str());
   }
   holoscan::Operator::stop();
@@ -2346,6 +2455,7 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
     HybridPostprocessResult hybrid_result;
     bool torchscript_forward_ready = false;
     holoscan::ops::DinoTorchRuntimeTiming aggregated_runtime_timing;
+    std::array<double, DinoV3SignalDetector::kReferenceStageCount> reference_stage_ms {};
     int aligned_input_rows = 0;
     int aligned_input_cols = 0;
     double power_threshold = 0.0;
@@ -2366,41 +2476,56 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       }
 
       std::vector<float> power_db_host(frame_elements, 0.0f);
-      const auto copy_result = cudaMemcpy(power_db_host.data(),
-                                          buffers.power_db_device,
-                                          frame_elements * sizeof(float),
-                                          cudaMemcpyDeviceToHost);
-      if (copy_result != cudaSuccess) {
-        throw std::runtime_error(std::string("failed to copy power_db to host for chunked live reference path: ") +
-                                 cudaGetErrorString(copy_result));
+      {
+        const auto stage_start = std::chrono::steady_clock::now();
+        const auto copy_result = cudaMemcpy(power_db_host.data(),
+                                            buffers.power_db_device,
+                                            frame_elements * sizeof(float),
+                                            cudaMemcpyDeviceToHost);
+        if (copy_result != cudaSuccess) {
+          throw std::runtime_error(std::string("failed to copy power_db to host for chunked live reference path: ") +
+                                   cudaGetErrorString(copy_result));
+        }
+        reference_stage_ms[0] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
       }
 
       float frontend_reference_level = 0.0f;
-      const auto corrected_db_host = frontend_correction_enable_.get()
-                                         ? frontend_corrected_db(power_db_host,
-                                                                 src_rows,
-                                                                 src_cols,
-                                                                 frontend_correction_smooth_sigma_.get(),
-                                                                 frontend_correction_reference_q_.get(),
-                                                                 frontend_correction_max_boost_db_.get(),
-                                                                 frontend_reference_level)
-                                         : power_db_host;
+      std::vector<float> corrected_db_host;
+      {
+        const auto stage_start = std::chrono::steady_clock::now();
+        corrected_db_host = frontend_correction_enable_.get()
+                                ? frontend_corrected_db(power_db_host,
+                                                        src_rows,
+                                                        src_cols,
+                                                        frontend_correction_smooth_sigma_.get(),
+                                                        frontend_correction_reference_q_.get(),
+                                                        frontend_correction_max_boost_db_.get(),
+                                                        frontend_reference_level)
+                                : power_db_host;
+        reference_stage_ms[1] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
+      }
       (void)frontend_reference_level;
 
       const double chunk_bin_hz = (std::isfinite(resolution_hz) && resolution_hz > 0.0) ? resolution_hz : 1.0;
-      auto source_valid_rows = compute_ignore_sideband_rows(src_rows,
-                                                            chunk_bin_hz,
-                                                            ignore_sideband_hz_.get(),
-                                                            16,
-                                                            &ignore_bins_per_side);
-      const auto source_freq_axis_hz = build_frequency_axis_hz(src_rows, resolution_hz);
-      const auto chunk_plan = build_frequency_chunks(source_freq_axis_hz,
-                                                     chunk_bandwidth_hz_.get(),
-                                                     chunk_overlap_hz_.get(),
-                                                     16,
-                                                     source_valid_rows,
-                                                     uncalibrated_chunk_fraction_.get(),
-                                                     uncalibrated_overlap_fraction_.get());
+      std::vector<uint8_t> source_valid_rows;
+      std::vector<ChunkPlanEntry> chunk_plan;
+      {
+        const auto stage_start = std::chrono::steady_clock::now();
+        source_valid_rows = compute_ignore_sideband_rows(src_rows,
+                                                         chunk_bin_hz,
+                                                         ignore_sideband_hz_.get(),
+                                                         16,
+                                                         &ignore_bins_per_side);
+        const auto source_freq_axis_hz = build_frequency_axis_hz(src_rows, resolution_hz);
+        chunk_plan = build_frequency_chunks(source_freq_axis_hz,
+                                            chunk_bandwidth_hz_.get(),
+                                            chunk_overlap_hz_.get(),
+                                            16,
+                                            source_valid_rows,
+                                            uncalibrated_chunk_fraction_.get(),
+                                            uncalibrated_overlap_fraction_.get());
+        reference_stage_ms[2] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
+      }
       if (chunk_plan.empty()) {
         throw std::runtime_error("validated live reference path produced an empty chunk plan");
       }
@@ -2417,8 +2542,10 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       runtime_config.torch_dtype = torch_dtype_.get();
       runtime_config.imagenet_mean = imagenet_mean_.get();
       runtime_config.imagenet_std = imagenet_std_.get();
-      runtime_config.return_final_mask = false;
+      runtime_config.return_final_mask = true;
       runtime_config.return_final_mask_device = false;
+      runtime_config.return_pre_model_gray = false;
+      runtime_config.return_patch_features = false;
       runtime_config.compute_dino_threshold = true;
       runtime_config.compute_power_score = false;
       runtime_config.ignore_sideband_hz = 0.0;
@@ -2469,21 +2596,25 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         float* power_chunk_device = nullptr;
         float* corrected_chunk_device = nullptr;
         const size_t chunk_bytes = static_cast<size_t>(chunk_rows) * static_cast<size_t>(src_cols) * sizeof(float);
-        if (cudaMalloc(reinterpret_cast<void**>(&power_chunk_device), chunk_bytes) != cudaSuccess ||
-            cudaMalloc(reinterpret_cast<void**>(&corrected_chunk_device), chunk_bytes) != cudaSuccess) {
-          if (power_chunk_device != nullptr) {
+        {
+          const auto stage_start = std::chrono::steady_clock::now();
+          if (cudaMalloc(reinterpret_cast<void**>(&power_chunk_device), chunk_bytes) != cudaSuccess ||
+              cudaMalloc(reinterpret_cast<void**>(&corrected_chunk_device), chunk_bytes) != cudaSuccess) {
+            if (power_chunk_device != nullptr) {
+              cudaFree(power_chunk_device);
+            }
+            if (corrected_chunk_device != nullptr) {
+              cudaFree(corrected_chunk_device);
+            }
+            throw std::runtime_error("failed to allocate chunk GPU buffers for live DINO reference path");
+          }
+          if (cudaMemcpy(power_chunk_device, power_chunk.data(), chunk_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+              cudaMemcpy(corrected_chunk_device, corrected_chunk.data(), chunk_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
             cudaFree(power_chunk_device);
-          }
-          if (corrected_chunk_device != nullptr) {
             cudaFree(corrected_chunk_device);
+            throw std::runtime_error("failed to upload chunk tensors for live DINO reference path");
           }
-          throw std::runtime_error("failed to allocate chunk GPU buffers for live DINO reference path");
-        }
-        if (cudaMemcpy(power_chunk_device, power_chunk.data(), chunk_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
-            cudaMemcpy(corrected_chunk_device, corrected_chunk.data(), chunk_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-          cudaFree(power_chunk_device);
-          cudaFree(corrected_chunk_device);
-          throw std::runtime_error("failed to upload chunk tensors for live DINO reference path");
+          reference_stage_ms[3] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
         }
 
         DinoTorchRuntimeInput runtime_input;
@@ -2528,46 +2659,74 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         aggregated_runtime_timing.dino_score_ms += runtime_result.timing.dino_score_ms;
         aggregated_runtime_timing.fusion_ms += runtime_result.timing.fusion_ms;
 
-        const auto raw_aligned_score = resize_bilinear(runtime_result.score_map,
-                                                       runtime_rows,
-                                                       runtime_cols,
-                                                       runtime_result.aligned_rows,
-                                                       runtime_result.aligned_cols);
-        const auto grouped_dino_score = resize_bilinear(raw_aligned_score,
-                                                        runtime_result.aligned_rows,
-                                                        runtime_result.aligned_cols,
-                                                        chunk_rows,
-                                                        src_cols);
-        const auto dino_score_norm = normalize01_quantile(grouped_dino_score, 5.0, 95.0);
+        std::vector<float> dino_score_norm;
+        {
+          const auto stage_start = std::chrono::steady_clock::now();
+          const auto raw_aligned_score = resize_bilinear(runtime_result.score_map,
+                                                         runtime_rows,
+                                                         runtime_cols,
+                                                         runtime_result.aligned_rows,
+                                                         runtime_result.aligned_cols);
+          const auto grouped_dino_score = project_aligned_map_to_output(raw_aligned_score,
+                                                                        runtime_result.aligned_rows,
+                                                                        runtime_result.aligned_cols,
+                                                                        chunk_rows,
+                                                                        src_cols,
+                                                                        0,
+                                                                        0,
+                                                                        chunk_rows,
+                                                                        src_cols);
+          dino_score_norm = normalize01_quantile(grouped_dino_score, 5.0, 95.0);
+          reference_stage_ms[4] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
+        }
         const auto chunk_valid_mask = expand_row_valid_mask(chunk_valid_rows, src_cols);
-        const auto coherence_gate = structure_tensor_gate(corrected_chunk, chunk_rows, src_cols, chunk_valid_mask);
-        const auto coherence_gate_norm = normalize01_quantile(coherence_gate, 5.0, 99.0);
-
-        std::vector<float> hybrid_contrib(dino_score_norm.size(), 0.0f);
-        for (size_t index = 0; index < hybrid_contrib.size(); ++index) {
-          hybrid_contrib[index] = dino_score_norm[index] * coherence_gate_norm[index];
+        HybridPostprocessResult chunk_hybrid;
+        {
+          const auto stage_start = std::chrono::steady_clock::now();
+          const auto coherence_gate = structure_tensor_gate(corrected_chunk, chunk_rows, src_cols, chunk_valid_mask);
+          const auto coherence_gate_norm = normalize01_quantile(coherence_gate, 5.0, 99.0);
+          chunk_hybrid = run_residual_veto_hybrid(dino_score_norm,
+                                                  coherence_gate_norm,
+                                                  chunk_valid_mask,
+                                                  chunk_rows,
+                                                  src_cols);
+          reference_stage_ms[5] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
         }
 
-        auto chunk_hybrid = run_residual_veto_hybrid(dino_score_norm,
-                                                     coherence_gate_norm,
-                                                     chunk_valid_mask,
-                                                     chunk_rows,
-                                                     src_cols);
-        auto chunk_grouping = group_mask_regions(chunk_hybrid.mask,
-                                                 chunk_hybrid.combined_score,
-                                                 chunk_valid_mask,
-                                                 chunk_rows,
-                                                 src_cols,
-                                                 filter_detection_mask_.get(),
-                                                 grouping_bridge_freq_px_.get(),
-                                                 grouping_bridge_time_px_.get(),
-                                                 grouping_min_component_size_.get(),
-                                                 grouping_min_freq_span_px_.get(),
-                                                 grouping_min_time_span_px_.get(),
-                                                 static_cast<float>(grouping_min_density_.get()),
-                                                 static_cast<float>(grouping_time_continuity_ratio_.get()));
-        accumulate_chunk_grouped_result(chunk_grouping.grouped_mask,
-                                        chunk_hybrid.combined_score,
+        GroupingResult chunk_grouping;
+        {
+          const auto stage_start = std::chrono::steady_clock::now();
+          chunk_grouping = group_mask_regions(chunk_hybrid.mask,
+                                              chunk_hybrid.combined_score,
+                                              chunk_valid_mask,
+                                              chunk_rows,
+                                              src_cols,
+                                              filter_detection_mask_.get(),
+                                              grouping_bridge_freq_px_.get(),
+                                              grouping_bridge_time_px_.get(),
+                                              grouping_min_component_size_.get(),
+                                              grouping_min_freq_span_px_.get(),
+                                              grouping_min_time_span_px_.get(),
+                                              static_cast<float>(grouping_min_density_.get()),
+                                              static_cast<float>(grouping_time_continuity_ratio_.get()));
+          reference_stage_ms[6] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
+        }
+        const int chunk_output_rows = std::max(1, input_height_.get());
+        const int chunk_output_cols = std::max(1, input_width_.get());
+        const auto chunk_grouped_mask_output = resize_mask_nearest(chunk_grouping.grouped_mask,
+                                                                   chunk_rows,
+                                                                   src_cols,
+                                                                   chunk_output_rows,
+                                                                   chunk_output_cols);
+        const auto chunk_combined_score_output = resize_bilinear(chunk_hybrid.combined_score,
+                                                                 chunk_rows,
+                                                                 src_cols,
+                                                                 chunk_output_rows,
+                                                                 chunk_output_cols);
+        accumulate_chunk_grouped_result(chunk_grouped_mask_output,
+                                        chunk_combined_score_output,
+                                        chunk_output_rows,
+                                        chunk_output_cols,
                                         chunk_rows,
                                         src_cols,
                                         chunk.row_start,
@@ -2603,19 +2762,24 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
         }
       }
 
-      auto global_grouping = group_mask_regions(projected_grouped_mask,
-                                                projected_grouped_score,
-                                                source_valid_mask,
-                                                src_rows,
-                                                src_cols,
-                                                filter_detection_mask_.get(),
-                                                grouping_bridge_freq_px_.get(),
-                                                grouping_bridge_time_px_.get(),
-                                                grouping_min_component_size_.get(),
-                                                grouping_min_freq_span_px_.get(),
-                                                grouping_min_time_span_px_.get(),
-                                                static_cast<float>(grouping_min_density_.get()),
-                                                static_cast<float>(grouping_time_continuity_ratio_.get()));
+      GroupingResult global_grouping;
+      {
+        const auto stage_start = std::chrono::steady_clock::now();
+        global_grouping = group_mask_regions(projected_grouped_mask,
+                                             projected_grouped_score,
+                                             source_valid_mask,
+                                             src_rows,
+                                             src_cols,
+                                             filter_detection_mask_.get(),
+                                             grouping_bridge_freq_px_.get(),
+                                             grouping_bridge_time_px_.get(),
+                                             grouping_min_component_size_.get(),
+                                             grouping_min_freq_span_px_.get(),
+                                             grouping_min_time_span_px_.get(),
+                                             static_cast<float>(grouping_min_density_.get()),
+                                             static_cast<float>(grouping_time_continuity_ratio_.get()));
+        reference_stage_ms[7] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
+      }
 
       hybrid_result.mask = std::move(global_grouping.grouped_mask);
       hybrid_result.final_fraction = mean_mask_value(hybrid_result.mask);
@@ -2689,6 +2853,12 @@ void DinoV3SignalDetector::compute(holoscan::InputContext& op_input,
       service.max_runtime_stage_ms[4] = std::max(service.max_runtime_stage_ms[4], aggregated_runtime_timing.torch_forward_ms);
       service.max_runtime_stage_ms[5] = std::max(service.max_runtime_stage_ms[5], aggregated_runtime_timing.dino_score_ms);
       service.max_runtime_stage_ms[6] = std::max(service.max_runtime_stage_ms[6], aggregated_runtime_timing.fusion_ms);
+      for (size_t stage_index = 0; stage_index < kReferenceStageNames.size(); ++stage_index) {
+        service.total_reference_stage_ms[stage_index] += reference_stage_ms[stage_index];
+        service.max_reference_stage_ms[stage_index] = std::max(service.max_reference_stage_ms[stage_index], reference_stage_ms[stage_index]);
+      }
+      service.total_chunk_count += static_cast<uint64_t>(std::max(0, chunk_count));
+      service.max_chunk_count = std::max<uint64_t>(service.max_chunk_count, static_cast<uint64_t>(std::max(0, chunk_count)));
     }
 
     meta->set("dino_frame_number", frame_number);

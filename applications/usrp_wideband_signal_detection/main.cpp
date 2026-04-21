@@ -3,11 +3,18 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../usrp_freq_detection/CHDR_converter/chdr_rx.h"
 #include "spectrogram_visualization.hpp"
+#include <algorithm>
+#include <limits>
+#include <optional>
 #include <coherent_power_signal_detector.hpp>
 #include <dinov3_signal_detector.hpp>
 #include <fft.hpp>
 #include <holoscan/operators/holoviz/holoviz.hpp>
 #include <spectrogram.hpp>
+
+#ifdef USRP_WIDEBAND_HAS_NVML
+#include <nvml.h>
+#endif
 
 namespace {
 
@@ -68,6 +75,38 @@ class LogOp: public holoscan::Operator {
     total_samples_.resize(num_channels_, 0);
     start_.resize(num_channels_, std::chrono::steady_clock::now());
     elapsed_.resize(num_channels_, std::chrono::steady_clock::duration::zero());
+    gpu_util_sum_.resize(num_channels_, 0.0);
+    gpu_util_samples_.resize(num_channels_, 0);
+    gpu_util_min_.resize(num_channels_, std::numeric_limits<unsigned int>::max());
+    gpu_util_max_.resize(num_channels_, 0);
+    gpu_sample_start_.resize(num_channels_, std::chrono::steady_clock::time_point {});
+    last_gpu_sample_.resize(num_channels_, std::chrono::steady_clock::time_point {});
+
+#ifdef USRP_WIDEBAND_HAS_NVML
+    const auto init_result = nvmlInit_v2();
+    if (init_result == NVML_SUCCESS) {
+      nvml_device_count_ = 0;
+      if (nvmlDeviceGetCount_v2(&nvml_device_count_) == NVML_SUCCESS && nvml_device_count_ > 0) {
+        nvmlDevice_t handle = nullptr;
+        if (nvmlDeviceGetHandleByIndex_v2(0, &handle) == NVML_SUCCESS) {
+          nvml_device_ = handle;
+        }
+      }
+      if (!nvml_device_.has_value()) {
+        nvmlShutdown();
+      }
+    }
+#endif
+  }
+
+  void stop() override {
+#ifdef USRP_WIDEBAND_HAS_NVML
+    if (nvml_device_.has_value()) {
+      nvmlShutdown();
+      nvml_device_.reset();
+    }
+#endif
+    holoscan::Operator::stop();
   }
 
   void compute(holoscan::InputContext& op_input,
@@ -89,26 +128,88 @@ class LogOp: public holoscan::Operator {
     total_samples_[channel_num] += num_samples;
     elapsed_[channel_num] += interval;
 
+    maybe_sample_gpu_util(channel_num, now);
+
     auto seconds = std::chrono::duration<double>(elapsed_[channel_num]).count();
     if (total_samples_[channel_num] > 0 && seconds >= log_interval_) {
       const double samples_per_second = static_cast<double>(total_samples_[channel_num]) / seconds;
       const double bits_per_second = static_cast<double>(total_samples_[channel_num]) * sizeof(int16_t) * 2 * 8 / seconds;
-      HOLOSCAN_LOG_INFO("Processed {} samples from channel {} at {:.2f} MSps ({:.2f} Gbps)",
-                        total_samples_[channel_num],
-                        channel_num,
-                        samples_per_second / 1e6,
-                        bits_per_second / 1e9);
+      if (gpu_util_samples_[channel_num] > 0) {
+        const double mean_gpu_util = gpu_util_sum_[channel_num] / static_cast<double>(gpu_util_samples_[channel_num]);
+        const unsigned int min_gpu_util = gpu_util_min_[channel_num] == std::numeric_limits<unsigned int>::max() ? 0U : gpu_util_min_[channel_num];
+        HOLOSCAN_LOG_INFO("Processed {} samples from channel {} at {:.2f} MSps ({:.2f} Gbps) gpu_util_pct(mean={:.2f},min={},max={})",
+                          total_samples_[channel_num],
+                          channel_num,
+                          samples_per_second / 1e6,
+                          bits_per_second / 1e9,
+                          mean_gpu_util,
+                          min_gpu_util,
+                          gpu_util_max_[channel_num]);
+      } else {
+        HOLOSCAN_LOG_INFO("Processed {} samples from channel {} at {:.2f} MSps ({:.2f} Gbps)",
+                          total_samples_[channel_num],
+                          channel_num,
+                          samples_per_second / 1e6,
+                          bits_per_second / 1e9);
+      }
       total_samples_[channel_num] = 0;
       elapsed_[channel_num] = std::chrono::steady_clock::duration::zero();
+      gpu_util_sum_[channel_num] = 0.0;
+      gpu_util_samples_[channel_num] = 0;
+      gpu_util_min_[channel_num] = std::numeric_limits<unsigned int>::max();
+      gpu_util_max_[channel_num] = 0;
+      gpu_sample_start_[channel_num] = std::chrono::steady_clock::time_point {};
     }
   }
 
  private:
+  void maybe_sample_gpu_util(uint16_t channel_num, const std::chrono::steady_clock::time_point& now) {
+    if (channel_num >= gpu_util_sum_.size()) {
+      return;
+    }
+#ifdef USRP_WIDEBAND_HAS_NVML
+    if (!nvml_device_.has_value()) {
+      return;
+    }
+    constexpr auto kGpuSamplePeriod = std::chrono::milliseconds(250);
+    if (last_gpu_sample_[channel_num] != std::chrono::steady_clock::time_point {} &&
+        now - last_gpu_sample_[channel_num] < kGpuSamplePeriod) {
+      return;
+    }
+    nvmlUtilization_t utilization {};
+    if (nvmlDeviceGetUtilizationRates(*nvml_device_, &utilization) != NVML_SUCCESS) {
+      return;
+    }
+    last_gpu_sample_[channel_num] = now;
+    if (gpu_sample_start_[channel_num] == std::chrono::steady_clock::time_point {}) {
+      gpu_sample_start_[channel_num] = now;
+    }
+    gpu_util_sum_[channel_num] += static_cast<double>(utilization.gpu);
+    gpu_util_samples_[channel_num] += 1;
+    gpu_util_min_[channel_num] = std::min(gpu_util_min_[channel_num], utilization.gpu);
+    gpu_util_max_[channel_num] = std::max(gpu_util_max_[channel_num], utilization.gpu);
+#else
+    static_cast<void>(channel_num);
+    static_cast<void>(now);
+#endif
+  }
+
   holoscan::Parameter<int> num_channels_;
   holoscan::Parameter<int> log_interval_;
   std::vector<int64_t> total_samples_;
   std::vector<std::chrono::steady_clock::time_point> start_;
   std::vector<std::chrono::steady_clock::duration> elapsed_;
+  std::vector<double> gpu_util_sum_;
+  std::vector<uint64_t> gpu_util_samples_;
+  std::vector<unsigned int> gpu_util_min_;
+  std::vector<unsigned int> gpu_util_max_;
+  std::vector<std::chrono::steady_clock::time_point> gpu_sample_start_;
+  std::vector<std::chrono::steady_clock::time_point> last_gpu_sample_;
+
+#ifdef USRP_WIDEBAND_HAS_NVML
+  std::optional<nvmlDevice_t> nvml_device_;
+  unsigned int nvml_device_count_ = 0;
+#endif
 };
 
 class DropOp: public holoscan::Operator {
@@ -161,6 +262,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         enable_spectrogram && enable_detector && !log_from_spectrogram && !enable_visualization &&
         !spectrogram_save_enabled && !spectrogram_tensor_save_enabled;
     const bool enable_logger_branch = !bypass_spectrogram_passthrough;
+    const bool force_logger_from_spectrogram =
+      enable_spectrogram && enable_logger_branch && !enable_detector && !enable_visualization;
+    const bool effective_log_from_spectrogram = log_from_spectrogram || force_logger_from_spectrogram;
     const int configured_dino_emit_stride =
         (enable_detector && detector_type == "dinov3")
             ? std::max(1, from_config("dinov3_signal_detector.emit_stride").as<int>())
@@ -249,6 +353,10 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
             configured_dino_emit_stride);
       }
     }
+    if (force_logger_from_spectrogram && !log_from_spectrogram) {
+      HOLOSCAN_LOG_INFO(
+          "Routing logger from spectrogram output because the detector is disabled and spectrogramOp needs a downstream consumer.");
+    }
 
     std::shared_ptr<holoscan::Operator> spectrogramVisualizerOp;
     std::shared_ptr<holoscan::Operator> holovizOp;
@@ -332,7 +440,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         }
       }
 
-      if (enable_logger_branch && log_from_spectrogram) {
+      if (enable_logger_branch && effective_log_from_spectrogram) {
         if (!enable_spectrogram) {
           HOLOSCAN_LOG_ERROR("pipeline.log_from_spectrogram=true requires pipeline.enable_spectrogram=true");
           exit(1);

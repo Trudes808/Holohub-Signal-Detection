@@ -12,9 +12,11 @@ APP_NAME=${APP_NAME:-usrp_wideband_signal_detection}
 VISUALIZER_NAME=${VISUALIZER_NAME:-offline_spectrogram_visualizer}
 COHERENT_VALIDATOR_NAME=${COHERENT_VALIDATOR_NAME:-offline_coherent_power_validator}
 DINO_VALIDATOR_NAME=${DINO_VALIDATOR_NAME:-offline_dino_validator}
+PERF_DINO_VALIDATOR_NAME=${PERF_DINO_VALIDATOR_NAME:-offline_dino_validator_performance}
 VISUALIZER_TARGET=${VISUALIZER_TARGET:-applications/${APP_NAME}/${VISUALIZER_NAME}}
 COHERENT_VALIDATOR_TARGET=${COHERENT_VALIDATOR_TARGET:-applications/${APP_NAME}/${COHERENT_VALIDATOR_NAME}}
 DINO_VALIDATOR_TARGET=${DINO_VALIDATOR_TARGET:-applications/${APP_NAME}/${DINO_VALIDATOR_NAME}}
+PERF_DINO_VALIDATOR_TARGET=${PERF_DINO_VALIDATOR_TARGET:-applications/${APP_NAME}/${PERF_DINO_VALIDATOR_NAME}}
 MATX_DIR=${MATX_DIR:-/usr/local/lib/cmake/matx}
 BUILD_APP_DIR=${BUILD_APP_DIR:-${WORKSPACE_DIR}/${BUILD_DIR}/applications/${APP_NAME}}
 SOURCE_APP_DIR=${SOURCE_APP_DIR:-${WORKSPACE_DIR}/applications/${APP_NAME}}
@@ -41,9 +43,9 @@ PY'
 
 build_targets() {
   if torch_available_in_container >/dev/null 2>&1; then
-    echo "${APP_NAME} ${VISUALIZER_TARGET} ${COHERENT_VALIDATOR_TARGET} ${DINO_VALIDATOR_TARGET} coherent_power_signal_detector dinov3_signal_detector dinov3_libtorch_sandbox"
+    echo "${APP_NAME} ${VISUALIZER_TARGET} ${COHERENT_VALIDATOR_TARGET} ${DINO_VALIDATOR_TARGET} ${PERF_DINO_VALIDATOR_TARGET} coherent_power_signal_detector dinov3_signal_detector dinov3_libtorch_sandbox"
   else
-    echo "${APP_NAME} ${VISUALIZER_TARGET} ${COHERENT_VALIDATOR_TARGET} ${DINO_VALIDATOR_TARGET} coherent_power_signal_detector"
+    echo "${APP_NAME} ${VISUALIZER_TARGET} ${COHERENT_VALIDATOR_TARGET} ${DINO_VALIDATOR_TARGET} ${PERF_DINO_VALIDATOR_TARGET} coherent_power_signal_detector"
   fi
 }
 

@@ -22,10 +22,11 @@ class DinoV3SignalDetector : public holoscan::Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(DinoV3SignalDetector)
 
-    static constexpr size_t kTimingStageCount = 8;
+  static constexpr size_t kTimingStageCount = 8;
+  static constexpr size_t kReferenceStageCount = 8;
 
   DinoV3SignalDetector() = default;
-    ~DinoV3SignalDetector() override;
+  ~DinoV3SignalDetector() override;
 
   void setup(holoscan::OperatorSpec& spec) override;
   void initialize() override;
@@ -83,6 +84,10 @@ class DinoV3SignalDetector : public holoscan::Operator {
     double max_hybrid_call_ms = 0.0;
     std::array<double, 7> total_runtime_stage_ms {};
     std::array<double, 7> max_runtime_stage_ms {};
+    std::array<double, kReferenceStageCount> total_reference_stage_ms {};
+    std::array<double, kReferenceStageCount> max_reference_stage_ms {};
+    uint64_t total_chunk_count = 0;
+    uint64_t max_chunk_count = 0;
   };
 
   holoscan::Parameter<int> num_channels_;

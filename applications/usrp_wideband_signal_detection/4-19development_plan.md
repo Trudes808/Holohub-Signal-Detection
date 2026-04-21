@@ -1,5 +1,21 @@
 # DINO Retry Chunk-Merge Port Plan
 
+## Progress Update 2026-04-21T07:41:24-05:00
+
+- Added first-pass stage profiling to `offline_dino_validator_performance.cpp` for both run-level stages and per-chunk stages.
+- The performance branch now records elapsed milliseconds, RSS snapshots, HWM snapshots, RSS or HWM deltas, and stage-local estimated component bytes for the major pipeline steps.
+- Profiling currently covers config load, tensor load, frontend correction, chunk planning, GPU uploads, Torch runtime calls, score remap, coherence generation, hybrid postprocess, per-chunk grouping, global merge, and artifact serialization.
+- The performance validator now writes a machine-readable stage profile artifact at `offline_stage_profile.json` and exposes that path in the main summary JSON.
+- Verbose runs now print an aggregated hotspot table so the next optimization pass can target the worst total-time stages instead of guessing.
+- The generated build tree has not yet been reconfigured, so the current `build.ninja` still does not list `offline_dino_validator_performance`; the next rebuild needs to force a CMake regenerate before the new target can be executed inside the container.
+
+## Progress Update 2026-04-21T07:26:15-05:00
+
+- Created an isolated performance branch for the offline validator so timing and memory instrumentation can move faster without destabilizing the current parity/debug path.
+- Added the new performance source file `offline_dino_validator_performance.cpp` and a matching launcher `run_offline_dino_validator_performance.sh` so the optimized path can be built and run as a separate binary.
+- The immediate branch objective is now three-stage: first instrument the major pipeline stages with timing and memory accounting, then optimize the proven hotspots while preserving debug artifact export, and only then expand execution from the current selected debug chunk to every planned subsection.
+- The performance branch must keep the existing artifact contract alive after every optimization pass so each faster implementation can still be checked against the notebook and the current reference validator before it becomes the new default.
+
 ## Progress Update 2026-04-20T20:08:53-05:00
 
 - Live-operator porting is now active. The immediate rollout target is the true DINO operator under the single-channel performance configuration before scaling back up to the 2-channel 500 MSps case.
@@ -111,6 +127,95 @@ Reference behavior requirements:
 4. Each chunk must emit enough metadata to be projected and merged in global coordinates.
 5. The final global mask must come from subsection merge behavior, not from naive OR over subsection masks.
 6. The validator must keep exporting intermediate artifacts so parity can be measured stage by stage.
+
+## Performance Validator Branch Plan
+
+Use `offline_dino_validator_performance.cpp` as the isolated branch for timing, memory, and optimization work. Keep `offline_dino_validator.cpp` as the reference harness until the performance branch produces equivalent artifacts and mask outputs on the frozen captures.
+
+Performance branch requirements:
+
+1. Every major pipeline step must log wall time, cumulative process memory, and the step-local memory estimate or allocation delta where that can be measured reliably.
+2. Instrumentation must write a machine-readable summary so timing and memory deltas can be compared after each code change.
+3. Debug artifact export must remain available after every optimization pass, even if some heavyweight exports become gated behind a debug flag.
+4. Hotspot reductions must be accepted only after checking both performance metrics and artifact parity against the current reference output.
+5. The branch should not enable all-subsection execution until the per-step metrics clearly identify the dominant costs and the optimized single-subsection path still preserves the required artifacts.
+
+Recommended execution order:
+
+### Phase P0: Freeze The Performance Branch Entry Point
+
+Tasks:
+
+1. Build and run the new `offline_dino_validator_performance` binary through `run_offline_dino_validator_performance.sh`.
+2. Confirm the copied branch reproduces the current single-debug-chunk behavior before any instrumentation changes.
+3. Keep the current reference validator runnable in parallel so timing changes can always be compared back to the known-good artifact set.
+
+Exit criteria:
+
+- the new performance binary runs end to end on the current subsection workflow
+- the copied launcher resolves the performance binary without replacing the existing validator flow
+
+### Phase P1: Add Stage Timing And Memory Instrumentation
+
+Instrument these stages first:
+
+1. tensor load and metadata parse
+2. frontend power and correction generation
+3. chunk planning
+4. chunk extraction and preprocessing
+5. Torch runtime invocation
+6. DINO score remap or resize
+7. coherence computation
+8. retry-hybrid support or residual-veto scoring
+9. grouping
+10. projection and merge
+11. artifact serialization
+
+Implementation notes:
+
+1. Use one shared stage-profiler helper so each stage records start time, stop time, elapsed milliseconds, RSS or HWM snapshot, cumulative peak memory, and optional component-estimated bytes.
+2. Emit both human-readable logs and JSON summary output in the artifact directory.
+3. Keep per-chunk and whole-run timing separate so subsection scaling can be estimated before the all-chunk loop is enabled.
+
+Exit criteria:
+
+- one run produces a stage-by-stage timing and memory report for the current debug chunk flow
+- the report is stable enough to rank hotspots instead of guessing
+
+### Phase P2: Optimize Hotspots Without Breaking Artifact Parity
+
+Optimization rules:
+
+1. Change one hotspot family at a time.
+2. After each hotspot change, rerun the performance validator with the same tensor and compare artifact outputs against the current reference branch.
+3. If a speedup requires dropping an artifact, gate that artifact behind a debug or verbose option instead of removing it outright.
+
+Expected hotspot areas to test first:
+
+1. repeated chunk buffer allocations
+2. unnecessary host-device or device-host copies
+3. full-resolution intermediate materialization when only reduced-grid data is needed
+4. dense grouped-score scratch buffers on non-debug chunks
+5. repeated resize or normalization passes that can be fused or reused
+
+Exit criteria:
+
+- the performance branch shows measured improvement on the dominant stages
+- the debug artifact set remains sufficient for notebook parity checks
+
+### Phase P3: Expand From Debug Chunk To All Subsections
+
+Tasks:
+
+1. Re-enable the full subsection loop in the performance branch only after the single-subsection metrics are understood.
+2. Keep per-chunk timing and memory entries so the slowest subsection can be identified quickly.
+3. Preserve the selected debug chunk artifact export while allowing non-debug chunks to use lighter-weight paths where parity does not require heavyweight dumps.
+4. Add whole-frame summary metrics for total runtime, peak RSS or HWM, total chunk count, and mean, median, and max chunk latency.
+
+Exit criteria:
+
+- the performance validator runs every planned subsection, not just the selected debug chunk
+- full-run timing and memory reports identify whether the remaining bottleneck is per-chunk runtime cost, merge cost, or artifact overhead
 
 ## Recommended Work Split
 
