@@ -3848,28 +3848,6 @@ int main(int argc, char** argv) {
     }
     const int ignore_bins_per_side = source_ignore_info.applied_bins;
 
-    std::vector<uint8_t> valid_mask;
-    {
-      const size_t estimated_bytes = static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width) * sizeof(uint8_t);
-      ScopedStageProfile stage(&profiler, "full_frame_valid_mask_resize", "run", -1, estimated_bytes, options.verbose);
-      valid_mask = resize_valid_row_mask(tensor.rows, config.input_height, config.input_width, ignore_bins_per_side);
-    }
-
-    float* power_db_device = nullptr;
-    float* corrected_db_device = nullptr;
-    const size_t source_bytes = power_db.size() * sizeof(float);
-    {
-      ScopedStageProfile stage(&profiler, "full_frame_gpu_upload", "run", -1, source_bytes * 2, options.verbose);
-      if (cudaMalloc(reinterpret_cast<void**>(&power_db_device), source_bytes) != cudaSuccess ||
-          cudaMalloc(reinterpret_cast<void**>(&corrected_db_device), source_bytes) != cudaSuccess) {
-        throw std::runtime_error("failed to allocate GPU buffers for offline DINO validator");
-      }
-      if (cudaMemcpy(power_db_device, power_db.data(), source_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
-          cudaMemcpy(corrected_db_device, corrected_db.data(), source_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-        throw std::runtime_error("failed to upload offline DINO validator tensors");
-      }
-    }
-
     holoscan::ops::DinoTorchRuntime runtime;
     holoscan::ops::DinoTorchRuntimeConfig runtime_config;
     runtime_config.inference_backend = config.inference_backend;
@@ -3881,7 +3859,7 @@ int main(int argc, char** argv) {
     runtime_config.return_final_mask = true;
     runtime_config.return_final_mask_device = false;
     runtime_config.return_pre_model_gray = false;
-    runtime_config.return_patch_features = !options.subsection_only_validation;
+    runtime_config.return_patch_features = false;
     runtime_config.compute_dino_threshold = true;
     runtime_config.compute_power_score = false;
     runtime_config.ignore_sideband_hz = config.ignore_sideband_hz;
@@ -3902,25 +3880,6 @@ int main(int argc, char** argv) {
     runtime_config.pipeline_gap_floor = config.pipeline_gap_floor;
     runtime_config.pipeline_power_rescue_floor = config.pipeline_power_rescue_floor;
     runtime_config.pipeline_power_rescue_gain = config.pipeline_power_rescue_gain;
-
-    holoscan::ops::DinoTorchRuntimeInput runtime_input;
-    runtime_input.src_rows = tensor.rows;
-    runtime_input.src_cols = tensor.cols;
-    runtime_input.dst_rows = config.input_height;
-    runtime_input.dst_cols = config.input_width;
-    runtime_input.patch_size = config.patch_size;
-    runtime_input.cuda_stream = nullptr;
-    runtime_input.resolution_hz = resolution_hz;
-    runtime_input.span_hz = config.span_hz;
-    runtime_input.power_db_device = power_db_device;
-    runtime_input.corrected_db_device = corrected_db_device;
-
-    holoscan::ops::DinoTorchRuntimeResult runtime_result;
-    {
-      ScopedStageProfile stage(&profiler, "full_frame_torch_runtime", "run", -1, source_bytes * 2, options.verbose);
-      runtime_result = runtime.run(runtime_config, runtime_input);
-    }
-
     const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_plan.size() - 1)));
     std::vector<ChunkRetryResult> chunk_results;
     chunk_results.reserve(chunk_plan.size());
@@ -3972,182 +3931,14 @@ int main(int argc, char** argv) {
           tensor.cols,
           source_ignore_info.valid_row_mask);
     }
-    cudaFree(power_db_device);
-    cudaFree(corrected_db_device);
-
-    if (!runtime_result.success) {
-      throw std::runtime_error("offline DINO runtime failed at " + runtime_result.error_stage + ": " + runtime_result.error_message + " (" + runtime_result.error_detail + ")");
-    }
-    if (runtime_result.score_map.size() != static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width)) {
-      throw std::runtime_error("unexpected DINO score map size returned from runtime");
-    }
-
-    const int runtime_row_offset = source_ignore_info.applied_bins;
-    const int runtime_col_offset = 0;
-    std::vector<float> raw_aligned_score;
-    std::vector<float> raw_dino_score_map;
-    std::vector<float> dino_score_map;
-    std::vector<float> grouped_score_patch;
-    int grouped_score_rows = runtime_result.aligned_rows;
-    int grouped_score_cols = runtime_result.aligned_cols;
-    bool grouped_score_is_patch_grid = false;
-    std::vector<float> dino_score_source;
-    {
-      const size_t estimated_bytes = static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width) * sizeof(float) * 3;
-      ScopedStageProfile stage(&profiler, "full_frame_score_projection", "run", -1, estimated_bytes, options.verbose);
-      raw_aligned_score = resize_bilinear(runtime_result.score_map,
-                                          config.input_height,
-                                          config.input_width,
-                                          runtime_result.aligned_rows,
-                                          runtime_result.aligned_cols);
-      if (!options.subsection_only_validation && !runtime_result.patch_features.empty() && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 && runtime_result.feature_dim > 0) {
-        const auto raw_patch_score = raw_feature_energy_score_patch(runtime_result.patch_features,
-                                                                    runtime_result.patch_rows,
-                                                                    runtime_result.patch_cols,
-                                                                    runtime_result.feature_dim);
-        raw_dino_score_map = project_patch_map_to_output(raw_patch_score,
-                                                         runtime_result.patch_rows,
-                                                         runtime_result.patch_cols,
-                                                         runtime_result.aligned_rows,
-                                                         runtime_result.aligned_cols,
-                                                         tensor.rows,
-                                                         tensor.cols,
-                                                         runtime_row_offset,
-                                                         runtime_col_offset,
-                                                         config.input_height,
-                                                         config.input_width);
-      } else {
-        raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
-                                                           runtime_result.aligned_rows,
-                                                           runtime_result.aligned_cols,
-                                                           tensor.rows,
-                                                           tensor.cols,
-                                                           runtime_row_offset,
-                                                           runtime_col_offset,
-                                                           config.input_height,
-                                                           config.input_width);
-      }
-      dino_score_map = normalize01_quantile(raw_dino_score_map, 5.0, 95.0);
-      grouped_score_patch = normalize01_quantile(raw_aligned_score, 5.0, 95.0);
-      if (!options.subsection_only_validation && !runtime_result.patch_features.empty() && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 && runtime_result.feature_dim > 0) {
-        const auto seed_patch = dino_seed_patch_map(corrected_db,
-                                                    tensor.rows,
-                                                    tensor.cols,
-                                                    runtime_result.aligned_rows,
-                                                    runtime_result.aligned_cols,
-                                                    runtime_result.patch_rows,
-                                                    runtime_result.patch_cols);
-        const auto grouped_patch = grouped_dino_from_patch_features(runtime_result.patch_features,
-                                                                    runtime_result.patch_rows,
-                                                                    runtime_result.patch_cols,
-                                                                    runtime_result.feature_dim,
-                                                                    seed_patch,
-                                                                    config,
-                                                                    options.verbose,
-                                                                    "offline_full_frame_grouped_patch");
-        if (!grouped_patch.score_patch.empty()) {
-          grouped_score_patch = grouped_patch.score_patch;
-          grouped_score_rows = runtime_result.patch_rows;
-          grouped_score_cols = runtime_result.patch_cols;
-          grouped_score_is_patch_grid = true;
-        }
-      } else if (options.subsection_only_validation && options.verbose) {
-        std::cerr << "[offline_dino_validator_performance] skipping offline_full_frame_grouped_patch in subsection-only validation mode\n";
-      }
-      dino_score_source = grouped_score_is_patch_grid
-                              ? project_patch_map_to_output(grouped_score_patch,
-                                                            grouped_score_rows,
-                                                            grouped_score_cols,
-                                                            runtime_result.aligned_rows,
-                                                            runtime_result.aligned_cols,
-                                                            tensor.rows,
-                                                            tensor.cols,
-                                                            runtime_row_offset,
-                                                            runtime_col_offset,
-                                                            tensor.rows,
-                                                            tensor.cols)
-                              : project_aligned_map_to_output(grouped_score_patch,
-                                                              grouped_score_rows,
-                                                              grouped_score_cols,
-                                                              tensor.rows,
-                                                              tensor.cols,
-                                                              runtime_row_offset,
-                                                              runtime_col_offset,
-                                                              tensor.rows,
-                                                              tensor.cols);
-      dino_score_map = resize_bilinear(dino_score_source,
-                                       tensor.rows,
-                                       tensor.cols,
-                                       config.input_height,
-                                       config.input_width);
-    }
     std::vector<float> corrected_resized;
-    std::vector<uint8_t> source_valid_mask;
-    std::vector<float> coherence_gate_source;
-    std::vector<float> coherence_gate_resized;
     {
-      const size_t estimated_bytes = static_cast<size_t>(tensor.rows) * static_cast<size_t>(tensor.cols) * (sizeof(uint8_t) + sizeof(float) * 2) +
-                                     static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width) * sizeof(float) * 2;
-      ScopedStageProfile stage(&profiler, "full_frame_coherence_and_resize", "run", -1, estimated_bytes, options.verbose);
+      const size_t estimated_bytes = static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width) * sizeof(float);
+      ScopedStageProfile stage(&profiler, "full_frame_corrected_resize", "run", -1, estimated_bytes, options.verbose);
       corrected_resized = resize_bilinear(corrected_db, tensor.rows, tensor.cols, config.input_height, config.input_width);
-      source_valid_mask = resize_row_valid_mask(source_ignore_info.valid_row_mask, tensor.rows, tensor.cols);
-      coherence_gate_source = structure_tensor_gate(corrected_db,
-                                                    tensor.rows,
-                                                    tensor.cols,
-                                                    source_valid_mask);
-      coherence_gate_resized = resize_bilinear(coherence_gate_source,
-                                               tensor.rows,
-                                               tensor.cols,
-                                               config.input_height,
-                                               config.input_width);
     }
-    // Previous faster approximation kept for future performance comparison:
-    // const auto coherence_gate_full = coherence_gate(corrected_db, tensor.rows, tensor.cols, ignore_bins_per_side, config);
-    // const auto coherence_gate_resized = resize_bilinear(coherence_gate_full, tensor.rows, tensor.cols, config.input_height, config.input_width);
-    std::vector<float> hybrid_contrib_source;
-    std::vector<float> hybrid_contrib;
-    HybridPostprocessResult hybrid_result_source;
-    std::vector<uint8_t> hybrid_result_mask;
-    {
-      const size_t estimated_bytes = static_cast<size_t>(tensor.rows) * static_cast<size_t>(tensor.cols) * sizeof(float) * 4 +
-                                     static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width) * (sizeof(float) + sizeof(uint8_t));
-      ScopedStageProfile stage(&profiler, "full_frame_hybrid_postprocess", "run", -1, estimated_bytes, options.verbose);
-      const auto dino_score_norm = normalize01_quantile(dino_score_source, 5.0, 95.0);
-      const auto coherence_gate_norm = normalize01_quantile(coherence_gate_source, 5.0, 99.0);
 
-      hybrid_contrib_source.assign(dino_score_source.size(), 0.0f);
-      for (size_t index = 0; index < hybrid_contrib_source.size(); ++index) {
-        hybrid_contrib_source[index] = dino_score_norm[index] * coherence_gate_norm[index];
-      }
-      hybrid_contrib = resize_bilinear(hybrid_contrib_source,
-                                       tensor.rows,
-                                       tensor.cols,
-                                       config.input_height,
-                                       config.input_width);
-      hybrid_result_source = run_residual_veto_hybrid(hybrid_contrib_source,
-                                                      source_valid_mask,
-                                                      tensor.rows,
-                                                      tensor.cols);
-      hybrid_result_mask = resize_mask_nearest(hybrid_result_source.mask,
-                                               tensor.rows,
-                                               tensor.cols,
-                                               config.input_height,
-                                               config.input_width);
-    }
-    // Previous faster approximation kept for future performance comparison:
-    // const auto hybrid_result = run_residual_veto_hybrid(dino_score_map,
-    //                                                     coherence_gate_resized,
-    //                                                     valid_mask,
-    //                                                     config.input_height,
-    //                                                     config.input_width);
-
-    const auto power_db_path = options.output_dir / "offline_power_db.npy";
-    const auto corrected_path = options.output_dir / "offline_corrected_db.npy";
     const auto corrected_resized_path = options.output_dir / "offline_corrected_resized.npy";
-    const auto dino_score_path = options.output_dir / "offline_dino_score.npy";
-    const auto raw_dino_score_path = options.output_dir / "offline_dino_score_raw.npy";
-    const auto coherence_gate_path = options.output_dir / "offline_coherence_gate.npy";
-    const auto hybrid_contrib_path = options.output_dir / "offline_hybrid_contrib.npy";
     const auto final_mask_path = options.output_dir / "offline_final_mask.npy";
     const auto final_mask_pgm = options.output_dir / "offline_final_mask.pgm";
     const auto chunk_plan_path = options.output_dir / "offline_chunk_plan.json";
@@ -4164,22 +3955,16 @@ int main(int argc, char** argv) {
     const auto stage_profile_path = options.output_dir / "offline_stage_profile.json";
 
     {
-      const size_t estimated_bytes = static_cast<size_t>(tensor.rows) * static_cast<size_t>(tensor.cols) * sizeof(float) * 6 +
-                                     static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width) * sizeof(float) * 6;
+      const size_t estimated_bytes = static_cast<size_t>(tensor.rows) * static_cast<size_t>(tensor.cols) * (sizeof(float) + sizeof(uint8_t)) +
+                                     static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width) * sizeof(float);
       ScopedStageProfile stage(&profiler, "artifact_serialization", "run", -1, estimated_bytes, options.verbose);
-      write_npy_2d(power_db_path, power_db.data(), power_db.size() * sizeof(float), tensor.rows, tensor.cols, "<f4");
-      write_npy_2d(corrected_path, corrected_db.data(), corrected_db.size() * sizeof(float), tensor.rows, tensor.cols, "<f4");
       write_npy_2d(corrected_resized_path, corrected_resized.data(), corrected_resized.size() * sizeof(float), config.input_height, config.input_width, "<f4");
-      write_npy_2d(dino_score_path, dino_score_map.data(), dino_score_map.size() * sizeof(float), config.input_height, config.input_width, "<f4");
-      write_npy_2d(raw_dino_score_path, raw_dino_score_map.data(), raw_dino_score_map.size() * sizeof(float), config.input_height, config.input_width, "<f4");
-      write_npy_2d(coherence_gate_path, coherence_gate_resized.data(), coherence_gate_resized.size() * sizeof(float), config.input_height, config.input_width, "<f4");
-      write_npy_2d(hybrid_contrib_path, hybrid_contrib.data(), hybrid_contrib.size() * sizeof(float), config.input_height, config.input_width, "<f4");
-      std::vector<float> final_mask_float(hybrid_result_mask.size(), 0.0f);
-      for (size_t index = 0; index < hybrid_result_mask.size(); ++index) {
-        final_mask_float[index] = hybrid_result_mask[index] ? 1.0f : 0.0f;
+      std::vector<float> final_mask_float(global_merged.merged_box_mask.size(), 0.0f);
+      for (size_t index = 0; index < global_merged.merged_box_mask.size(); ++index) {
+        final_mask_float[index] = global_merged.merged_box_mask[index] ? 1.0f : 0.0f;
       }
-      write_npy_2d(final_mask_path, final_mask_float.data(), final_mask_float.size() * sizeof(float), config.input_height, config.input_width, "<f4");
-      write_pgm(final_mask_pgm, mask_to_u8(hybrid_result_mask), config.input_width, config.input_height);
+      write_npy_2d(final_mask_path, final_mask_float.data(), final_mask_float.size() * sizeof(float), tensor.rows, tensor.cols, "<f4");
+      write_pgm(final_mask_pgm, mask_to_u8(global_merged.merged_box_mask), tensor.cols, tensor.rows);
       std::vector<float> projected_grouped_mask_float(global_merged.projected_grouped_mask.size(), 0.0f);
       for (size_t index = 0; index < global_merged.projected_grouped_mask.size(); ++index) {
         projected_grouped_mask_float[index] = global_merged.projected_grouped_mask[index] ? 1.0f : 0.0f;
@@ -4562,12 +4347,12 @@ int main(int argc, char** argv) {
       int live_rows = 0;
       int live_cols = 0;
       const auto live_mask = load_pgm(*options.live_mask_path, live_rows, live_cols);
-      if (live_rows == config.input_height && live_cols == config.input_width) {
+      if (live_rows == tensor.rows && live_cols == tensor.cols) {
         std::vector<uint8_t> live_binary(live_mask.size(), 0);
         for (size_t index = 0; index < live_mask.size(); ++index) {
           live_binary[index] = live_mask[index] >= 128 ? 1 : 0;
         }
-        live_comparison = compare_masks(hybrid_result_mask, live_binary);
+        live_comparison = compare_masks(global_merged.merged_box_mask, live_binary);
       }
     }
 
@@ -4598,19 +4383,13 @@ int main(int argc, char** argv) {
     summary << "  \"chunk_bandwidth_hz\": " << config.chunk_bandwidth_hz << ",\n";
     summary << "  \"chunk_overlap_hz\": " << config.chunk_overlap_hz << ",\n";
     summary << "  \"frontend_reference_level\": " << frontend_reference_level << ",\n";
-    summary << "  \"runtime_backend_used\": \"" << json_escape(runtime_result.backend_used) << "\",\n";
-    summary << "  \"runtime_dino_threshold\": " << runtime_result.dino_threshold << ",\n";
-    summary << "  \"runtime_final_threshold\": " << runtime_result.final_threshold << ",\n";
-    summary << "  \"hybrid_seed_freq_threshold\": " << hybrid_result_source.seed_freq_threshold << ",\n";
-    summary << "  \"hybrid_seed_res_threshold\": " << hybrid_result_source.seed_res_threshold << ",\n";
-    summary << "  \"hybrid_combined_threshold\": " << hybrid_result_source.combined_threshold << ",\n";
-    summary << "  \"hybrid_final_fraction\": " << hybrid_result_source.final_fraction << ",\n";
-    summary << "  \"hybrid_connected_fraction\": " << hybrid_result_source.connected_fraction << ",\n";
-    summary << "  \"hybrid_component_count\": " << hybrid_result_source.component_count << ",\n";
+    summary << "  \"runtime_backend_used\": \"" << json_escape(runtime_config.inference_backend) << "\",\n";
     if (!chunk_results.empty()) {
       const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_results.size() - 1)));
       const auto& debug_chunk = chunk_results[debug_chunk_index];
       summary << "  \"debug_chunk_index\": " << debug_chunk.chunk_index << ",\n";
+      summary << "  \"debug_chunk_dino_threshold\": " << debug_chunk.dino_threshold << ",\n";
+      summary << "  \"debug_chunk_runtime_final_threshold\": " << debug_chunk.runtime_final_threshold << ",\n";
       summary << "  \"debug_chunk_seed_freq_threshold\": " << debug_chunk.seed_freq_threshold << ",\n";
       summary << "  \"debug_chunk_seed_res_threshold\": " << debug_chunk.seed_res_threshold << ",\n";
       summary << "  \"debug_chunk_combined_threshold\": " << debug_chunk.combined_threshold << ",\n";
@@ -4621,12 +4400,7 @@ int main(int argc, char** argv) {
     summary << "  \"projected_grouped_box_count\": " << global_merged.projected_boxes.size() << ",\n";
     summary << "  \"merged_grouped_box_count\": " << global_merged.merged_boxes.size() << ",\n";
     summary << "  \"stage_profile_json\": \"" << json_escape(stage_profile_path.string()) << "\",\n";
-    summary << "  \"power_db_npy\": \"" << json_escape(power_db_path.string()) << "\",\n";
-    summary << "  \"corrected_db_npy\": \"" << json_escape(corrected_path.string()) << "\",\n";
     summary << "  \"corrected_resized_npy\": \"" << json_escape(corrected_resized_path.string()) << "\",\n";
-    summary << "  \"dino_score_npy\": \"" << json_escape(dino_score_path.string()) << "\",\n";
-    summary << "  \"coherence_gate_npy\": \"" << json_escape(coherence_gate_path.string()) << "\",\n";
-    summary << "  \"hybrid_contrib_npy\": \"" << json_escape(hybrid_contrib_path.string()) << "\",\n";
     summary << "  \"projected_grouped_mask_npy\": \"" << json_escape(projected_grouped_mask_path.string()) << "\",\n";
     summary << "  \"projected_grouped_mask_pgm\": \"" << json_escape(projected_grouped_mask_pgm.string()) << "\",\n";
     summary << "  \"projected_grouped_score_npy\": \"" << json_escape(projected_grouped_score_path.string()) << "\",\n";
@@ -4649,7 +4423,7 @@ int main(int argc, char** argv) {
       std::cout << "Offline DINO validation\n";
       std::cout << "  tensor: " << options.tensor_path << "\n";
       std::cout << "  config: " << options.config_path << "\n";
-      std::cout << "  runtime backend: " << runtime_result.backend_used << "\n";
+      std::cout << "  runtime backend: " << runtime_config.inference_backend << "\n";
       std::cout << "  ignore bins/side: " << ignore_bins_per_side << "\n";
       std::cout << "  chunk count: " << chunk_plan.size() << "\n";
       std::cout << "  subsection-only validation: " << (options.subsection_only_validation ? "true" : "false") << "\n";
@@ -4663,12 +4437,10 @@ int main(int argc, char** argv) {
         std::cout << "  debug chunk thresholds: freq=" << debug_chunk.seed_freq_threshold
                   << " res=" << debug_chunk.seed_res_threshold
                   << " combined=" << debug_chunk.combined_threshold << "\n";
+        std::cout << "  debug chunk dino threshold: " << debug_chunk.dino_threshold
+                  << " runtime_final=" << debug_chunk.runtime_final_threshold << "\n";
         std::cout << "  debug chunk grouped boxes: " << debug_chunk.grouped_box_count << "\n";
       }
-      std::cout << "  dino threshold: " << runtime_result.dino_threshold << "\n";
-      std::cout << "  hybrid seed thresholds: freq=" << hybrid_result_source.seed_freq_threshold
-            << " res=" << hybrid_result_source.seed_res_threshold << "\n";
-      std::cout << "  hybrid component count: " << hybrid_result_source.component_count << "\n";
       if (live_comparison.available) {
         std::cout << "  live mask agreement: " << live_comparison.pixel_agreement
                   << " IoU=" << live_comparison.intersection_over_union << "\n";

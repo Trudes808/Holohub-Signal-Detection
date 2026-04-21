@@ -128,6 +128,7 @@ fi
 
 exec sudo docker exec -it \
   -e VALIDATOR_BIN="${container_validator_bin}" \
+  -e VALIDATOR_NAME="${VALIDATOR_NAME}" \
   -e BUILD_APP_DIR="${BUILD_APP_DIR}" \
   -e TENSOR_PATH="${container_tensor_path}" \
   -e CONFIG_PATH="${container_config_path}" \
@@ -280,7 +281,8 @@ required_files = [
   chunk_debug_dir / "chunk_runtime_input_gray.npy",
   chunk_debug_dir / "chunk_dino_score_raw.npy",
   chunk_debug_dir / "chunk_patch_features.npy",
-  output_dir / "offline_dino_score_raw.npy",
+  output_dir / "offline_corrected_resized.npy",
+  output_dir / "offline_final_mask.npy",
 ]
 
 failures = []

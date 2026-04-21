@@ -689,15 +689,7 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
         "selected_chunk": chunk_results_by_index[chunk_index],
         "selected_plan_entry": chunk_plan_by_index[chunk_index],
         "full_frame": {
-            "corrected_db": np.load(output_path / "offline_corrected_db.npy", allow_pickle=False).astype(np.float32),
             "corrected_resized": np.load(output_path / "offline_corrected_resized.npy", allow_pickle=False).astype(np.float32),
-            "dino_score": np.load(output_path / "offline_dino_score.npy", allow_pickle=False).astype(np.float32),
-            "dino_score_raw": np.load(output_path / "offline_dino_score_raw.npy", allow_pickle=False).astype(np.float32) if (output_path / "offline_dino_score_raw.npy").exists() else np.load(output_path / "offline_dino_score.npy", allow_pickle=False).astype(np.float32),
-            "coherence_gate": np.load(output_path / "offline_coherence_gate.npy", allow_pickle=False).astype(np.float32),
-            "hybrid_contrib": np.load(output_path / "offline_hybrid_contrib.npy", allow_pickle=False).astype(np.float32),
-            "projected_grouped_score": np.load(output_path / "offline_projected_grouped_score.npy", allow_pickle=False).astype(np.float32),
-            "projected_grouped_mask": load_bool_npy(output_path / "offline_projected_grouped_mask.npy"),
-            "merged_box_mask": load_bool_npy(output_path / "offline_merged_box_mask.npy"),
             "final_mask": load_bool_npy(output_path / "offline_final_mask.npy"),
         },
         "chunk_debug": {
@@ -1230,10 +1222,6 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
 
     overview_panels = [
         ("Offline corrected resized", cpp_full["corrected_resized"], "magma"),
-        ("Offline DINO score", cpp_full["dino_score"], "inferno"),
-        ("Offline coherence gate", cpp_full["coherence_gate"], "viridis"),
-        ("Offline hybrid contrib", cpp_full["hybrid_contrib"], "cividis"),
-        ("Projected grouped score", cpp_full["projected_grouped_score"], "plasma"),
         ("Offline final mask", cpp_full["final_mask"].astype(np.float32), "gray"),
     ]
 
