@@ -1028,6 +1028,14 @@ def build_chunk_comparison_bundle(
         "final_mask": resize_mask_to_shape(python_support["final_mask"], target_shape),
         "bridged_mask": resize_mask_to_shape(np.asarray(python_grouping["bridged_mask"], dtype=bool), target_shape),
         "grouped_mask": resize_mask_to_shape(np.asarray(python_grouping["grouped_mask"], dtype=bool), target_shape),
+        "grouped_boxes": [
+            scale_box_to_shape(
+                box,
+                tuple(int(value) for value in np.asarray(python_grouping["grouped_mask"]).shape),
+                target_shape,
+            )
+            for box in list(python_grouping.get("boxes", []))
+        ],
     }
     dino_input_valid_mask = np.ones(target_shape, dtype=bool) if (cpp_runtime_input_gray is not None and python_expected_runtime_input is not None) else python_mapped["valid_mask"]
 
@@ -1307,10 +1315,7 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
     ]
 
     cpp_boxes = list(cpp_chunk["grouped_boxes"])
-    python_boxes_native = list(python_bundle["python_grouping"].get("boxes", []))
-    python_grouped_shape = tuple(int(value) for value in np.asarray(python_bundle["python_grouping"]["grouped_mask"]).shape)
-    cpp_shape = tuple(int(value) for value in np.asarray(cpp_chunk["corrected_resized"]).shape)
-    python_boxes_scaled = [scale_box_to_shape(box, python_grouped_shape, cpp_shape) for box in python_boxes_native]
+    python_boxes_scaled = list(python_mapped.get("grouped_boxes", []))
     match_rows = build_box_match_rows(cpp_boxes, python_boxes_scaled)
 
     return {

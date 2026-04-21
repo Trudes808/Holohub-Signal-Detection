@@ -1312,6 +1312,51 @@ std::vector<float> project_patch_map_to_output(const std::vector<float>& patch_m
       output_cols);
 }
 
+std::vector<uint8_t> resize_mask_nearest(const std::vector<uint8_t>& input,
+                                         int input_rows,
+                                         int input_cols,
+                                         int output_rows,
+                                         int output_cols) {
+  std::vector<uint8_t> output(static_cast<size_t>(std::max(output_rows, 0)) * static_cast<size_t>(std::max(output_cols, 0)), 0);
+  if (input_rows <= 0 || input_cols <= 0 || output_rows <= 0 || output_cols <= 0 ||
+      input.size() != static_cast<size_t>(input_rows) * static_cast<size_t>(input_cols)) {
+    return output;
+  }
+  for (int out_row = 0; out_row < output_rows; ++out_row) {
+    const int src_row = std::min(input_rows - 1,
+                                 static_cast<int>((static_cast<int64_t>(out_row) * static_cast<int64_t>(input_rows)) /
+                                                  static_cast<int64_t>(std::max(output_rows, 1))));
+    for (int out_col = 0; out_col < output_cols; ++out_col) {
+      const int src_col = std::min(input_cols - 1,
+                                   static_cast<int>((static_cast<int64_t>(out_col) * static_cast<int64_t>(input_cols)) /
+                                                    static_cast<int64_t>(std::max(output_cols, 1))));
+      output[flat_index(output_cols, out_row, out_col)] = input[flat_index(input_cols, src_row, src_col)];
+    }
+  }
+  return output;
+}
+
+DetectionBox scale_box_to_shape(const DetectionBox& box,
+                                int source_rows,
+                                int source_cols,
+                                int target_rows,
+                                int target_cols) {
+  DetectionBox scaled = box;
+  scaled.freq_start = static_cast<int>(std::floor(static_cast<double>(box.freq_start) * static_cast<double>(target_rows) /
+                                                  static_cast<double>(std::max(source_rows, 1))));
+  scaled.freq_stop = static_cast<int>(std::ceil(static_cast<double>(box.freq_stop) * static_cast<double>(target_rows) /
+                                                static_cast<double>(std::max(source_rows, 1))));
+  scaled.time_start = static_cast<int>(std::floor(static_cast<double>(box.time_start) * static_cast<double>(target_cols) /
+                                                  static_cast<double>(std::max(source_cols, 1))));
+  scaled.time_stop = static_cast<int>(std::ceil(static_cast<double>(box.time_stop) * static_cast<double>(target_cols) /
+                                                static_cast<double>(std::max(source_cols, 1))));
+  scaled.freq_start = clamp_value(scaled.freq_start, 0, target_rows);
+  scaled.freq_stop = clamp_value(std::max(scaled.freq_stop, scaled.freq_start), 0, target_rows);
+  scaled.time_start = clamp_value(scaled.time_start, 0, target_cols);
+  scaled.time_stop = clamp_value(std::max(scaled.time_stop, scaled.time_start), 0, target_cols);
+  return scaled;
+}
+
 std::vector<float> positional_design_matrix(int patch_rows, int patch_cols) {
   constexpr float kPi = 3.14159265358979323846f;
   const int n = patch_rows * patch_cols;
@@ -2584,6 +2629,10 @@ void group_chunk_mask_regions(ChunkRetryResult& chunk,
                               int min_time_span_px,
                               float min_density,
                               float time_continuity_ratio) {
+  if (!chunk.combined_score.empty() && !chunk.final_mask.empty() && !chunk.grouped_mask.empty() && !chunk.bridged_mask.empty()) {
+    chunk.grouped_box_count = static_cast<int>(chunk.grouped_boxes.size());
+    return;
+  }
   const auto grouping = group_mask_regions(chunk.final_mask,
                                            chunk.combined_score,
                                            chunk.valid_mask,
@@ -3096,27 +3145,32 @@ ChunkRetryResult run_retry_chunk(holoscan::ops::DinoTorchRuntime& runtime,
       grouped_score_is_patch_grid = true;
     }
   }
-  const auto grouped_dino_score_map = grouped_score_is_patch_grid
-                                          ? project_patch_map_to_output(grouped_score_patch,
-                                                                        grouped_score_rows,
-                                                                        grouped_score_cols,
-                                                                        runtime_result.aligned_rows,
-                                                                        runtime_result.aligned_cols,
-                                                                        result.src_rows,
-                                                                        result.src_cols,
-                                                                        runtime_row_offset,
-                                                                        runtime_col_offset,
-                                                                        result.dst_rows,
-                                                                        result.dst_cols)
-                                          : project_aligned_map_to_output(grouped_score_patch,
-                                                                          grouped_score_rows,
-                                                                          grouped_score_cols,
-                                                                          result.src_rows,
-                                                                          result.src_cols,
-                                                                          runtime_row_offset,
-                                                                          runtime_col_offset,
-                                                                          result.dst_rows,
-                                                                          result.dst_cols);
+  const auto grouped_dino_score_source = grouped_score_is_patch_grid
+                                             ? project_patch_map_to_output(grouped_score_patch,
+                                                                           grouped_score_rows,
+                                                                           grouped_score_cols,
+                                                                           runtime_result.aligned_rows,
+                                                                           runtime_result.aligned_cols,
+                                                                           result.src_rows,
+                                                                           result.src_cols,
+                                                                           runtime_row_offset,
+                                                                           runtime_col_offset,
+                                                                           result.src_rows,
+                                                                           result.src_cols)
+                                             : project_aligned_map_to_output(grouped_score_patch,
+                                                                             grouped_score_rows,
+                                                                             grouped_score_cols,
+                                                                             result.src_rows,
+                                                                             result.src_cols,
+                                                                             runtime_row_offset,
+                                                                             runtime_col_offset,
+                                                                             result.src_rows,
+                                                                             result.src_cols);
+  const auto grouped_dino_score_map = resize_bilinear(grouped_dino_score_source,
+                                                      result.src_rows,
+                                                      result.src_cols,
+                                                      result.dst_rows,
+                                                      result.dst_cols);
   if (keep_debug_artifacts) {
     result.dino_score_map = grouped_dino_score_map;
     result.corrected_resized = resize_bilinear(corrected_chunk, result.src_rows, result.src_cols, result.dst_rows, result.dst_cols);
@@ -3135,25 +3189,73 @@ ChunkRetryResult run_retry_chunk(holoscan::ops::DinoTorchRuntime& runtime,
     result.coherence_gate = coherence_gate;
   }
 
-  const auto dino_score_norm = normalize01_quantile(grouped_dino_score_map, 5.0, 95.0);
-  const auto coherence_gate_norm = normalize01_quantile(coherence_gate, 5.0, 99.0);
-  std::vector<float> hybrid_contrib(grouped_dino_score_map.size(), 0.0f);
-  for (size_t index = 0; index < hybrid_contrib.size(); ++index) {
-    hybrid_contrib[index] = dino_score_norm[index] * coherence_gate_norm[index];
+  const auto dino_score_norm_source = normalize01_quantile(grouped_dino_score_source, 5.0, 95.0);
+  const auto coherence_gate_norm_source = normalize01_quantile(source_chunk_coherence_gate, 5.0, 99.0);
+  std::vector<float> hybrid_contrib_source(grouped_dino_score_source.size(), 0.0f);
+  for (size_t index = 0; index < hybrid_contrib_source.size(); ++index) {
+    hybrid_contrib_source[index] = dino_score_norm_source[index] * coherence_gate_norm_source[index];
   }
+  const auto hybrid_contrib = resize_bilinear(hybrid_contrib_source,
+                                              result.src_rows,
+                                              result.src_cols,
+                                              result.dst_rows,
+                                              result.dst_cols);
   if (keep_debug_artifacts) {
     result.hybrid_contrib = hybrid_contrib;
   }
 
-  const auto hybrid_result = run_residual_veto_hybrid(hybrid_contrib, result.valid_mask, result.dst_rows, result.dst_cols);
-  result.seed_freq_threshold = hybrid_result.seed_freq_threshold;
-  result.seed_res_threshold = hybrid_result.seed_res_threshold;
-  result.combined_threshold = hybrid_result.combined_threshold;
-  result.final_fraction = hybrid_result.final_fraction;
-  result.connected_fraction = hybrid_result.connected_fraction;
-  result.component_count = hybrid_result.component_count;
-  result.final_mask = hybrid_result.mask;
-  result.combined_score = hybrid_result.combined_score;
+  const auto hybrid_result_source = run_residual_veto_hybrid(hybrid_contrib_source,
+                                                             source_chunk_valid_mask,
+                                                             result.src_rows,
+                                                             result.src_cols);
+  const auto grouping_source = group_mask_regions(hybrid_result_source.mask,
+                                                  hybrid_result_source.combined_score,
+                                                  source_chunk_valid_mask,
+                                                  result.src_rows,
+                                                  result.src_cols,
+                                                  33,
+                                                  5,
+                                                  24,
+                                                  18,
+                                                  2,
+                                                  0.06f,
+                                                  0.85f);
+  result.seed_freq_threshold = hybrid_result_source.seed_freq_threshold;
+  result.seed_res_threshold = hybrid_result_source.seed_res_threshold;
+  result.combined_threshold = hybrid_result_source.combined_threshold;
+  result.final_fraction = hybrid_result_source.final_fraction;
+  result.connected_fraction = hybrid_result_source.connected_fraction;
+  result.component_count = hybrid_result_source.component_count;
+  result.final_mask = resize_mask_nearest(hybrid_result_source.mask,
+                                          result.src_rows,
+                                          result.src_cols,
+                                          result.dst_rows,
+                                          result.dst_cols);
+  result.combined_score = resize_bilinear(hybrid_result_source.combined_score,
+                                          result.src_rows,
+                                          result.src_cols,
+                                          result.dst_rows,
+                                          result.dst_cols);
+  result.bridged_mask = resize_mask_nearest(grouping_source.bridged_mask,
+                                            result.src_rows,
+                                            result.src_cols,
+                                            result.dst_rows,
+                                            result.dst_cols);
+  result.grouped_mask = resize_mask_nearest(grouping_source.grouped_mask,
+                                            result.src_rows,
+                                            result.src_cols,
+                                            result.dst_rows,
+                                            result.dst_cols);
+  result.grouped_boxes.clear();
+  result.grouped_boxes.reserve(grouping_source.boxes.size());
+  for (const auto& source_box : grouping_source.boxes) {
+    result.grouped_boxes.push_back(scale_box_to_shape(source_box,
+                                                      result.src_rows,
+                                                      result.src_cols,
+                                                      result.dst_rows,
+                                                      result.dst_cols));
+  }
+  result.grouped_box_count = static_cast<int>(result.grouped_boxes.size());
   return result;
 }
 
@@ -3478,27 +3580,32 @@ int main(int argc, char** argv) {
     } else if (options.subsection_only_validation && options.verbose) {
       std::cerr << "[offline_dino_validator] skipping offline_full_frame_grouped_patch in subsection-only validation mode\n";
     }
-    dino_score_map = grouped_score_is_patch_grid
-                         ? project_patch_map_to_output(grouped_score_patch,
-                                                       grouped_score_rows,
-                                                       grouped_score_cols,
-                                                       runtime_result.aligned_rows,
-                                                       runtime_result.aligned_cols,
-                                                       tensor.rows,
-                                                       tensor.cols,
-                                                       runtime_row_offset,
-                                                       runtime_col_offset,
-                                                       config.input_height,
-                                                       config.input_width)
-                         : project_aligned_map_to_output(grouped_score_patch,
-                                                         grouped_score_rows,
-                                                         grouped_score_cols,
-                                                         tensor.rows,
-                                                         tensor.cols,
-                                                         runtime_row_offset,
-                                                         runtime_col_offset,
-                                                         config.input_height,
-                                                         config.input_width);
+    const auto dino_score_source = grouped_score_is_patch_grid
+                       ? project_patch_map_to_output(grouped_score_patch,
+                                     grouped_score_rows,
+                                     grouped_score_cols,
+                                     runtime_result.aligned_rows,
+                                     runtime_result.aligned_cols,
+                                     tensor.rows,
+                                     tensor.cols,
+                                     runtime_row_offset,
+                                     runtime_col_offset,
+                                     tensor.rows,
+                                     tensor.cols)
+                       : project_aligned_map_to_output(grouped_score_patch,
+                                       grouped_score_rows,
+                                       grouped_score_cols,
+                                       tensor.rows,
+                                       tensor.cols,
+                                       runtime_row_offset,
+                                       runtime_col_offset,
+                                       tensor.rows,
+                                       tensor.cols);
+    dino_score_map = resize_bilinear(dino_score_source,
+                     tensor.rows,
+                     tensor.cols,
+                     config.input_height,
+                     config.input_width);
 
     const auto corrected_resized = resize_bilinear(corrected_db, tensor.rows, tensor.cols, config.input_height, config.input_width);
     const auto source_valid_mask = resize_row_valid_mask(source_ignore_info.valid_row_mask, tensor.rows, tensor.cols);
@@ -3514,18 +3621,27 @@ int main(int argc, char** argv) {
     // Previous faster approximation kept for future performance comparison:
     // const auto coherence_gate_full = coherence_gate(corrected_db, tensor.rows, tensor.cols, ignore_bins_per_side, config);
     // const auto coherence_gate_resized = resize_bilinear(coherence_gate_full, tensor.rows, tensor.cols, config.input_height, config.input_width);
-    const auto dino_score_norm = normalize01_quantile(dino_score_map, 5.0, 95.0);
-    const auto coherence_gate_norm = normalize01_quantile(coherence_gate_resized, 5.0, 99.0);
+    const auto dino_score_norm = normalize01_quantile(dino_score_source, 5.0, 95.0);
+    const auto coherence_gate_norm = normalize01_quantile(coherence_gate_source, 5.0, 99.0);
 
-    std::vector<float> hybrid_contrib(dino_score_map.size(), 0.0f);
-    for (size_t index = 0; index < hybrid_contrib.size(); ++index) {
-      hybrid_contrib[index] = dino_score_norm[index] * coherence_gate_norm[index];
+    std::vector<float> hybrid_contrib_source(dino_score_source.size(), 0.0f);
+    for (size_t index = 0; index < hybrid_contrib_source.size(); ++index) {
+      hybrid_contrib_source[index] = dino_score_norm[index] * coherence_gate_norm[index];
       // Previous faster approximation kept for future performance comparison:
-      // hybrid_contrib[index] = dino_score_map[index] * coherence_gate_resized[index];
+      // hybrid_contrib_source[index] = dino_score_source[index] * coherence_gate_source[index];
     }
-
-    const auto hybrid_result = run_residual_veto_hybrid(hybrid_contrib,
-                                                        valid_mask,
+    const auto hybrid_contrib = resize_bilinear(hybrid_contrib_source,
+                                                tensor.rows,
+                                                tensor.cols,
+                                                config.input_height,
+                                                config.input_width);
+    const auto hybrid_result_source = run_residual_veto_hybrid(hybrid_contrib_source,
+                                                               source_valid_mask,
+                                                               tensor.rows,
+                                                               tensor.cols);
+    const auto hybrid_result_mask = resize_mask_nearest(hybrid_result_source.mask,
+                                                        tensor.rows,
+                                                        tensor.cols,
                                                         config.input_height,
                                                         config.input_width);
     // Previous faster approximation kept for future performance comparison:
@@ -3563,12 +3679,12 @@ int main(int argc, char** argv) {
     write_npy_2d(raw_dino_score_path, raw_dino_score_map.data(), raw_dino_score_map.size() * sizeof(float), config.input_height, config.input_width, "<f4");
     write_npy_2d(coherence_gate_path, coherence_gate_resized.data(), coherence_gate_resized.size() * sizeof(float), config.input_height, config.input_width, "<f4");
     write_npy_2d(hybrid_contrib_path, hybrid_contrib.data(), hybrid_contrib.size() * sizeof(float), config.input_height, config.input_width, "<f4");
-    std::vector<float> final_mask_float(hybrid_result.mask.size(), 0.0f);
-    for (size_t index = 0; index < hybrid_result.mask.size(); ++index) {
-      final_mask_float[index] = hybrid_result.mask[index] ? 1.0f : 0.0f;
+    std::vector<float> final_mask_float(hybrid_result_mask.size(), 0.0f);
+    for (size_t index = 0; index < hybrid_result_mask.size(); ++index) {
+      final_mask_float[index] = hybrid_result_mask[index] ? 1.0f : 0.0f;
     }
     write_npy_2d(final_mask_path, final_mask_float.data(), final_mask_float.size() * sizeof(float), config.input_height, config.input_width, "<f4");
-    write_pgm(final_mask_pgm, mask_to_u8(hybrid_result.mask), config.input_width, config.input_height);
+    write_pgm(final_mask_pgm, mask_to_u8(hybrid_result_mask), config.input_width, config.input_height);
     std::vector<float> projected_grouped_mask_float(global_merged.projected_grouped_mask.size(), 0.0f);
     for (size_t index = 0; index < global_merged.projected_grouped_mask.size(); ++index) {
       projected_grouped_mask_float[index] = global_merged.projected_grouped_mask[index] ? 1.0f : 0.0f;
@@ -3961,7 +4077,7 @@ int main(int argc, char** argv) {
         for (size_t index = 0; index < live_mask.size(); ++index) {
           live_binary[index] = live_mask[index] >= 128 ? 1 : 0;
         }
-        live_comparison = compare_masks(hybrid_result.mask, live_binary);
+        live_comparison = compare_masks(hybrid_result_mask, live_binary);
       }
     }
 
@@ -3995,12 +4111,12 @@ int main(int argc, char** argv) {
     summary << "  \"runtime_backend_used\": \"" << json_escape(runtime_result.backend_used) << "\",\n";
     summary << "  \"runtime_dino_threshold\": " << runtime_result.dino_threshold << ",\n";
     summary << "  \"runtime_final_threshold\": " << runtime_result.final_threshold << ",\n";
-    summary << "  \"hybrid_seed_freq_threshold\": " << hybrid_result.seed_freq_threshold << ",\n";
-    summary << "  \"hybrid_seed_res_threshold\": " << hybrid_result.seed_res_threshold << ",\n";
-    summary << "  \"hybrid_combined_threshold\": " << hybrid_result.combined_threshold << ",\n";
-    summary << "  \"hybrid_final_fraction\": " << hybrid_result.final_fraction << ",\n";
-    summary << "  \"hybrid_connected_fraction\": " << hybrid_result.connected_fraction << ",\n";
-    summary << "  \"hybrid_component_count\": " << hybrid_result.component_count << ",\n";
+    summary << "  \"hybrid_seed_freq_threshold\": " << hybrid_result_source.seed_freq_threshold << ",\n";
+    summary << "  \"hybrid_seed_res_threshold\": " << hybrid_result_source.seed_res_threshold << ",\n";
+    summary << "  \"hybrid_combined_threshold\": " << hybrid_result_source.combined_threshold << ",\n";
+    summary << "  \"hybrid_final_fraction\": " << hybrid_result_source.final_fraction << ",\n";
+    summary << "  \"hybrid_connected_fraction\": " << hybrid_result_source.connected_fraction << ",\n";
+    summary << "  \"hybrid_component_count\": " << hybrid_result_source.component_count << ",\n";
     if (!chunk_results.empty()) {
       const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_results.size() - 1)));
       const auto& debug_chunk = chunk_results[debug_chunk_index];
@@ -4059,9 +4175,9 @@ int main(int argc, char** argv) {
         std::cout << "  debug chunk grouped boxes: " << debug_chunk.grouped_box_count << "\n";
       }
       std::cout << "  dino threshold: " << runtime_result.dino_threshold << "\n";
-      std::cout << "  hybrid seed thresholds: freq=" << hybrid_result.seed_freq_threshold
-                << " res=" << hybrid_result.seed_res_threshold << "\n";
-      std::cout << "  hybrid component count: " << hybrid_result.component_count << "\n";
+      std::cout << "  hybrid seed thresholds: freq=" << hybrid_result_source.seed_freq_threshold
+            << " res=" << hybrid_result_source.seed_res_threshold << "\n";
+      std::cout << "  hybrid component count: " << hybrid_result_source.component_count << "\n";
       if (live_comparison.available) {
         std::cout << "  live mask agreement: " << live_comparison.pixel_agreement
                   << " IoU=" << live_comparison.intersection_over_union << "\n";
