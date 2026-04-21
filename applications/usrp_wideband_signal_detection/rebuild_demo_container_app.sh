@@ -49,7 +49,7 @@ build_targets() {
 
 ninja_target_exists() {
   local target=$1
-  run_in_container "set -euo pipefail && ninja -C ${WORKSPACE_DIR}/${BUILD_DIR} -t targets all | awk '{print \\$1}' | grep -Fx -- '${target}' >/dev/null"
+  run_in_container "set -euo pipefail && ninja -C ${WORKSPACE_DIR}/${BUILD_DIR} -t targets all | cut -d: -f1 | grep -Fx -- '${target}' >/dev/null"
 }
 
 build_auxiliary_targets() {

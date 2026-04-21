@@ -55,27 +55,45 @@ bool use_fp16_torch_dtype(const std::string& torch_dtype) {
   return torch_dtype == "fp16" || torch_dtype == "half";
 }
 
-int64_t quantile_index(int64_t size, double q) {
-  if (size <= 1) {
-    return 0;
-  }
-  const double clamped = std::clamp(q, 0.0, 1.0);
-  return static_cast<int64_t>(std::llround(clamped * static_cast<double>(size - 1)));
-}
-
-int64_t quantile_kth(int64_t size, double q) {
-  return std::min<int64_t>(size, quantile_index(size, q) + 1);
-}
-
 torch::Tensor select_quantile_along_dim(const torch::Tensor& input, double q, int64_t dim) {
-  const auto k = quantile_kth(input.size(dim), q);
-  return std::get<0>(torch::kthvalue(input, k, dim, false));
+  const auto size = input.size(dim);
+  if (size <= 1) {
+    return input.select(dim, 0);
+  }
+
+  const double clamped = std::clamp(q, 0.0, 1.0);
+  const double position = clamped * static_cast<double>(size - 1);
+  const auto lower = static_cast<int64_t>(std::floor(position));
+  const auto upper = static_cast<int64_t>(std::ceil(position));
+  auto sorted = std::get<0>(torch::sort(input, dim, false));
+  auto lower_values = sorted.select(dim, lower);
+  if (upper == lower) {
+    return lower_values;
+  }
+  auto upper_values = sorted.select(dim, upper);
+  const double weight = position - static_cast<double>(lower);
+  return lower_values + (upper_values - lower_values) * weight;
 }
 
 torch::Tensor scalar_quantile_tensor(const torch::Tensor& input, double q) {
   auto flat = input.reshape({-1});
-  const auto k = quantile_kth(flat.size(0), q);
-  return std::get<0>(torch::kthvalue(flat, k, 0, false));
+  const auto size = flat.size(0);
+  if (size <= 1) {
+    return flat[0];
+  }
+
+  const double clamped = std::clamp(q, 0.0, 1.0);
+  const double position = clamped * static_cast<double>(size - 1);
+  const auto lower = static_cast<int64_t>(std::floor(position));
+  const auto upper = static_cast<int64_t>(std::ceil(position));
+  auto sorted = std::get<0>(torch::sort(flat, 0, false));
+  auto lower_value = sorted[lower];
+  if (upper == lower) {
+    return lower_value;
+  }
+  auto upper_value = sorted[upper];
+  const double weight = position - static_cast<double>(lower);
+  return lower_value + (upper_value - lower_value) * weight;
 }
 
 double scalar_quantile(const torch::Tensor& input, double q) {
@@ -95,6 +113,23 @@ torch::Tensor gaussian_filter1d(const torch::Tensor& input, double sigma) {
   kernel = kernel / kernel.sum();
 
   auto padded = torch::constant_pad_nd(input.view({1, 1, -1}), {radius, radius}, 0.0);
+  auto filtered = torch::conv1d(padded, kernel.view({1, 1, kernel_size}));
+  return filtered.view({-1});
+}
+
+torch::Tensor gaussian_filter1d_nearest(const torch::Tensor& input, double sigma) {
+  if (sigma <= 0.0) {
+    return input.clone();
+  }
+
+  const auto radius = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(3.0 * sigma)));
+  const auto kernel_size = 2 * radius + 1;
+  auto options = torch::TensorOptions().dtype(input.dtype()).device(input.device());
+  auto x = torch::arange(-radius, radius + 1, options);
+  auto kernel = torch::exp(-(x * x) / (2.0 * sigma * sigma));
+  kernel = kernel / kernel.sum();
+
+  auto padded = torch::replication_pad1d(input.view({1, 1, -1}), {radius, radius});
   auto filtered = torch::conv1d(padded, kernel.view({1, 1, kernel_size}));
   return filtered.view({-1});
 }
@@ -162,6 +197,21 @@ torch::Tensor gaussian_blur_2d(const torch::Tensor& input, double sigma_rows, do
   return convolve_cols_2d(convolve_rows_2d(input, row_kernel), col_kernel).contiguous();
 }
 
+torch::Tensor uniform_filter_2d_nearest(const torch::Tensor& input, int kernel_rows, int kernel_cols) {
+  const int row_radius = std::max(0, kernel_rows / 2);
+  const int col_radius = std::max(0, kernel_cols / 2);
+  auto padded = torch::replication_pad2d(input.unsqueeze(0).unsqueeze(0), {col_radius, col_radius, row_radius, row_radius});
+  return torch::avg_pool2d(padded,
+                           {std::max(1, kernel_rows), std::max(1, kernel_cols)},
+                           {1, 1},
+                           {0, 0},
+                           false,
+                           true)
+      .squeeze(0)
+      .squeeze(0)
+      .contiguous();
+}
+
 torch::Tensor gaussian_second_derivative_rows_2d(const torch::Tensor& input, double sigma) {
   auto kernel = gaussian_second_derivative_kernel_tensor(sigma, input.device());
   return convolve_rows_2d(input, kernel).contiguous();
@@ -190,6 +240,37 @@ torch::Tensor binary_erode_rect_tensor(const torch::Tensor& mask, int kernel_row
 
 torch::Tensor binary_closing_rect_tensor(const torch::Tensor& mask, int kernel_rows, int kernel_cols) {
   return binary_erode_rect_tensor(binary_dilate_rect_tensor(mask, kernel_rows, kernel_cols), kernel_rows, kernel_cols);
+}
+
+torch::Tensor signal_agnostic_dino_gray(const torch::Tensor& sxx_db_local) {
+  auto x_db = sxx_db_local.to(torch::kFloat32).contiguous();
+
+  const double row_sigma = std::max(1.0, static_cast<double>(x_db.size(0)) / 32.0);
+  const double col_sigma = std::max(1.0, static_cast<double>(x_db.size(1)) / 32.0);
+  auto row_trend = gaussian_filter1d_nearest(x_db.mean(1), row_sigma).unsqueeze(1);
+  auto col_trend = gaussian_filter1d_nearest(x_db.mean(0), col_sigma).unsqueeze(0);
+  auto trend = (row_trend + col_trend - x_db.mean()).contiguous();
+
+  auto detrended = (x_db - trend).contiguous();
+  auto local_mean = uniform_filter_2d_nearest(detrended, 7, 7);
+  auto local_resid = (detrended - local_mean).contiguous();
+  auto local_scale = torch::sqrt(uniform_filter_2d_nearest(local_resid * local_resid, 9, 9) + 1e-6);
+  auto local_z = (local_resid / torch::clamp_min(local_scale, 1e-4)).contiguous();
+
+  auto abs_detrended = normalize_map01(detrended, 0.02, 0.98);
+  auto local_abs = torch::abs(local_z).reshape({-1});
+  auto scale = scalar_quantile_tensor(local_abs, 0.95);
+  scale = torch::clamp_min(scale, 1e-6);
+  auto local_resid_n = torch::clamp(0.5 + 0.5 * (local_z / scale), 0.0, 1.0);
+
+  auto combined = (0.70 * local_resid_n + 0.30 * abs_detrended).to(torch::kFloat32).contiguous();
+  const double combined_std = combined.std(/*unbiased=*/false).item<double>();
+  if (combined_std < 0.02) {
+    combined = normalize_map01(detrended, 0.01, 0.99).to(torch::kFloat32).contiguous();
+  }
+
+  // Match the Python path, which converts through uint8 RGB before ToTensor().
+  return torch::round(torch::clamp(combined, 0.0, 1.0) * 255.0).div(255.0).contiguous();
 }
 
 torch::Tensor derive_dino_score_map(torch::Tensor model_output,
@@ -259,6 +340,49 @@ torch::Tensor derive_dino_score_map(torch::Tensor model_output,
   return resized.squeeze(0).squeeze(0).contiguous();
 }
 
+torch::Tensor extract_patch_feature_matrix(torch::Tensor model_output,
+                                          int aligned_rows,
+                                          int aligned_cols,
+                                          int patch_size) {
+  const int patch_rows = std::max(1, aligned_rows / std::max(1, patch_size));
+  const int patch_cols = std::max(1, aligned_cols / std::max(1, patch_size));
+  const int64_t patch_count = static_cast<int64_t>(patch_rows) * static_cast<int64_t>(patch_cols);
+
+  if (model_output.dim() == 4 && model_output.size(0) == 1) {
+    model_output = model_output.squeeze(0);
+  }
+
+  torch::Tensor features;
+  if (model_output.dim() == 3) {
+    if (model_output.size(0) == 1) {
+      model_output = model_output.squeeze(0);
+    } else if (model_output.size(1) == patch_rows && model_output.size(2) == patch_cols) {
+      features = model_output.permute({1, 2, 0}).contiguous().view({patch_count, model_output.size(0)});
+    } else if (model_output.size(0) == patch_rows && model_output.size(1) == patch_cols) {
+      features = model_output.contiguous().view({patch_count, model_output.size(2)});
+    }
+  }
+
+  if (!features.defined() && model_output.dim() == 2) {
+    if (model_output.size(0) == patch_count) {
+      features = model_output.contiguous();
+    } else if (model_output.size(1) == patch_count) {
+      features = model_output.transpose(0, 1).contiguous();
+    }
+  }
+
+  if (!features.defined()) {
+    std::ostringstream error;
+    error << "TorchScript forward returned an unsupported tensor shape for patch features: "
+          << model_output.sizes();
+    throw std::runtime_error(error.str());
+  }
+  if (features.dim() != 2 || features.size(0) != patch_count) {
+    throw std::runtime_error("Derived patch feature matrix has unexpected shape");
+  }
+  return features.to(torch::kFloat32).contiguous();
+}
+
 template <typename Fn>
 double measure_ms(Fn&& fn) {
   const auto start = std::chrono::steady_clock::now();
@@ -275,8 +399,8 @@ class DinoTorchRuntime::Impl {
   DinoTorchRuntimeResult run(const DinoTorchRuntimeConfig& config, const DinoTorchRuntimeInput& input) {
     DinoTorchRuntimeResult result;
     result.backend_used = "pytorch_placeholder";
-    result.aligned_rows = std::max(1, (input.dst_rows / std::max(1, input.patch_size)) * std::max(1, input.patch_size));
-    result.aligned_cols = std::max(1, (input.dst_cols / std::max(1, input.patch_size)) * std::max(1, input.patch_size));
+    result.aligned_rows = std::max(1, input.patch_size);
+    result.aligned_cols = std::max(1, input.patch_size);
     result.final_threshold = config.pipeline_final_threshold;
     std::string failure_stage = "input_validation";
     std::string failure_detail;
@@ -409,37 +533,51 @@ class DinoTorchRuntime::Impl {
         if (result.ignore_bins_per_side > 0 && (2 * result.ignore_bins_per_side) < corrected_db.size(0)) {
           corrected_db = corrected_db.index({torch::indexing::Slice(result.ignore_bins_per_side, corrected_db.size(0) - result.ignore_bins_per_side), torch::indexing::Slice()});
         }
+
+        const int safe_patch = std::max(1, input.patch_size);
+        result.aligned_rows = static_cast<int>((corrected_db.size(0) / safe_patch) * safe_patch);
+        result.aligned_cols = static_cast<int>((corrected_db.size(1) / safe_patch) * safe_patch);
+        if (result.aligned_rows < safe_patch || result.aligned_cols < safe_patch) {
+          throw std::runtime_error("Corrected chunk is too small for DINO patch-aligned input");
+        }
       });
 
       torch::Tensor resized_db;
       failure_stage = "resize";
       result.timing.resize_ms = measure_ms([&] {
-        resized_db = torch::nn::functional::interpolate(
-                         corrected_db.unsqueeze(0).unsqueeze(0),
-                         torch::nn::functional::InterpolateFuncOptions()
-                             .size(std::vector<int64_t>{static_cast<int64_t>(result.aligned_rows), static_cast<int64_t>(result.aligned_cols)})
-                             .mode(torch::kBilinear)
-                             .align_corners(false))
-                         .squeeze(0)
-                         .squeeze(0)
-                         .contiguous();
+        if (corrected_db.size(0) == result.aligned_rows && corrected_db.size(1) == result.aligned_cols) {
+          resized_db = corrected_db.contiguous();
+        } else {
+          resized_db = corrected_db.index({
+              torch::indexing::Slice(0, result.aligned_rows),
+              torch::indexing::Slice(0, result.aligned_cols),
+          }).contiguous();
+        }
       });
 
       torch::Tensor model_input;
       failure_stage = "model_prep";
       result.timing.model_prep_ms = measure_ms([&] {
-        auto grayscale = normalize_map01(resized_db, 0.01, 0.99).to(torch::kFloat32).unsqueeze(0).unsqueeze(0);
+        auto grayscale_2d = signal_agnostic_dino_gray(resized_db).contiguous();
+        auto grayscale = grayscale_2d.unsqueeze(0).unsqueeze(0);
         auto rgb = grayscale.expand({1, 3, grayscale.size(2), grayscale.size(3)});
         const auto [mean, std] = get_normalization_tensors(config, compute_device);
         model_input = ((rgb - mean) / std).contiguous();
         if (use_fp16) {
           model_input = model_input.to(torch::kHalf);
         }
+
+        if (config.return_pre_model_gray) {
+          auto pre_model_gray_cpu = grayscale_2d.device().is_cuda() ? grayscale_2d.to(torch::kCPU) : grayscale_2d;
+          result.pre_model_gray.resize(static_cast<size_t>(result.aligned_rows) * static_cast<size_t>(result.aligned_cols));
+          std::memcpy(result.pre_model_gray.data(), pre_model_gray_cpu.data_ptr<float>(), result.pre_model_gray.size() * sizeof(float));
+        }
       });
 
       torch::Tensor dino_score;
       if (backend == "torchscript") {
         torch::Tensor model_output;
+        torch::Tensor patch_features;
         failure_stage = "torch_forward";
         result.timing.torch_forward_ms = measure_ms([&] {
           auto raw_output = torchscript_module_->forward({model_input});
@@ -458,8 +596,17 @@ class DinoTorchRuntime::Impl {
 
         failure_stage = "dino_score";
         result.timing.dino_score_ms = measure_ms([&] {
+          patch_features = extract_patch_feature_matrix(model_output, result.aligned_rows, result.aligned_cols, input.patch_size);
           dino_score = derive_dino_score_map(model_output, result.aligned_rows, result.aligned_cols, input.patch_size, input.dst_rows, input.dst_cols);
         });
+        if (config.return_patch_features && patch_features.defined()) {
+          auto patch_features_cpu = patch_features.device().is_cuda() ? patch_features.to(torch::kCPU) : patch_features;
+          result.patch_rows = std::max(1, result.aligned_rows / std::max(1, input.patch_size));
+          result.patch_cols = std::max(1, result.aligned_cols / std::max(1, input.patch_size));
+          result.feature_dim = static_cast<int>(patch_features_cpu.size(1));
+          result.patch_features.resize(static_cast<size_t>(patch_features_cpu.numel()));
+          std::memcpy(result.patch_features.data(), patch_features_cpu.data_ptr<float>(), result.patch_features.size() * sizeof(float));
+        }
         result.backend_used = "torchscript";
       } else {
         result.timing.dino_score_ms = measure_ms([&] {
@@ -650,6 +797,7 @@ class DinoTorchRuntime::Impl {
                                                 safe_patch,
                                                 std::max(1, dst_rows),
                                                 std::max(1, dst_cols));
+      (void)extract_patch_feature_matrix(warmup_tensor, aligned_rows, aligned_cols, safe_patch);
       if (!warmup_score.defined()) {
         throw std::runtime_error("TorchScript warmup failed to derive DINO score map");
       }

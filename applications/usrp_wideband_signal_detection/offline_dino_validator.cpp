@@ -23,7 +23,10 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#include <torch/torch.h>
 
 namespace {
 
@@ -36,6 +39,7 @@ struct ValidatorOptions {
   std::filesystem::path output_dir;
   int debug_chunk_index = 13;
   bool verbose = false;
+  bool subsection_only_validation = false;
 };
 
 struct ValidatorConfig {
@@ -61,7 +65,10 @@ struct ValidatorConfig {
   double dino_coherence_gate_floor = 0.25;
   double dino_coherence_gate_span_db = 3.0;
   double power_q = 0.90;
+  int dino_group_k = 8;
+  double dino_group_spatial_weight = 0.35;
   double dino_group_score_q = 0.60;
+  int min_component_size = 6;
   double pipeline_final_threshold = 0.20;
   double pipeline_gap_floor = 0.10;
   double pipeline_power_rescue_floor = 0.10;
@@ -98,6 +105,7 @@ struct MaskComparison {
 
 struct HybridPostprocessResult {
   std::vector<uint8_t> mask;
+  std::vector<float> combined_score;
   float seed_freq_threshold = 1.0f;
   float seed_res_threshold = 1.0f;
   float grow_freq_threshold = 1.0f;
@@ -155,6 +163,37 @@ struct GroupingResult {
   float peak_score_floor = 0.0f;
 };
 
+struct ComponentLabelling {
+  std::vector<int> labels;
+  std::vector<int> sizes;
+};
+
+struct DinoComponentSummaryRow {
+  int cluster = 0;
+  float size_fraction = 0.0f;
+  float support_mean = 0.0f;
+  float support_peak = 0.0f;
+  float internal_aff = 0.0f;
+  float boundary_aff = 0.0f;
+  float seed_mean = 0.0f;
+  float smoothness = 0.0f;
+  float combined_score = 0.0f;
+  float size_penalty = 0.0f;
+};
+
+struct GroupedDinoPatchResult {
+  std::vector<uint8_t> mask_patch;
+  std::vector<float> score_patch;
+  std::vector<uint8_t> label_map_patch;
+  std::vector<int> cluster_map;
+  std::vector<float> support_map;
+  std::vector<float> cluster_quality_map;
+  std::vector<float> selected_support_map;
+  float threshold = 0.0f;
+};
+
+ComponentLabelling label_components(const std::vector<uint8_t>& mask, int rows, int cols);
+
 struct ChunkRetryResult {
   int chunk_index = 0;
   int row_start = 0;
@@ -176,7 +215,15 @@ struct ChunkRetryResult {
   float connected_fraction = 0.0f;
   int component_count = 0;
   int grouped_box_count = 0;
+  int runtime_input_gray_rows = 0;
+  int runtime_input_gray_cols = 0;
+  int patch_rows = 0;
+  int patch_cols = 0;
+  int feature_dim = 0;
+  std::vector<float> runtime_input_gray;
+  std::vector<float> patch_features;
   std::vector<float> corrected_resized;
+  std::vector<float> raw_dino_score_map;
   std::vector<float> dino_score_map;
   std::vector<float> coherence_gate;
   std::vector<float> hybrid_contrib;
@@ -264,7 +311,10 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.dino_coherence_gate_floor = extract_number<double>(text, "dino_coherence_gate_floor").value_or(config.dino_coherence_gate_floor);
   config.dino_coherence_gate_span_db = extract_number<double>(text, "dino_coherence_gate_span_db").value_or(config.dino_coherence_gate_span_db);
   config.power_q = extract_number<double>(text, "power_q").value_or(config.power_q);
+  config.dino_group_k = extract_number<int>(text, "dino_group_k").value_or(config.dino_group_k);
+  config.dino_group_spatial_weight = extract_number<double>(text, "dino_group_spatial_weight").value_or(config.dino_group_spatial_weight);
   config.dino_group_score_q = extract_number<double>(text, "dino_group_score_q").value_or(config.dino_group_score_q);
+  config.min_component_size = extract_number<int>(text, "min_component_size").value_or(config.min_component_size);
   config.pipeline_final_threshold = extract_number<double>(text, "pipeline_final_threshold").value_or(config.pipeline_final_threshold);
   config.pipeline_gap_floor = extract_number<double>(text, "pipeline_gap_floor").value_or(config.pipeline_gap_floor);
   config.pipeline_power_rescue_floor = extract_number<double>(text, "pipeline_power_rescue_floor").value_or(config.pipeline_power_rescue_floor);
@@ -820,9 +870,21 @@ float quantile_from_values(std::vector<float> values, double q, float fallback =
     return fallback;
   }
   q = clamp_value(q, 0.0, 1.0);
-  const size_t index = static_cast<size_t>(std::llround(q * static_cast<double>(values.size() - 1)));
-  std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(index), values.end());
-  return values[index];
+  if (values.size() == 1) {
+    return values[0];
+  }
+  const double position = q * static_cast<double>(values.size() - 1);
+  const size_t lower_index = static_cast<size_t>(std::floor(position));
+  const size_t upper_index = static_cast<size_t>(std::ceil(position));
+  std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(lower_index), values.end());
+  const float lower_value = values[lower_index];
+  if (upper_index == lower_index) {
+    return lower_value;
+  }
+  std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(upper_index), values.end());
+  const float upper_value = values[upper_index];
+  const double weight = position - static_cast<double>(lower_index);
+  return static_cast<float>(lower_value + static_cast<float>(weight) * (upper_value - lower_value));
 }
 
 std::vector<float> gaussian_kernel(double sigma) {
@@ -905,7 +967,8 @@ std::vector<float> gaussian_first_derivative_rows(const std::vector<float>& inpu
     kernel[static_cast<size_t>(offset + radius)] =
         static_cast<float>((-x / sigma2) * std::exp(-(x * x) / (2.0 * sigma2)));
   }
-  return convolve_axis(input, rows, cols, kernel, true);
+  const auto smoothed_cols = convolve_axis(input, rows, cols, gaussian_kernel(sigma), false);
+  return convolve_axis(smoothed_cols, rows, cols, kernel, true);
 }
 
 std::vector<float> gaussian_first_derivative_cols(const std::vector<float>& input,
@@ -923,7 +986,8 @@ std::vector<float> gaussian_first_derivative_cols(const std::vector<float>& inpu
     kernel[static_cast<size_t>(offset + radius)] =
         static_cast<float>((-x / sigma2) * std::exp(-(x * x) / (2.0 * sigma2)));
   }
-  return convolve_axis(input, rows, cols, kernel, false);
+  const auto smoothed_rows = convolve_axis(input, rows, cols, gaussian_kernel(sigma), true);
+  return convolve_axis(smoothed_rows, rows, cols, kernel, false);
 }
 
 std::vector<float> normalize01_masked_minmax(const std::vector<float>& input,
@@ -967,24 +1031,8 @@ std::vector<float> normalize01_quantile(const std::vector<float>& input,
     return output;
   }
 
-  const auto select_quantile = [](std::vector<float> quantile_values, double q, float fallback) {
-    quantile_values.erase(std::remove_if(quantile_values.begin(), quantile_values.end(), [](float value) {
-                           return !std::isfinite(value);
-                         }),
-                         quantile_values.end());
-    if (quantile_values.empty()) {
-      return fallback;
-    }
-    q = clamp_value(q, 0.0, 1.0);
-    const size_t quantile_index = static_cast<size_t>(std::llround(q * static_cast<double>(quantile_values.size() - 1)));
-    std::nth_element(quantile_values.begin(),
-                     quantile_values.begin() + static_cast<std::ptrdiff_t>(quantile_index),
-                     quantile_values.end());
-    return quantile_values[quantile_index];
-  };
-
-  const float low = select_quantile(values, clamp_value(low_q / 100.0, 0.0, 1.0), 0.0f);
-  const float high = select_quantile(values, clamp_value(high_q / 100.0, 0.0, 1.0), 1.0f);
+  const float low = quantile_from_values(values, clamp_value(low_q / 100.0, 0.0, 1.0), 0.0f);
+  const float high = quantile_from_values(values, clamp_value(high_q / 100.0, 0.0, 1.0), 1.0f);
   const float scale = std::max(high - low, 1.0e-6f);
   for (size_t index = 0; index < input.size(); ++index) {
     if (!std::isfinite(input[index])) {
@@ -993,6 +1041,1069 @@ std::vector<float> normalize01_quantile(const std::vector<float>& input,
     output[index] = clamp_value((input[index] - low) / scale, 0.0f, 1.0f);
   }
   return output;
+}
+
+std::vector<float> normalize_vector01(const std::vector<float>& input) {
+  std::vector<float> output(input.size(), 1.0f);
+  if (input.empty()) {
+    return output;
+  }
+  float low = std::numeric_limits<float>::infinity();
+  float high = -std::numeric_limits<float>::infinity();
+  for (float value : input) {
+    if (!std::isfinite(value)) {
+      continue;
+    }
+    low = std::min(low, value);
+    high = std::max(high, value);
+  }
+  if (!std::isfinite(low) || !std::isfinite(high) || high <= low + 1.0e-8f) {
+    return output;
+  }
+  const float scale = high - low;
+  for (size_t index = 0; index < input.size(); ++index) {
+    output[index] = std::isfinite(input[index]) ? (input[index] - low) / scale : 0.0f;
+  }
+  return output;
+}
+
+struct ProcessMemorySnapshot {
+  size_t vm_rss_kib = 0;
+  size_t vm_hwm_kib = 0;
+};
+
+ProcessMemorySnapshot read_process_memory_snapshot() {
+  ProcessMemorySnapshot snapshot;
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    auto parse_kib = [&](const char* prefix, size_t* out) {
+      const std::string prefix_text(prefix);
+      if (line.rfind(prefix_text, 0) != 0) {
+        return false;
+      }
+      std::istringstream input(line.substr(prefix_text.size()));
+      size_t value = 0;
+      std::string unit;
+      input >> value >> unit;
+      if (input && unit == "kB") {
+        *out = value;
+      }
+      return true;
+    };
+    if (parse_kib("VmRSS:", &snapshot.vm_rss_kib)) {
+      continue;
+    }
+    if (parse_kib("VmHWM:", &snapshot.vm_hwm_kib)) {
+      continue;
+    }
+  }
+  return snapshot;
+}
+
+double dense_square_matrix_mib(int size) {
+  if (size <= 0) {
+    return 0.0;
+  }
+  const double bytes = static_cast<double>(size) * static_cast<double>(size) * static_cast<double>(sizeof(float));
+  return bytes / (1024.0 * 1024.0);
+}
+
+void log_grouped_patch_memory(bool verbose,
+                              std::string_view stage,
+                              const char* debug_label,
+                              int patch_rows,
+                              int patch_cols,
+                              int feature_dim) {
+  if (!verbose) {
+    return;
+  }
+  const int patch_count = std::max(0, patch_rows * patch_cols);
+  const auto memory = read_process_memory_snapshot();
+  std::cerr << "[offline_dino_validator] grouped_patch_memory stage=" << stage
+            << " label=" << debug_label
+            << " patch_grid=" << patch_rows << "x" << patch_cols
+            << " patch_count=" << patch_count
+            << " feature_dim=" << feature_dim
+            << " dense_matrix_mib=" << std::fixed << std::setprecision(1) << dense_square_matrix_mib(patch_count)
+            << " rss_mib=" << (static_cast<double>(memory.vm_rss_kib) / 1024.0)
+            << " hwm_mib=" << (static_cast<double>(memory.vm_hwm_kib) / 1024.0)
+            << "\n";
+}
+
+torch::Tensor vector_to_tensor_2d(const std::vector<float>& input, int rows, int cols) {
+  if (rows <= 0 || cols <= 0 || input.size() != static_cast<size_t>(rows) * static_cast<size_t>(cols)) {
+    return torch::zeros({std::max(rows, 0), std::max(cols, 0)}, torch::TensorOptions().dtype(torch::kFloat32));
+  }
+  return torch::tensor(input, torch::TensorOptions().dtype(torch::kFloat32)).view({rows, cols}).clone();
+}
+
+std::vector<float> tensor_to_vector_float(const torch::Tensor& tensor) {
+  const auto contiguous = tensor.contiguous().to(torch::kCPU, torch::kFloat32);
+  std::vector<float> output(static_cast<size_t>(contiguous.numel()), 0.0f);
+  if (!output.empty()) {
+    std::memcpy(output.data(), contiguous.data_ptr<float>(), output.size() * sizeof(float));
+  }
+  return output;
+}
+
+std::vector<float> patch_mean_map(const std::vector<float>& input,
+                                  int src_rows,
+                                  int src_cols,
+                                  int patch_rows,
+                                  int patch_cols) {
+  std::vector<float> output(static_cast<size_t>(patch_rows) * static_cast<size_t>(patch_cols), 0.0f);
+  if (src_rows <= 0 || src_cols <= 0 || patch_rows <= 0 || patch_cols <= 0) {
+    return output;
+  }
+  const int block_rows = std::max(1, src_rows / patch_rows);
+  const int block_cols = std::max(1, src_cols / patch_cols);
+  const int use_rows = std::min(src_rows, patch_rows * block_rows);
+  const int use_cols = std::min(src_cols, patch_cols * block_cols);
+  for (int patch_row = 0; patch_row < patch_rows; ++patch_row) {
+    for (int patch_col = 0; patch_col < patch_cols; ++patch_col) {
+      float sum = 0.0f;
+      int count = 0;
+      for (int row = patch_row * block_rows; row < std::min(use_rows, (patch_row + 1) * block_rows); ++row) {
+        for (int col = patch_col * block_cols; col < std::min(use_cols, (patch_col + 1) * block_cols); ++col) {
+          sum += input[flat_index(src_cols, row, col)];
+          ++count;
+        }
+      }
+      output[flat_index(patch_cols, patch_row, patch_col)] = count > 0 ? sum / static_cast<float>(count) : 0.0f;
+    }
+  }
+  return output;
+}
+
+std::vector<float> dino_seed_patch_map(const std::vector<float>& spectrogram_db,
+                                       int src_rows,
+                                       int src_cols,
+                                       int runtime_rows,
+                                       int runtime_cols,
+                                       int patch_rows,
+                                       int patch_cols) {
+  std::vector<float> rel_db(static_cast<size_t>(runtime_rows) * static_cast<size_t>(runtime_cols), 0.0f);
+  std::vector<float> linear_values;
+  linear_values.reserve(rel_db.size());
+  for (int row = 0; row < runtime_rows; ++row) {
+    for (int col = 0; col < runtime_cols; ++col) {
+      const float db = spectrogram_db[flat_index(src_cols, row, col)];
+      linear_values.push_back(std::pow(10.0f, db / 10.0f));
+    }
+  }
+  const float p_floor = std::max(quantile_from_values(linear_values, 0.30, 1.0e-20f), 1.0e-20f);
+  for (int row = 0; row < runtime_rows; ++row) {
+    for (int col = 0; col < runtime_cols; ++col) {
+      const float db = spectrogram_db[flat_index(src_cols, row, col)];
+      const float p_lin = std::pow(10.0f, db / 10.0f);
+      const float value = 10.0f * std::log10(std::max(p_lin, 1.0e-20f) / p_floor);
+      rel_db[flat_index(runtime_cols, row, col)] = clamp_value(value, -10.0f, 25.0f);
+    }
+  }
+  const auto persistence_px = box_mean_cols(rel_db, runtime_rows, runtime_cols, 3);
+  const auto local_avg = box_mean_2d(rel_db, runtime_rows, runtime_cols, 2, 2);
+  std::vector<float> contrast_px(rel_db.size(), 0.0f);
+  for (size_t index = 0; index < contrast_px.size(); ++index) {
+    contrast_px[index] = rel_db[index] - local_avg[index];
+  }
+  const auto persistence_n = normalize01_quantile(persistence_px, 5.0, 95.0);
+  const auto contrast_n = normalize01_quantile(contrast_px, 5.0, 95.0);
+  std::vector<float> seed_px(rel_db.size(), 0.0f);
+  for (size_t index = 0; index < seed_px.size(); ++index) {
+    seed_px[index] = 0.65f * persistence_n[index] + 0.35f * contrast_n[index];
+  }
+  return patch_mean_map(seed_px, runtime_rows, runtime_cols, patch_rows, patch_cols);
+}
+
+std::vector<float> raw_feature_energy_score_patch(const std::vector<float>& patch_features,
+                                                  int patch_rows,
+                                                  int patch_cols,
+                                                  int feature_dim) {
+  const int patch_count = patch_rows * patch_cols;
+  std::vector<float> raw_patch_score(static_cast<size_t>(patch_count), 0.0f);
+  if (patch_count <= 0 || feature_dim <= 0 ||
+      patch_features.size() != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
+    return raw_patch_score;
+  }
+  for (int patch_index = 0; patch_index < patch_count; ++patch_index) {
+    float mean_sq = 0.0f;
+    for (int feature_index = 0; feature_index < feature_dim; ++feature_index) {
+      const float value = patch_features[flat_index(feature_dim, patch_index, feature_index)];
+      mean_sq += value * value;
+    }
+    mean_sq /= static_cast<float>(feature_dim);
+    raw_patch_score[static_cast<size_t>(patch_index)] = std::sqrt(std::max(mean_sq, 1.0e-6f));
+  }
+  return normalize01_quantile(raw_patch_score, 5.0, 95.0);
+}
+
+std::vector<float> embed_aligned_map_in_source_canvas(const std::vector<float>& aligned_map,
+                                                      int aligned_rows,
+                                                      int aligned_cols,
+                                                      int source_rows,
+                                                      int source_cols,
+                                                      int row_offset,
+                                                      int col_offset) {
+  std::vector<float> canvas(static_cast<size_t>(std::max(source_rows, 0)) * static_cast<size_t>(std::max(source_cols, 0)), 0.0f);
+  if (source_rows <= 0 || source_cols <= 0 || aligned_rows <= 0 || aligned_cols <= 0 ||
+      aligned_map.size() != static_cast<size_t>(aligned_rows) * static_cast<size_t>(aligned_cols)) {
+    return canvas;
+  }
+  const int safe_row_offset = clamp_value(row_offset, 0, std::max(0, source_rows - 1));
+  const int safe_col_offset = clamp_value(col_offset, 0, std::max(0, source_cols - 1));
+  const int copy_rows = std::min(aligned_rows, std::max(0, source_rows - safe_row_offset));
+  const int copy_cols = std::min(aligned_cols, std::max(0, source_cols - safe_col_offset));
+  for (int row = 0; row < copy_rows; ++row) {
+    const int dst_row = safe_row_offset + row;
+    for (int col = 0; col < copy_cols; ++col) {
+      const int dst_col = safe_col_offset + col;
+      canvas[flat_index(source_cols, dst_row, dst_col)] = aligned_map[flat_index(aligned_cols, row, col)];
+    }
+  }
+  return canvas;
+}
+
+std::vector<float> project_aligned_map_to_output(const std::vector<float>& aligned_map,
+                                                 int aligned_rows,
+                                                 int aligned_cols,
+                                                 int source_rows,
+                                                 int source_cols,
+                                                 int row_offset,
+                                                 int col_offset,
+                                                 int output_rows,
+                                                 int output_cols) {
+  const auto source_canvas = embed_aligned_map_in_source_canvas(
+      aligned_map,
+      aligned_rows,
+      aligned_cols,
+      source_rows,
+      source_cols,
+      row_offset,
+      col_offset);
+  return resize_bilinear(source_canvas, source_rows, source_cols, output_rows, output_cols);
+}
+
+std::vector<float> project_patch_map_to_output(const std::vector<float>& patch_map,
+                                               int patch_rows,
+                                               int patch_cols,
+                                               int aligned_rows,
+                                               int aligned_cols,
+                                               int source_rows,
+                                               int source_cols,
+                                               int row_offset,
+                                               int col_offset,
+                                               int output_rows,
+                                               int output_cols) {
+  if (patch_rows <= 0 || patch_cols <= 0 ||
+      patch_map.size() != static_cast<size_t>(patch_rows) * static_cast<size_t>(patch_cols)) {
+    return std::vector<float>(static_cast<size_t>(std::max(output_rows, 0)) * static_cast<size_t>(std::max(output_cols, 0)), 0.0f);
+  }
+  const auto aligned_map = resize_bilinear(patch_map, patch_rows, patch_cols, aligned_rows, aligned_cols);
+  return project_aligned_map_to_output(
+      aligned_map,
+      aligned_rows,
+      aligned_cols,
+      source_rows,
+      source_cols,
+      row_offset,
+      col_offset,
+      output_rows,
+      output_cols);
+}
+
+std::vector<float> positional_design_matrix(int patch_rows, int patch_cols) {
+  constexpr float kPi = 3.14159265358979323846f;
+  const int n = patch_rows * patch_cols;
+  const int basis_dim = 16;
+  std::vector<float> design(static_cast<size_t>(n) * static_cast<size_t>(basis_dim), 0.0f);
+  for (int row = 0; row < patch_rows; ++row) {
+    const float row_coord = patch_rows > 1 ? -1.0f + 2.0f * static_cast<float>(row) / static_cast<float>(patch_rows - 1) : 0.0f;
+    for (int col = 0; col < patch_cols; ++col) {
+      const float col_coord = patch_cols > 1 ? -1.0f + 2.0f * static_cast<float>(col) / static_cast<float>(patch_cols - 1) : 0.0f;
+      const size_t base = static_cast<size_t>(flat_index(patch_cols, row, col)) * static_cast<size_t>(basis_dim);
+      design[base + 0] = 1.0f;
+      design[base + 1] = row_coord;
+      design[base + 2] = col_coord;
+      design[base + 3] = row_coord * row_coord;
+      design[base + 4] = col_coord * col_coord;
+      design[base + 5] = row_coord * col_coord;
+      design[base + 6] = std::sin(kPi * row_coord);
+      design[base + 7] = std::sin(kPi * col_coord);
+      design[base + 8] = std::cos(kPi * row_coord);
+      design[base + 9] = std::cos(kPi * col_coord);
+      design[base + 10] = std::sin(2.0f * kPi * row_coord);
+      design[base + 11] = std::sin(2.0f * kPi * col_coord);
+      design[base + 12] = std::cos(2.0f * kPi * row_coord);
+      design[base + 13] = std::cos(2.0f * kPi * col_coord);
+      design[base + 14] = std::sin(kPi * row_coord) * std::cos(kPi * col_coord);
+      design[base + 15] = std::cos(kPi * row_coord) * std::sin(kPi * col_coord);
+    }
+  }
+  return design;
+}
+
+std::vector<float> pca_project_features(const std::vector<float>& patch_features,
+                                        int patch_count,
+                                        int feature_dim) {
+  if (patch_count <= 1 || feature_dim <= 0 || patch_features.size() != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
+    return patch_features;
+  }
+  const int out_dim = std::min({12, feature_dim, patch_count - 1});
+  if (out_dim < 1) {
+    return patch_features;
+  }
+  const auto x = vector_to_tensor_2d(patch_features, patch_count, feature_dim);
+  const auto centered = x - x.mean(0, true);
+  const auto svd = torch::linalg_svd(centered, false);
+  const auto u = std::get<0>(svd).narrow(1, 0, out_dim);
+  const auto s = std::get<1>(svd).narrow(0, 0, out_dim).unsqueeze(0);
+  return tensor_to_vector_float(u * s);
+}
+
+std::vector<float> remove_positional_trend(const std::vector<float>& features,
+                                           int patch_count,
+                                           int feature_dim,
+                                           int patch_rows,
+                                           int patch_cols) {
+  if (patch_count <= 0 || feature_dim <= 0) {
+    return features;
+  }
+  const auto design = vector_to_tensor_2d(positional_design_matrix(patch_rows, patch_cols), patch_count, 16);
+  const auto x = vector_to_tensor_2d(features, patch_count, feature_dim);
+  const auto xtx = design.transpose(0, 1).matmul(design);
+  const auto ridge = 1.0e-3f * torch::eye(xtx.size(0), torch::TensorOptions().dtype(torch::kFloat32));
+  const auto beta = torch::linalg_solve(xtx + ridge, design.transpose(0, 1).matmul(x));
+  return tensor_to_vector_float(x - design.matmul(beta));
+}
+
+std::vector<float> remove_position_correlated_components(const std::vector<float>& features,
+                                                         int patch_count,
+                                                         int feature_dim,
+                                                         int patch_rows,
+                                                         int patch_cols) {
+  if (patch_count <= 1 || feature_dim <= 1) {
+    return features;
+  }
+  const auto design = positional_design_matrix(patch_rows, patch_cols);
+  std::vector<float> basis(static_cast<size_t>(patch_count) * 15U, 0.0f);
+  for (int row = 0; row < patch_count; ++row) {
+    const size_t src_base = static_cast<size_t>(row) * 16U;
+    const size_t dst_base = static_cast<size_t>(row) * 15U;
+    for (int col = 0; col < 15; ++col) {
+      basis[dst_base + static_cast<size_t>(col)] = design[src_base + static_cast<size_t>(col + 1)];
+    }
+  }
+  const auto x = vector_to_tensor_2d(features, patch_count, feature_dim);
+  const auto centered = x - x.mean(0, true);
+  const auto svd = torch::linalg_svd(centered, false);
+  auto scores = std::get<0>(svd) * std::get<1>(svd).unsqueeze(0);
+  const auto vh = std::get<2>(svd);
+  const int components = static_cast<int>(scores.size(1));
+  if (components <= 0) {
+    return features;
+  }
+  const auto basis_values = basis;
+  auto score_values = tensor_to_vector_float(scores);
+  std::vector<uint8_t> keep(static_cast<size_t>(components), 1);
+  std::vector<float> correlations(static_cast<size_t>(components), 0.0f);
+  for (int comp = 0; comp < components; ++comp) {
+    std::vector<float> y(static_cast<size_t>(patch_count), 0.0f);
+    float mean = 0.0f;
+    for (int row = 0; row < patch_count; ++row) {
+      const float value = score_values[static_cast<size_t>(row) * static_cast<size_t>(components) + static_cast<size_t>(comp)];
+      y[static_cast<size_t>(row)] = value;
+      mean += value;
+    }
+    mean /= static_cast<float>(patch_count);
+    float y_norm = 0.0f;
+    for (float& value : y) {
+      value -= mean;
+      y_norm += value * value;
+    }
+    y_norm = std::sqrt(y_norm);
+    if (y_norm < 1.0e-8f) {
+      continue;
+    }
+    float max_corr = 0.0f;
+    for (int basis_col = 0; basis_col < 15; ++basis_col) {
+      float basis_mean = 0.0f;
+      for (int row = 0; row < patch_count; ++row) {
+        basis_mean += basis_values[static_cast<size_t>(row) * 15U + static_cast<size_t>(basis_col)];
+      }
+      basis_mean /= static_cast<float>(patch_count);
+      float dot = 0.0f;
+      float basis_norm = 0.0f;
+      for (int row = 0; row < patch_count; ++row) {
+        const float centered_basis = basis_values[static_cast<size_t>(row) * 15U + static_cast<size_t>(basis_col)] - basis_mean;
+        dot += y[static_cast<size_t>(row)] * centered_basis;
+        basis_norm += centered_basis * centered_basis;
+      }
+      basis_norm = std::sqrt(basis_norm);
+      if (basis_norm < 1.0e-8f) {
+        continue;
+      }
+      max_corr = std::max(max_corr, std::fabs(dot / std::max(y_norm * basis_norm, 1.0e-8f)));
+    }
+    correlations[static_cast<size_t>(comp)] = max_corr;
+    if (max_corr >= 0.30f) {
+      keep[static_cast<size_t>(comp)] = 0;
+    }
+  }
+  if (std::none_of(keep.begin(), keep.end(), [](uint8_t value) { return value != 0; })) {
+    const auto min_iter = std::min_element(correlations.begin(), correlations.end());
+    if (min_iter != correlations.end()) {
+      keep[static_cast<size_t>(std::distance(correlations.begin(), min_iter))] = 1;
+    }
+  }
+  for (int comp = 0; comp < components; ++comp) {
+    if (keep[static_cast<size_t>(comp)] == 0) {
+      scores.index_put_({torch::indexing::Slice(), comp}, 0.0f);
+    }
+  }
+  return tensor_to_vector_float(scores.matmul(vh));
+}
+
+std::vector<float> row_normalize_square_matrix(const std::vector<float>& input, int size) {
+  std::vector<float> output(input.size(), 0.0f);
+  for (int row = 0; row < size; ++row) {
+    float row_sum = 0.0f;
+    for (int col = 0; col < size; ++col) {
+      row_sum += input[flat_index(size, row, col)];
+    }
+    row_sum = std::max(row_sum, 1.0e-6f);
+    for (int col = 0; col < size; ++col) {
+      output[flat_index(size, row, col)] = input[flat_index(size, row, col)] / row_sum;
+    }
+  }
+  return output;
+}
+
+std::vector<float> feature_affinity_matrix(const std::vector<float>& features,
+                                           int patch_count,
+                                           int feature_dim,
+                                           int k) {
+  std::vector<float> normalized(features.size(), 0.0f);
+  for (int row = 0; row < patch_count; ++row) {
+    float norm = 0.0f;
+    for (int col = 0; col < feature_dim; ++col) {
+      const float value = features[flat_index(feature_dim, row, col)];
+      norm += value * value;
+    }
+    norm = std::sqrt(std::max(norm, 1.0e-12f));
+    for (int col = 0; col < feature_dim; ++col) {
+      normalized[flat_index(feature_dim, row, col)] = features[flat_index(feature_dim, row, col)] / norm;
+    }
+  }
+  std::vector<float> cosine_dist(static_cast<size_t>(patch_count) * static_cast<size_t>(patch_count), 1.0f);
+  const int neighbors = std::min(std::max(1, k), std::max(1, patch_count - 1));
+  std::vector<float> positive_distances;
+  for (int row = 0; row < patch_count; ++row) {
+    cosine_dist[flat_index(patch_count, row, row)] = 0.0f;
+    std::vector<std::pair<float, int>> ranked;
+    ranked.reserve(static_cast<size_t>(patch_count - 1));
+    for (int col = 0; col < patch_count; ++col) {
+      if (col == row) {
+        continue;
+      }
+      float dot = 0.0f;
+      for (int feat = 0; feat < feature_dim; ++feat) {
+        dot += normalized[flat_index(feature_dim, row, feat)] * normalized[flat_index(feature_dim, col, feat)];
+      }
+      const float distance = std::max(0.0f, 1.0f - dot);
+      cosine_dist[flat_index(patch_count, row, col)] = distance;
+      ranked.emplace_back(distance, col);
+    }
+    std::partial_sort(ranked.begin(), ranked.begin() + neighbors, ranked.end());
+    for (int idx = 0; idx < neighbors; ++idx) {
+      if (ranked[static_cast<size_t>(idx)].first > 0.0f) {
+        positive_distances.push_back(ranked[static_cast<size_t>(idx)].first);
+      }
+    }
+  }
+  const float sigma = std::max(quantile_from_values(positive_distances, 0.50, 1.0f), 1.0e-3f);
+  std::vector<float> affinity(static_cast<size_t>(patch_count) * static_cast<size_t>(patch_count), 0.0f);
+  for (int row = 0; row < patch_count; ++row) {
+    affinity[flat_index(patch_count, row, row)] = 1.0f;
+    std::vector<std::pair<float, int>> ranked;
+    ranked.reserve(static_cast<size_t>(patch_count - 1));
+    for (int col = 0; col < patch_count; ++col) {
+      if (col == row) {
+        continue;
+      }
+      ranked.emplace_back(cosine_dist[flat_index(patch_count, row, col)], col);
+    }
+    std::partial_sort(ranked.begin(), ranked.begin() + neighbors, ranked.end());
+    for (int idx = 0; idx < neighbors; ++idx) {
+      const int col = ranked[static_cast<size_t>(idx)].second;
+      const float distance = ranked[static_cast<size_t>(idx)].first;
+      const float weight = std::exp(-((distance * distance) / (2.0f * sigma * sigma)));
+      affinity[flat_index(patch_count, row, col)] = std::max(affinity[flat_index(patch_count, row, col)], weight);
+      affinity[flat_index(patch_count, col, row)] = std::max(affinity[flat_index(patch_count, col, row)], weight);
+    }
+  }
+  return affinity;
+}
+
+std::vector<float> mutual_knn_affinity(const std::vector<float>& affinity, int patch_count, int top_k, float keep_q) {
+  const int clipped_top_k = clamp_value(top_k, 1, std::max(1, patch_count - 1));
+  std::vector<uint8_t> knn_mask(static_cast<size_t>(patch_count) * static_cast<size_t>(patch_count), 0);
+  for (int row = 0; row < patch_count; ++row) {
+    std::vector<std::pair<float, int>> ranked;
+    ranked.reserve(static_cast<size_t>(patch_count - 1));
+    for (int col = 0; col < patch_count; ++col) {
+      if (col == row) {
+        continue;
+      }
+      ranked.emplace_back(affinity[flat_index(patch_count, row, col)], col);
+    }
+    std::partial_sort(ranked.begin(), ranked.begin() + clipped_top_k, ranked.end(), std::greater<>());
+    for (int idx = 0; idx < clipped_top_k; ++idx) {
+      knn_mask[flat_index(patch_count, row, ranked[static_cast<size_t>(idx)].second)] = 1;
+    }
+  }
+  std::vector<float> values;
+  for (int row = 0; row < patch_count; ++row) {
+    for (int col = 0; col < patch_count; ++col) {
+      if (row == col) {
+        continue;
+      }
+      if (knn_mask[flat_index(patch_count, row, col)] != 0 && knn_mask[flat_index(patch_count, col, row)] != 0) {
+        const float value = affinity[flat_index(patch_count, row, col)];
+        if (value > 0.0f) {
+          values.push_back(value);
+        }
+      }
+    }
+  }
+  if (values.empty()) {
+    auto output = affinity;
+    for (int idx = 0; idx < patch_count; ++idx) {
+      output[flat_index(patch_count, idx, idx)] = 1.0f;
+    }
+    return output;
+  }
+  const float keep_threshold = quantile_from_values(values, clamp_value(static_cast<double>(keep_q), 0.0, 0.95), 0.0f);
+  std::vector<float> output(affinity.size(), 0.0f);
+  for (int row = 0; row < patch_count; ++row) {
+    output[flat_index(patch_count, row, row)] = 1.0f;
+    for (int col = 0; col < patch_count; ++col) {
+      if (row == col) {
+        continue;
+      }
+      const bool mutual = knn_mask[flat_index(patch_count, row, col)] != 0 && knn_mask[flat_index(patch_count, col, row)] != 0;
+      const float value = affinity[flat_index(patch_count, row, col)];
+      output[flat_index(patch_count, row, col)] = (mutual && value >= keep_threshold) ? value : 0.0f;
+    }
+  }
+  return output;
+}
+
+std::vector<float> inject_spatial_shortcuts(const std::vector<float>& local_aff,
+                                            const std::vector<float>& full_aff,
+                                            int patch_rows,
+                                            int patch_cols,
+                                            float spatial_weight) {
+  auto output = local_aff;
+  const int patch_count = patch_rows * patch_cols;
+  for (int row = 0; row < patch_rows; ++row) {
+    for (int col = 0; col < patch_cols; ++col) {
+      const int idx0 = flat_index(patch_cols, row, col);
+      for (int rr = std::max(0, row - 1); rr < std::min(patch_rows, row + 2); ++rr) {
+        for (int cc = std::max(0, col - 1); cc < std::min(patch_cols, col + 2); ++cc) {
+          if (rr == row && cc == col) {
+            continue;
+          }
+          const int idx1 = flat_index(patch_cols, rr, cc);
+          const float base_weight = full_aff[flat_index(patch_count, idx0, idx1)];
+          if (base_weight <= 0.0f) {
+            continue;
+          }
+          const float shortcut = spatial_weight * base_weight;
+          output[flat_index(patch_count, idx0, idx1)] = std::max(output[flat_index(patch_count, idx0, idx1)], shortcut);
+          output[flat_index(patch_count, idx1, idx0)] = std::max(output[flat_index(patch_count, idx1, idx0)], shortcut);
+        }
+      }
+    }
+  }
+  for (int idx = 0; idx < patch_count; ++idx) {
+    output[flat_index(patch_count, idx, idx)] = 1.0f;
+  }
+  return output;
+}
+
+std::vector<float> local_affinity_score_map(const std::vector<float>& local_aff, int patch_rows, int patch_cols) {
+  const int patch_count = patch_rows * patch_cols;
+  const auto trans = row_normalize_square_matrix(local_aff, patch_count);
+  std::vector<float> trans2(static_cast<size_t>(patch_count) * static_cast<size_t>(patch_count), 0.0f);
+  std::vector<float> trans3(static_cast<size_t>(patch_count) * static_cast<size_t>(patch_count), 0.0f);
+  for (int row = 0; row < patch_count; ++row) {
+    for (int mid = 0; mid < patch_count; ++mid) {
+      const float left = trans[flat_index(patch_count, row, mid)];
+      if (left == 0.0f) {
+        continue;
+      }
+      for (int col = 0; col < patch_count; ++col) {
+        trans2[flat_index(patch_count, row, col)] += left * trans[flat_index(patch_count, mid, col)];
+      }
+    }
+  }
+  for (int row = 0; row < patch_count; ++row) {
+    for (int mid = 0; mid < patch_count; ++mid) {
+      const float left = trans2[flat_index(patch_count, row, mid)];
+      if (left == 0.0f) {
+        continue;
+      }
+      for (int col = 0; col < patch_count; ++col) {
+        trans3[flat_index(patch_count, row, col)] += left * trans[flat_index(patch_count, mid, col)];
+      }
+    }
+  }
+  std::vector<float> weighted_degree(static_cast<size_t>(patch_count), 0.0f);
+  std::vector<float> two_hop_return(static_cast<size_t>(patch_count), 0.0f);
+  std::vector<float> three_hop_return(static_cast<size_t>(patch_count), 0.0f);
+  std::vector<float> spatial_strength(static_cast<size_t>(patch_count), 0.0f);
+  for (int idx = 0; idx < patch_count; ++idx) {
+    float degree = 0.0f;
+    for (int col = 0; col < patch_count; ++col) {
+      degree += local_aff[flat_index(patch_count, idx, col)];
+    }
+    weighted_degree[static_cast<size_t>(idx)] = degree - 1.0f;
+    two_hop_return[static_cast<size_t>(idx)] = trans2[flat_index(patch_count, idx, idx)];
+    three_hop_return[static_cast<size_t>(idx)] = trans3[flat_index(patch_count, idx, idx)];
+  }
+  for (int row = 0; row < patch_rows; ++row) {
+    for (int col = 0; col < patch_cols; ++col) {
+      const int idx0 = flat_index(patch_cols, row, col);
+      float sum = 0.0f;
+      int count = 0;
+      for (int rr = std::max(0, row - 1); rr < std::min(patch_rows, row + 2); ++rr) {
+        for (int cc = std::max(0, col - 1); cc < std::min(patch_cols, col + 2); ++cc) {
+          if (rr == row && cc == col) {
+            continue;
+          }
+          sum += local_aff[flat_index(patch_count, idx0, flat_index(patch_cols, rr, cc))];
+          ++count;
+        }
+      }
+      spatial_strength[static_cast<size_t>(idx0)] = count > 0 ? sum / static_cast<float>(count) : 0.0f;
+    }
+  }
+  const auto degree_n = normalize_vector01(weighted_degree);
+  const auto two_hop_n = normalize_vector01(two_hop_return);
+  const auto three_hop_n = normalize_vector01(three_hop_return);
+  const auto spatial_n = normalize_vector01(spatial_strength);
+  std::vector<float> score(static_cast<size_t>(patch_count), 0.0f);
+  for (int idx = 0; idx < patch_count; ++idx) {
+    score[static_cast<size_t>(idx)] = 0.35f * degree_n[static_cast<size_t>(idx)] +
+                                      0.30f * two_hop_n[static_cast<size_t>(idx)] +
+                                      0.20f * three_hop_n[static_cast<size_t>(idx)] +
+                                      0.15f * spatial_n[static_cast<size_t>(idx)];
+  }
+  return normalize01_quantile(score, 5.0, 95.0);
+}
+
+std::pair<std::vector<int>, std::vector<uint8_t>> connected_affinity_components(const std::vector<float>& local_aff,
+                                                                                 const std::vector<float>& support_map,
+                                                                                 int patch_rows,
+                                                                                 int patch_cols) {
+  const int patch_count = patch_rows * patch_cols;
+  std::vector<float> positive;
+  for (int row = 0; row < patch_count; ++row) {
+    for (int col = 0; col < patch_count; ++col) {
+      if (row == col) {
+        continue;
+      }
+      const float value = local_aff[flat_index(patch_count, row, col)];
+      if (value > 0.0f) {
+        positive.push_back(value);
+      }
+    }
+  }
+  const float edge_threshold = positive.empty() ? 0.0f : quantile_from_values(positive, 0.55, 0.0f);
+  const float seed_threshold = quantile_from_values(support_map, 0.72, 1.0f);
+  const float grow_threshold = quantile_from_values(support_map, 0.58, 1.0f);
+  std::vector<uint8_t> active(static_cast<size_t>(patch_count), 0);
+  std::vector<uint8_t> eligible(static_cast<size_t>(patch_count), 0);
+  for (int idx = 0; idx < patch_count; ++idx) {
+    active[static_cast<size_t>(idx)] = support_map[static_cast<size_t>(idx)] >= seed_threshold ? 1 : 0;
+    eligible[static_cast<size_t>(idx)] = support_map[static_cast<size_t>(idx)] >= grow_threshold ? 1 : 0;
+  }
+  for (int iter = 0; iter < 2; ++iter) {
+    auto updated = active;
+    bool changed = false;
+    for (int row = 0; row < patch_rows; ++row) {
+      for (int col = 0; col < patch_cols; ++col) {
+        const int idx0 = flat_index(patch_cols, row, col);
+        if (active[static_cast<size_t>(idx0)] != 0 || eligible[static_cast<size_t>(idx0)] == 0) {
+          continue;
+        }
+        bool linked = false;
+        for (int rr = std::max(0, row - 1); rr < std::min(patch_rows, row + 2) && !linked; ++rr) {
+          for (int cc = std::max(0, col - 1); cc < std::min(patch_cols, col + 2); ++cc) {
+            if (rr == row && cc == col) {
+              continue;
+            }
+            const int idx1 = flat_index(patch_cols, rr, cc);
+            if (active[static_cast<size_t>(idx1)] != 0 && local_aff[flat_index(patch_count, idx0, idx1)] >= edge_threshold) {
+              linked = true;
+              break;
+            }
+          }
+        }
+        if (linked) {
+          updated[static_cast<size_t>(idx0)] = 1;
+          changed = true;
+        }
+      }
+    }
+    active = std::move(updated);
+    if (!changed) {
+      break;
+    }
+  }
+  return {label_components(active, patch_rows, patch_cols).labels, active};
+}
+
+float component_boundary_affinity(const std::vector<float>& local_aff,
+                                  const std::vector<uint8_t>& component_mask,
+                                  int patch_rows,
+                                  int patch_cols) {
+  const int patch_count = patch_rows * patch_cols;
+  std::vector<float> values;
+  for (int row = 0; row < patch_rows; ++row) {
+    for (int col = 0; col < patch_cols; ++col) {
+      const int idx0 = flat_index(patch_cols, row, col);
+      if (component_mask[static_cast<size_t>(idx0)] == 0) {
+        continue;
+      }
+      for (int rr = std::max(0, row - 1); rr < std::min(patch_rows, row + 2); ++rr) {
+        for (int cc = std::max(0, col - 1); cc < std::min(patch_cols, col + 2); ++cc) {
+          if (rr == row && cc == col) {
+            continue;
+          }
+          const int idx1 = flat_index(patch_cols, rr, cc);
+          if (component_mask[static_cast<size_t>(idx1)] == 0) {
+            values.push_back(local_aff[flat_index(patch_count, idx0, idx1)]);
+          }
+        }
+      }
+    }
+  }
+  return values.empty() ? 0.0f : std::accumulate(values.begin(), values.end(), 0.0f) / static_cast<float>(values.size());
+}
+
+float mask_smoothness(const std::vector<uint8_t>& mask, int patch_rows, int patch_cols) {
+  float v_disagree = 0.0f;
+  float h_disagree = 0.0f;
+  int v_count = 0;
+  int h_count = 0;
+  for (int row = 1; row < patch_rows; ++row) {
+    for (int col = 0; col < patch_cols; ++col) {
+      v_disagree += mask[flat_index(patch_cols, row, col)] != mask[flat_index(patch_cols, row - 1, col)] ? 1.0f : 0.0f;
+      ++v_count;
+    }
+  }
+  for (int row = 0; row < patch_rows; ++row) {
+    for (int col = 1; col < patch_cols; ++col) {
+      h_disagree += mask[flat_index(patch_cols, row, col)] != mask[flat_index(patch_cols, row, col - 1)] ? 1.0f : 0.0f;
+      ++h_count;
+    }
+  }
+  const float edge_disagreement = 0.5f * ((v_count > 0 ? v_disagree / static_cast<float>(v_count) : 0.0f) +
+                                          (h_count > 0 ? h_disagree / static_cast<float>(h_count) : 0.0f));
+  return 1.0f - edge_disagreement;
+}
+
+std::vector<DinoComponentSummaryRow> component_summary_table(const std::vector<float>& local_aff,
+                                                             const std::vector<int>& component_map,
+                                                             const std::vector<float>& support_map,
+                                                             const std::vector<float>& seed_norm,
+                                                             int patch_rows,
+                                                             int patch_cols) {
+  const int patch_count = patch_rows * patch_cols;
+  int max_label = 0;
+  for (int label : component_map) {
+    max_label = std::max(max_label, label);
+  }
+  std::vector<DinoComponentSummaryRow> rows;
+  for (int label = 1; label <= max_label; ++label) {
+    std::vector<int> indices;
+    std::vector<uint8_t> mask(static_cast<size_t>(patch_count), 0);
+    for (int idx = 0; idx < patch_count; ++idx) {
+      if (component_map[static_cast<size_t>(idx)] == label) {
+        indices.push_back(idx);
+        mask[static_cast<size_t>(idx)] = 1;
+      }
+    }
+    if (indices.empty()) {
+      continue;
+    }
+    float internal_sum = 0.0f;
+    int internal_count = 0;
+    for (size_t ii = 0; ii < indices.size(); ++ii) {
+      for (size_t jj = ii + 1; jj < indices.size(); ++jj) {
+        internal_sum += local_aff[flat_index(patch_count, indices[ii], indices[jj])];
+        ++internal_count;
+      }
+    }
+    std::vector<float> support_values;
+    float support_mean = 0.0f;
+    float seed_mean = 0.0f;
+    for (int idx : indices) {
+      support_values.push_back(support_map[static_cast<size_t>(idx)]);
+      support_mean += support_map[static_cast<size_t>(idx)];
+      seed_mean += seed_norm[static_cast<size_t>(idx)];
+    }
+    DinoComponentSummaryRow row;
+    row.cluster = label;
+    row.size_fraction = static_cast<float>(indices.size()) / static_cast<float>(patch_count);
+    row.support_mean = support_mean / static_cast<float>(indices.size());
+    row.support_peak = quantile_from_values(support_values, 0.90, 0.0f);
+    row.internal_aff = internal_count > 0 ? internal_sum / static_cast<float>(internal_count) : 0.0f;
+    row.boundary_aff = component_boundary_affinity(local_aff, mask, patch_rows, patch_cols);
+    row.seed_mean = seed_mean / static_cast<float>(indices.size());
+    row.smoothness = mask_smoothness(mask, patch_rows, patch_cols);
+    rows.push_back(row);
+  }
+  if (rows.empty()) {
+    return rows;
+  }
+  std::vector<float> support_mean_vals;
+  std::vector<float> support_peak_vals;
+  std::vector<float> internal_vals;
+  std::vector<float> boundary_gap_vals;
+  std::vector<float> seed_vals;
+  std::vector<float> smooth_vals;
+  std::vector<float> size_vals;
+  for (const auto& row : rows) {
+    support_mean_vals.push_back(row.support_mean);
+    support_peak_vals.push_back(row.support_peak);
+    internal_vals.push_back(row.internal_aff);
+    boundary_gap_vals.push_back(row.internal_aff - row.boundary_aff);
+    seed_vals.push_back(row.seed_mean);
+    smooth_vals.push_back(row.smoothness);
+    size_vals.push_back(row.size_fraction);
+  }
+  const auto support_mean_n = normalize_vector01(support_mean_vals);
+  const auto support_peak_n = normalize_vector01(support_peak_vals);
+  const auto internal_n = normalize_vector01(internal_vals);
+  const auto boundary_gap_n = normalize_vector01(boundary_gap_vals);
+  const auto seed_n = normalize_vector01(seed_vals);
+  const auto smooth_n = normalize_vector01(smooth_vals);
+  for (size_t index = 0; index < rows.size(); ++index) {
+    const float size_penalty = clamp_value((size_vals[index] - 0.30f) / 0.20f, 0.0f, 1.0f);
+    rows[index].size_penalty = size_penalty;
+    rows[index].combined_score = 0.35f * support_mean_n[index] +
+                                 0.20f * support_peak_n[index] +
+                                 0.20f * internal_n[index] +
+                                 0.15f * boundary_gap_n[index] +
+                                 0.05f * seed_n[index] +
+                                 0.05f * smooth_n[index] -
+                                 0.10f * size_penalty;
+  }
+  std::sort(rows.begin(), rows.end(), [](const DinoComponentSummaryRow& lhs, const DinoComponentSummaryRow& rhs) {
+    return lhs.combined_score > rhs.combined_score;
+  });
+  return rows;
+}
+
+std::vector<int> select_signal_components(const std::vector<DinoComponentSummaryRow>& component_rows) {
+  if (component_rows.empty()) {
+    return {};
+  }
+  const float best_score = component_rows.front().combined_score;
+  const float score_floor = std::max(0.35f, 0.72f * best_score);
+  std::vector<int> selected;
+  for (const auto& row : component_rows) {
+    if (row.combined_score < score_floor) {
+      continue;
+    }
+    if (row.size_fraction > 0.45f && row.combined_score < 0.95f * best_score) {
+      continue;
+    }
+    selected.push_back(row.cluster);
+    if (selected.size() >= 3) {
+      break;
+    }
+  }
+  if (selected.empty()) {
+    selected.push_back(component_rows.front().cluster);
+  }
+  return selected;
+}
+
+std::vector<uint8_t> smooth_binary_label_map(const std::vector<uint8_t>& label_map,
+                                             int patch_rows,
+                                             int patch_cols,
+                                             int iters,
+                                             int min_component_size) {
+  auto output = label_map;
+  for (int iter = 0; iter < std::max(0, iters); ++iter) {
+    std::vector<float> float_map(output.begin(), output.end());
+    const auto avg = box_mean_2d(float_map, patch_rows, patch_cols, 1, 1);
+    for (size_t index = 0; index < output.size(); ++index) {
+      output[index] = avg[index] >= 0.5f ? 1 : 0;
+    }
+  }
+  const auto labelled = label_components(output, patch_rows, patch_cols);
+  if (!labelled.sizes.empty()) {
+    std::vector<uint8_t> small_mask(output.size(), 0);
+    for (size_t index = 0; index < labelled.labels.size(); ++index) {
+      const int label = labelled.labels[index];
+      if (label > 0 && labelled.sizes[static_cast<size_t>(label - 1)] < std::max(1, min_component_size)) {
+        small_mask[index] = 1;
+      }
+    }
+    std::vector<float> float_map(output.begin(), output.end());
+    const auto neigh = box_mean_2d(float_map, patch_rows, patch_cols, 1, 1);
+    for (size_t index = 0; index < output.size(); ++index) {
+      if (small_mask[index] != 0) {
+        output[index] = neigh[index] >= 0.5f ? 1 : 0;
+      }
+    }
+  }
+  return output;
+}
+
+GroupedDinoPatchResult grouped_dino_from_patch_features(const std::vector<float>& patch_features,
+                                                        int patch_rows,
+                                                        int patch_cols,
+                                                        int feature_dim,
+                                                        const std::vector<float>& seed_patch,
+                                                        const ValidatorConfig& config,
+                                                        bool verbose,
+                                                        const char* debug_label) {
+  GroupedDinoPatchResult result;
+  const int patch_count = patch_rows * patch_cols;
+  result.mask_patch.assign(static_cast<size_t>(patch_count), 0);
+  result.score_patch.assign(static_cast<size_t>(patch_count), 0.0f);
+  result.label_map_patch.assign(static_cast<size_t>(patch_count), 0);
+  result.cluster_map.assign(static_cast<size_t>(patch_count), 0);
+  result.support_map.assign(static_cast<size_t>(patch_count), 0.0f);
+  result.cluster_quality_map.assign(static_cast<size_t>(patch_count), 0.0f);
+  result.selected_support_map.assign(static_cast<size_t>(patch_count), 0.0f);
+  if (patch_count <= 0 || feature_dim <= 0 || patch_features.size() != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
+    return result;
+  }
+
+  log_grouped_patch_memory(verbose, "start", debug_label, patch_rows, patch_cols, feature_dim);
+
+  auto x = pca_project_features(patch_features, patch_count, feature_dim);
+  const int reduced_dim = std::max(1, static_cast<int>(x.size()) / std::max(1, patch_count));
+  log_grouped_patch_memory(verbose, "after_pca", debug_label, patch_rows, patch_cols, reduced_dim);
+  x = remove_positional_trend(x, patch_count, reduced_dim, patch_rows, patch_cols);
+  x = remove_position_correlated_components(x, patch_count, reduced_dim, patch_rows, patch_cols);
+  std::vector<float> feature_mean(static_cast<size_t>(reduced_dim), 0.0f);
+  for (int row = 0; row < patch_count; ++row) {
+    for (int col = 0; col < reduced_dim; ++col) {
+      feature_mean[static_cast<size_t>(col)] += x[flat_index(reduced_dim, row, col)];
+    }
+  }
+  for (float& value : feature_mean) {
+    value /= static_cast<float>(patch_count);
+  }
+  for (int row = 0; row < patch_count; ++row) {
+    float norm = 0.0f;
+    for (int col = 0; col < reduced_dim; ++col) {
+      float& value = x[flat_index(reduced_dim, row, col)];
+      value -= feature_mean[static_cast<size_t>(col)];
+      norm += value * value;
+    }
+    norm = std::sqrt(std::max(norm, 1.0e-6f));
+    for (int col = 0; col < reduced_dim; ++col) {
+      x[flat_index(reduced_dim, row, col)] /= norm;
+    }
+  }
+
+  const auto full_aff = feature_affinity_matrix(x, patch_count, reduced_dim, config.dino_group_k);
+  log_grouped_patch_memory(verbose, "after_full_aff", debug_label, patch_rows, patch_cols, reduced_dim);
+  auto local_aff = mutual_knn_affinity(full_aff, patch_count, config.dino_group_k, 0.40f);
+  local_aff = inject_spatial_shortcuts(local_aff, full_aff, patch_rows, patch_cols, static_cast<float>(config.dino_group_spatial_weight));
+  log_grouped_patch_memory(verbose, "after_local_aff", debug_label, patch_rows, patch_cols, reduced_dim);
+  const auto seed_norm = normalize01_quantile(seed_patch, 5.0, 95.0);
+  result.support_map = local_affinity_score_map(local_aff, patch_rows, patch_cols);
+  log_grouped_patch_memory(verbose, "after_support_map", debug_label, patch_rows, patch_cols, reduced_dim);
+  const auto components = connected_affinity_components(local_aff, result.support_map, patch_rows, patch_cols);
+  result.cluster_map = components.first;
+  const auto component_rows = component_summary_table(local_aff, result.cluster_map, result.support_map, seed_norm, patch_rows, patch_cols);
+  const auto selected_components = select_signal_components(component_rows);
+  if (!selected_components.empty()) {
+    for (size_t index = 0; index < result.label_map_patch.size(); ++index) {
+      result.label_map_patch[index] = std::find(selected_components.begin(), selected_components.end(), result.cluster_map[index]) != selected_components.end() ? 1 : 0;
+    }
+  } else {
+    const float fallback_threshold = quantile_from_values(result.support_map, 0.80, 1.0f);
+    for (size_t index = 0; index < result.label_map_patch.size(); ++index) {
+      result.label_map_patch[index] = result.support_map[index] >= fallback_threshold ? 1 : 0;
+      result.cluster_map[index] = result.label_map_patch[index] != 0 ? 1 : 0;
+    }
+  }
+  result.label_map_patch = smooth_binary_label_map(result.label_map_patch, patch_rows, patch_cols, 2, config.min_component_size);
+  std::vector<float> support_selected(result.support_map.size(), 0.0f);
+  for (size_t index = 0; index < support_selected.size(); ++index) {
+    support_selected[index] = result.support_map[index] * static_cast<float>(result.label_map_patch[index]);
+  }
+  result.selected_support_map = normalize01_quantile(box_mean_2d(support_selected, patch_rows, patch_cols, 1, 1), 5.0, 95.0);
+  if (!component_rows.empty()) {
+    std::vector<float> component_scores;
+    for (const auto& row : component_rows) {
+      component_scores.push_back(std::max(0.0f, row.combined_score));
+    }
+    const auto component_scores_n = normalize_vector01(component_scores);
+    for (size_t row_index = 0; row_index < component_rows.size(); ++row_index) {
+      for (size_t index = 0; index < result.cluster_map.size(); ++index) {
+        if (result.cluster_map[index] == component_rows[row_index].cluster) {
+          result.cluster_quality_map[index] = component_scores_n[row_index];
+        }
+      }
+    }
+  }
+  for (size_t index = 0; index < result.score_patch.size(); ++index) {
+    result.score_patch[index] = 0.70f * result.selected_support_map[index] +
+                                0.20f * result.cluster_quality_map[index] +
+                                0.10f * seed_norm[index];
+  }
+  result.score_patch = normalize01_quantile(result.score_patch, 5.0, 95.0);
+
+  std::vector<float> candidate_scores;
+  for (size_t index = 0; index < result.score_patch.size(); ++index) {
+    if (result.label_map_patch[index] != 0) {
+      candidate_scores.push_back(result.score_patch[index]);
+    }
+  }
+  const double score_q = clamp_value(config.dino_group_score_q, 0.50, 0.95);
+  if (candidate_scores.size() >= 4) {
+    result.threshold = quantile_from_values(candidate_scores, score_q, 1.0f);
+    for (size_t index = 0; index < result.mask_patch.size(); ++index) {
+      result.mask_patch[index] = (result.label_map_patch[index] != 0 && result.score_patch[index] >= result.threshold) ? 1 : 0;
+    }
+    const float fraction = result.mask_patch.empty() ? 0.0f : static_cast<float>(std::count(result.mask_patch.begin(), result.mask_patch.end(), 1)) / static_cast<float>(result.mask_patch.size());
+    if (fraction < 0.02f) {
+      const float fallback_threshold = quantile_from_values(result.selected_support_map, 0.75, 1.0f);
+      std::vector<uint8_t> fallback_mask(result.mask_patch.size(), 0);
+      for (size_t index = 0; index < fallback_mask.size(); ++index) {
+        fallback_mask[index] = result.selected_support_map[index] >= fallback_threshold ? 1 : 0;
+      }
+      std::vector<float> fallback_scores;
+      for (size_t index = 0; index < fallback_mask.size(); ++index) {
+        if (fallback_mask[index] != 0) {
+          fallback_scores.push_back(result.score_patch[index]);
+        }
+      }
+      result.threshold = fallback_scores.empty() ? quantile_from_values(result.score_patch, score_q, 1.0f)
+                                                 : quantile_from_values(fallback_scores, std::min(score_q, 0.80), 1.0f);
+      result.mask_patch = std::move(fallback_mask);
+    }
+  } else {
+    result.threshold = quantile_from_values(result.score_patch, score_q, 1.0f);
+    for (size_t index = 0; index < result.mask_patch.size(); ++index) {
+      result.mask_patch[index] = result.score_patch[index] >= result.threshold ? 1 : 0;
+    }
+  }
+  result.mask_patch = smooth_binary_label_map(result.mask_patch, patch_rows, patch_cols, 1, std::max(2, config.min_component_size / 2));
+  log_grouped_patch_memory(verbose, "done", debug_label, patch_rows, patch_cols, reduced_dim);
+  return result;
 }
 
 std::vector<float> structure_tensor_gate(const std::vector<float>& corrected_resized,
@@ -1061,11 +2172,6 @@ std::vector<float> structure_tensor_gate(const std::vector<float>& corrected_res
   }
   return gate_px;
 }
-
-struct ComponentLabelling {
-  std::vector<int> labels;
-  std::vector<int> sizes;
-};
 
 ComponentLabelling label_components(const std::vector<uint8_t>& mask, int rows, int cols) {
   ComponentLabelling result;
@@ -1771,6 +2877,7 @@ HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& hybri
     combined_input[index] = keep_freq[index] * (0.35f + 0.65f * residual_veto_gate[index]);
   }
   const auto combined_score = normalize01_masked_minmax(combined_input, valid_mask);
+  result.combined_score = combined_score;
 
   std::vector<float> active_freq;
   std::vector<float> active_res;
@@ -1824,7 +2931,9 @@ ChunkRetryResult run_retry_chunk(holoscan::ops::DinoTorchRuntime& runtime,
                                  int full_rows,
                                  int full_cols,
                                  double resolution_hz,
-                                 const std::vector<uint8_t>& source_valid_row_mask) {
+                                 const std::vector<uint8_t>& source_valid_row_mask,
+                                 bool keep_debug_artifacts,
+                                 bool verbose) {
   ChunkRetryResult result;
   result.chunk_index = chunk.chunk_index;
   result.row_start = chunk.row_start;
@@ -1856,12 +2965,7 @@ ChunkRetryResult run_retry_chunk(holoscan::ops::DinoTorchRuntime& runtime,
                                     (std::max(1, result.src_rows) / std::max(1, config.patch_size)) * std::max(1, config.patch_size));
   const int runtime_cols = std::max(config.patch_size,
                                     (std::max(1, result.src_cols) / std::max(1, config.patch_size)) * std::max(1, config.patch_size));
-  int source_ignore_bins = 0;
-  while (source_ignore_bins < result.src_rows && !source_chunk_valid_rows[static_cast<size_t>(source_ignore_bins)]) {
-    ++source_ignore_bins;
-  }
-  result.ignore_bins_per_side = std::min(result.dst_rows / 2, static_cast<int>(std::llround(
-      static_cast<double>(source_ignore_bins) * static_cast<double>(result.dst_rows) / static_cast<double>(std::max(result.src_rows, 1)))));
+  result.ignore_bins_per_side = 0;
 
   float* power_chunk_device = nullptr;
   float* corrected_chunk_device = nullptr;
@@ -1895,7 +2999,11 @@ ChunkRetryResult run_retry_chunk(holoscan::ops::DinoTorchRuntime& runtime,
   runtime_input.power_db_device = power_chunk_device;
   runtime_input.corrected_db_device = corrected_chunk_device;
 
-  const auto runtime_result = runtime.run(runtime_config, runtime_input);
+  auto chunk_runtime_config = runtime_config;
+  chunk_runtime_config.ignore_sideband_hz = 0.0;
+  chunk_runtime_config.return_pre_model_gray = keep_debug_artifacts;
+  chunk_runtime_config.return_patch_features = keep_debug_artifacts;
+  const auto runtime_result = runtime.run(chunk_runtime_config, runtime_input);
   cudaFree(power_chunk_device);
   cudaFree(corrected_chunk_device);
 
@@ -1905,34 +3013,139 @@ ChunkRetryResult run_retry_chunk(holoscan::ops::DinoTorchRuntime& runtime,
   if (runtime_result.score_map.size() != static_cast<size_t>(runtime_rows) * static_cast<size_t>(runtime_cols)) {
     throw std::runtime_error("unexpected chunk DINO score map size returned from runtime");
   }
+  if (!runtime_result.pre_model_gray.empty() &&
+      runtime_result.pre_model_gray.size() != static_cast<size_t>(runtime_result.aligned_rows) * static_cast<size_t>(runtime_result.aligned_cols)) {
+    throw std::runtime_error("unexpected pre-model grayscale size returned from runtime");
+  }
 
   result.dino_threshold = runtime_result.dino_threshold;
   result.runtime_final_threshold = runtime_result.final_threshold;
-  result.dino_score_map = resize_bilinear(runtime_result.score_map,
-                                          runtime_rows,
-                                          runtime_cols,
-                                          result.dst_rows,
-                                          result.dst_cols);
-  result.corrected_resized = resize_bilinear(corrected_chunk, result.src_rows, result.src_cols, result.dst_rows, result.dst_cols);
+  if (keep_debug_artifacts && !runtime_result.pre_model_gray.empty()) {
+    result.runtime_input_gray_rows = runtime_result.aligned_rows;
+    result.runtime_input_gray_cols = runtime_result.aligned_cols;
+    result.runtime_input_gray = runtime_result.pre_model_gray;
+  }
+  result.patch_rows = runtime_result.patch_rows;
+  result.patch_cols = runtime_result.patch_cols;
+  result.feature_dim = runtime_result.feature_dim;
+  if (keep_debug_artifacts) {
+    result.patch_features = runtime_result.patch_features;
+  }
+  const int runtime_row_offset = 0;
+  const int runtime_col_offset = 0;
+  const auto raw_aligned_score = resize_bilinear(runtime_result.score_map,
+                                                 runtime_rows,
+                                                 runtime_cols,
+                                                 runtime_result.aligned_rows,
+                                                 runtime_result.aligned_cols);
+  std::vector<float> raw_dino_score_map;
+  if (!runtime_result.patch_features.empty() && result.patch_rows > 0 && result.patch_cols > 0 && result.feature_dim > 0) {
+    const auto raw_patch_score = raw_feature_energy_score_patch(runtime_result.patch_features,
+                                                                result.patch_rows,
+                                                                result.patch_cols,
+                                                                result.feature_dim);
+    raw_dino_score_map = project_patch_map_to_output(raw_patch_score,
+                                                     result.patch_rows,
+                                                     result.patch_cols,
+                                                     runtime_result.aligned_rows,
+                                                     runtime_result.aligned_cols,
+                                                     result.src_rows,
+                                                     result.src_cols,
+                                                     runtime_row_offset,
+                                                     runtime_col_offset,
+                                                     result.dst_rows,
+                                                     result.dst_cols);
+  } else {
+    raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
+                                                       runtime_result.aligned_rows,
+                                                       runtime_result.aligned_cols,
+                                                       result.src_rows,
+                                                       result.src_cols,
+                                                       runtime_row_offset,
+                                                       runtime_col_offset,
+                                                       result.dst_rows,
+                                                       result.dst_cols);
+  }
+  if (keep_debug_artifacts) {
+    result.raw_dino_score_map = raw_dino_score_map;
+  }
+  std::vector<float> grouped_score_patch = normalize01_quantile(raw_aligned_score, 5.0, 95.0);
+  int grouped_score_rows = runtime_result.aligned_rows;
+  int grouped_score_cols = runtime_result.aligned_cols;
+  bool grouped_score_is_patch_grid = false;
+  if (keep_debug_artifacts && !runtime_result.patch_features.empty() && result.patch_rows > 0 && result.patch_cols > 0 && result.feature_dim > 0) {
+    const auto seed_patch = dino_seed_patch_map(corrected_chunk,
+                                                result.src_rows,
+                                                result.src_cols,
+                                                runtime_rows,
+                                                runtime_cols,
+                                                result.patch_rows,
+                                                result.patch_cols);
+    const auto grouped_patch = grouped_dino_from_patch_features(runtime_result.patch_features,
+                                                                result.patch_rows,
+                                                                result.patch_cols,
+                                                                result.feature_dim,
+                                                                seed_patch,
+                                                                config,
+                                                                verbose && keep_debug_artifacts,
+                                                                "debug_chunk_grouped_patch");
+    if (!grouped_patch.score_patch.empty()) {
+      grouped_score_patch = grouped_patch.score_patch;
+      grouped_score_rows = result.patch_rows;
+      grouped_score_cols = result.patch_cols;
+      grouped_score_is_patch_grid = true;
+    }
+  }
+  const auto grouped_dino_score_map = grouped_score_is_patch_grid
+                                          ? project_patch_map_to_output(grouped_score_patch,
+                                                                        grouped_score_rows,
+                                                                        grouped_score_cols,
+                                                                        runtime_result.aligned_rows,
+                                                                        runtime_result.aligned_cols,
+                                                                        result.src_rows,
+                                                                        result.src_cols,
+                                                                        runtime_row_offset,
+                                                                        runtime_col_offset,
+                                                                        result.dst_rows,
+                                                                        result.dst_cols)
+                                          : project_aligned_map_to_output(grouped_score_patch,
+                                                                          grouped_score_rows,
+                                                                          grouped_score_cols,
+                                                                          result.src_rows,
+                                                                          result.src_cols,
+                                                                          runtime_row_offset,
+                                                                          runtime_col_offset,
+                                                                          result.dst_rows,
+                                                                          result.dst_cols);
+  if (keep_debug_artifacts) {
+    result.dino_score_map = grouped_dino_score_map;
+    result.corrected_resized = resize_bilinear(corrected_chunk, result.src_rows, result.src_cols, result.dst_rows, result.dst_cols);
+  }
   const auto source_chunk_valid_mask = resize_row_valid_mask(source_chunk_valid_rows, result.src_rows, result.src_cols);
   const auto source_chunk_coherence_gate = structure_tensor_gate(corrected_chunk,
                                                                  result.src_rows,
                                                                  result.src_cols,
                                                                  source_chunk_valid_mask);
-  result.coherence_gate = resize_bilinear(source_chunk_coherence_gate,
-                                          result.src_rows,
-                                          result.src_cols,
-                                          result.dst_rows,
-                                          result.dst_cols);
-
-  const auto dino_score_norm = normalize01_quantile(result.dino_score_map, 5.0, 95.0);
-  const auto coherence_gate_norm = normalize01_quantile(result.coherence_gate, 5.0, 99.0);
-  result.hybrid_contrib.assign(result.dino_score_map.size(), 0.0f);
-  for (size_t index = 0; index < result.hybrid_contrib.size(); ++index) {
-    result.hybrid_contrib[index] = dino_score_norm[index] * coherence_gate_norm[index];
+  const auto coherence_gate = resize_bilinear(source_chunk_coherence_gate,
+                                              result.src_rows,
+                                              result.src_cols,
+                                              result.dst_rows,
+                                              result.dst_cols);
+  if (keep_debug_artifacts) {
+    result.coherence_gate = coherence_gate;
   }
 
-  const auto hybrid_result = run_residual_veto_hybrid(result.hybrid_contrib, result.valid_mask, result.dst_rows, result.dst_cols);
+  const auto dino_score_norm = normalize01_quantile(grouped_dino_score_map, 5.0, 95.0);
+  const auto coherence_gate_norm = normalize01_quantile(coherence_gate, 5.0, 99.0);
+  std::vector<float> hybrid_contrib(grouped_dino_score_map.size(), 0.0f);
+  for (size_t index = 0; index < hybrid_contrib.size(); ++index) {
+    hybrid_contrib[index] = dino_score_norm[index] * coherence_gate_norm[index];
+  }
+  if (keep_debug_artifacts) {
+    result.hybrid_contrib = hybrid_contrib;
+  }
+
+  const auto hybrid_result = run_residual_veto_hybrid(hybrid_contrib, result.valid_mask, result.dst_rows, result.dst_cols);
   result.seed_freq_threshold = hybrid_result.seed_freq_threshold;
   result.seed_res_threshold = hybrid_result.seed_res_threshold;
   result.combined_threshold = hybrid_result.combined_threshold;
@@ -1940,8 +3153,31 @@ ChunkRetryResult run_retry_chunk(holoscan::ops::DinoTorchRuntime& runtime,
   result.connected_fraction = hybrid_result.connected_fraction;
   result.component_count = hybrid_result.component_count;
   result.final_mask = hybrid_result.mask;
-  result.combined_score = result.hybrid_contrib;
+  result.combined_score = hybrid_result.combined_score;
   return result;
+}
+
+void discard_non_debug_chunk_payload(ChunkRetryResult& chunk_result) {
+  chunk_result.runtime_input_gray.clear();
+  chunk_result.runtime_input_gray.shrink_to_fit();
+  chunk_result.patch_features.clear();
+  chunk_result.patch_features.shrink_to_fit();
+  chunk_result.corrected_resized.clear();
+  chunk_result.corrected_resized.shrink_to_fit();
+  chunk_result.raw_dino_score_map.clear();
+  chunk_result.raw_dino_score_map.shrink_to_fit();
+  chunk_result.dino_score_map.clear();
+  chunk_result.dino_score_map.shrink_to_fit();
+  chunk_result.coherence_gate.clear();
+  chunk_result.coherence_gate.shrink_to_fit();
+  chunk_result.hybrid_contrib.clear();
+  chunk_result.hybrid_contrib.shrink_to_fit();
+  chunk_result.valid_mask.clear();
+  chunk_result.valid_mask.shrink_to_fit();
+  chunk_result.final_mask.clear();
+  chunk_result.final_mask.shrink_to_fit();
+  chunk_result.bridged_mask.clear();
+  chunk_result.bridged_mask.shrink_to_fit();
 }
 
 std::vector<uint8_t> mask_to_u8(const std::vector<uint8_t>& mask) {
@@ -2010,8 +3246,10 @@ ValidatorOptions parse_arguments(int argc, char** argv) {
       options.debug_chunk_index = std::stoi(argv[++index]);
     } else if (arg == "--verbose") {
       options.verbose = true;
+    } else if (arg == "--subsection-only-validation") {
+      options.subsection_only_validation = true;
     } else if (arg == "--help") {
-      std::cout << "Usage: " << argv[0] << " --tensor-npy PATH --config FILE [--live-mask PATH] [--output-dir DIR] [--debug-chunk-index N] [--verbose]\n";
+      std::cout << "Usage: " << argv[0] << " --tensor-npy PATH --config FILE [--live-mask PATH] [--output-dir DIR] [--debug-chunk-index N] [--verbose] [--subsection-only-validation]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unrecognized argument: " + arg);
@@ -2091,6 +3329,8 @@ int main(int argc, char** argv) {
     runtime_config.imagenet_std = {0.229, 0.224, 0.225};
     runtime_config.return_final_mask = true;
     runtime_config.return_final_mask_device = false;
+    runtime_config.return_pre_model_gray = false;
+    runtime_config.return_patch_features = !options.subsection_only_validation;
     runtime_config.compute_dino_threshold = true;
     runtime_config.compute_power_score = false;
     runtime_config.ignore_sideband_hz = config.ignore_sideband_hz;
@@ -2104,6 +3344,8 @@ int main(int argc, char** argv) {
     runtime_config.frontend_correction_edge_taper_sigma = config.frontend_correction_edge_taper_sigma;
     runtime_config.frontend_correction_edge_target_drop_db = config.frontend_correction_edge_target_drop_db;
     runtime_config.power_q = config.power_q;
+    runtime_config.dino_group_k = config.dino_group_k;
+    runtime_config.dino_group_spatial_weight = config.dino_group_spatial_weight;
     runtime_config.dino_group_score_q = config.dino_group_score_q;
     runtime_config.pipeline_final_threshold = config.pipeline_final_threshold;
     runtime_config.pipeline_gap_floor = config.pipeline_gap_floor;
@@ -2124,10 +3366,12 @@ int main(int argc, char** argv) {
 
     const auto runtime_result = runtime.run(runtime_config, runtime_input);
 
+    const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_plan.size() - 1)));
     std::vector<ChunkRetryResult> chunk_results;
     chunk_results.reserve(chunk_plan.size());
-    for (const auto& chunk : chunk_plan) {
-      chunk_results.push_back(run_retry_chunk(
+    for (size_t chunk_index = 0; chunk_index < chunk_plan.size(); ++chunk_index) {
+      const auto& chunk = chunk_plan[chunk_index];
+      auto chunk_result = run_retry_chunk(
           runtime,
           runtime_config,
           config,
@@ -2137,9 +3381,9 @@ int main(int argc, char** argv) {
           tensor.rows,
           tensor.cols,
           resolution_hz,
-          source_ignore_info.valid_row_mask));
-    }
-    for (auto& chunk_result : chunk_results) {
+          source_ignore_info.valid_row_mask,
+          chunk_index == debug_chunk_index,
+          options.verbose);
       group_chunk_mask_regions(
           chunk_result,
           33,
@@ -2149,6 +3393,10 @@ int main(int argc, char** argv) {
           2,
           0.06f,
           0.85f);
+      if (chunk_index != debug_chunk_index) {
+        discard_non_debug_chunk_payload(chunk_result);
+      }
+      chunk_results.push_back(std::move(chunk_result));
     }
     const auto global_merged = build_global_merged_result(
         chunk_results,
@@ -2165,7 +3413,92 @@ int main(int argc, char** argv) {
       throw std::runtime_error("unexpected DINO score map size returned from runtime");
     }
 
-    const auto& dino_score_map = runtime_result.score_map;
+    const int runtime_row_offset = source_ignore_info.applied_bins;
+    const int runtime_col_offset = 0;
+    const auto raw_aligned_score = resize_bilinear(runtime_result.score_map,
+                                                   config.input_height,
+                                                   config.input_width,
+                                                   runtime_result.aligned_rows,
+                                                   runtime_result.aligned_cols);
+    std::vector<float> raw_dino_score_map;
+    if (!options.subsection_only_validation && !runtime_result.patch_features.empty() && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 && runtime_result.feature_dim > 0) {
+      const auto raw_patch_score = raw_feature_energy_score_patch(runtime_result.patch_features,
+                                                                  runtime_result.patch_rows,
+                                                                  runtime_result.patch_cols,
+                                                                  runtime_result.feature_dim);
+      raw_dino_score_map = project_patch_map_to_output(raw_patch_score,
+                                                       runtime_result.patch_rows,
+                                                       runtime_result.patch_cols,
+                                                       runtime_result.aligned_rows,
+                                                       runtime_result.aligned_cols,
+                                                       tensor.rows,
+                                                       tensor.cols,
+                                                       runtime_row_offset,
+                                                       runtime_col_offset,
+                                                       config.input_height,
+                                                       config.input_width);
+    } else {
+      raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
+                                                         runtime_result.aligned_rows,
+                                                         runtime_result.aligned_cols,
+                                                         tensor.rows,
+                                                         tensor.cols,
+                                                         runtime_row_offset,
+                                                         runtime_col_offset,
+                                                         config.input_height,
+                                                         config.input_width);
+    }
+    auto dino_score_map = normalize01_quantile(raw_dino_score_map, 5.0, 95.0);
+    std::vector<float> grouped_score_patch = normalize01_quantile(raw_aligned_score, 5.0, 95.0);
+    int grouped_score_rows = runtime_result.aligned_rows;
+    int grouped_score_cols = runtime_result.aligned_cols;
+    bool grouped_score_is_patch_grid = false;
+    if (!options.subsection_only_validation && !runtime_result.patch_features.empty() && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 && runtime_result.feature_dim > 0) {
+      const auto seed_patch = dino_seed_patch_map(corrected_db,
+                                                  tensor.rows,
+                                                  tensor.cols,
+                                                  runtime_result.aligned_rows,
+                                                  runtime_result.aligned_cols,
+                                                  runtime_result.patch_rows,
+                                                  runtime_result.patch_cols);
+      const auto grouped_patch = grouped_dino_from_patch_features(runtime_result.patch_features,
+                                                                  runtime_result.patch_rows,
+                                                                  runtime_result.patch_cols,
+                                                                  runtime_result.feature_dim,
+                                                                  seed_patch,
+                                                                  config,
+                                                                  options.verbose,
+                                                                  "offline_full_frame_grouped_patch");
+      if (!grouped_patch.score_patch.empty()) {
+        grouped_score_patch = grouped_patch.score_patch;
+        grouped_score_rows = runtime_result.patch_rows;
+        grouped_score_cols = runtime_result.patch_cols;
+        grouped_score_is_patch_grid = true;
+      }
+    } else if (options.subsection_only_validation && options.verbose) {
+      std::cerr << "[offline_dino_validator] skipping offline_full_frame_grouped_patch in subsection-only validation mode\n";
+    }
+    dino_score_map = grouped_score_is_patch_grid
+                         ? project_patch_map_to_output(grouped_score_patch,
+                                                       grouped_score_rows,
+                                                       grouped_score_cols,
+                                                       runtime_result.aligned_rows,
+                                                       runtime_result.aligned_cols,
+                                                       tensor.rows,
+                                                       tensor.cols,
+                                                       runtime_row_offset,
+                                                       runtime_col_offset,
+                                                       config.input_height,
+                                                       config.input_width)
+                         : project_aligned_map_to_output(grouped_score_patch,
+                                                         grouped_score_rows,
+                                                         grouped_score_cols,
+                                                         tensor.rows,
+                                                         tensor.cols,
+                                                         runtime_row_offset,
+                                                         runtime_col_offset,
+                                                         config.input_height,
+                                                         config.input_width);
 
     const auto corrected_resized = resize_bilinear(corrected_db, tensor.rows, tensor.cols, config.input_height, config.input_width);
     const auto source_valid_mask = resize_row_valid_mask(source_ignore_info.valid_row_mask, tensor.rows, tensor.cols);
@@ -2206,6 +3539,7 @@ int main(int argc, char** argv) {
     const auto corrected_path = options.output_dir / "offline_corrected_db.npy";
     const auto corrected_resized_path = options.output_dir / "offline_corrected_resized.npy";
     const auto dino_score_path = options.output_dir / "offline_dino_score.npy";
+    const auto raw_dino_score_path = options.output_dir / "offline_dino_score_raw.npy";
     const auto coherence_gate_path = options.output_dir / "offline_coherence_gate.npy";
     const auto hybrid_contrib_path = options.output_dir / "offline_hybrid_contrib.npy";
     const auto final_mask_path = options.output_dir / "offline_final_mask.npy";
@@ -2226,6 +3560,7 @@ int main(int argc, char** argv) {
     write_npy_2d(corrected_path, corrected_db.data(), corrected_db.size() * sizeof(float), tensor.rows, tensor.cols, "<f4");
     write_npy_2d(corrected_resized_path, corrected_resized.data(), corrected_resized.size() * sizeof(float), config.input_height, config.input_width, "<f4");
     write_npy_2d(dino_score_path, dino_score_map.data(), dino_score_map.size() * sizeof(float), config.input_height, config.input_width, "<f4");
+    write_npy_2d(raw_dino_score_path, raw_dino_score_map.data(), raw_dino_score_map.size() * sizeof(float), config.input_height, config.input_width, "<f4");
     write_npy_2d(coherence_gate_path, coherence_gate_resized.data(), coherence_gate_resized.size() * sizeof(float), config.input_height, config.input_width, "<f4");
     write_npy_2d(hybrid_contrib_path, hybrid_contrib.data(), hybrid_contrib.size() * sizeof(float), config.input_height, config.input_width, "<f4");
     std::vector<float> final_mask_float(hybrid_result.mask.size(), 0.0f);
@@ -2270,10 +3605,13 @@ int main(int argc, char** argv) {
       const auto& debug_chunk = chunk_results[debug_chunk_index];
       const auto debug_chunk_summary = chunk_debug_dir / "chunk_debug_summary.json";
       const auto debug_corrected_path = chunk_debug_dir / "chunk_corrected_resized.npy";
+      const auto debug_runtime_input_gray_path = chunk_debug_dir / "chunk_runtime_input_gray.npy";
       const auto debug_dino_score_path = chunk_debug_dir / "chunk_dino_score.npy";
+      const auto debug_raw_dino_score_path = chunk_debug_dir / "chunk_dino_score_raw.npy";
       const auto debug_coherence_gate_path = chunk_debug_dir / "chunk_coherence_gate.npy";
       const auto debug_hybrid_contrib_path = chunk_debug_dir / "chunk_hybrid_contrib.npy";
       const auto debug_combined_score_path = chunk_debug_dir / "chunk_combined_score.npy";
+      const auto debug_patch_features_path = chunk_debug_dir / "chunk_patch_features.npy";
       const auto debug_valid_mask_path = chunk_debug_dir / "chunk_valid_mask.npy";
       const auto debug_bridged_mask_path = chunk_debug_dir / "chunk_bridged_mask.npy";
       const auto debug_grouped_mask_path = chunk_debug_dir / "chunk_grouped_mask.npy";
@@ -2288,12 +3626,24 @@ int main(int argc, char** argv) {
                    debug_chunk.dst_rows,
                    debug_chunk.dst_cols,
                    "<f4");
+      write_npy_2d(debug_runtime_input_gray_path,
+           debug_chunk.runtime_input_gray.data(),
+           debug_chunk.runtime_input_gray.size() * sizeof(float),
+         std::max(1, debug_chunk.runtime_input_gray_rows),
+         std::max(1, debug_chunk.runtime_input_gray_cols),
+           "<f4");
       write_npy_2d(debug_dino_score_path,
                    debug_chunk.dino_score_map.data(),
                    debug_chunk.dino_score_map.size() * sizeof(float),
                    debug_chunk.dst_rows,
                    debug_chunk.dst_cols,
                    "<f4");
+      write_npy_2d(debug_raw_dino_score_path,
+           debug_chunk.raw_dino_score_map.data(),
+           debug_chunk.raw_dino_score_map.size() * sizeof(float),
+           debug_chunk.dst_rows,
+           debug_chunk.dst_cols,
+           "<f4");
       write_npy_2d(debug_coherence_gate_path,
                    debug_chunk.coherence_gate.data(),
                    debug_chunk.coherence_gate.size() * sizeof(float),
@@ -2312,6 +3662,14 @@ int main(int argc, char** argv) {
                    debug_chunk.dst_rows,
                    debug_chunk.dst_cols,
                    "<f4");
+      if (!debug_chunk.patch_features.empty() && debug_chunk.patch_rows > 0 && debug_chunk.patch_cols > 0 && debug_chunk.feature_dim > 0) {
+        write_npy_2d(debug_patch_features_path,
+                     debug_chunk.patch_features.data(),
+                     debug_chunk.patch_features.size() * sizeof(float),
+                     debug_chunk.patch_rows * debug_chunk.patch_cols,
+                     debug_chunk.feature_dim,
+                     "<f4");
+      }
       std::vector<float> debug_valid_mask_float(debug_chunk.valid_mask.size(), 0.0f);
       for (size_t index = 0; index < debug_chunk.valid_mask.size(); ++index) {
         debug_valid_mask_float[index] = debug_chunk.valid_mask[index] ? 1.0f : 0.0f;
@@ -2407,11 +3765,20 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"connected_fraction\": " << debug_chunk.connected_fraction << ",\n";
       debug_summary_out << "  \"component_count\": " << debug_chunk.component_count << ",\n";
       debug_summary_out << "  \"grouped_box_count\": " << debug_chunk.grouped_box_count << ",\n";
+      debug_summary_out << "  \"runtime_input_gray_rows\": " << debug_chunk.runtime_input_gray_rows << ",\n";
+      debug_summary_out << "  \"runtime_input_gray_cols\": " << debug_chunk.runtime_input_gray_cols << ",\n";
+      debug_summary_out << "  \"patch_rows\": " << debug_chunk.patch_rows << ",\n";
+      debug_summary_out << "  \"patch_cols\": " << debug_chunk.patch_cols << ",\n";
+      debug_summary_out << "  \"feature_dim\": " << debug_chunk.feature_dim << ",\n";
+      debug_summary_out << "  \"artifact_contract\": \"chunk_no_extra_sideband_crop_v2\",\n";
       debug_summary_out << "  \"corrected_resized_npy\": \"" << json_escape(debug_corrected_path.string()) << "\",\n";
+      debug_summary_out << "  \"runtime_input_gray_npy\": \"" << json_escape(debug_runtime_input_gray_path.string()) << "\",\n";
       debug_summary_out << "  \"dino_score_npy\": \"" << json_escape(debug_dino_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"dino_score_raw_npy\": \"" << json_escape(debug_raw_dino_score_path.string()) << "\",\n";
       debug_summary_out << "  \"coherence_gate_npy\": \"" << json_escape(debug_coherence_gate_path.string()) << "\",\n";
       debug_summary_out << "  \"hybrid_contrib_npy\": \"" << json_escape(debug_hybrid_contrib_path.string()) << "\",\n";
       debug_summary_out << "  \"combined_score_npy\": \"" << json_escape(debug_combined_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"patch_features_npy\": \"" << json_escape(debug_patch_features_path.string()) << "\",\n";
       debug_summary_out << "  \"valid_mask_npy\": \"" << json_escape(debug_valid_mask_path.string()) << "\",\n";
       debug_summary_out << "  \"bridged_mask_npy\": \"" << json_escape(debug_bridged_mask_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_mask_npy\": \"" << json_escape(debug_grouped_mask_path.string()) << "\",\n";
@@ -2678,6 +4045,7 @@ int main(int argc, char** argv) {
       std::cout << "  runtime backend: " << runtime_result.backend_used << "\n";
       std::cout << "  ignore bins/side: " << ignore_bins_per_side << "\n";
       std::cout << "  chunk count: " << chunk_plan.size() << "\n";
+      std::cout << "  subsection-only validation: " << (options.subsection_only_validation ? "true" : "false") << "\n";
       std::cout << "  projected grouped boxes: " << global_merged.projected_boxes.size() << "\n";
       std::cout << "  merged grouped boxes: " << global_merged.merged_boxes.size() << "\n";
       if (!chunk_results.empty()) {

@@ -20,6 +20,8 @@ struct DinoTorchRuntimeConfig {
   std::vector<double> imagenet_std;
   bool return_final_mask = true;
   bool return_final_mask_device = false;
+  bool return_pre_model_gray = false;
+  bool return_patch_features = false;
   bool compute_dino_threshold = true;
   bool compute_power_score = true;
   double ignore_sideband_hz = 0.0;
@@ -33,6 +35,8 @@ struct DinoTorchRuntimeConfig {
   double frontend_correction_edge_taper_sigma = 6.0;
   double frontend_correction_edge_target_drop_db = 2.5;
   double power_q = 0.90;
+  int dino_group_k = 8;
+  double dino_group_spatial_weight = 0.35;
   double dino_group_score_q = 0.60;
   double pipeline_final_threshold = 0.20;
   double pipeline_gap_floor = 0.10;
@@ -82,6 +86,11 @@ struct DinoTorchRuntimeResult {
   double power_threshold = 0.0;
   double final_threshold = 0.0;
   DinoTorchRuntimeTiming timing;
+  std::vector<float> pre_model_gray;
+  int patch_rows = 0;
+  int patch_cols = 0;
+  int feature_dim = 0;
+  std::vector<float> patch_features;
   std::vector<float> score_map;
   std::vector<float> final_mask;
   const float* score_map_device = nullptr;

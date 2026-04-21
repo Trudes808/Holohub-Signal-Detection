@@ -51,6 +51,7 @@ live_mask_path=${LIVE_MASK_PATH:-}
 output_dir=${OUTPUT_DIR:-}
 debug_chunk_index=${DEBUG_CHUNK_INDEX:-13}
 verbose=0
+subsection_only_validation=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -78,8 +79,12 @@ while [[ $# -gt 0 ]]; do
       verbose=1
       shift
       ;;
+    --subsection-only-validation)
+      subsection_only_validation=1
+      shift
+      ;;
     *)
-      echo "Usage: $0 --tensor-npy PATH [--config PATH] [--live-mask PATH] [--output-dir DIR] [--debug-chunk-index N] [--verbose]" >&2
+      echo "Usage: $0 --tensor-npy PATH [--config PATH] [--live-mask PATH] [--output-dir DIR] [--debug-chunk-index N] [--verbose] [--subsection-only-validation]" >&2
       exit 1
       ;;
   esac
@@ -129,14 +134,18 @@ exec sudo docker exec -it \
   -e LIVE_MASK_PATH="${container_live_mask_path}" \
   -e DEBUG_CHUNK_INDEX="${debug_chunk_index}" \
   -e VERBOSE_FLAG="${verbose}" \
+  -e SUBSECTION_ONLY_VALIDATION_FLAG="${subsection_only_validation}" \
   "${CONTAINER_NAME}" \
   bash -lc '
 set -euo pipefail
 
 validator_bin="${VALIDATOR_BIN}"
+preferred_validator_bin=""
+discovered_candidates=()
 if [[ -z "${validator_bin}" || "${validator_bin}" == "__AUTO__" ]]; then
+  preferred_validator_bin="${BUILD_APP_DIR}/offline_dino_validator"
   candidates=(
-    "${BUILD_APP_DIR}/offline_dino_validator"
+    "${preferred_validator_bin}"
     "/workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection/offline_dino_validator"
     "/workspace/holohub/build/applications/usrp_wideband_signal_detection/offline_dino_validator"
     "/workspace/holohub/build/usrp_wideband_signal_detection/offline_dino_validator"
@@ -147,10 +156,24 @@ if [[ -z "${validator_bin}" || "${validator_bin}" == "__AUTO__" ]]; then
   validator_bin=""
   for candidate in "${candidates[@]}"; do
     if [[ -x "${candidate}" ]]; then
-      validator_bin="${candidate}"
-      break
+      already_listed=0
+      for discovered in "${discovered_candidates[@]}"; do
+        if [[ "${discovered}" == "${candidate}" ]]; then
+          already_listed=1
+          break
+        fi
+      done
+      if [[ "${already_listed}" != "1" ]]; then
+        discovered_candidates+=("${candidate}")
+      fi
     fi
   done
+
+  if [[ -x "${preferred_validator_bin}" ]]; then
+    validator_bin="${preferred_validator_bin}"
+  elif [[ ${#discovered_candidates[@]} -gt 0 ]]; then
+    validator_bin="${discovered_candidates[0]}"
+  fi
 fi
 
 if [[ -z "${validator_bin}" ]]; then
@@ -158,6 +181,55 @@ if [[ -z "${validator_bin}" ]]; then
   echo "Checked BUILD_APP_DIR=${BUILD_APP_DIR} and common build output locations." >&2
   echo "Rebuild it first or set VALIDATOR_BIN to the container path of the binary." >&2
   exit 1
+fi
+
+if [[ -n "${preferred_validator_bin:-}" && -x "${preferred_validator_bin}" && "${validator_bin}" != "${preferred_validator_bin}" ]]; then
+  echo "Warning: selected validator does not match preferred build output ${preferred_validator_bin}" >&2
+fi
+
+if [[ ${#discovered_candidates[@]} -gt 0 ]]; then
+  echo "Discovered offline_dino_validator candidates:" >&2
+  for candidate in "${discovered_candidates[@]}"; do
+    if command -v stat >/dev/null 2>&1; then
+      printf "  - %s (%s)\\n" "${candidate}" "$(stat -c "%y" "${candidate}" 2>/dev/null || printf "%s" "mtime unavailable")" >&2
+    else
+      printf "  - %s\\n" "${candidate}" >&2
+    fi
+  done
+fi
+
+echo "Using offline_dino_validator: ${validator_bin}" >&2
+if command -v stat >/dev/null 2>&1; then
+  stat -c "Validator mtime: %y" "${validator_bin}" >&2 || true
+fi
+
+if command -v stat >/dev/null 2>&1; then
+  source_candidates=(
+    "/workspace/holohub/applications/usrp_wideband_signal_detection/offline_dino_validator.cpp"
+    "/workspace/holohub/operators/dinov3_signal_detector/dinov3_torch_runtime.cpp"
+    "/workspace/holohub/operators/dinov3_signal_detector/dinov3_torch_runtime.hpp"
+    "/workspace/holohub-dev/applications/usrp_wideband_signal_detection/offline_dino_validator.cpp"
+    "/workspace/holohub-dev/operators/dinov3_signal_detector/dinov3_torch_runtime.cpp"
+    "/workspace/holohub-dev/operators/dinov3_signal_detector/dinov3_torch_runtime.hpp"
+  )
+  stale_against=()
+  validator_mtime=$(stat -c '%Y' "${validator_bin}" 2>/dev/null || printf '0')
+  for source_path in "${source_candidates[@]}"; do
+    if [[ -f "${source_path}" ]]; then
+      source_mtime=$(stat -c '%Y' "${source_path}" 2>/dev/null || printf '0')
+      if [[ "${source_mtime}" -gt "${validator_mtime}" ]]; then
+        stale_against+=("${source_path}")
+      fi
+    fi
+  done
+  if [[ ${#stale_against[@]} -gt 0 ]]; then
+    echo "Selected offline_dino_validator is older than patched source files and is likely stale." >&2
+    for source_path in "${stale_against[@]}"; do
+      printf "  - newer source: %s (%s)\\n" "${source_path}" "$(stat -c "%y" "${source_path}" 2>/dev/null || printf "%s" "mtime unavailable")" >&2
+    done
+    echo "Rebuild the preferred build tree or set VALIDATOR_BIN explicitly to the freshly rebuilt container binary." >&2
+    exit 1
+  fi
 fi
 
 cmd=(
@@ -173,6 +245,85 @@ fi
 if [[ "${VERBOSE_FLAG}" == "1" ]]; then
   cmd+=("--verbose")
 fi
+if [[ "${SUBSECTION_ONLY_VALIDATION_FLAG}" == "1" ]]; then
+  cmd+=("--subsection-only-validation")
+fi
 
-exec "${cmd[@]}"
+echo "Resetting validator output directory: ${OUTPUT_DIR}" >&2
+rm -rf "${OUTPUT_DIR}"
+mkdir -p "${OUTPUT_DIR}"
+
+set +e
+"${cmd[@]}"
+validator_status=$?
+set -e
+
+if [[ ${validator_status} -ne 0 ]]; then
+  if [[ ${validator_status} -eq 137 ]]; then
+    echo "offline_dino_validator was killed with exit code 137 (SIGKILL), which usually means the container hit an OOM or cgroup memory limit." >&2
+    echo "The validator now only keeps heavyweight debug buffers for the selected debug chunk, so rerun after rebuilding this latest binary before investigating algorithm parity further." >&2
+  fi
+  exit ${validator_status}
+fi
+
+OUTPUT_DIR_FOR_VALIDATION="${OUTPUT_DIR}" python3 - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+output_dir = Path(os.environ["OUTPUT_DIR_FOR_VALIDATION"])
+chunk_debug_dir = output_dir / "chunk_debug"
+summary_path = chunk_debug_dir / "chunk_debug_summary.json"
+required_files = [
+  chunk_debug_dir / "chunk_runtime_input_gray.npy",
+  chunk_debug_dir / "chunk_dino_score_raw.npy",
+  chunk_debug_dir / "chunk_patch_features.npy",
+  output_dir / "offline_dino_score_raw.npy",
+]
+
+failures = []
+if not summary_path.exists():
+  failures.append(f"missing summary: {summary_path}")
+  summary = {}
+else:
+  summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+for path in required_files:
+  if not path.exists():
+    failures.append(f"missing artifact: {path}")
+
+artifact_contract = str(summary.get("artifact_contract", "") or "")
+if artifact_contract != "chunk_no_extra_sideband_crop_v2":
+  failures.append(
+    f"unexpected artifact_contract {artifact_contract!r} in {summary_path}; expected 'chunk_no_extra_sideband_crop_v2'"
+  )
+
+runtime_rows = int(summary.get("runtime_input_gray_rows", 0) or 0)
+runtime_cols = int(summary.get("runtime_input_gray_cols", 0) or 0)
+src_rows = int(summary.get("src_rows", 0) or 0)
+src_cols = int(summary.get("src_cols", 0) or 0)
+ignore_bins = int(summary.get("ignore_bins_per_side", 0) or 0)
+patch_rows = int(summary.get("patch_rows", 0) or 0)
+patch_cols = int(summary.get("patch_cols", 0) or 0)
+feature_dim = int(summary.get("feature_dim", 0) or 0)
+
+if ignore_bins == 0 and src_rows > 0 and src_cols > 0 and (runtime_rows, runtime_cols) != (src_rows, src_cols):
+  failures.append(
+    f"runtime_input_gray shape {(runtime_rows, runtime_cols)} does not match source chunk {(src_rows, src_cols)} when ignore_bins_per_side=0"
+  )
+
+if patch_rows <= 0 or patch_cols <= 0 or feature_dim <= 0:
+  failures.append(
+    f"invalid patch metadata patch_rows={patch_rows}, patch_cols={patch_cols}, feature_dim={feature_dim}"
+  )
+
+if failures:
+  print("Fresh validator run completed, but the produced artifact bundle is still stale or incomplete:", file=sys.stderr)
+  for failure in failures:
+    print(f"- {failure}", file=sys.stderr)
+  sys.exit(1)
+
+print(f"Validated fresh artifact bundle: {summary_path}", file=sys.stderr)
+PY
 '

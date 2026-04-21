@@ -11,6 +11,51 @@ find_package(matx CONFIG REQUIRED
 find_package(CUDAToolkit REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "from pathlib import Path; import sys; hints=[];\ntry:\n import torch, torch.utils\n cmake_prefix=getattr(torch.utils, 'cmake_prefix_path', '')\n torch_file=Path(torch.__file__).resolve()\n torch_dir=torch_file.parent\n candidates=[cmake_prefix, str(torch_dir), str(torch_dir / 'share' / 'cmake'), str(torch_dir / 'share' / 'cmake' / 'Torch'), str(torch_dir.parent), str(torch_dir.parent / 'share' / 'cmake'), str(torch_dir.parent / 'share' / 'cmake' / 'Torch')]\n for item in candidates:\n  if item and item not in hints:\n   hints.append(item)\n print(';'.join(hints))\nexcept Exception:\n print('')"
+  OUTPUT_VARIABLE PYTORCH_CMAKE_HINTS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "from pathlib import Path; import sys; includes=[];\ntry:\n import torch\n torch_dir=Path(torch.__file__).resolve().parent\n candidates=[torch_dir / 'include', torch_dir / 'include' / 'torch' / 'csrc' / 'api' / 'include', torch_dir.parent / 'include', torch_dir.parent / 'include' / 'torch' / 'csrc' / 'api' / 'include']\n for item in candidates:\n  if item.exists():\n   includes.append(str(item))\n print(';'.join(dict.fromkeys(includes)))\nexcept Exception:\n print('')"
+  OUTPUT_VARIABLE PYTORCH_INCLUDE_HINTS
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+
+set(TORCH_SEARCH_HINTS "")
+if(PYTORCH_CMAKE_HINTS)
+  string(REPLACE ";" ";" PYTORCH_CMAKE_HINTS_LIST "${PYTORCH_CMAKE_HINTS}")
+  foreach(TORCH_HINT IN LISTS PYTORCH_CMAKE_HINTS_LIST)
+    if(TORCH_HINT AND EXISTS "${TORCH_HINT}")
+      list(APPEND TORCH_SEARCH_HINTS "${TORCH_HINT}")
+    endif()
+  endforeach()
+endif()
+list(REMOVE_DUPLICATES TORCH_SEARCH_HINTS)
+
+set(TORCH_INCLUDE_HINTS "")
+if(PYTORCH_INCLUDE_HINTS)
+  string(REPLACE ";" ";" PYTORCH_INCLUDE_HINTS_LIST "${PYTORCH_INCLUDE_HINTS}")
+  foreach(TORCH_INCLUDE_HINT IN LISTS PYTORCH_INCLUDE_HINTS_LIST)
+    if(TORCH_INCLUDE_HINT AND EXISTS "${TORCH_INCLUDE_HINT}")
+      list(APPEND TORCH_INCLUDE_HINTS "${TORCH_INCLUDE_HINT}")
+    endif()
+  endforeach()
+endif()
+list(REMOVE_DUPLICATES TORCH_INCLUDE_HINTS)
+
+if(TORCH_SEARCH_HINTS)
+  list(PREPEND CMAKE_PREFIX_PATH ${TORCH_SEARCH_HINTS})
+endif()
+
+find_package(Torch QUIET PATHS ${TORCH_SEARCH_HINTS})
+if(NOT Torch_FOUND)
+  find_package(Torch QUIET)
+endif()
+
 find_library(APP_VULKAN_LINK_ITEM
   NAMES vulkan libvulkan.so.1
   PATHS
@@ -141,6 +186,15 @@ target_link_libraries(offline_dino_validator
   holoscan::ops::dinov3_signal_detector
 )
 
+if(NOT Torch_FOUND)
+  message(FATAL_ERROR "offline_dino_validator requires LibTorch, but find_package(Torch) failed. Ensure Python torch is installed in the build environment.")
+endif()
+
+target_link_libraries(offline_dino_validator
+  PRIVATE
+  ${TORCH_LIBRARIES}
+)
+
 if(APP_VULKAN_LINK_ITEM)
   target_link_libraries(usrp_wideband_signal_detection PRIVATE ${APP_VULKAN_LINK_ITEM})
   target_link_libraries(offline_spectrogram_visualizer PRIVATE ${APP_VULKAN_LINK_ITEM})
@@ -189,6 +243,14 @@ target_include_directories(offline_dino_validator
   ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/dinov3_signal_detector
 )
 
+if(TORCH_INCLUDE_DIRS)
+  target_include_directories(offline_dino_validator PRIVATE ${TORCH_INCLUDE_DIRS})
+endif()
+
+if(TORCH_INCLUDE_HINTS)
+  target_include_directories(offline_dino_validator PRIVATE ${TORCH_INCLUDE_HINTS})
+endif()
+
 target_compile_definitions(usrp_wideband_signal_detection
   PRIVATE
   USRP_WIDEBAND_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
@@ -201,6 +263,10 @@ target_compile_definitions(offline_spectrogram_visualizer
 
 target_compile_features(offline_coherent_power_validator PRIVATE cxx_std_17)
 target_compile_features(offline_dino_validator PRIVATE cxx_std_17)
+
+if(TORCH_CXX_FLAGS)
+  target_compile_options(offline_dino_validator PRIVATE ${TORCH_CXX_FLAGS})
+endif()
 
 if(NOT DEFINED ANO_MGR)
     set(ANO_MGR "dpdk gpunetio" CACHE STRING "Manager type(s) list")

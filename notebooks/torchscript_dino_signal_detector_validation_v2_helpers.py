@@ -466,6 +466,104 @@ def build_python_raw_feature_energy_score(python_retry: dict[str, Any], output_s
     }
 
 
+def build_signal_agnostic_input_debug(
+    retry_helper,
+    corrected_chunk: np.ndarray,
+    output_shape: tuple[int, int],
+    *,
+    db_min: float,
+    db_max: float,
+) -> dict[str, np.ndarray]:
+    _, input_debug = retry_helper.build_signal_agnostic_dino_input(
+        np.asarray(corrected_chunk, dtype=np.float32),
+        db_min=float(db_min),
+        db_max=float(db_max),
+    )
+    input_gray = np.asarray(input_debug["input_gray01"], dtype=np.float32)
+    input_gray = np.clip(np.round(255.0 * input_gray), 0.0, 255.0).astype(np.float32) / 255.0
+    fixed_gray = np.asarray(input_debug["fixed_gray01"], dtype=np.float32)
+    resized_shape = tuple(int(value) for value in output_shape)
+    return {
+        "input_gray": resize_array_to_shape(input_gray, resized_shape, order=1),
+        "fixed_gray": resize_array_to_shape(fixed_gray, resized_shape, order=1),
+    }
+
+
+def build_python_expected_dino_runtime_input(
+    retry_helper,
+    corrected_chunk: np.ndarray,
+    chunk_freq_axis_hz: np.ndarray,
+    *,
+    ignore_sideband_hz: float,
+    patch_size: int,
+    target_shape: tuple[int, int],
+    db_min: float,
+    db_max: float,
+) -> dict[str, Any] | None:
+    local_ignore_info = retry_helper.compute_ignore_sideband_rows(
+        np.asarray(chunk_freq_axis_hz, dtype=np.float32),
+        ignore_sideband_percent=0.0,
+        min_keep_rows=max(int(patch_size), 16),
+        ignore_sideband_hz=float(ignore_sideband_hz),
+    )
+    valid_row_mask = np.asarray(local_ignore_info["valid_row_mask"], dtype=bool)
+    valid_row_idx = np.flatnonzero(valid_row_mask)
+    if valid_row_idx.size == 0:
+        return None
+
+    row_start = int(valid_row_idx[0])
+    row_stop = int(valid_row_idx[-1]) + 1
+    cropped_chunk = np.asarray(corrected_chunk[row_start:row_stop, :], dtype=np.float32)
+
+    expected_rows = (cropped_chunk.shape[0] // int(patch_size)) * int(patch_size)
+    expected_cols = (cropped_chunk.shape[1] // int(patch_size)) * int(patch_size)
+    if expected_rows < int(patch_size) or expected_cols < int(patch_size):
+        return None
+
+    python_runtime_chunk = np.asarray(cropped_chunk[:expected_rows, :expected_cols], dtype=np.float32)
+    dino_input_debug = build_signal_agnostic_input_debug(
+        retry_helper,
+        python_runtime_chunk,
+        target_shape,
+        db_min=db_min,
+        db_max=db_max,
+    )
+    return {
+        "row_start": row_start,
+        "row_stop": row_stop,
+        "expected_shape": (int(expected_rows), int(expected_cols)),
+        "runtime_chunk": np.asarray(python_runtime_chunk, dtype=np.float32),
+        "input_gray": np.asarray(dino_input_debug["input_gray"], dtype=np.float32),
+        "fixed_gray": np.asarray(dino_input_debug["fixed_gray"], dtype=np.float32),
+    }
+
+
+def embed_runtime_crop_to_chunk_grid(
+    runtime_map: np.ndarray,
+    source_shape: tuple[int, int],
+    *,
+    row_start: int,
+    expected_shape: tuple[int, int],
+    target_shape: tuple[int, int],
+    order: int,
+) -> np.ndarray:
+    runtime_map = np.asarray(runtime_map, dtype=np.float32)
+    source_rows, source_cols = (int(value) for value in source_shape)
+    expected_rows, expected_cols = (int(value) for value in expected_shape)
+    if runtime_map.shape != (expected_rows, expected_cols):
+        raise ValueError(
+            f"Runtime map shape {runtime_map.shape} does not match expected runtime crop {(expected_rows, expected_cols)}"
+        )
+
+    canvas = np.zeros((source_rows, source_cols), dtype=np.float32)
+    safe_row_start = max(0, min(source_rows, int(row_start)))
+    copy_rows = min(expected_rows, max(0, source_rows - safe_row_start))
+    copy_cols = min(expected_cols, source_cols)
+    if copy_rows > 0 and copy_cols > 0:
+        canvas[safe_row_start:safe_row_start + copy_rows, :copy_cols] = runtime_map[:copy_rows, :copy_cols]
+    return resize_array_to_shape(canvas, target_shape, order=order)
+
+
 def box_signature(box: dict[str, Any]) -> tuple[int, int, int, int, str]:
     return (
         int(box.get("freq_start", 0)),
@@ -528,6 +626,57 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
     row_stop = int(debug_summary["row_stop"])
     mapped_row_start = max(0, min(output_rows - 1, int(np.floor(row_start * output_rows / max(canonical_rows, 1)))))
     mapped_row_stop = max(mapped_row_start + 1, min(output_rows, int(np.ceil(row_stop * output_rows / max(canonical_rows, 1)))))
+    chunk_dino_score = np.load(output_path / "chunk_debug" / "chunk_dino_score.npy", allow_pickle=False).astype(np.float32)
+    chunk_dino_score_raw_path = output_path / "chunk_debug" / "chunk_dino_score_raw.npy"
+    chunk_dino_score_raw = np.load(chunk_dino_score_raw_path, allow_pickle=False).astype(np.float32) if chunk_dino_score_raw_path.exists() else chunk_dino_score.copy()
+    chunk_combined_score = np.load(output_path / "chunk_debug" / "chunk_combined_score.npy", allow_pickle=False).astype(np.float32)
+    runtime_input_gray_path = output_path / "chunk_debug" / "chunk_runtime_input_gray.npy"
+    chunk_grouped_mask = load_bool_npy(output_path / "chunk_debug" / "chunk_grouped_mask.npy")
+    chunk_grouped_combined_score = np.where(chunk_grouped_mask, chunk_combined_score, 0.0).astype(np.float32)
+    chunk_grouped_dino_score = np.where(chunk_grouped_mask, chunk_dino_score, 0.0).astype(np.float32)
+    chunk_grouped_raw_dino_score = np.where(chunk_grouped_mask, chunk_dino_score_raw, 0.0).astype(np.float32)
+    runtime_input_gray = np.load(runtime_input_gray_path, allow_pickle=False).astype(np.float32) if runtime_input_gray_path.exists() else None
+    runtime_input_gray_rows = int(debug_summary.get("runtime_input_gray_rows", 0) or 0)
+    runtime_input_gray_cols = int(debug_summary.get("runtime_input_gray_cols", 0) or 0)
+    patch_features_path = output_path / "chunk_debug" / "chunk_patch_features.npy"
+    patch_features = np.load(patch_features_path, allow_pickle=False).astype(np.float32) if patch_features_path.exists() else None
+    patch_rows = int(debug_summary.get("patch_rows", 0) or 0)
+    patch_cols = int(debug_summary.get("patch_cols", 0) or 0)
+    feature_dim = int(debug_summary.get("feature_dim", 0) or 0)
+    artifact_contract = str(debug_summary.get("artifact_contract", "") or "")
+    has_patch_feature_grouping = bool(
+        patch_features is not None
+        and patch_rows > 0
+        and patch_cols > 0
+        and feature_dim > 0
+        and patch_features.ndim == 2
+        and patch_features.shape == (patch_rows * patch_cols, feature_dim)
+    )
+    artifact_warnings: list[str] = []
+    if not chunk_dino_score_raw_path.exists():
+        artifact_warnings.append(
+            "chunk_debug/chunk_dino_score_raw.npy is missing, so the notebook would compare the C++ grouped/fallback DINO surface against the Python raw feature score."
+        )
+    if runtime_input_gray is None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_runtime_input_gray.npy is missing, so the exact pre-model grayscale panel cannot use the true C++ runtime dump."
+        )
+    if runtime_input_gray is not None and runtime_input_gray_rows > 0 and runtime_input_gray_cols > 0:
+        src_rows = int(debug_summary.get("src_rows", runtime_input_gray_rows) or runtime_input_gray_rows)
+        src_cols = int(debug_summary.get("src_cols", runtime_input_gray_cols) or runtime_input_gray_cols)
+        ignore_bins_per_side = int(debug_summary.get("ignore_bins_per_side", 0) or 0)
+        if ignore_bins_per_side == 0 and runtime_input_gray_rows < src_rows:
+            artifact_warnings.append(
+                f"C++ runtime_input_gray shape is {(runtime_input_gray_rows, runtime_input_gray_cols)} for a {(src_rows, src_cols)} chunk even though ignore_bins_per_side=0; this is the legacy extra-runtime-crop signature."
+            )
+    if not patch_features_path.exists() or not has_patch_feature_grouping:
+        artifact_warnings.append(
+            "chunk_debug/chunk_patch_features.npy is missing or inconsistent, so the saved C++ grouped DINO surface is not a verified patch-feature grouping result."
+        )
+    if artifact_contract and artifact_contract != "chunk_no_extra_sideband_crop_v2":
+        artifact_warnings.append(
+            f"Chunk artifact contract is '{artifact_contract}' instead of 'chunk_no_extra_sideband_crop_v2'."
+        )
 
     return {
         "output_dir": output_path,
@@ -543,6 +692,7 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
             "corrected_db": np.load(output_path / "offline_corrected_db.npy", allow_pickle=False).astype(np.float32),
             "corrected_resized": np.load(output_path / "offline_corrected_resized.npy", allow_pickle=False).astype(np.float32),
             "dino_score": np.load(output_path / "offline_dino_score.npy", allow_pickle=False).astype(np.float32),
+            "dino_score_raw": np.load(output_path / "offline_dino_score_raw.npy", allow_pickle=False).astype(np.float32) if (output_path / "offline_dino_score_raw.npy").exists() else np.load(output_path / "offline_dino_score.npy", allow_pickle=False).astype(np.float32),
             "coherence_gate": np.load(output_path / "offline_coherence_gate.npy", allow_pickle=False).astype(np.float32),
             "hybrid_contrib": np.load(output_path / "offline_hybrid_contrib.npy", allow_pickle=False).astype(np.float32),
             "projected_grouped_score": np.load(output_path / "offline_projected_grouped_score.npy", allow_pickle=False).astype(np.float32),
@@ -552,19 +702,35 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
         },
         "chunk_debug": {
             "corrected_resized": np.load(output_path / "chunk_debug" / "chunk_corrected_resized.npy", allow_pickle=False).astype(np.float32),
-            "dino_score": np.load(output_path / "chunk_debug" / "chunk_dino_score.npy", allow_pickle=False).astype(np.float32),
+            "runtime_input_gray": runtime_input_gray,
+            "runtime_input_gray_rows": runtime_input_gray_rows,
+            "runtime_input_gray_cols": runtime_input_gray_cols,
+            "patch_features": patch_features,
+            "patch_rows": patch_rows,
+            "patch_cols": patch_cols,
+            "feature_dim": feature_dim,
+            "has_patch_feature_grouping": has_patch_feature_grouping,
+            "grouped_dino_source": "patch_feature_grouping" if has_patch_feature_grouping else "raw_score_fallback",
+            "dino_score": chunk_dino_score,
+            "dino_score_raw": chunk_dino_score_raw,
+            "dino_score_grouped": chunk_dino_score,
+            "grouped_dino_score": chunk_grouped_dino_score,
+            "grouped_combined_score": chunk_grouped_combined_score,
+            "grouped_raw_dino_score": chunk_grouped_raw_dino_score,
             "coherence_gate": np.load(output_path / "chunk_debug" / "chunk_coherence_gate.npy", allow_pickle=False).astype(np.float32),
             "hybrid_contrib": np.load(output_path / "chunk_debug" / "chunk_hybrid_contrib.npy", allow_pickle=False).astype(np.float32),
-            "combined_score": np.load(output_path / "chunk_debug" / "chunk_combined_score.npy", allow_pickle=False).astype(np.float32),
+            "combined_score": chunk_combined_score,
             "valid_mask": load_bool_npy(output_path / "chunk_debug" / "chunk_valid_mask.npy"),
             "bridged_mask": load_bool_npy(output_path / "chunk_debug" / "chunk_bridged_mask.npy"),
-            "grouped_mask": load_bool_npy(output_path / "chunk_debug" / "chunk_grouped_mask.npy"),
+            "grouped_mask": chunk_grouped_mask,
             "final_mask": load_bool_npy(output_path / "chunk_debug" / "chunk_final_mask.npy"),
             "grouped_boxes": list(cpp_boxes_payload.get("boxes", [])),
             "mapped_row_start": mapped_row_start,
             "mapped_row_stop": mapped_row_stop,
             "output_shape": (output_rows, output_cols),
+            "artifact_contract": artifact_contract,
         },
+        "artifact_warnings": artifact_warnings,
     }
 
 
@@ -725,13 +891,121 @@ def build_chunk_comparison_bundle(
     python_corrected_cpp_grid = resize_array_to_shape(python_bundle["corrected_chunk"], target_shape, order=1)
     python_valid_cpp_grid = resize_mask_to_shape(python_bundle["valid_score_mask"], target_shape)
     python_dino_score_variants = build_python_raw_feature_energy_score(python_retry, target_shape)
+    python_dino_input_debug = build_signal_agnostic_input_debug(
+        retry_helper,
+        python_bundle["corrected_chunk"],
+        target_shape,
+        db_min=python_bundle["dino_db_min"],
+        db_max=python_bundle["dino_db_max"],
+    )
+    cpp_dino_input_debug = build_signal_agnostic_input_debug(
+        retry_helper,
+        cpp_chunk["corrected_resized"],
+        target_shape,
+        db_min=python_bundle["dino_db_min"],
+        db_max=python_bundle["dino_db_max"],
+    )
+    cpp_runtime_input_gray = cpp_chunk.get("runtime_input_gray")
+    cpp_runtime_shape = None
+    if cpp_runtime_input_gray is not None:
+        cpp_runtime_shape = (
+            int(cpp_chunk.get("runtime_input_gray_rows", 0) or 0),
+            int(cpp_chunk.get("runtime_input_gray_cols", 0) or 0),
+        )
+    python_dino_patch_size = int(
+        python_bundle["python_retry"]["dino_texture_experiment"]["dino"].get("patch_size", 16)
+    )
+    local_chunk_freq_axis_hz = np.asarray(
+        python_bundle["input_record"]["freq_axis_hz"][int(python_bundle["selected_chunk"]["row_start"]):int(python_bundle["selected_chunk"]["row_stop"])],
+        dtype=np.float32,
+    )
+    python_expected_runtime_input = build_python_expected_dino_runtime_input(
+        retry_helper,
+        python_bundle["corrected_chunk"],
+        local_chunk_freq_axis_hz,
+        ignore_sideband_hz=0.0,
+        patch_size=python_dino_patch_size,
+        target_shape=target_shape,
+        db_min=python_bundle["dino_db_min"],
+        db_max=python_bundle["dino_db_max"],
+    )
+    python_runtime_retry = None
+    python_runtime_raw_variants = None
+    python_runtime_mapped_raw = None
+    python_runtime_mapped_grouped = None
+    if python_expected_runtime_input is not None:
+        runtime_chunk = np.asarray(python_expected_runtime_input["runtime_chunk"], dtype=np.float32)
+        runtime_valid_mask = np.ones(runtime_chunk.shape, dtype=bool)
+        python_runtime_retry = build_python_retry_hybrid_products(
+            retry_helper,
+            runtime_chunk,
+            runtime_valid_mask,
+            dino_repo_dir=python_bundle["config"]["model_repo_path"],
+            dino_weights_path=python_bundle["config"]["weights_path"],
+            dino_model_name=python_bundle["config"]["model_name"],
+            dino_device=python_bundle["dino_device"],
+            min_component_size=python_bundle["config"]["min_component_size"],
+            dino_db_min=python_bundle["dino_db_min"],
+            dino_db_max=python_bundle["dino_db_max"],
+        )
+        python_runtime_raw_variants = build_python_raw_feature_energy_score(
+            python_runtime_retry,
+            tuple(int(value) for value in python_expected_runtime_input["expected_shape"]),
+        )
+        python_runtime_mapped_raw = embed_runtime_crop_to_chunk_grid(
+            np.asarray(python_runtime_raw_variants["raw_pixel_score"], dtype=np.float32),
+            tuple(int(value) for value in python_bundle["corrected_chunk"].shape),
+            row_start=int(python_expected_runtime_input["row_start"]),
+            expected_shape=tuple(int(value) for value in python_expected_runtime_input["expected_shape"]),
+            target_shape=target_shape,
+            order=1,
+        )
+        python_runtime_mapped_grouped = embed_runtime_crop_to_chunk_grid(
+            np.asarray(python_runtime_raw_variants["grouped_pixel_score"], dtype=np.float32),
+            tuple(int(value) for value in python_bundle["corrected_chunk"].shape),
+            row_start=int(python_expected_runtime_input["row_start"]),
+            expected_shape=tuple(int(value) for value in python_expected_runtime_input["expected_shape"]),
+            target_shape=target_shape,
+            order=1,
+        )
+    artifact_warnings = list(cpp_bundle.get("artifact_warnings", []))
+    if python_expected_runtime_input is not None:
+        expected_runtime_shape = tuple(int(value) for value in python_expected_runtime_input["expected_shape"])
+        if cpp_runtime_shape is None or cpp_runtime_shape[0] <= 0 or cpp_runtime_shape[1] <= 0:
+            artifact_warnings.append(
+                f"Expected a C++ runtime grayscale dump for runtime crop {expected_runtime_shape}, but the artifact bundle does not contain a valid runtime_input_gray shape."
+            )
+        elif cpp_runtime_shape != expected_runtime_shape:
+            artifact_warnings.append(
+                f"C++ runtime grayscale shape {cpp_runtime_shape} does not match the Python-expected runtime crop {expected_runtime_shape}."
+            )
+    if artifact_warnings:
+        formatted_warnings = "\n".join(f"- {warning}" for warning in artifact_warnings)
+        raise RuntimeError(
+            "Offline validator artifact bundle is stale or was produced by a mismatched validator binary, so this notebook comparison would not be apples-to-apples:\n"
+            f"{formatted_warnings}\n"
+            "Rebuild the validator binary actually used by validate_offline_dino_subsection.sh, rerun the validator, then rerun Cell 3."
+        )
+    if cpp_runtime_input_gray is not None:
+        cpp_runtime_input_gray = np.asarray(cpp_runtime_input_gray, dtype=np.float32)
+        runtime_rows = int(cpp_chunk.get("runtime_input_gray_rows", 0) or 0)
+        runtime_cols = int(cpp_chunk.get("runtime_input_gray_cols", 0) or 0)
+        if runtime_rows > 0 and runtime_cols > 0 and cpp_runtime_input_gray.shape == (runtime_rows, runtime_cols):
+            cpp_runtime_input_gray = resize_array_to_shape(cpp_runtime_input_gray, target_shape, order=1)
     python_coherence_cpp_grid = build_structure_tensor_coherence_products(
         retry_helper,
         python_corrected_cpp_grid,
         python_valid_cpp_grid,
         min_component_size=python_bundle["config"]["min_component_size"],
     )
-    python_coherence_source_mapped = resize_array_to_shape(python_retry["coherence_gate_px"], target_shape, order=1)
+    python_coherence_source_mapped = np.asarray(
+        retry_helper.resize_float_image(
+            np.asarray(python_retry["coherence_gate_px"], dtype=np.float32),
+            width=int(target_shape[1]),
+            height=int(target_shape[0]),
+        ),
+        dtype=np.float32,
+    )
 
     python_mapped = {
         "corrected": python_corrected_cpp_grid,
@@ -739,9 +1013,14 @@ def build_chunk_comparison_bundle(
         "coherence_gate_source_mapped": python_coherence_source_mapped,
         "coherence_gate_cpp_grid": np.asarray(python_coherence_cpp_grid["coherence_gate_px"], dtype=np.float32),
         "coherence_region_mask_cpp_grid": np.asarray(python_coherence_cpp_grid["coherence_region_mask"], dtype=bool),
-        "dino_score": np.asarray(python_dino_score_variants["grouped_pixel_score"], dtype=np.float32),
-        "dino_score_grouped": np.asarray(python_dino_score_variants["grouped_pixel_score"], dtype=np.float32),
+        "dino_score": np.asarray(python_dino_score_variants["raw_pixel_score"], dtype=np.float32),
         "dino_score_raw_feature": np.asarray(python_dino_score_variants["raw_pixel_score"], dtype=np.float32),
+        "dino_score_grouped": np.asarray(python_dino_score_variants["grouped_pixel_score"], dtype=np.float32),
+        "dino_score_runtime_raw_feature": None if python_runtime_mapped_raw is None else np.asarray(python_runtime_mapped_raw, dtype=np.float32),
+        "dino_score_runtime_grouped": None if python_runtime_mapped_grouped is None else np.asarray(python_runtime_mapped_grouped, dtype=np.float32),
+        "dino_input_gray": np.asarray(python_dino_input_debug["input_gray"], dtype=np.float32),
+        "dino_input_fixed_gray": np.asarray(python_dino_input_debug["fixed_gray"], dtype=np.float32),
+        "dino_input_expected_runtime_gray": None if python_expected_runtime_input is None else np.asarray(python_expected_runtime_input["input_gray"], dtype=np.float32),
         "hybrid_contrib": resize_array_to_shape(python_retry["hybrid_dino_contrib"], target_shape, order=1),
         "combined_score": resize_array_to_shape(python_support["combined_score"], target_shape, order=1),
         "valid_mask": python_valid_cpp_grid,
@@ -750,6 +1029,7 @@ def build_chunk_comparison_bundle(
         "bridged_mask": resize_mask_to_shape(np.asarray(python_grouping["bridged_mask"], dtype=bool), target_shape),
         "grouped_mask": resize_mask_to_shape(np.asarray(python_grouping["grouped_mask"], dtype=bool), target_shape),
     }
+    dino_input_valid_mask = np.ones(target_shape, dtype=bool) if (cpp_runtime_input_gray is not None and python_expected_runtime_input is not None) else python_mapped["valid_mask"]
 
     cpp_metrics = {
         "coherence_gate": mask_metrics(cpp_chunk["coherence_gate"] >= np.quantile(cpp_chunk["coherence_gate"], 0.80), python_mapped["coherence_gate"] >= np.quantile(python_mapped["coherence_gate"], 0.80)),
@@ -776,18 +1056,30 @@ def build_chunk_comparison_bundle(
     }
 
     dino_diagnostics = {
+        "input_gray": {
+            "float_metrics": float_map_metrics(
+                cpp_runtime_input_gray if cpp_runtime_input_gray is not None else cpp_dino_input_debug["input_gray"],
+                python_mapped["dino_input_expected_runtime_gray"] if python_mapped["dino_input_expected_runtime_gray"] is not None else python_mapped["dino_input_gray"],
+                dino_input_valid_mask,
+            ),
+        },
         "grouped": {
-            "float_metrics": float_map_metrics(cpp_chunk["dino_score"], python_mapped["dino_score_grouped"], python_mapped["valid_mask"]),
+            "float_metrics": float_map_metrics(cpp_chunk["dino_score_grouped"], python_mapped["dino_score_grouped"], python_mapped["valid_mask"]),
             "mask_metrics": mask_metrics(
-                cpp_chunk["dino_score"] >= np.quantile(cpp_chunk["dino_score"][python_mapped["valid_mask"]], 0.80),
+                cpp_chunk["dino_score_grouped"] >= np.quantile(cpp_chunk["dino_score_grouped"][python_mapped["valid_mask"]], 0.80),
                 python_mapped["dino_score_grouped"] >= np.quantile(python_mapped["dino_score_grouped"][python_mapped["valid_mask"]], 0.80),
             ),
         },
         "raw_feature": {
-            "float_metrics": float_map_metrics(cpp_chunk["dino_score"], python_mapped["dino_score_raw_feature"], python_mapped["valid_mask"]),
+            "float_metrics": float_map_metrics(
+                cpp_chunk["dino_score_raw"],
+                python_mapped["dino_score_runtime_raw_feature"] if python_mapped["dino_score_runtime_raw_feature"] is not None else python_mapped["dino_score_raw_feature"],
+                python_mapped["valid_mask"],
+            ),
             "mask_metrics": mask_metrics(
-                cpp_chunk["dino_score"] >= np.quantile(cpp_chunk["dino_score"][python_mapped["valid_mask"]], 0.80),
-                python_mapped["dino_score_raw_feature"] >= np.quantile(python_mapped["dino_score_raw_feature"][python_mapped["valid_mask"]], 0.80),
+                cpp_chunk["dino_score_raw"] >= np.quantile(cpp_chunk["dino_score_raw"][python_mapped["valid_mask"]], 0.80),
+                (python_mapped["dino_score_runtime_raw_feature"] if python_mapped["dino_score_runtime_raw_feature"] is not None else python_mapped["dino_score_raw_feature"])
+                >= np.quantile((python_mapped["dino_score_runtime_raw_feature"] if python_mapped["dino_score_runtime_raw_feature"] is not None else python_mapped["dino_score_raw_feature"])[python_mapped["valid_mask"]], 0.80),
             ),
         },
         "python_patch_shape": list(int(value) for value in python_dino_score_variants["patch_shape"]),
@@ -808,6 +1100,11 @@ def build_chunk_comparison_bundle(
         "config_path": Path(config_path).expanduser().resolve(),
         "output_dir": resolved_output_dir,
         "cpp": cpp_bundle,
+        "cpp_proxy": {
+            "dino_input_gray": np.asarray(cpp_dino_input_debug["input_gray"], dtype=np.float32),
+            "dino_input_fixed_gray": np.asarray(cpp_dino_input_debug["fixed_gray"], dtype=np.float32),
+            "runtime_input_gray": cpp_runtime_input_gray,
+        },
         "python": python_bundle,
         "python_mapped": python_mapped,
         "metrics": cpp_metrics,
@@ -824,6 +1121,210 @@ def disagreement_mask(lhs: np.ndarray, rhs: np.ndarray) -> dict[str, np.ndarray]
         "lhs_only": np.logical_and(lhs, ~rhs),
         "rhs_only": np.logical_and(~lhs, rhs),
         "overlap": np.logical_and(lhs, rhs),
+    }
+
+
+def scale_box_to_shape(box: dict[str, Any], source_shape: tuple[int, int], target_shape: tuple[int, int]) -> dict[str, int]:
+    src_rows, src_cols = int(source_shape[0]), int(source_shape[1])
+    dst_rows, dst_cols = int(target_shape[0]), int(target_shape[1])
+    return {
+        "freq_start": int(np.floor(int(box.get("freq_start", 0)) * dst_rows / max(src_rows, 1))),
+        "freq_stop": int(np.ceil(int(box.get("freq_stop", 0)) * dst_rows / max(src_rows, 1))),
+        "time_start": int(np.floor(int(box.get("time_start", 0)) * dst_cols / max(src_cols, 1))),
+        "time_stop": int(np.ceil(int(box.get("time_stop", 0)) * dst_cols / max(src_cols, 1))),
+    }
+
+
+def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
+    cpp_bundle = comparison["cpp"]
+    python_bundle = comparison["python"]
+    python_mapped = comparison["python_mapped"]
+    cpp_chunk = cpp_bundle["chunk_debug"]
+    cpp_full = cpp_bundle["full_frame"]
+    script_report = cpp_bundle["comparison_report"]
+    has_patch_feature_grouping = bool(cpp_chunk.get("has_patch_feature_grouping", False))
+    grouped_surface_label = "Grouped DINO score" if has_patch_feature_grouping else "Fallback DINO score"
+    grouped_surface_note = (
+        "Current C++ artifact includes patch-feature exports, so this compares the grouped patch-feature score surface directly."
+        if has_patch_feature_grouping
+        else "Current C++ artifact is missing patch-feature exports, so the saved C++ DINO surface is a fallback derived from the raw runtime score_map rather than the grouped patch-feature path."
+    )
+
+    summary_rows = [
+        {
+            "metric": "chunk_count",
+            "value": int(cpp_bundle["summary"]["chunk_count"]),
+        },
+        {
+            "metric": "dino_input_mae",
+            "value": float(comparison["dino_diagnostics"]["input_gray"]["float_metrics"]["mae"]),
+        },
+        {
+            "metric": "dino_input_corr",
+            "value": float(comparison["dino_diagnostics"]["input_gray"]["float_metrics"]["corr"]),
+        },
+        {
+            "metric": "raw_dino_mae",
+            "value": float(comparison["dino_diagnostics"]["raw_feature"]["float_metrics"]["mae"]),
+        },
+        {
+            "metric": "raw_dino_corr",
+            "value": float(comparison["dino_diagnostics"]["raw_feature"]["float_metrics"]["corr"]),
+        },
+        {
+            "metric": "script_grouped_mask_agreement",
+            "value": None if script_report is None else float(script_report["grouped_mask_metrics"]["pixel_agreement"]),
+        },
+        {
+            "metric": "script_grouped_mask_iou",
+            "value": None if script_report is None else float(script_report["grouped_mask_metrics"]["iou"]),
+        },
+        {
+            "metric": "mapped_final_mask_iou",
+            "value": float(comparison["metrics"]["final_mask"]["iou"]),
+        },
+        {
+            "metric": "mapped_bridged_mask_iou",
+            "value": float(comparison["metrics"]["bridged_mask"]["iou"]),
+        },
+        {
+            "metric": "mapped_grouped_mask_iou",
+            "value": float(comparison["metrics"]["grouped_mask"]["iou"]),
+        },
+        {
+            "metric": "cpp_box_count",
+            "value": int(comparison["box_summary"]["cpp_box_count"]),
+        },
+        {
+            "metric": "python_box_count",
+            "value": int(comparison["box_summary"]["python_box_count"]),
+        },
+        {
+            "metric": "cpp_grouped_patch_features_present",
+            "value": int(has_patch_feature_grouping),
+        },
+    ]
+
+    script_report_rows = []
+    if script_report is not None:
+        script_report_rows.append(
+            {
+                "kind": "script_report",
+                "chunk_plan_row_match": bool(script_report["chunk_plan_match"]["row_start_matches"]) and bool(script_report["chunk_plan_match"]["row_stop_matches"]),
+                "chunk_plan_freq_match": bool(script_report["chunk_plan_match"]["freq_start_hz_matches"]) and bool(script_report["chunk_plan_match"]["freq_stop_hz_matches"]),
+                "grouped_mask_agreement": float(script_report["grouped_mask_metrics"]["pixel_agreement"]),
+                "grouped_mask_iou": float(script_report["grouped_mask_metrics"]["iou"]),
+                "cpp_box_count": int(script_report["box_comparison"]["cpp_box_count"]),
+                "python_box_count": int(script_report["box_comparison"]["python_box_count"]),
+                "exact_box_signature_match": bool(script_report["box_comparison"]["exact_signature_match"]),
+            }
+        )
+
+    overview_panels = [
+        ("Offline corrected resized", cpp_full["corrected_resized"], "magma"),
+        ("Offline DINO score", cpp_full["dino_score"], "inferno"),
+        ("Offline coherence gate", cpp_full["coherence_gate"], "viridis"),
+        ("Offline hybrid contrib", cpp_full["hybrid_contrib"], "cividis"),
+        ("Projected grouped score", cpp_full["projected_grouped_score"], "plasma"),
+        ("Offline final mask", cpp_full["final_mask"].astype(np.float32), "gray"),
+    ]
+
+    coherence_variants = [
+        {
+            "title": "Python source gate mapped to C++ grid",
+            "python_image": python_mapped["coherence_gate_source_mapped"],
+            "diagnostics": comparison["coherence_diagnostics"]["source_mapped"],
+        },
+        {
+            "title": "Python gate recomputed on resized corrected chunk",
+            "python_image": python_mapped["coherence_gate_cpp_grid"],
+            "diagnostics": comparison["coherence_diagnostics"]["cpp_grid"],
+        },
+    ]
+
+    runtime_input_gray = comparison["cpp_proxy"].get("runtime_input_gray")
+    runtime_python_input_gray = python_mapped.get("dino_input_expected_runtime_gray")
+    dino_input_panel = {
+        "cpp_image": np.asarray(runtime_input_gray, dtype=np.float32) if runtime_input_gray is not None else comparison["cpp_proxy"]["dino_input_gray"],
+        "cpp_title": "C++ exact pre-model grayscale input" if runtime_input_gray is not None else "C++-side signal-agnostic DINO input proxy",
+        "python_image": runtime_python_input_gray if runtime_python_input_gray is not None else python_mapped["dino_input_gray"],
+        "python_title": "Python expected pre-model grayscale input" if runtime_python_input_gray is not None else "Python signal-agnostic DINO input",
+        "diagnostics": comparison["dino_diagnostics"]["input_gray"]["float_metrics"],
+        "is_runtime_dump": bool(runtime_input_gray is not None),
+    }
+
+    raw_dino_panel = {
+        "cpp_title": "C++ raw runtime score_map (feature-energy proxy)"
+        if has_patch_feature_grouping
+        else "C++ raw runtime score_map (also backing the current fallback DINO surface)",
+        "cpp_image": cpp_chunk["dino_score_raw"],
+        "python_title": "Python runtime-cropped raw feature-energy score"
+        if python_mapped.get("dino_score_runtime_raw_feature") is not None
+        else "Python raw feature-energy score",
+        "python_image": python_mapped["dino_score_runtime_raw_feature"]
+        if python_mapped.get("dino_score_runtime_raw_feature") is not None
+        else python_mapped["dino_score_raw_feature"],
+        "diagnostics": comparison["dino_diagnostics"]["raw_feature"],
+        "valid_mask": python_mapped["valid_mask"],
+        "display_vmin": 0.0,
+        "display_vmax": 1.0,
+    }
+
+    python_grouped_combined = np.where(python_mapped["grouped_mask"], python_mapped["combined_score"], 0.0).astype(np.float32)
+    grouped_note_rows = [
+        {
+            "comparison": "grouped_score_surface",
+            "cpp_surface": "grouped DINO score from C++ patch-feature grouping"
+            if has_patch_feature_grouping
+            else "fallback C++ DINO score derived without exported patch features",
+            "python_surface": "Python grouped DINO support score",
+            "note": grouped_surface_note,
+        },
+        {
+            "comparison": "raw_dino_surface",
+            "cpp_surface": "runtime score_map exported by TorchScript runtime",
+            "python_surface": "runtime-cropped raw feature-energy proxy built from Python features"
+            if python_mapped.get("dino_score_runtime_raw_feature") is not None
+            else "raw feature-energy proxy built from Python features",
+            "note": "This row now compares the raw feature-energy proxy on the runtime-cropped DINO slice contract when that runtime crop can be reconstructed in Python. It is still not the full grouped/postprocessed Python DINO path.",
+        }
+    ]
+
+    stage_pairs = [
+        ("Corrected", cpp_chunk["corrected_resized"], python_mapped["corrected"], "magma"),
+        (
+            grouped_surface_label,
+            cpp_chunk["dino_score_grouped"],
+            python_mapped["dino_score_runtime_grouped"]
+            if (not has_patch_feature_grouping and python_mapped.get("dino_score_runtime_grouped") is not None)
+            else python_mapped["dino_score_grouped"],
+            "plasma",
+        ),
+        ("Hybrid contrib", cpp_chunk["hybrid_contrib"], python_mapped["hybrid_contrib"], "cividis"),
+        ("Combined score", cpp_chunk["combined_score"], python_mapped["combined_score"], "plasma"),
+        ("Grouped combined score", cpp_chunk["grouped_combined_score"], python_grouped_combined, "plasma"),
+        ("Final mask", cpp_chunk["final_mask"].astype(np.float32), python_mapped["final_mask"].astype(np.float32), "gray"),
+    ]
+
+    cpp_boxes = list(cpp_chunk["grouped_boxes"])
+    python_boxes_native = list(python_bundle["python_grouping"].get("boxes", []))
+    python_grouped_shape = tuple(int(value) for value in np.asarray(python_bundle["python_grouping"]["grouped_mask"]).shape)
+    cpp_shape = tuple(int(value) for value in np.asarray(cpp_chunk["corrected_resized"]).shape)
+    python_boxes_scaled = [scale_box_to_shape(box, python_grouped_shape, cpp_shape) for box in python_boxes_native]
+    match_rows = build_box_match_rows(cpp_boxes, python_boxes_scaled)
+
+    return {
+        "summary_rows": summary_rows,
+        "script_report_rows": script_report_rows,
+        "overview_panels": overview_panels,
+        "coherence_variants": coherence_variants,
+        "dino_input_panel": dino_input_panel,
+        "raw_dino_panel": raw_dino_panel,
+        "grouped_note_rows": grouped_note_rows,
+        "stage_pairs": stage_pairs,
+        "cpp_boxes": cpp_boxes,
+        "python_boxes_scaled": python_boxes_scaled,
+        "match_rows": match_rows,
     }
 
 
