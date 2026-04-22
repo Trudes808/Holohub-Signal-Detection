@@ -99,6 +99,7 @@ constexpr std::array<const char*, holoscan::ops::CoherentPowerSignalDetector::kP
   };
 
 constexpr int kQuantileHistogramBins = 1024;
+constexpr int kMaxGaussianKernelSize = 129;
 
 struct ChunkPlanEntry {
   int chunk_index = 0;
@@ -129,9 +130,7 @@ struct DetectionBox {
 
 struct DetectionChunkResult {
   ChunkPlanEntry chunk;
-  std::vector<float> combined_raw_px;
   std::vector<float> score_px;
-  std::vector<uint8_t> support_px;
   std::vector<uint8_t> mask_px;
   std::vector<uint8_t> grouped_mask;
   std::vector<uint8_t> valid_row_mask;
@@ -259,7 +258,7 @@ class ChunkWorkerPool {
 };
 
 ChunkWorkerPool& chunk_worker_pool() {
-  static ChunkWorkerPool pool(std::max<size_t>(1, std::min<size_t>(16, std::thread::hardware_concurrency())));
+  static ChunkWorkerPool pool(std::max<size_t>(1, std::min<size_t>(8, std::thread::hardware_concurrency())));
   return pool;
 }
 
@@ -750,8 +749,8 @@ __global__ void coherent_power_subtract_clamp_kernel(const float* input,
 __global__ void coherent_power_gaussian_rows_kernel(const float* input,
                                                     int rows,
                                                     int cols,
+                                                    const float* kernel,
                                                     int radius,
-                                                    float sigma,
                                                     float* output) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = rows * cols;
@@ -762,21 +761,19 @@ __global__ void coherent_power_gaussian_rows_kernel(const float* input,
   const int row = idx / cols;
   const int col = idx % cols;
   float sum = 0.0f;
-  float weight_sum = 0.0f;
   for (int offset = -radius; offset <= radius; ++offset) {
     const int src_col = max(0, min(cols - 1, col + offset));
-    const float weight = expf(-(static_cast<float>(offset * offset)) / (2.0f * sigma * sigma));
+    const float weight = kernel[offset + radius];
     sum += input[flat_index(rows, cols, row, src_col)] * weight;
-    weight_sum += weight;
   }
-  output[idx] = weight_sum > 0.0f ? sum / weight_sum : input[idx];
+  output[idx] = sum;
 }
 
 __global__ void coherent_power_gaussian_cols_kernel(const float* input,
                                                     int rows,
                                                     int cols,
+                                                    const float* kernel,
                                                     int radius,
-                                                    float sigma,
                                                     float* output) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = rows * cols;
@@ -787,14 +784,12 @@ __global__ void coherent_power_gaussian_cols_kernel(const float* input,
   const int row = idx / cols;
   const int col = idx % cols;
   float sum = 0.0f;
-  float weight_sum = 0.0f;
   for (int offset = -radius; offset <= radius; ++offset) {
     const int src_row = max(0, min(rows - 1, row + offset));
-    const float weight = expf(-(static_cast<float>(offset * offset)) / (2.0f * sigma * sigma));
+    const float weight = kernel[offset + radius];
     sum += input[flat_index(rows, cols, src_row, col)] * weight;
-    weight_sum += weight;
   }
-  output[idx] = weight_sum > 0.0f ? sum / weight_sum : input[idx];
+  output[idx] = sum;
 }
 
 __global__ void coherent_power_gradient_kernel(const float* input,
@@ -856,6 +851,27 @@ __global__ void coherent_power_eigen_metrics_kernel(const float* j_ff,
   const float denom = fmaxf(lam1 + lam2, 1e-6f);
   coherence[idx] = (lam1 - lam2) / denom;
   energy[idx] = lam1 + lam2;
+}
+
+__global__ void coherent_power_elementwise_max_inplace_kernel(const float* input,
+                                                              int total,
+                                                              float* output_max) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  output_max[idx] = fmaxf(output_max[idx], input[idx]);
+}
+
+__global__ void coherent_power_structure_gate_kernel(const float* coherence,
+                                                     const float* energy,
+                                                     int total,
+                                                     float* gate) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  gate[idx] = coherence[idx] * sqrtf(fmaxf(energy[idx], 0.0f));
 }
 
 __global__ void coherent_power_db_to_linear_kernel(const float* input_db,
@@ -1217,19 +1233,31 @@ bool gaussian_blur_2d_cuda(const float* input_device,
                            int rows,
                            int cols,
                            float sigma,
+                           float* kernel_device,
                            float* scratch_device,
                            float* output_device,
                            cudaStream_t stream) {
   sigma = std::max(0.5f, sigma);
-  const int radius = std::max(1, static_cast<int>(std::ceil(3.0f * sigma)));
+  const auto kernel = gaussian_kernel_1d(sigma);
+  if (kernel.empty() || kernel.size() > static_cast<size_t>(kMaxGaussianKernelSize)) {
+    return false;
+  }
+  const int radius = static_cast<int>(kernel.size() / 2);
   const int total = rows * cols;
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
+  if (cudaMemcpyAsync(kernel_device,
+                      kernel.data(),
+                      kernel.size() * sizeof(float),
+                      cudaMemcpyHostToDevice,
+                      stream) != cudaSuccess) {
+    return false;
+  }
   coherent_power_gaussian_rows_kernel<<<blocks, threads, 0, stream>>>(input_device,
                                                                        rows,
                                                                        cols,
+                                                                       kernel_device,
                                                                        radius,
-                                                                       sigma,
                                                                        scratch_device);
   auto cuda_result = cudaGetLastError();
   if (cuda_result != cudaSuccess) {
@@ -1238,8 +1266,8 @@ bool gaussian_blur_2d_cuda(const float* input_device,
   coherent_power_gaussian_cols_kernel<<<blocks, threads, 0, stream>>>(scratch_device,
                                                                        rows,
                                                                        cols,
+                                                                       kernel_device,
                                                                        radius,
-                                                                       sigma,
                                                                        output_device);
   cuda_result = cudaGetLastError();
   return cuda_result == cudaSuccess;
@@ -1711,6 +1739,7 @@ struct ChunkCudaScratch {
   std::array<float*, 8> buffers {};
   std::array<uint8_t*, 2> mask_buffers {};
   std::array<unsigned int*, 2> histogram_buffers {};
+  float* gaussian_kernel_device = nullptr;
   size_t capacity = 0;
 
   void release_buffers() {
@@ -1731,6 +1760,10 @@ struct ChunkCudaScratch {
         cudaFree(pointer);
         pointer = nullptr;
       }
+    }
+    if (gaussian_kernel_device != nullptr) {
+      cudaFree(gaussian_kernel_device);
+      gaussian_kernel_device = nullptr;
     }
     capacity = 0;
   }
@@ -1761,6 +1794,10 @@ struct ChunkCudaScratch {
         release_buffers();
         return false;
       }
+    }
+    if (cudaMalloc(reinterpret_cast<void**>(&gaussian_kernel_device), kMaxGaussianKernelSize * sizeof(float)) != cudaSuccess) {
+      release_buffers();
+      return false;
     }
     capacity = requested_elements;
     return true;
@@ -2178,9 +2215,8 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
                                double coherence_bridge_bias,
                                double coherence_power_joint_weight,
                                int min_component_size,
-                               std::vector<float>& combined_raw_px,
+                               bool filter_detection_mask,
                                std::vector<float>& score_px,
-                               std::vector<uint8_t>& support_px,
                                std::vector<uint8_t>& mask_px,
                                float& support_threshold,
                                float& score_threshold) {
@@ -2293,24 +2329,12 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk support majority smooth kernel failed");
   }
-
-  support_px.assign(static_cast<size_t>(total), 0);
-  if (cudaMemcpyAsync(support_px.data(),
+  if (cudaMemcpyAsync(mask_device,
                       scratch.mask_buffers[0],
                       static_cast<size_t>(total) * sizeof(uint8_t),
-                      cudaMemcpyDeviceToHost,
-                      stream) != cudaSuccess ||
-      cudaStreamSynchronize(stream) != cudaSuccess) {
-    throw std::runtime_error("chunk support mask readback failed");
-  }
-  support_px = prune_small_components(std::move(support_px), rows, cols, std::max(3, min_component_size / 2));
-
-  if (cudaMemcpyAsync(mask_device,
-                      support_px.data(),
-                      static_cast<size_t>(total) * sizeof(uint8_t),
-                      cudaMemcpyHostToDevice,
+                      cudaMemcpyDeviceToDevice,
                       stream) != cudaSuccess) {
-    throw std::runtime_error("chunk support mask upload failed");
+    throw std::runtime_error("chunk support mask device copy failed");
   }
 
   coherent_power_copy_masked_with_sentinel_kernel<<<blocks, threads, 0, stream>>>(d3,
@@ -2347,15 +2371,9 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
     throw std::runtime_error("chunk final majority smooth kernel failed");
   }
 
-  combined_raw_px.assign(static_cast<size_t>(total), 0.0f);
   score_px.assign(static_cast<size_t>(total), 0.0f);
   mask_px.assign(static_cast<size_t>(total), 0);
-  if (cudaMemcpyAsync(combined_raw_px.data(),
-                      d2,
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyDeviceToHost,
-                      stream) != cudaSuccess ||
-      cudaMemcpyAsync(score_px.data(),
+  if (cudaMemcpyAsync(score_px.data(),
                       d3,
                       static_cast<size_t>(total) * sizeof(float),
                       cudaMemcpyDeviceToHost,
@@ -2368,7 +2386,9 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
       cudaStreamSynchronize(stream) != cudaSuccess) {
     throw std::runtime_error("chunk score/mask readback failed");
   }
-  mask_px = prune_small_components(std::move(mask_px), rows, cols, min_component_size);
+  if (!filter_detection_mask) {
+    mask_px = prune_small_components(std::move(mask_px), rows, cols, min_component_size);
+  }
 }
 
 bool local_relative_power_support_map_cuda(const float* sxx_db_local,
@@ -2503,6 +2523,8 @@ bool multi_scale_structure_tensor_gate_cuda(const float* sxx_db_local,
   auto* d3 = scratch.buffers[3];
   auto* d4 = scratch.buffers[4];
   auto* d5 = scratch.buffers[5];
+  auto* d6 = scratch.buffers[6];
+  auto* d7 = scratch.buffers[7];
   auto stream = scratch.stream;
 
   if (cudaMemcpyAsync(d0,
@@ -2537,34 +2559,21 @@ bool multi_scale_structure_tensor_gate_cuda(const float* sxx_db_local,
   if (cudaGetLastError() != cudaSuccess) {
     return false;
   }
-
-  std::vector<float> residual_db(static_cast<size_t>(total), 0.0f);
-  if (cudaMemcpyAsync(residual_db.data(),
+  normalize_map01_device_inplace(d1, total, 5.0f, 99.0f, 0.0f, 40.0f, scratch.histogram_buffers[0], stream);
+  if (cudaMemcpyAsync(d0,
                       d1,
                       static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyDeviceToHost,
+                      cudaMemcpyDeviceToDevice,
                       stream) != cudaSuccess ||
-      cudaStreamSynchronize(stream) != cudaSuccess) {
-    return false;
-  }
-
-  auto residual_n = normalize_map01_local(residual_db, 5.0f, 99.0f);
-  if (cudaMemcpyAsync(d0,
-                      residual_n.data(),
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyHostToDevice,
-                      stream) != cudaSuccess) {
+      cudaMemsetAsync(d6, 0, static_cast<size_t>(total) * sizeof(float), stream) != cudaSuccess ||
+      cudaMemsetAsync(d7, 0, static_cast<size_t>(total) * sizeof(float), stream) != cudaSuccess) {
     return false;
   }
 
   const std::array<float, 3> scales{{0.8f, 1.6f, 3.2f}};
-  coherence_max.assign(static_cast<size_t>(total), 0.0f);
-  energy_max.assign(static_cast<size_t>(total), 0.0f);
-  std::vector<float> coherence(static_cast<size_t>(total), 0.0f);
-  std::vector<float> energy(static_cast<size_t>(total), 0.0f);
 
   for (const float grad_sigma : scales) {
-    if (!gaussian_blur_2d_cuda(d0, rows, cols, grad_sigma, d1, d2, stream)) {
+    if (!gaussian_blur_2d_cuda(d0, rows, cols, grad_sigma, scratch.gaussian_kernel_device, d1, d2, stream)) {
       return false;
     }
     coherent_power_gradient_kernel<<<total_blocks, total_threads, 0, stream>>>(d2, rows, cols, d3, d4);
@@ -2577,9 +2586,9 @@ bool multi_scale_structure_tensor_gate_cuda(const float* sxx_db_local,
     }
 
     const float integ_sigma = std::max(1.0f, 1.8f * grad_sigma);
-    if (!gaussian_blur_2d_cuda(d1, rows, cols, integ_sigma, d0, d1, stream) ||
-        !gaussian_blur_2d_cuda(d2, rows, cols, integ_sigma, d0, d2, stream) ||
-        !gaussian_blur_2d_cuda(d5, rows, cols, integ_sigma, d0, d5, stream)) {
+    if (!gaussian_blur_2d_cuda(d1, rows, cols, integ_sigma, scratch.gaussian_kernel_device, d0, d1, stream) ||
+        !gaussian_blur_2d_cuda(d2, rows, cols, integ_sigma, scratch.gaussian_kernel_device, d0, d2, stream) ||
+        !gaussian_blur_2d_cuda(d5, rows, cols, integ_sigma, scratch.gaussian_kernel_device, d0, d5, stream)) {
       return false;
     }
 
@@ -2592,34 +2601,45 @@ bool multi_scale_structure_tensor_gate_cuda(const float* sxx_db_local,
     if (cudaGetLastError() != cudaSuccess) {
       return false;
     }
-
-    if (cudaMemcpyAsync(coherence.data(),
-                        d3,
-                        static_cast<size_t>(total) * sizeof(float),
-                        cudaMemcpyDeviceToHost,
-                        stream) != cudaSuccess ||
-        cudaMemcpyAsync(energy.data(),
-                        d4,
-                        static_cast<size_t>(total) * sizeof(float),
-                        cudaMemcpyDeviceToHost,
-                        stream) != cudaSuccess ||
-        cudaStreamSynchronize(stream) != cudaSuccess) {
+    normalize_map01_device_inplace(d3, total, 5.0f, 99.0f, 0.0f, 1.0f, scratch.histogram_buffers[0], stream);
+    normalize_map01_device_inplace(d4, total, 5.0f, 99.0f, 0.0f, 1.0f, scratch.histogram_buffers[0], stream);
+    coherent_power_elementwise_max_inplace_kernel<<<total_blocks, total_threads, 0, stream>>>(d3, total, d6);
+    if (cudaGetLastError() != cudaSuccess) {
       return false;
     }
-
-    coherence = normalize_map01_local(coherence, 5.0f, 99.0f);
-    energy = normalize_map01_local(energy, 5.0f, 99.0f);
-    for (size_t index = 0; index < coherence.size(); ++index) {
-      coherence_max[index] = std::max(coherence_max[index], coherence[index]);
-      energy_max[index] = std::max(energy_max[index], energy[index]);
+    coherent_power_elementwise_max_inplace_kernel<<<total_blocks, total_threads, 0, stream>>>(d4, total, d7);
+    if (cudaGetLastError() != cudaSuccess) {
+      return false;
     }
   }
 
-  gate.assign(coherence_max.size(), 0.0f);
-  for (size_t index = 0; index < gate.size(); ++index) {
-    gate[index] = coherence_max[index] * std::sqrt(std::max(energy_max[index], 0.0f));
+  coherent_power_structure_gate_kernel<<<total_blocks, total_threads, 0, stream>>>(d6, d7, total, d5);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
   }
-  gate = normalize_map01_local(gate, 5.0f, 99.0f);
+  normalize_map01_device_inplace(d5, total, 5.0f, 99.0f, 0.0f, 1.0f, scratch.histogram_buffers[0], stream);
+
+  coherence_max.assign(static_cast<size_t>(total), 0.0f);
+  energy_max.assign(static_cast<size_t>(total), 0.0f);
+  gate.assign(static_cast<size_t>(total), 0.0f);
+  if (cudaMemcpyAsync(coherence_max.data(),
+                      d6,
+                      static_cast<size_t>(total) * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess ||
+      cudaMemcpyAsync(energy_max.data(),
+                      d7,
+                      static_cast<size_t>(total) * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess ||
+      cudaMemcpyAsync(gate.data(),
+                      d5,
+                      static_cast<size_t>(total) * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess ||
+      cudaStreamSynchronize(stream) != cudaSuccess) {
+    return false;
+  }
   return true;
 }
 
@@ -3600,9 +3620,8 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
                               coherence_bridge_bias,
                               coherence_power_joint_weight,
                               min_component_size,
-                              result.combined_raw_px,
+                              filter_detection_mask,
                               result.score_px,
-                              result.support_px,
                               result.mask_px,
                               result.support_threshold,
                               result.score_threshold);
@@ -3613,9 +3632,7 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
       if (result.valid_score_mask[index]) {
         continue;
       }
-      result.combined_raw_px[index] = 0.0f;
       result.score_px[index] = 0.0f;
-      result.support_px[index] = 0;
       result.mask_px[index] = 0;
     }
   });

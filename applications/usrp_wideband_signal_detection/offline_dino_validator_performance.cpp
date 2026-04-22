@@ -21,6 +21,7 @@
 #include <iostream>
 #include <limits>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -2642,81 +2643,6 @@ std::vector<HybridPostprocessResult> run_residual_veto_hybrid_gpu_batch(const st
   }
 }
 
-void precompute_retry_chunk_hybrid_batch(std::vector<ChunkInferenceArtifacts>& artifacts_batch,
-                                         const ValidatorConfig& config,
-                                         StageProfiler* profiler,
-                                         bool verbose) {
-  if (artifacts_batch.empty()) {
-    return;
-  }
-  const int batch_size = static_cast<int>(artifacts_batch.size());
-  const int rows = artifacts_batch.front().result.src_rows;
-  const int cols = artifacts_batch.front().result.src_cols;
-  if (rows <= 0 || cols <= 0) {
-    return;
-  }
-  if (std::all_of(artifacts_batch.begin(), artifacts_batch.end(), [](const ChunkInferenceArtifacts& artifacts) {
-        return artifacts.has_precomputed_hybrid_result;
-      })) {
-    return;
-  }
-
-  const size_t sample_elements = static_cast<size_t>(rows) * static_cast<size_t>(cols);
-  std::vector<float> hybrid_contrib_batch(static_cast<size_t>(batch_size) * sample_elements, 0.0f);
-  std::vector<uint8_t> valid_mask_batch(static_cast<size_t>(batch_size) * sample_elements, 0);
-  {
-    const size_t estimated_bytes = static_cast<size_t>(batch_size) * sample_elements * (sizeof(float) * 3 + sizeof(uint8_t));
-    ScopedStageProfile stage(profiler, "chunk_hybrid_support_batch", "run", -1, estimated_bytes, verbose);
-    const auto norm_start = std::chrono::steady_clock::now();
-    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
-      auto& artifacts = artifacts_batch[static_cast<size_t>(sample_index)];
-      if (artifacts.keep_debug_artifacts || artifacts.result.src_rows != rows || artifacts.result.src_cols != cols ||
-          artifacts.grouped_dino_score_source.size() != sample_elements || artifacts.source_chunk_coherence_gate.size() != sample_elements ||
-          artifacts.source_chunk_valid_mask.size() != sample_elements) {
-        return;
-      }
-      const size_t offset = static_cast<size_t>(sample_index) * sample_elements;
-      auto* hybrid_contrib_output = hybrid_contrib_batch.data() + static_cast<std::ptrdiff_t>(offset);
-      const auto& hybrid_dino_source = artifacts.grouped_dino_score_source;
-      const auto [dino_low, dino_high] = quantile_bounds_from_input(hybrid_dino_source, 5.0, 95.0);
-      normalize01_quantile_into(hybrid_dino_source,
-                                dino_low,
-                                dino_high,
-                                hybrid_contrib_output);
-      const auto [coherence_low, coherence_high] = quantile_bounds_from_input(artifacts.source_chunk_coherence_gate, 5.0, 99.0);
-      multiply_normalized_quantile_into(artifacts.source_chunk_coherence_gate,
-                                        coherence_low,
-                                        coherence_high,
-                                        hybrid_contrib_output);
-      std::copy(artifacts.source_chunk_valid_mask.begin(),
-                artifacts.source_chunk_valid_mask.end(),
-                valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(offset));
-    }
-    record_timed_stage(profiler,
-                       "chunk_hybrid_norm_batch_cpu",
-                       "run",
-                       -1,
-                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - norm_start).count());
-
-    const auto residual_veto_start = std::chrono::steady_clock::now();
-    auto hybrid_results = run_residual_veto_hybrid_gpu_batch(hybrid_contrib_batch,
-                                                             valid_mask_batch,
-                                                             batch_size,
-                                                             rows,
-                                                             cols,
-                                                             use_fp16_precision(config.hybrid_torch_dtype));
-    record_timed_stage(profiler,
-                       "chunk_hybrid_residual_veto_batch",
-                       "run",
-                       -1,
-                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - residual_veto_start).count());
-    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
-      artifacts_batch[static_cast<size_t>(sample_index)].precomputed_hybrid_result_source = std::move(hybrid_results[static_cast<size_t>(sample_index)]);
-      artifacts_batch[static_cast<size_t>(sample_index)].has_precomputed_hybrid_result = true;
-    }
-  }
-}
-
 std::vector<float> patch_mean_map(const std::vector<float>& input,
                                   int src_rows,
                                   int src_cols,
@@ -2814,7 +2740,15 @@ std::vector<float> dino_seed_patch_map(const std::vector<float>& spectrogram_db,
       .seed_patch;
 }
 
-std::vector<float> raw_feature_energy_score_patch(const std::vector<float>& patch_features,
+std::vector<float> suppress_raw_dino_positional_features(const float* patch_features,
+                                                         size_t patch_features_size,
+                                                         int patch_rows,
+                                                         int patch_cols,
+                                                         int feature_dim,
+                                                         float suppression);
+
+std::vector<float> raw_feature_energy_score_patch(const float* patch_features,
+                                                  size_t patch_features_size,
                                                   int patch_rows,
                                                   int patch_cols,
                                                   int feature_dim,
@@ -2822,25 +2756,44 @@ std::vector<float> raw_feature_energy_score_patch(const std::vector<float>& patc
   const int patch_count = patch_rows * patch_cols;
   std::vector<float> raw_patch_score(static_cast<size_t>(patch_count), 0.0f);
   if (patch_count <= 0 || feature_dim <= 0 ||
-      patch_features.size() != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
+      patch_features == nullptr ||
+      patch_features_size != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
     return raw_patch_score;
   }
-  const auto energy_features = suppress_raw_dino_positional_features(
-      patch_features,
-      patch_rows,
-      patch_cols,
-      feature_dim,
-      positional_suppression);
+  std::vector<float> energy_features;
+  const float* energy_features_ptr = patch_features;
+  if (positional_suppression > 0.0f) {
+    energy_features = suppress_raw_dino_positional_features(patch_features,
+                                                            patch_features_size,
+                                                            patch_rows,
+                                                            patch_cols,
+                                                            feature_dim,
+                                                            positional_suppression);
+    energy_features_ptr = energy_features.data();
+  }
   for (int patch_index = 0; patch_index < patch_count; ++patch_index) {
     float mean_sq = 0.0f;
     for (int feature_index = 0; feature_index < feature_dim; ++feature_index) {
-      const float value = energy_features[flat_index(feature_dim, patch_index, feature_index)];
+      const float value = energy_features_ptr[flat_index(feature_dim, patch_index, feature_index)];
       mean_sq += value * value;
     }
     mean_sq /= static_cast<float>(feature_dim);
     raw_patch_score[static_cast<size_t>(patch_index)] = std::sqrt(std::max(mean_sq, 1.0e-6f));
   }
   return normalize01_quantile(raw_patch_score, 5.0, 95.0);
+}
+
+std::vector<float> raw_feature_energy_score_patch(const std::vector<float>& patch_features,
+                                                  int patch_rows,
+                                                  int patch_cols,
+                                                  int feature_dim,
+                                                  float positional_suppression = 0.0f) {
+  return raw_feature_energy_score_patch(patch_features.data(),
+                                        patch_features.size(),
+                                        patch_rows,
+                                        patch_cols,
+                                        feature_dim,
+                                        positional_suppression);
 }
 
 std::vector<float> embed_aligned_map_in_source_canvas(const std::vector<float>& aligned_map,
@@ -3045,6 +2998,58 @@ std::vector<float> positional_design_matrix(int patch_rows, int patch_cols) {
   return design;
 }
 
+struct PositionalSuppressionCache {
+  int patch_count = 0;
+  torch::Tensor design;
+  torch::Tensor design_t;
+  torch::Tensor solve_lhs;
+  std::vector<float> centered_basis;
+  std::vector<float> centered_basis_norms;
+};
+
+std::shared_ptr<const PositionalSuppressionCache> get_positional_suppression_cache(int patch_rows, int patch_cols) {
+  const uint64_t cache_key = (static_cast<uint64_t>(static_cast<uint32_t>(patch_rows)) << 32U) |
+                             static_cast<uint64_t>(static_cast<uint32_t>(patch_cols));
+  static std::mutex cache_mutex;
+  static std::unordered_map<uint64_t, std::shared_ptr<const PositionalSuppressionCache>> cache_by_shape;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    const auto found = cache_by_shape.find(cache_key);
+    if (found != cache_by_shape.end()) {
+      return found->second;
+    }
+  }
+
+  auto cache = std::make_shared<PositionalSuppressionCache>();
+  cache->patch_count = patch_rows * patch_cols;
+  const auto design_values = positional_design_matrix(patch_rows, patch_cols);
+  cache->design = vector_to_tensor_2d(design_values, cache->patch_count, 16);
+  cache->design_t = cache->design.transpose(0, 1).contiguous();
+  const auto xtx = cache->design_t.matmul(cache->design);
+  const auto ridge = 1.0e-3f * torch::eye(xtx.size(0), torch::TensorOptions().dtype(torch::kFloat32));
+  cache->solve_lhs = (xtx + ridge).contiguous();
+  cache->centered_basis.assign(static_cast<size_t>(cache->patch_count) * 15U, 0.0f);
+  cache->centered_basis_norms.assign(15U, 0.0f);
+  for (int basis_col = 0; basis_col < 15; ++basis_col) {
+    float basis_mean = 0.0f;
+    for (int row = 0; row < cache->patch_count; ++row) {
+      basis_mean += design_values[static_cast<size_t>(row) * 16U + static_cast<size_t>(basis_col + 1)];
+    }
+    basis_mean /= static_cast<float>(std::max(cache->patch_count, 1));
+    float basis_norm = 0.0f;
+    for (int row = 0; row < cache->patch_count; ++row) {
+      const float centered_basis = design_values[static_cast<size_t>(row) * 16U + static_cast<size_t>(basis_col + 1)] - basis_mean;
+      cache->centered_basis[static_cast<size_t>(row) * 15U + static_cast<size_t>(basis_col)] = centered_basis;
+      basis_norm += centered_basis * centered_basis;
+    }
+    cache->centered_basis_norms[static_cast<size_t>(basis_col)] = std::sqrt(basis_norm);
+  }
+
+  std::lock_guard<std::mutex> lock(cache_mutex);
+  const auto [iter, inserted] = cache_by_shape.emplace(cache_key, cache);
+  return inserted ? cache : iter->second;
+}
+
 std::vector<float> pca_project_features(const std::vector<float>& patch_features,
                                         int patch_count,
                                         int feature_dim) {
@@ -3071,12 +3076,13 @@ std::vector<float> remove_positional_trend(const std::vector<float>& features,
   if (patch_count <= 0 || feature_dim <= 0) {
     return features;
   }
-  const auto design = vector_to_tensor_2d(positional_design_matrix(patch_rows, patch_cols), patch_count, 16);
+  const auto cache = get_positional_suppression_cache(patch_rows, patch_cols);
+  if (!cache || cache->patch_count != patch_count) {
+    return features;
+  }
   const auto x = vector_to_tensor_2d(features, patch_count, feature_dim);
-  const auto xtx = design.transpose(0, 1).matmul(design);
-  const auto ridge = 1.0e-3f * torch::eye(xtx.size(0), torch::TensorOptions().dtype(torch::kFloat32));
-  const auto beta = torch::linalg_solve(xtx + ridge, design.transpose(0, 1).matmul(x));
-  return tensor_to_vector_float(x - design.matmul(beta));
+  const auto beta = torch::linalg_solve(cache->solve_lhs, cache->design_t.matmul(x));
+  return tensor_to_vector_float(x - cache->design.matmul(beta));
 }
 
 std::vector<float> remove_position_correlated_components(const std::vector<float>& features,
@@ -3087,14 +3093,9 @@ std::vector<float> remove_position_correlated_components(const std::vector<float
   if (patch_count <= 1 || feature_dim <= 1) {
     return features;
   }
-  const auto design = positional_design_matrix(patch_rows, patch_cols);
-  std::vector<float> basis(static_cast<size_t>(patch_count) * 15U, 0.0f);
-  for (int row = 0; row < patch_count; ++row) {
-    const size_t src_base = static_cast<size_t>(row) * 16U;
-    const size_t dst_base = static_cast<size_t>(row) * 15U;
-    for (int col = 0; col < 15; ++col) {
-      basis[dst_base + static_cast<size_t>(col)] = design[src_base + static_cast<size_t>(col + 1)];
-    }
+  const auto cache = get_positional_suppression_cache(patch_rows, patch_cols);
+  if (!cache || cache->patch_count != patch_count) {
+    return features;
   }
   const auto x = vector_to_tensor_2d(features, patch_count, feature_dim);
   const auto centered = x - x.mean(0, true);
@@ -3105,7 +3106,6 @@ std::vector<float> remove_position_correlated_components(const std::vector<float
   if (components <= 0) {
     return features;
   }
-  const auto basis_values = basis;
   auto score_values = tensor_to_vector_float(scores);
   std::vector<uint8_t> keep(static_cast<size_t>(components), 1);
   std::vector<float> correlations(static_cast<size_t>(components), 0.0f);
@@ -3129,21 +3129,14 @@ std::vector<float> remove_position_correlated_components(const std::vector<float
     }
     float max_corr = 0.0f;
     for (int basis_col = 0; basis_col < 15; ++basis_col) {
-      float basis_mean = 0.0f;
-      for (int row = 0; row < patch_count; ++row) {
-        basis_mean += basis_values[static_cast<size_t>(row) * 15U + static_cast<size_t>(basis_col)];
-      }
-      basis_mean /= static_cast<float>(patch_count);
       float dot = 0.0f;
-      float basis_norm = 0.0f;
-      for (int row = 0; row < patch_count; ++row) {
-        const float centered_basis = basis_values[static_cast<size_t>(row) * 15U + static_cast<size_t>(basis_col)] - basis_mean;
-        dot += y[static_cast<size_t>(row)] * centered_basis;
-        basis_norm += centered_basis * centered_basis;
-      }
-      basis_norm = std::sqrt(basis_norm);
+      const float basis_norm = cache->centered_basis_norms[static_cast<size_t>(basis_col)];
       if (basis_norm < 1.0e-8f) {
         continue;
+      }
+      for (int row = 0; row < patch_count; ++row) {
+        const float centered_basis = cache->centered_basis[static_cast<size_t>(row) * 15U + static_cast<size_t>(basis_col)];
+        dot += y[static_cast<size_t>(row)] * centered_basis;
       }
       max_corr = std::max(max_corr, std::fabs(dot / std::max(y_norm * basis_norm, 1.0e-8f)));
     }
@@ -3167,27 +3160,45 @@ std::vector<float> remove_position_correlated_components(const std::vector<float
 }
 constexpr float kHybridRawDinoPositionalDeweight = 0.75f;
 
+std::vector<float> suppress_raw_dino_positional_features(const float* patch_features,
+                                                         size_t patch_features_size,
+                                                         int patch_rows,
+                                                         int patch_cols,
+                                                         int feature_dim,
+                                                         float suppression) {
+  if (patch_features == nullptr) {
+    return {};
+  }
+  std::vector<float> patch_feature_vector(patch_features, patch_features + static_cast<std::ptrdiff_t>(patch_features_size));
+  const int patch_count = patch_rows * patch_cols;
+  if (suppression <= 0.0f || patch_count <= 0 || feature_dim <= 0 ||
+      patch_features_size != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
+    return patch_feature_vector;
+  }
+  const float clamped = clamp_value(suppression, 0.0f, 1.0f);
+  auto suppressed = remove_positional_trend(patch_feature_vector, patch_count, feature_dim, patch_rows, patch_cols);
+  suppressed = remove_position_correlated_components(suppressed, patch_count, feature_dim, patch_rows, patch_cols);
+  if (clamped >= 1.0f) {
+    return suppressed;
+  }
+  std::vector<float> blended(patch_feature_vector.size(), 0.0f);
+  for (size_t index = 0; index < patch_feature_vector.size(); ++index) {
+    blended[index] = (1.0f - clamped) * patch_feature_vector[index] + clamped * suppressed[index];
+  }
+  return blended;
+}
+
 std::vector<float> suppress_raw_dino_positional_features(const std::vector<float>& patch_features,
                                                          int patch_rows,
                                                          int patch_cols,
                                                          int feature_dim,
                                                          float suppression) {
-  const int patch_count = patch_rows * patch_cols;
-  if (suppression <= 0.0f || patch_count <= 0 || feature_dim <= 0 ||
-      patch_features.size() != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
-    return patch_features;
-  }
-  const float clamped = clamp_value(suppression, 0.0f, 1.0f);
-  auto suppressed = remove_positional_trend(patch_features, patch_count, feature_dim, patch_rows, patch_cols);
-  suppressed = remove_position_correlated_components(suppressed, patch_count, feature_dim, patch_rows, patch_cols);
-  if (clamped >= 1.0f) {
-    return suppressed;
-  }
-  std::vector<float> blended(patch_features.size(), 0.0f);
-  for (size_t index = 0; index < patch_features.size(); ++index) {
-    blended[index] = (1.0f - clamped) * patch_features[index] + clamped * suppressed[index];
-  }
-  return blended;
+  return suppress_raw_dino_positional_features(patch_features.data(),
+                                               patch_features.size(),
+                                               patch_rows,
+                                               patch_cols,
+                                               feature_dim,
+                                               suppression);
 }
 
 std::vector<float> row_normalize_square_matrix(const std::vector<float>& input, int size) {
@@ -5783,10 +5794,9 @@ std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::o
       if (sample_offset + patch_count * feature_dim > runtime_result.patch_features_batch.size()) {
         throw std::runtime_error("batched grouped score patch feature slice is out of range");
       }
-      const std::vector<float> patch_features_sample(
-          runtime_result.patch_features_batch.begin() + static_cast<std::ptrdiff_t>(sample_offset),
-          runtime_result.patch_features_batch.begin() + static_cast<std::ptrdiff_t>(sample_offset + patch_count * feature_dim));
-      const auto deweighted_raw_patch_score = raw_feature_energy_score_patch(patch_features_sample,
+        const float* patch_features_sample = runtime_result.patch_features_batch.data() + static_cast<std::ptrdiff_t>(sample_offset);
+        const auto deweighted_raw_patch_score = raw_feature_energy_score_patch(patch_features_sample,
+                                           patch_count * feature_dim,
                                                                              runtime_result.patch_rows,
                                                                              runtime_result.patch_cols,
                                                                              runtime_result.feature_dim,
@@ -5848,6 +5858,59 @@ std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::o
                                                                            uniform_rows,
                                                                            src_cols,
                                                                            use_fp16_precision(config.hybrid_torch_dtype));
+    record_timed_stage(profiler,
+                       "chunk_hybrid_residual_veto_batch",
+                       "run",
+                       -1,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - residual_veto_start).count());
+    for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+      artifacts_batch[batch_index].precomputed_hybrid_result_source = std::move(hybrid_results[batch_index]);
+      artifacts_batch[batch_index].has_precomputed_hybrid_result = true;
+    }
+  } else {
+    const size_t estimated_bytes = static_cast<size_t>(batch_size) * chunk_elements * (sizeof(float) * 3 + sizeof(uint8_t));
+    ScopedStageProfile stage(profiler, "chunk_hybrid_support_batch", "run", -1, estimated_bytes, verbose);
+    std::vector<float> hybrid_contrib_batch(batch_size * chunk_elements, 0.0f);
+    std::vector<uint8_t> valid_mask_batch(batch_size * chunk_elements, 0);
+    const auto norm_start = std::chrono::steady_clock::now();
+    for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+      auto& artifacts = artifacts_batch[batch_index];
+      if (artifacts.keep_debug_artifacts ||
+          artifacts.grouped_dino_score_source.size() != chunk_elements ||
+          artifacts.source_chunk_coherence_gate.size() != chunk_elements ||
+          artifacts.source_chunk_valid_mask.size() != chunk_elements) {
+        throw std::runtime_error("batched hybrid fallback requires dense deweighted DINO, coherence, and valid-mask inputs");
+      }
+      const size_t offset = batch_index * chunk_elements;
+      auto* hybrid_contrib_output = hybrid_contrib_batch.data() + static_cast<std::ptrdiff_t>(offset);
+      const auto& hybrid_dino_source = artifacts.grouped_dino_score_source;
+      const auto [dino_low, dino_high] = quantile_bounds_from_input(hybrid_dino_source, 5.0, 95.0);
+      normalize01_quantile_into(hybrid_dino_source,
+                                dino_low,
+                                dino_high,
+                                hybrid_contrib_output);
+      const auto [coherence_low, coherence_high] = quantile_bounds_from_input(artifacts.source_chunk_coherence_gate, 5.0, 99.0);
+      multiply_normalized_quantile_into(artifacts.source_chunk_coherence_gate,
+                                        coherence_low,
+                                        coherence_high,
+                                        hybrid_contrib_output);
+      std::copy(artifacts.source_chunk_valid_mask.begin(),
+                artifacts.source_chunk_valid_mask.end(),
+                valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+    record_timed_stage(profiler,
+                       "chunk_hybrid_norm_batch_cpu",
+                       "run",
+                       -1,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - norm_start).count());
+
+    const auto residual_veto_start = std::chrono::steady_clock::now();
+    auto hybrid_results = run_residual_veto_hybrid_gpu_batch(hybrid_contrib_batch,
+                                                             valid_mask_batch,
+                                                             static_cast<int>(batch_size),
+                                                             uniform_rows,
+                                                             src_cols,
+                                                             use_fp16_precision(config.hybrid_torch_dtype));
     record_timed_stage(profiler,
                        "chunk_hybrid_residual_veto_batch",
                        "run",
@@ -6544,7 +6607,6 @@ int main(int argc, char** argv) {
                                                                  gpu_workspace,
                                                                  &profiler,
                                                                  options.verbose);
-        precompute_retry_chunk_hybrid_batch(batched_inference, config, &profiler, options.verbose);
         auto mapped_indices = pending_runtime_indices;
         pending_postprocess.push_back(std::async(std::launch::async,
                                                  [&, mapped_indices = std::move(mapped_indices), batched_inference = std::move(batched_inference)]() mutable {
