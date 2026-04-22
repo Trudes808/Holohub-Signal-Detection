@@ -297,9 +297,9 @@ for path in required_files:
     failures.append(f"missing artifact: {path}")
 
 artifact_contract = str(summary.get("artifact_contract", "") or "")
-if artifact_contract != "chunk_no_extra_sideband_crop_v2":
+if artifact_contract not in {"chunk_no_extra_sideband_crop_v2", "chunk_fixed_detector_grid_v1"}:
   failures.append(
-    f"unexpected artifact_contract {artifact_contract!r} in {summary_path}; expected 'chunk_no_extra_sideband_crop_v2'"
+    f"unexpected artifact_contract {artifact_contract!r} in {summary_path}; expected a supported runtime contract"
   )
 
 runtime_rows = int(summary.get("runtime_input_gray_rows", 0) or 0)
@@ -311,9 +311,9 @@ patch_rows = int(summary.get("patch_rows", 0) or 0)
 patch_cols = int(summary.get("patch_cols", 0) or 0)
 feature_dim = int(summary.get("feature_dim", 0) or 0)
 
-if ignore_bins == 0 and src_rows > 0 and src_cols > 0 and (runtime_rows, runtime_cols) != (src_rows, src_cols):
+if src_rows > 0 and src_cols > 0 and (runtime_rows > src_rows or runtime_cols > src_cols):
   failures.append(
-    f"runtime_input_gray shape {(runtime_rows, runtime_cols)} does not match source chunk {(src_rows, src_cols)} when ignore_bins_per_side=0"
+    f"runtime_input_gray shape {(runtime_rows, runtime_cols)} exceeds source chunk {(src_rows, src_cols)}"
   )
 
 if patch_rows <= 0 or patch_cols <= 0 or feature_dim <= 0:

@@ -110,6 +110,20 @@ struct CanonicalTensorView {
   bool transposed = false;
 };
 
+int compute_ignore_bins_per_side(int rows,
+                                 double resolution_hz,
+                                 double ignore_sideband_percent,
+                                 double ignore_sideband_hz) {
+  int ignore_bins_per_side = 0;
+  if (ignore_sideband_percent > 0.0) {
+    ignore_bins_per_side = static_cast<int>(
+        std::floor(static_cast<double>(rows) * ignore_sideband_percent / 100.0));
+  } else if (resolution_hz > 0.0 && ignore_sideband_hz > 0.0) {
+    ignore_bins_per_side = static_cast<int>(std::ceil(ignore_sideband_hz / resolution_hz));
+  }
+  return std::clamp(ignore_bins_per_side, 0, std::max(0, (rows - 16) / 2));
+}
+
 std::string json_bool(bool value) {
   return value ? "true" : "false";
 }
@@ -1961,9 +1975,9 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                        double grouping_min_density,
                                        double grouping_time_continuity_ratio) {
   PipelineSummary summary;
-  if (resolution_hz <= 0.0 && ignore_bins_per_side == 0 && ignore_sideband_percent > 0.0) {
-    ignore_bins_per_side = static_cast<int>(std::floor(static_cast<double>(src_rows) * ignore_sideband_percent / 100.0));
-    ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
+  if (ignore_bins_per_side == 0) {
+    ignore_bins_per_side = compute_ignore_bins_per_side(
+        src_rows, resolution_hz, ignore_sideband_percent, 0.0);
   }
   summary.ignore_bins_per_side = ignore_bins_per_side;
 
@@ -2156,14 +2170,8 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
     result.power_db[index] = 10.0f * std::log10(re * re + im * im + 1e-12f);
   }
 
-  int ignore_bins_per_side = 0;
-  if (resolution_hz > 0.0 && config.ignore_sideband_hz > 0.0) {
-    ignore_bins_per_side = static_cast<int>(std::ceil(config.ignore_sideband_hz / resolution_hz));
-    ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
-  } else if (resolution_hz <= 0.0 && config.ignore_sideband_percent > 0.0) {
-    ignore_bins_per_side = static_cast<int>(std::floor(static_cast<double>(src_rows) * config.ignore_sideband_percent / 100.0));
-    ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
-  }
+  const int ignore_bins_per_side = compute_ignore_bins_per_side(
+      src_rows, resolution_hz, config.ignore_sideband_percent, config.ignore_sideband_hz);
   result.ignore_bins_per_side = ignore_bins_per_side;
 
   std::vector<uint8_t> valid_row_mask(static_cast<size_t>(src_rows), 1);
@@ -2563,13 +2571,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     resolution_hz = span_hz / static_cast<double>(src_rows);
   }
   const double sample_rate_hz = span_hz;
-  if (resolution_hz > 0.0 && ignore_sideband_hz_.get() > 0.0) {
-    ignore_bins_per_side = static_cast<int>(std::ceil(ignore_sideband_hz_.get() / resolution_hz));
-    ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
-  } else if (resolution_hz <= 0.0 && ignore_sideband_percent_.get() > 0.0) {
-    ignore_bins_per_side = static_cast<int>(std::floor(static_cast<double>(src_rows) * ignore_sideband_percent_.get() / 100.0));
-    ignore_bins_per_side = std::clamp(ignore_bins_per_side, 0, std::max(0, (src_rows - 16) / 2));
-  }
+  ignore_bins_per_side = compute_ignore_bins_per_side(
+      src_rows, resolution_hz, ignore_sideband_percent_.get(), ignore_sideband_hz_.get());
 
   const int total_bins = src_rows * src_cols;
   const size_t power_db_bytes = static_cast<size_t>(total_bins) * sizeof(float);

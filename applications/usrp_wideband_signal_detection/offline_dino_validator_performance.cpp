@@ -32,6 +32,7 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+#include <charconv>
 
 #include <torch/torch.h>
 
@@ -77,6 +78,14 @@ struct ValidatorConfig {
   double dino_group_score_q = 0.60;
   int min_component_size = 6;
   bool filter_detection_mask = true;
+  bool fast_boxes_only_non_debug_grouping = false;
+  int grouping_bridge_freq_px = 33;
+  int grouping_bridge_time_px = 5;
+  int grouping_min_component_size = 24;
+  int grouping_min_freq_span_px = 18;
+  int grouping_min_time_span_px = 2;
+  double grouping_min_density = 0.06;
+  double grouping_time_continuity_ratio = 0.85;
   double pipeline_final_threshold = 0.20;
   double pipeline_gap_floor = 0.10;
   double pipeline_power_rescue_floor = 0.10;
@@ -85,6 +94,9 @@ struct ValidatorConfig {
   std::string model_script_path = "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts";
   std::string torchscript_init_mode = "load_cuda_eval";
   std::string torch_dtype = "fp32";
+  std::string hybrid_torch_dtype = "fp32";
+  bool legacy_fast_gray_preprocess = false;
+  int runtime_batch_size = 4;
 };
 
 struct NpyArray2D {
@@ -142,6 +154,10 @@ struct ChunkPlanEntry {
   double freq_start_hz = 0.0;
   double freq_stop_hz = 0.0;
 };
+
+int chunk_row_count(const ChunkPlanEntry& chunk) {
+  return std::max(0, chunk.row_stop - chunk.row_start);
+}
 
 struct DetectionBox {
   int freq_start = 0;
@@ -201,6 +217,24 @@ struct GroupedDinoPatchResult {
 };
 
 ComponentLabelling label_components(const std::vector<uint8_t>& mask, int rows, int cols);
+std::vector<uint8_t> keep_large_components(const std::vector<uint8_t>& mask,
+                                           int rows,
+                                           int cols,
+                                           int min_size,
+                                           int* kept_component_count);
+std::vector<uint8_t> binary_closing_rect(const std::vector<uint8_t>& mask,
+                                         int rows,
+                                         int cols,
+                                         int kernel_rows,
+                                         int kernel_cols);
+std::vector<uint8_t> binary_fill_holes(const std::vector<uint8_t>& mask, int rows, int cols);
+float mean_mask_value(const std::vector<uint8_t>& mask);
+float connected_fraction(const std::vector<uint8_t>& mask, const std::vector<uint8_t>& valid_mask);
+HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& hybrid_dino_contrib,
+                                                 const std::vector<uint8_t>& valid_mask,
+                                                 int rows,
+                                                 int cols);
+DetectionBox merge_box_cluster(const std::vector<DetectionBox>& cluster);
 
 struct ChunkRetryResult {
   int chunk_index = 0;
@@ -237,7 +271,9 @@ struct ChunkRetryResult {
   std::vector<float> hybrid_contrib;
   std::vector<uint8_t> valid_mask;
   std::vector<uint8_t> final_mask;
+  std::vector<uint8_t> final_mask_source;
   std::vector<uint8_t> grouped_mask;
+  std::vector<uint8_t> grouped_mask_source;
   std::vector<uint8_t> bridged_mask;
   std::vector<float> combined_score;
   std::vector<DetectionBox> grouped_boxes;
@@ -246,7 +282,9 @@ struct ChunkRetryResult {
 struct ChunkGpuWorkspace {
   float* power_chunk_device = nullptr;
   float* corrected_chunk_device = nullptr;
+  float* corrected_full_frame_device = nullptr;
   size_t capacity_elements = 0;
+  size_t full_frame_capacity_elements = 0;
   cudaStream_t stream = nullptr;
 
   ChunkGpuWorkspace() {
@@ -261,6 +299,9 @@ struct ChunkGpuWorkspace {
     }
     if (corrected_chunk_device != nullptr) {
       cudaFree(corrected_chunk_device);
+    }
+    if (corrected_full_frame_device != nullptr) {
+      cudaFree(corrected_full_frame_device);
     }
     if (stream != nullptr) {
       cudaStreamDestroy(stream);
@@ -297,6 +338,21 @@ struct ChunkGpuWorkspace {
     }
     capacity_elements = required_elements;
   }
+
+  void ensure_full_frame_capacity(size_t required_elements) {
+    if (required_elements <= full_frame_capacity_elements) {
+      return;
+    }
+    if (corrected_full_frame_device != nullptr) {
+      cudaFree(corrected_full_frame_device);
+      corrected_full_frame_device = nullptr;
+    }
+    const size_t required_bytes = required_elements * sizeof(float);
+    if (cudaMalloc(reinterpret_cast<void**>(&corrected_full_frame_device), required_bytes) != cudaSuccess) {
+      throw std::runtime_error("failed to allocate full-frame corrected GPU buffer for offline DINO validator");
+    }
+    full_frame_capacity_elements = required_elements;
+  }
 };
 
 struct ChunkInferenceArtifacts {
@@ -305,6 +361,8 @@ struct ChunkInferenceArtifacts {
   std::vector<uint8_t> source_chunk_valid_mask;
   std::vector<float> grouped_dino_score_source;
   std::vector<float> source_chunk_coherence_gate;
+  HybridPostprocessResult precomputed_hybrid_result_source;
+  bool has_precomputed_hybrid_result = false;
   bool keep_debug_artifacts = false;
 };
 
@@ -341,6 +399,49 @@ struct StageAggregateEntry {
   size_t max_component_estimated_bytes = 0;
 };
 
+std::vector<StageAggregateEntry> aggregate_stage_entries(const std::vector<StageProfileEntry>& entries) {
+  struct AggregateState {
+    StageAggregateEntry value;
+  };
+
+  std::unordered_map<std::string, AggregateState> grouped;
+  for (const auto& entry : entries) {
+    const std::string key = entry.scope + "\n" + entry.stage;
+    auto& state = grouped[key].value;
+    if (state.count == 0) {
+      state.scope = entry.scope;
+      state.stage = entry.stage;
+    }
+    state.count += 1;
+    state.failure_count += entry.failed ? 1 : 0;
+    state.total_ms += entry.elapsed_ms;
+    state.max_ms = std::max(state.max_ms, entry.elapsed_ms);
+    state.max_rss_after_kb = std::max(state.max_rss_after_kb, entry.rss_after_kb);
+    state.max_hwm_after_kb = std::max(state.max_hwm_after_kb, entry.hwm_after_kb);
+    state.max_component_estimated_bytes = std::max(state.max_component_estimated_bytes,
+                                                   entry.component_estimated_bytes);
+  }
+
+  std::vector<StageAggregateEntry> result;
+  result.reserve(grouped.size());
+  for (auto& [_, state] : grouped) {
+    if (state.value.count > 0) {
+      state.value.mean_ms = state.value.total_ms / static_cast<double>(state.value.count);
+    }
+    result.push_back(std::move(state.value));
+  }
+  std::sort(result.begin(), result.end(), [](const StageAggregateEntry& lhs, const StageAggregateEntry& rhs) {
+    if (lhs.total_ms != rhs.total_ms) {
+      return lhs.total_ms > rhs.total_ms;
+    }
+    if (lhs.max_hwm_after_kb != rhs.max_hwm_after_kb) {
+      return lhs.max_hwm_after_kb > rhs.max_hwm_after_kb;
+    }
+    return lhs.stage < rhs.stage;
+  });
+  return result;
+}
+
 class StageProfiler {
  public:
   void add_entry(StageProfileEntry entry) {
@@ -354,46 +455,7 @@ class StageProfiler {
 
   std::vector<StageAggregateEntry> aggregate() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    struct AggregateState {
-      StageAggregateEntry value;
-    };
-
-    std::unordered_map<std::string, AggregateState> grouped;
-    for (const auto& entry : entries_) {
-      const std::string key = entry.scope + "\n" + entry.stage;
-      auto& state = grouped[key].value;
-      if (state.count == 0) {
-        state.scope = entry.scope;
-        state.stage = entry.stage;
-      }
-      state.count += 1;
-      state.failure_count += entry.failed ? 1 : 0;
-      state.total_ms += entry.elapsed_ms;
-      state.max_ms = std::max(state.max_ms, entry.elapsed_ms);
-      state.max_rss_after_kb = std::max(state.max_rss_after_kb, entry.rss_after_kb);
-      state.max_hwm_after_kb = std::max(state.max_hwm_after_kb, entry.hwm_after_kb);
-      state.max_component_estimated_bytes = std::max(state.max_component_estimated_bytes,
-                                                     entry.component_estimated_bytes);
-    }
-
-    std::vector<StageAggregateEntry> result;
-    result.reserve(grouped.size());
-    for (auto& [_, state] : grouped) {
-      if (state.value.count > 0) {
-        state.value.mean_ms = state.value.total_ms / static_cast<double>(state.value.count);
-      }
-      result.push_back(std::move(state.value));
-    }
-    std::sort(result.begin(), result.end(), [](const StageAggregateEntry& lhs, const StageAggregateEntry& rhs) {
-      if (lhs.total_ms != rhs.total_ms) {
-        return lhs.total_ms > rhs.total_ms;
-      }
-      if (lhs.max_hwm_after_kb != rhs.max_hwm_after_kb) {
-        return lhs.max_hwm_after_kb > rhs.max_hwm_after_kb;
-      }
-      return lhs.stage < rhs.stage;
-    });
-    return result;
+    return aggregate_stage_entries(entries_);
   }
 
  private:
@@ -474,17 +536,93 @@ class ScopedStageProfile {
   int uncaught_exceptions_on_entry_ = 0;
 };
 
+void record_timed_stage(StageProfiler* profiler,
+                        std::string_view stage_name,
+                        std::string_view scope_name,
+                        int chunk_index,
+                        double elapsed_ms) {
+  if (profiler == nullptr || !(std::isfinite(elapsed_ms)) || elapsed_ms <= 0.0) {
+    return;
+  }
+  StageProfileEntry entry;
+  entry.stage = std::string(stage_name);
+  entry.scope = std::string(scope_name);
+  entry.chunk_index = chunk_index;
+  entry.elapsed_ms = elapsed_ms;
+  profiler->add_entry(std::move(entry));
+}
+
 struct GlobalMergedResult {
   std::vector<uint8_t> projected_grouped_mask;
   std::vector<float> projected_grouped_score;
   std::vector<uint8_t> merged_box_mask;
   std::vector<DetectionBox> projected_boxes;
   std::vector<DetectionBox> merged_boxes;
+  std::vector<uint8_t> stitched_final_mask;
 };
 
 template <typename T>
 T clamp_value(T value, T low, T high) {
   return value < low ? low : (value > high ? high : value);
+}
+
+std::string_view trim_ascii_whitespace(std::string_view text) {
+  size_t begin = 0;
+  while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
+    ++begin;
+  }
+  size_t end = text.size();
+  while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
+    --end;
+  }
+  return text.substr(begin, end - begin);
+}
+
+int parse_int_or_throw(std::string_view text, std::string_view field_name) {
+  const std::string_view trimmed = trim_ascii_whitespace(text);
+  if (trimmed.empty()) {
+    throw std::runtime_error("missing integer for " + std::string(field_name));
+  }
+  int value = 0;
+  const auto* begin = trimmed.data();
+  const auto* end = trimmed.data() + trimmed.size();
+  const auto result = std::from_chars(begin, end, value);
+  if (result.ec != std::errc() || result.ptr != end) {
+    throw std::runtime_error("invalid integer for " + std::string(field_name) + ": '" + std::string(trimmed) + "'");
+  }
+  return value;
+}
+
+template <typename Fn>
+void parallel_for_ranges(size_t item_count, size_t min_items_per_task, Fn&& fn) {
+  if (item_count == 0) {
+    return;
+  }
+  const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
+  const size_t clamped_min_items = std::max<size_t>(1, min_items_per_task);
+  const size_t max_task_count = (item_count + clamped_min_items - 1) / clamped_min_items;
+  const size_t task_count = std::min<size_t>(static_cast<size_t>(hw_threads), std::max<size_t>(1, max_task_count));
+  if (task_count <= 1) {
+    fn(static_cast<size_t>(0), item_count);
+    return;
+  }
+
+  const size_t block_size = (item_count + task_count - 1) / task_count;
+  std::vector<std::future<void>> tasks;
+  tasks.reserve(task_count);
+  for (size_t task_index = 0; task_index < task_count; ++task_index) {
+    const size_t start = task_index * block_size;
+    const size_t stop = std::min(item_count, start + block_size);
+    if (start >= stop) {
+      break;
+    }
+    tasks.push_back(std::async(std::launch::async, [start, stop, &fn]() {
+      fn(start, stop);
+    }));
+  }
+  for (auto& task : tasks) {
+    task.get();
+  }
 }
 
 size_t flat_index(int cols, int row, int col) {
@@ -539,6 +677,14 @@ std::string read_text_file(const std::filesystem::path& path) {
   return buffer.str();
 }
 
+bool use_fp16_precision(const std::string& dtype_text) {
+  std::string lowered = dtype_text;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return lowered == "fp16" || lowered == "half";
+}
+
 ValidatorConfig load_config(const std::filesystem::path& path) {
   const std::string text = read_text_file(path);
   ValidatorConfig config;
@@ -568,6 +714,14 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.dino_group_score_q = extract_number<double>(text, "dino_group_score_q").value_or(config.dino_group_score_q);
   config.min_component_size = extract_number<int>(text, "min_component_size").value_or(config.min_component_size);
   config.filter_detection_mask = extract_bool(text, "filter_detection_mask").value_or(config.filter_detection_mask);
+  config.fast_boxes_only_non_debug_grouping = extract_bool(text, "fast_boxes_only_non_debug_grouping").value_or(config.fast_boxes_only_non_debug_grouping);
+  config.grouping_bridge_freq_px = extract_number<int>(text, "grouping_bridge_freq_px").value_or(config.grouping_bridge_freq_px);
+  config.grouping_bridge_time_px = extract_number<int>(text, "grouping_bridge_time_px").value_or(config.grouping_bridge_time_px);
+  config.grouping_min_component_size = extract_number<int>(text, "grouping_min_component_size").value_or(config.grouping_min_component_size);
+  config.grouping_min_freq_span_px = extract_number<int>(text, "grouping_min_freq_span_px").value_or(config.grouping_min_freq_span_px);
+  config.grouping_min_time_span_px = extract_number<int>(text, "grouping_min_time_span_px").value_or(config.grouping_min_time_span_px);
+  config.grouping_min_density = extract_number<double>(text, "grouping_min_density").value_or(config.grouping_min_density);
+  config.grouping_time_continuity_ratio = extract_number<double>(text, "grouping_time_continuity_ratio").value_or(config.grouping_time_continuity_ratio);
   config.pipeline_final_threshold = extract_number<double>(text, "pipeline_final_threshold").value_or(config.pipeline_final_threshold);
   config.pipeline_gap_floor = extract_number<double>(text, "pipeline_gap_floor").value_or(config.pipeline_gap_floor);
   config.pipeline_power_rescue_floor = extract_number<double>(text, "pipeline_power_rescue_floor").value_or(config.pipeline_power_rescue_floor);
@@ -576,6 +730,9 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.model_script_path = extract_yaml_string(text, "model_script_path").value_or(config.model_script_path);
   config.torchscript_init_mode = extract_yaml_string(text, "torchscript_init_mode").value_or(config.torchscript_init_mode);
   config.torch_dtype = extract_yaml_string(text, "torch_dtype").value_or(config.torch_dtype);
+  config.hybrid_torch_dtype = extract_yaml_string(text, "hybrid_torch_dtype").value_or(config.hybrid_torch_dtype);
+  config.legacy_fast_gray_preprocess = extract_bool(text, "legacy_fast_gray_preprocess").value_or(config.legacy_fast_gray_preprocess);
+  config.runtime_batch_size = extract_number<int>(text, "runtime_batch_size").value_or(config.runtime_batch_size);
   return config;
 }
 
@@ -624,8 +781,8 @@ NpyArray2D load_npy_2d(const std::filesystem::path& path) {
 
   NpyArray2D array;
   array.descr = descr_match[1].str();
-  array.rows = std::stoi(shape_match[1].str());
-  array.cols = std::stoi(shape_match[2].str());
+  array.rows = parse_int_or_throw(shape_match[1].str(), "npy shape rows in " + path.string());
+  array.cols = parse_int_or_throw(shape_match[2].str(), "npy shape cols in " + path.string());
   const size_t element_bytes = array.descr == "<c8" ? sizeof(float) * 2 : sizeof(float);
   const size_t payload_bytes = static_cast<size_t>(array.rows) * static_cast<size_t>(array.cols) * element_bytes;
   array.payload.resize(payload_bytes);
@@ -669,7 +826,8 @@ bool write_npy_2d(const std::filesystem::path& path,
                   int rows,
                   int cols,
                   const std::string& dtype_descr) {
-  std::ofstream out(path, std::ios::binary);
+  const auto tmp_path = path.string() + ".tmp";
+  std::ofstream out(tmp_path, std::ios::binary);
   if (!out.is_open()) {
     return false;
   }
@@ -695,7 +853,22 @@ bool write_npy_2d(const std::filesystem::path& path,
   out.write(reinterpret_cast<const char*>(header_bytes), 2);
   out.write(header.data(), static_cast<std::streamsize>(header.size()));
   out.write(reinterpret_cast<const char*>(payload), static_cast<std::streamsize>(payload_bytes));
-  return out.good();
+  out.close();
+  if (!out.good()) {
+    std::error_code cleanup_error;
+    std::filesystem::remove(tmp_path, cleanup_error);
+    return false;
+  }
+  std::error_code remove_error;
+  std::filesystem::remove(path, remove_error);
+  std::error_code rename_error;
+  std::filesystem::rename(tmp_path, path, rename_error);
+  if (rename_error) {
+    std::error_code cleanup_error;
+    std::filesystem::remove(tmp_path, cleanup_error);
+    return false;
+  }
+  return true;
 }
 
 std::vector<uint8_t> load_pgm(const std::filesystem::path& path, int& rows, int& cols) {
@@ -735,11 +908,13 @@ bool write_pgm(const std::filesystem::path& path, const std::vector<uint8_t>& im
 
 std::vector<float> power_db_from_tensor(const CanonicalTensor& tensor) {
   std::vector<float> power_db(tensor.values.size(), 0.0f);
-  for (size_t index = 0; index < tensor.values.size(); ++index) {
-    const float real = tensor.values[index].real();
-    const float imag = tensor.values[index].imag();
-    power_db[index] = 10.0f * std::log10(real * real + imag * imag + 1.0e-12f);
-  }
+  parallel_for_ranges(tensor.values.size(), static_cast<size_t>(1) << 18, [&](size_t start, size_t stop) {
+    for (size_t index = start; index < stop; ++index) {
+      const float real = tensor.values[index].real();
+      const float imag = tensor.values[index].imag();
+      power_db[index] = 10.0f * std::log10(real * real + imag * imag + 1.0e-12f);
+    }
+  });
   return power_db;
 }
 
@@ -765,13 +940,16 @@ std::vector<float> frontend_corrected_db(const std::vector<float>& power_db,
                                          const ValidatorConfig& config,
                                          float& reference_level_out) {
   std::vector<float> row_mean(static_cast<size_t>(rows), 0.0f);
-  for (int row = 0; row < rows; ++row) {
-    float sum = 0.0f;
-    for (int col = 0; col < cols; ++col) {
-      sum += power_db[flat_index(cols, row, col)];
+  parallel_for_ranges(static_cast<size_t>(rows), 32, [&](size_t start, size_t stop) {
+    for (size_t row = start; row < stop; ++row) {
+      const float* row_ptr = power_db.data() + row * static_cast<size_t>(cols);
+      float sum = 0.0f;
+      for (int col = 0; col < cols; ++col) {
+        sum += row_ptr[static_cast<size_t>(col)];
+      }
+      row_mean[row] = sum / static_cast<float>(std::max(cols, 1));
     }
-    row_mean[static_cast<size_t>(row)] = sum / static_cast<float>(std::max(cols, 1));
-  }
+  });
   const float sigma = static_cast<float>(std::max(config.frontend_correction_smooth_sigma, 1.0));
   const int radius = std::max(1, static_cast<int>(std::ceil(sigma * 1.5f)));
   const auto row_smooth = gaussian_smooth_rows(row_mean, rows, radius, sigma);
@@ -787,14 +965,28 @@ std::vector<float> frontend_corrected_db(const std::vector<float>& power_db,
   const float blend = clamp_value((quantile - 0.5f) / 0.5f, 0.0f, 1.0f);
   reference_level_out = mean_value + blend * (max_value - mean_value);
 
-  std::vector<float> corrected(power_db.size(), 0.0f);
+  std::vector<float> row_boost(static_cast<size_t>(rows), 0.0f);
   for (int row = 0; row < rows; ++row) {
-    const float boost = std::min(std::max(reference_level_out - row_smooth[static_cast<size_t>(row)], 0.0f),
-                                 static_cast<float>(config.frontend_correction_max_boost_db));
-    for (int col = 0; col < cols; ++col) {
-      corrected[flat_index(cols, row, col)] = power_db[flat_index(cols, row, col)] + boost;
-    }
+    row_boost[static_cast<size_t>(row)] = std::min(std::max(reference_level_out - row_smooth[static_cast<size_t>(row)], 0.0f),
+                                                   static_cast<float>(config.frontend_correction_max_boost_db));
   }
+
+  std::vector<float> corrected(power_db.size(), 0.0f);
+  parallel_for_ranges(static_cast<size_t>(rows), 16, [&](size_t start, size_t stop) {
+    for (size_t row = start; row < stop; ++row) {
+      const float boost = row_boost[row];
+      const size_t row_offset = row * static_cast<size_t>(cols);
+      const float* src_row = power_db.data() + row_offset;
+      float* dst_row = corrected.data() + row_offset;
+      if (boost <= 0.0f) {
+        std::memcpy(dst_row, src_row, static_cast<size_t>(cols) * sizeof(float));
+        continue;
+      }
+      for (int col = 0; col < cols; ++col) {
+        dst_row[static_cast<size_t>(col)] = src_row[static_cast<size_t>(col)] + boost;
+      }
+    }
+  });
   return corrected;
 }
 
@@ -813,6 +1005,29 @@ std::vector<float> slice_rows(const std::vector<float>& input,
     std::memcpy(output.data() + dst_offset, input.data() + src_offset, static_cast<size_t>(cols) * sizeof(float));
   }
   return output;
+}
+
+void copy_rows_device_to_device(const float* src_device,
+                                int src_cols,
+                                int row_start,
+                                int row_count,
+                                float* dst_device,
+                                cudaStream_t stream) {
+  if (src_device == nullptr || dst_device == nullptr || src_cols <= 0 || row_count <= 0) {
+    return;
+  }
+  const size_t row_bytes = static_cast<size_t>(src_cols) * sizeof(float);
+  const float* src_row0 = src_device + static_cast<size_t>(row_start) * static_cast<size_t>(src_cols);
+  if (cudaMemcpy2DAsync(dst_device,
+                        row_bytes,
+                        src_row0,
+                        row_bytes,
+                        row_bytes,
+                        static_cast<size_t>(row_count),
+                        cudaMemcpyDeviceToDevice,
+                        stream) != cudaSuccess) {
+    throw std::runtime_error("failed to copy corrected rows on GPU for offline DINO validator");
+  }
 }
 
 std::vector<uint8_t> resize_row_valid_mask(const std::vector<uint8_t>& src_valid_rows,
@@ -995,6 +1210,209 @@ std::vector<ChunkPlanEntry> build_frequency_chunks(const std::vector<double>& fr
   return chunks;
 }
 
+bool chunk_plan_has_uniform_rows(const std::vector<ChunkPlanEntry>& chunks) {
+  if (chunks.empty()) {
+    return false;
+  }
+  const int reference_rows = chunk_row_count(chunks.front());
+  if (reference_rows <= 0) {
+    return false;
+  }
+  for (const auto& chunk : chunks) {
+    if (chunk_row_count(chunk) != reference_rows) {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct UniformChunkGeometry {
+  int chunk_rows = 0;
+  int overlap_rows = 0;
+  int step_rows = 0;
+};
+
+std::optional<UniformChunkGeometry> calibrated_uniform_chunk_geometry(double bin_hz,
+                                                                      double chunk_bandwidth_hz,
+                                                                      double chunk_overlap_hz,
+                                                                      int min_chunk_rows) {
+  if (!std::isfinite(bin_hz) || bin_hz <= 0.0 || !std::isfinite(chunk_bandwidth_hz) || chunk_bandwidth_hz <= 0.0) {
+    return std::nullopt;
+  }
+  const double step_hz = chunk_bandwidth_hz - chunk_overlap_hz;
+  if (!std::isfinite(step_hz) || step_hz <= 0.0) {
+    return std::nullopt;
+  }
+
+  UniformChunkGeometry geometry;
+  geometry.chunk_rows = std::max(min_chunk_rows, static_cast<int>(std::llround(chunk_bandwidth_hz / bin_hz)));
+  geometry.overlap_rows = clamp_value(static_cast<int>(std::llround(chunk_overlap_hz / bin_hz)), 0, geometry.chunk_rows - 1);
+  geometry.step_rows = std::max(1, geometry.chunk_rows - geometry.overlap_rows);
+  if (geometry.chunk_rows < min_chunk_rows) {
+    return std::nullopt;
+  }
+  return geometry;
+}
+
+std::vector<ChunkPlanEntry> build_uniform_row_chunks(const std::vector<double>& freq_axis_hz,
+                                                     const std::vector<uint8_t>& valid_row_mask,
+                                                     int chunk_rows,
+                                                     int step_rows,
+                                                     int min_chunk_rows) {
+  std::vector<ChunkPlanEntry> chunks;
+  if (freq_axis_hz.empty() || valid_row_mask.size() != freq_axis_hz.size() || chunk_rows < min_chunk_rows || step_rows <= 0) {
+    return chunks;
+  }
+
+  std::vector<int> valid_idx;
+  valid_idx.reserve(valid_row_mask.size());
+  for (size_t index = 0; index < valid_row_mask.size(); ++index) {
+    if (valid_row_mask[index]) {
+      valid_idx.push_back(static_cast<int>(index));
+    }
+  }
+  const int valid_count = static_cast<int>(valid_idx.size());
+  if (valid_count < chunk_rows) {
+    return chunks;
+  }
+
+  int chunk_index = 0;
+  for (int start_pos = 0; start_pos + chunk_rows <= valid_count; start_pos += step_rows) {
+    const int row_start = valid_idx[static_cast<size_t>(start_pos)];
+    const int row_stop = valid_idx[static_cast<size_t>(start_pos + chunk_rows - 1)] + 1;
+    chunks.push_back(ChunkPlanEntry {
+        .chunk_index = chunk_index++,
+        .row_start = row_start,
+        .row_stop = row_stop,
+        .freq_start_hz = freq_axis_hz[static_cast<size_t>(row_start)],
+        .freq_stop_hz = freq_axis_hz[static_cast<size_t>(row_stop - 1)],
+    });
+  }
+  return chunks;
+}
+
+struct PlannedIgnoreSidebandSelection {
+  IgnoreSidebandInfo ignore_info;
+  std::vector<ChunkPlanEntry> chunk_plan;
+};
+
+PlannedIgnoreSidebandSelection select_uniform_chunk_plan_with_minimal_sideband_trim(
+    int num_rows,
+    double bin_hz,
+    double ignore_sideband_percent,
+    int min_keep_rows,
+    std::optional<double> ignore_sideband_hz,
+    const std::vector<double>& freq_axis_hz,
+    double chunk_bandwidth_hz,
+    double chunk_overlap_hz,
+    int min_chunk_rows,
+    double uncalibrated_chunk_fraction,
+    double uncalibrated_overlap_fraction) {
+  PlannedIgnoreSidebandSelection selection;
+  selection.ignore_info = compute_ignore_sideband_rows(
+      num_rows,
+      bin_hz,
+      ignore_sideband_percent,
+      min_keep_rows,
+      ignore_sideband_hz);
+
+  const auto calibrated_geometry = calibrated_uniform_chunk_geometry(
+      bin_hz,
+      chunk_bandwidth_hz,
+      chunk_overlap_hz,
+      min_chunk_rows);
+
+  if (calibrated_geometry.has_value()) {
+    const int max_bins = std::max(0, (num_rows - std::max(1, min_keep_rows)) / 2);
+    for (int applied_bins = selection.ignore_info.applied_bins; applied_bins <= max_bins; ++applied_bins) {
+      const int valid_count = num_rows - 2 * applied_bins;
+      if (valid_count < calibrated_geometry->chunk_rows) {
+        break;
+      }
+      if (((valid_count - calibrated_geometry->chunk_rows) % calibrated_geometry->step_rows) != 0) {
+        continue;
+      }
+
+      PlannedIgnoreSidebandSelection candidate;
+      candidate.ignore_info = selection.ignore_info;
+      candidate.ignore_info.applied_bins = applied_bins;
+      candidate.ignore_info.applied_hz = static_cast<double>(applied_bins) * candidate.ignore_info.bin_hz;
+      candidate.ignore_info.applied_percent = static_cast<double>(applied_bins) / static_cast<double>(std::max(num_rows, 1));
+      candidate.ignore_info.valid_row_mask.assign(static_cast<size_t>(std::max(num_rows, 0)), static_cast<uint8_t>(1));
+      if (applied_bins > 0) {
+        std::fill(candidate.ignore_info.valid_row_mask.begin(),
+                  candidate.ignore_info.valid_row_mask.begin() + applied_bins,
+                  static_cast<uint8_t>(0));
+        std::fill(candidate.ignore_info.valid_row_mask.end() - applied_bins,
+                  candidate.ignore_info.valid_row_mask.end(),
+                  static_cast<uint8_t>(0));
+      }
+      candidate.chunk_plan = build_uniform_row_chunks(
+          freq_axis_hz,
+          candidate.ignore_info.valid_row_mask,
+          calibrated_geometry->chunk_rows,
+          calibrated_geometry->step_rows,
+          min_chunk_rows);
+      if (!candidate.chunk_plan.empty() && chunk_plan_has_uniform_rows(candidate.chunk_plan)) {
+        return candidate;
+      }
+    }
+  }
+
+  auto build_plan_for_bins = [&](int applied_bins) {
+    PlannedIgnoreSidebandSelection candidate;
+    candidate.ignore_info = selection.ignore_info;
+    candidate.ignore_info.applied_bins = applied_bins;
+    candidate.ignore_info.applied_hz = static_cast<double>(applied_bins) * candidate.ignore_info.bin_hz;
+    candidate.ignore_info.applied_percent = static_cast<double>(applied_bins) / static_cast<double>(std::max(num_rows, 1));
+    candidate.ignore_info.valid_row_mask.assign(static_cast<size_t>(std::max(num_rows, 0)), static_cast<uint8_t>(1));
+    if (applied_bins > 0) {
+      std::fill(candidate.ignore_info.valid_row_mask.begin(),
+                candidate.ignore_info.valid_row_mask.begin() + applied_bins,
+                static_cast<uint8_t>(0));
+      std::fill(candidate.ignore_info.valid_row_mask.end() - applied_bins,
+                candidate.ignore_info.valid_row_mask.end(),
+                static_cast<uint8_t>(0));
+    }
+    candidate.chunk_plan = build_frequency_chunks(
+        freq_axis_hz,
+        chunk_bandwidth_hz,
+        chunk_overlap_hz,
+        min_chunk_rows,
+        candidate.ignore_info.valid_row_mask,
+        uncalibrated_chunk_fraction,
+        uncalibrated_overlap_fraction);
+    return candidate;
+  };
+
+  selection = build_plan_for_bins(selection.ignore_info.applied_bins);
+  if (chunk_plan_has_uniform_rows(selection.chunk_plan)) {
+    return selection;
+  }
+
+  const int target_chunk_count = static_cast<int>(selection.chunk_plan.size());
+  const int max_bins = std::max(0, (num_rows - std::max(1, min_keep_rows)) / 2);
+
+  for (int applied_bins = selection.ignore_info.applied_bins + 1; applied_bins <= max_bins; ++applied_bins) {
+    auto candidate = build_plan_for_bins(applied_bins);
+    if (static_cast<int>(candidate.chunk_plan.size()) != target_chunk_count) {
+      continue;
+    }
+    if (chunk_plan_has_uniform_rows(candidate.chunk_plan)) {
+      return candidate;
+    }
+  }
+
+  for (int applied_bins = selection.ignore_info.applied_bins + 1; applied_bins <= max_bins; ++applied_bins) {
+    auto candidate = build_plan_for_bins(applied_bins);
+    if (chunk_plan_has_uniform_rows(candidate.chunk_plan)) {
+      return candidate;
+    }
+  }
+
+  return selection;
+}
+
 std::vector<float> box_mean_cols(const std::vector<float>& input, int rows, int cols, int radius_cols) {
   std::vector<float> output(input.size(), 0.0f);
   for (int row = 0; row < rows; ++row) {
@@ -1123,21 +1541,9 @@ float quantile_from_values(std::vector<float> values, double q, float fallback =
     return fallback;
   }
   q = clamp_value(q, 0.0, 1.0);
-  if (values.size() == 1) {
-    return values[0];
-  }
-  const double position = q * static_cast<double>(values.size() - 1);
-  const size_t lower_index = static_cast<size_t>(std::floor(position));
-  const size_t upper_index = static_cast<size_t>(std::ceil(position));
-  std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(lower_index), values.end());
-  const float lower_value = values[lower_index];
-  if (upper_index == lower_index) {
-    return lower_value;
-  }
-  std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(upper_index), values.end());
-  const float upper_value = values[upper_index];
-  const double weight = position - static_cast<double>(lower_index);
-  return static_cast<float>(lower_value + static_cast<float>(weight) * (upper_value - lower_value));
+  const size_t rank_index = static_cast<size_t>(std::llround(q * static_cast<double>(values.size() - 1)));
+  std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(rank_index), values.end());
+  return values[rank_index];
 }
 
 std::vector<float> gaussian_kernel(double sigma) {
@@ -1296,6 +1702,53 @@ std::vector<float> normalize01_quantile(const std::vector<float>& input,
   return output;
 }
 
+std::pair<float, float> quantile_bounds_from_input(const std::vector<float>& input,
+                                                   double low_q,
+                                                   double high_q) {
+  std::vector<float> values;
+  values.reserve(input.size());
+  for (float value : input) {
+    if (std::isfinite(value)) {
+      values.push_back(value);
+    }
+  }
+  if (values.empty()) {
+    return {0.0f, 1.0f};
+  }
+  const float low = quantile_from_values(values, clamp_value(low_q / 100.0, 0.0, 1.0), 0.0f);
+  const float high = quantile_from_values(values, clamp_value(high_q / 100.0, 0.0, 1.0), 1.0f);
+  return {low, std::max(high, low + 1.0e-6f)};
+}
+
+void normalize01_quantile_into(const std::vector<float>& input,
+                               float low,
+                               float high,
+                               float* output) {
+  if (output == nullptr) {
+    return;
+  }
+  const float scale = std::max(high - low, 1.0e-6f);
+  for (size_t index = 0; index < input.size(); ++index) {
+    const float value = input[index];
+    output[index] = std::isfinite(value) ? clamp_value((value - low) / scale, 0.0f, 1.0f) : 0.0f;
+  }
+}
+
+void multiply_normalized_quantile_into(const std::vector<float>& input,
+                                       float low,
+                                       float high,
+                                       float* output) {
+  if (output == nullptr) {
+    return;
+  }
+  const float scale = std::max(high - low, 1.0e-6f);
+  for (size_t index = 0; index < input.size(); ++index) {
+    const float value = input[index];
+    const float normalized = std::isfinite(value) ? clamp_value((value - low) / scale, 0.0f, 1.0f) : 0.0f;
+    output[index] *= normalized;
+  }
+}
+
 std::vector<float> normalize_vector01(const std::vector<float>& input) {
   std::vector<float> output(input.size(), 1.0f);
   if (input.empty()) {
@@ -1407,17 +1860,8 @@ torch::Tensor scalar_quantile_tensor_torch(const torch::Tensor& input, double q)
     return flat[0];
   }
   const double clamped = std::clamp(q, 0.0, 1.0);
-  const double position = clamped * static_cast<double>(size - 1);
-  const auto lower = static_cast<int64_t>(std::floor(position));
-  const auto upper = static_cast<int64_t>(std::ceil(position));
-  auto sorted = std::get<0>(torch::sort(flat, 0, false));
-  auto lower_value = sorted[lower];
-  if (upper == lower) {
-    return lower_value;
-  }
-  auto upper_value = sorted[upper];
-  const double weight = position - static_cast<double>(lower);
-  return lower_value + (upper_value - lower_value) * weight;
+  const auto rank = static_cast<int64_t>(std::llround(clamped * static_cast<double>(size - 1)));
+  return std::get<0>(torch::kthvalue(flat, rank + 1, 0, false));
 }
 
 torch::Tensor normalize_map01_quantile_torch(const torch::Tensor& input, double low_q, double high_q) {
@@ -1428,7 +1872,7 @@ torch::Tensor normalize_map01_quantile_torch(const torch::Tensor& input, double 
 }
 
 torch::Tensor normalize_map01_masked_minmax_torch(const torch::Tensor& input, const torch::Tensor& valid_mask) {
-  auto output = torch::zeros_like(input, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
+  auto output = torch::zeros_like(input);
   auto active = input.masked_select(valid_mask);
   if (active.numel() == 0) {
     return output;
@@ -1436,29 +1880,40 @@ torch::Tensor normalize_map01_masked_minmax_torch(const torch::Tensor& input, co
   const double lo = active.min().item<double>();
   const double hi = active.max().item<double>();
   const double scale = std::max(hi - lo, 1e-6);
-  auto normalized = torch::clamp((input - lo) / scale, 0.0, 1.0).to(torch::kFloat32);
+  auto normalized = torch::clamp((input - lo) / scale, 0.0, 1.0).to(input.scalar_type());
   return torch::where(valid_mask, normalized, output);
 }
 
-torch::Tensor gaussian_kernel_tensor_torch(double sigma, const c10::Device& device) {
+torch::Tensor gaussian_kernel_tensor_torch(double sigma, const c10::Device& device, c10::ScalarType dtype) {
   if (sigma <= 0.0) {
-    return torch::ones({1}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    return torch::ones({1}, torch::TensorOptions().dtype(dtype).device(device));
   }
   const auto radius = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(3.0 * sigma)));
-  auto x = torch::arange(-radius, radius + 1, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  auto x = torch::arange(-radius, radius + 1, torch::TensorOptions().dtype(dtype).device(device));
   auto kernel = torch::exp(-(x * x) / (2.0 * sigma * sigma));
   kernel = kernel / kernel.sum();
   return kernel.contiguous();
 }
 
-torch::Tensor gaussian_first_derivative_kernel_tensor_torch(double sigma, const c10::Device& device) {
+torch::Tensor gaussian_first_derivative_kernel_tensor_torch(double sigma, const c10::Device& device, c10::ScalarType dtype) {
   if (sigma <= 0.0) {
-    return torch::zeros({1}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    return torch::zeros({1}, torch::TensorOptions().dtype(dtype).device(device));
   }
   const auto radius = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(3.0 * sigma)));
-  auto x = torch::arange(-radius, radius + 1, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  auto x = torch::arange(-radius, radius + 1, torch::TensorOptions().dtype(dtype).device(device));
   const double sigma2 = sigma * sigma;
   auto kernel = (-x / sigma2) * torch::exp(-(x * x) / (2.0 * sigma2));
+  return kernel.contiguous();
+}
+
+torch::Tensor gaussian_second_derivative_kernel_tensor_torch(double sigma, const c10::Device& device, c10::ScalarType dtype) {
+  if (sigma <= 0.0) {
+    return torch::zeros({1}, torch::TensorOptions().dtype(dtype).device(device));
+  }
+  const auto radius = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(3.0 * sigma)));
+  auto x = torch::arange(-radius, radius + 1, torch::TensorOptions().dtype(dtype).device(device));
+  const double sigma2 = sigma * sigma;
+  auto kernel = ((x * x - sigma2) / (sigma2 * sigma2)) * torch::exp(-(x * x) / (2.0 * sigma2));
   return kernel.contiguous();
 }
 
@@ -1474,22 +1929,116 @@ torch::Tensor convolve_cols_2d_torch(const torch::Tensor& input, const torch::Te
   return torch::conv2d(padded, kernel.view({1, 1, 1, kernel.size(0)})).squeeze(0).squeeze(0);
 }
 
+torch::Tensor convolve_rows_2d_torch_batch(const torch::Tensor& input, const torch::Tensor& kernel) {
+  const auto radius = kernel.size(0) / 2;
+  auto padded = torch::replication_pad2d(input.unsqueeze(1), {0, 0, radius, radius});
+  return torch::conv2d(padded, kernel.view({1, 1, kernel.size(0), 1})).squeeze(1).contiguous();
+}
+
+torch::Tensor convolve_cols_2d_torch_batch(const torch::Tensor& input, const torch::Tensor& kernel) {
+  const auto radius = kernel.size(0) / 2;
+  auto padded = torch::replication_pad2d(input.unsqueeze(1), {radius, radius, 0, 0});
+  return torch::conv2d(padded, kernel.view({1, 1, 1, kernel.size(0)})).squeeze(1).contiguous();
+}
+
 torch::Tensor gaussian_blur_2d_torch(const torch::Tensor& input, double sigma_rows, double sigma_cols) {
-  auto row_kernel = gaussian_kernel_tensor_torch(sigma_rows, input.device());
-  auto col_kernel = gaussian_kernel_tensor_torch(sigma_cols, input.device());
+  auto row_kernel = gaussian_kernel_tensor_torch(sigma_rows, input.device(), input.scalar_type());
+  auto col_kernel = gaussian_kernel_tensor_torch(sigma_cols, input.device(), input.scalar_type());
   return convolve_cols_2d_torch(convolve_rows_2d_torch(input, row_kernel), col_kernel).contiguous();
 }
 
+torch::Tensor gaussian_blur_2d_torch_batch(const torch::Tensor& input, double sigma_rows, double sigma_cols) {
+  auto row_kernel = gaussian_kernel_tensor_torch(sigma_rows, input.device(), input.scalar_type());
+  auto col_kernel = gaussian_kernel_tensor_torch(sigma_cols, input.device(), input.scalar_type());
+  return convolve_cols_2d_torch_batch(convolve_rows_2d_torch_batch(input, row_kernel), col_kernel).contiguous();
+}
+
 torch::Tensor gaussian_first_derivative_rows_2d_torch(const torch::Tensor& input, double sigma) {
-  auto smooth_kernel = gaussian_kernel_tensor_torch(sigma, input.device());
-  auto deriv_kernel = gaussian_first_derivative_kernel_tensor_torch(sigma, input.device());
+  auto smooth_kernel = gaussian_kernel_tensor_torch(sigma, input.device(), input.scalar_type());
+  auto deriv_kernel = gaussian_first_derivative_kernel_tensor_torch(sigma, input.device(), input.scalar_type());
   return convolve_rows_2d_torch(convolve_cols_2d_torch(input, smooth_kernel), deriv_kernel).contiguous();
 }
 
 torch::Tensor gaussian_first_derivative_cols_2d_torch(const torch::Tensor& input, double sigma) {
-  auto smooth_kernel = gaussian_kernel_tensor_torch(sigma, input.device());
-  auto deriv_kernel = gaussian_first_derivative_kernel_tensor_torch(sigma, input.device());
+  auto smooth_kernel = gaussian_kernel_tensor_torch(sigma, input.device(), input.scalar_type());
+  auto deriv_kernel = gaussian_first_derivative_kernel_tensor_torch(sigma, input.device(), input.scalar_type());
   return convolve_cols_2d_torch(convolve_rows_2d_torch(input, smooth_kernel), deriv_kernel).contiguous();
+}
+
+torch::Tensor gaussian_first_derivative_rows_2d_torch_batch(const torch::Tensor& input, double sigma) {
+  auto smooth_kernel = gaussian_kernel_tensor_torch(sigma, input.device(), input.scalar_type());
+  auto deriv_kernel = gaussian_first_derivative_kernel_tensor_torch(sigma, input.device(), input.scalar_type());
+  return convolve_rows_2d_torch_batch(convolve_cols_2d_torch_batch(input, smooth_kernel), deriv_kernel).contiguous();
+}
+
+torch::Tensor gaussian_first_derivative_cols_2d_torch_batch(const torch::Tensor& input, double sigma) {
+  auto smooth_kernel = gaussian_kernel_tensor_torch(sigma, input.device(), input.scalar_type());
+  auto deriv_kernel = gaussian_first_derivative_kernel_tensor_torch(sigma, input.device(), input.scalar_type());
+  return convolve_cols_2d_torch_batch(convolve_rows_2d_torch_batch(input, smooth_kernel), deriv_kernel).contiguous();
+}
+
+torch::Tensor gaussian_second_derivative_rows_2d_torch(const torch::Tensor& input, double sigma) {
+  auto kernel = gaussian_second_derivative_kernel_tensor_torch(sigma, input.device(), input.scalar_type());
+  return convolve_rows_2d_torch(input, kernel).contiguous();
+}
+
+torch::Tensor gaussian_second_derivative_rows_2d_torch_batch(const torch::Tensor& input, double sigma) {
+  auto kernel = gaussian_second_derivative_kernel_tensor_torch(sigma, input.device(), input.scalar_type());
+  return convolve_rows_2d_torch_batch(input, kernel).contiguous();
+}
+
+torch::Tensor normalize_map01_masked_minmax_torch_batch(const torch::Tensor& input, const torch::Tensor& valid_mask) {
+  auto output = torch::zeros_like(input);
+  if (input.dim() != 3 || valid_mask.dim() != 3 || input.sizes() != valid_mask.sizes()) {
+    return output;
+  }
+
+  const auto batch_size = input.size(0);
+  if (batch_size <= 0) {
+    return output;
+  }
+
+  auto flat_valid = valid_mask.reshape({batch_size, -1});
+  auto has_active = flat_valid.any(1);
+  if (!has_active.any().item<bool>()) {
+    return output;
+  }
+
+  auto pos_inf = torch::full_like(input, std::numeric_limits<float>::infinity());
+  auto neg_inf = torch::full_like(input, -std::numeric_limits<float>::infinity());
+  auto masked_lo = torch::where(valid_mask, input, pos_inf).reshape({batch_size, -1});
+  auto masked_hi = torch::where(valid_mask, input, neg_inf).reshape({batch_size, -1});
+  auto lo = std::get<0>(masked_lo.min(1)).view({batch_size, 1, 1});
+  auto hi = std::get<0>(masked_hi.max(1)).view({batch_size, 1, 1});
+  auto scale = torch::clamp_min(hi - lo, 1.0e-6);
+  auto normalized = torch::clamp((input - lo) / scale, 0.0, 1.0).to(input.scalar_type());
+  auto normalized_masked = torch::where(valid_mask, normalized, output);
+  auto active_mask = has_active.view({batch_size, 1, 1}).expand_as(valid_mask);
+  return torch::where(active_mask, normalized_masked, output);
+}
+
+torch::Tensor select_quantile_flat_batch_torch(const torch::Tensor& input, double q) {
+  if (input.dim() != 3 || input.size(0) <= 0) {
+    return torch::zeros({0, 1, 1}, input.options());
+  }
+  auto flat = input.reshape({input.size(0), -1});
+  const auto size = flat.size(1);
+  if (size <= 1) {
+    return flat.select(1, 0).view({input.size(0), 1, 1});
+  }
+  const double clamped = std::clamp(q, 0.0, 1.0);
+  const auto rank = static_cast<int64_t>(std::llround(clamped * static_cast<double>(size - 1)));
+  return std::get<0>(torch::kthvalue(flat, rank + 1, 1, false)).view({input.size(0), 1, 1});
+}
+
+torch::Tensor normalize_map01_quantile_torch_batch(const torch::Tensor& input, double low_q, double high_q) {
+  if (input.dim() != 3) {
+    return torch::zeros_like(input);
+  }
+  auto lo = select_quantile_flat_batch_torch(input, low_q);
+  auto hi = select_quantile_flat_batch_torch(input, high_q);
+  auto scale = torch::clamp_min(hi - lo, 1e-6);
+  return torch::clamp((input - lo) / scale, 0.0, 1.0);
 }
 
 torch::Tensor uniform_filter_2d_nearest_torch(const torch::Tensor& input, int kernel_rows, int kernel_cols) {
@@ -1507,13 +2056,27 @@ torch::Tensor uniform_filter_2d_nearest_torch(const torch::Tensor& input, int ke
       .contiguous();
 }
 
+    torch::Tensor uniform_filter_2d_nearest_torch_batch(const torch::Tensor& input, int kernel_rows, int kernel_cols) {
+      const int row_radius = std::max(0, kernel_rows / 2);
+      const int col_radius = std::max(0, kernel_cols / 2);
+      auto padded = torch::replication_pad2d(input.unsqueeze(1), {col_radius, col_radius, row_radius, row_radius});
+      return torch::avg_pool2d(padded,
+               {std::max(1, kernel_rows), std::max(1, kernel_cols)},
+               {1, 1},
+               {0, 0},
+               false,
+               true)
+      .squeeze(1)
+      .contiguous();
+    }
+
 std::vector<float> structure_tensor_gate_gpu(const float* corrected_device,
                                              int rows,
                                              int cols,
-                                             const std::vector<uint8_t>& valid_mask,
+                                             const std::vector<uint8_t>& valid_row_mask,
                                              cudaStream_t cuda_stream) {
   if (rows <= 0 || cols <= 0 || corrected_device == nullptr ||
-      valid_mask.size() != static_cast<size_t>(rows) * static_cast<size_t>(cols)) {
+      valid_row_mask.size() != static_cast<size_t>(rows)) {
     return {};
   }
 
@@ -1529,11 +2092,11 @@ std::vector<float> structure_tensor_gate_gpu(const float* corrected_device,
                                     {static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
                                     float_options)
                        .contiguous();
-  auto valid_mask_cpu = torch::from_blob(const_cast<uint8_t*>(valid_mask.data()),
-                                         {static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
-                                         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
-                            .clone();
-  auto valid_mask_gpu = valid_mask_cpu.to(compute_device, torch::kBool);
+  auto valid_row_mask_gpu = torch::from_blob(const_cast<uint8_t*>(valid_row_mask.data()),
+                                             {static_cast<int64_t>(rows), 1},
+                                             torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+                                .to(compute_device, torch::kBool)
+                                .expand({static_cast<int64_t>(rows), static_cast<int64_t>(cols)});
 
   const int bg_freq = std::max(9, 2 * std::max(1, rows / 24) + 1);
   const int bg_time = std::max(9, 2 * std::max(1, cols / 24) + 1);
@@ -1566,8 +2129,547 @@ std::vector<float> structure_tensor_gate_gpu(const float* corrected_device,
   }
 
   auto gate = normalize_map01_quantile_torch(gate_max, 0.05, 0.99).to(torch::kFloat32);
-  gate = torch::where(valid_mask_gpu, gate, torch::zeros_like(gate));
+  gate = torch::where(valid_row_mask_gpu, gate, torch::zeros_like(gate));
   return tensor_to_vector_float(gate);
+}
+
+std::vector<float> structure_tensor_gate_gpu_batch(const float* corrected_batch_device,
+                                                   int batch_size,
+                                                   int rows,
+                                                   int cols,
+                                                   const std::vector<uint8_t>& valid_row_mask_batch,
+                                                   cudaStream_t cuda_stream) {
+  auto gate_tensor = [&]() -> torch::Tensor {
+    if (batch_size <= 0 || rows <= 0 || cols <= 0 || corrected_batch_device == nullptr ||
+        valid_row_mask_batch.size() != static_cast<size_t>(batch_size) * static_cast<size_t>(rows)) {
+      return {};
+    }
+
+    torch::InferenceMode inference_mode_guard(true);
+    const c10::Device compute_device(torch::kCUDA, 0);
+    const auto torch_stream = cuda_stream
+                                  ? c10::cuda::getStreamFromExternal(cuda_stream, compute_device.index())
+                                  : c10::cuda::getDefaultCUDAStream(compute_device.index());
+    c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
+
+    auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(compute_device);
+    auto corrected = torch::from_blob(const_cast<float*>(corrected_batch_device),
+                                      {static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+                                      float_options)
+                         .contiguous();
+    auto valid_mask_gpu = torch::from_blob(const_cast<uint8_t*>(valid_row_mask_batch.data()),
+                         {static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), 1},
+                         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+                  .to(compute_device, torch::kBool)
+                  .expand({static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), static_cast<int64_t>(cols)});
+
+    const int bg_freq = std::max(9, 2 * std::max(1, rows / 24) + 1);
+    const int bg_time = std::max(9, 2 * std::max(1, cols / 24) + 1);
+    auto background = uniform_filter_2d_nearest_torch_batch(corrected,
+                                                            std::max(1, bg_freq),
+                                                            std::max(1, bg_time));
+    auto residual_db = torch::clamp_min(corrected - background, 0.0);
+    auto residual_n = normalize_map01_quantile_torch_batch(residual_db, 0.05, 0.99);
+
+    const std::array<double, 3> scales = {0.8, 1.6, 3.2};
+    auto gate_max = torch::zeros_like(corrected, float_options);
+    for (double grad_sigma : scales) {
+      const double integ_sigma = std::max(1.0, 1.8 * grad_sigma);
+      auto grad_f = gaussian_first_derivative_rows_2d_torch_batch(residual_n, grad_sigma);
+      auto grad_t = gaussian_first_derivative_cols_2d_torch_batch(residual_n, grad_sigma);
+      auto j_ff = gaussian_blur_2d_torch_batch(grad_f * grad_f, integ_sigma, integ_sigma);
+      auto j_ft = gaussian_blur_2d_torch_batch(grad_f * grad_t, integ_sigma, integ_sigma);
+      auto j_tt = gaussian_blur_2d_torch_batch(grad_t * grad_t, integ_sigma, integ_sigma);
+
+      auto delta = torch::sqrt(torch::clamp_min((j_ff - j_tt) * (j_ff - j_tt) + 4.0f * (j_ft * j_ft), 0.0));
+      auto lambda1 = 0.5f * (j_ff + j_tt + delta);
+      auto lambda2 = 0.5f * (j_ff + j_tt - delta);
+      auto coherence = (lambda1 - lambda2) / torch::clamp_min(lambda1 + lambda2, 1.0e-6);
+      auto energy = lambda1 + lambda2;
+
+      auto coherence_n = normalize_map01_quantile_torch_batch(coherence, 0.05, 0.99);
+      auto energy_n = normalize_map01_quantile_torch_batch(energy, 0.05, 0.99);
+      auto gate_value = coherence_n * torch::sqrt(torch::clamp_min(energy_n, 0.0));
+      gate_max = torch::maximum(gate_max, gate_value);
+    }
+
+    auto gate = normalize_map01_quantile_torch_batch(gate_max, 0.05, 0.99).to(torch::kFloat32);
+    return torch::where(valid_mask_gpu, gate, torch::zeros_like(gate)).contiguous();
+  }();
+
+  if (!gate_tensor.defined()) {
+    return {};
+  }
+  auto gate_cpu = gate_tensor.to(torch::kCPU, torch::kFloat32).contiguous();
+  std::vector<float> output(static_cast<size_t>(gate_cpu.numel()), 0.0f);
+  if (!output.empty()) {
+    std::memcpy(output.data(), gate_cpu.data_ptr<float>(), output.size() * sizeof(float));
+  }
+  return output;
+}
+
+torch::Tensor structure_tensor_gate_gpu_batch_tensor(const float* corrected_batch_device,
+                                                     int batch_size,
+                                                     int rows,
+                                                     int cols,
+                                                     const std::vector<uint8_t>& valid_row_mask_batch,
+                                                     cudaStream_t cuda_stream) {
+  if (batch_size <= 0 || rows <= 0 || cols <= 0 || corrected_batch_device == nullptr ||
+      valid_row_mask_batch.size() != static_cast<size_t>(batch_size) * static_cast<size_t>(rows)) {
+    return {};
+  }
+
+  torch::InferenceMode inference_mode_guard(true);
+  const c10::Device compute_device(torch::kCUDA, 0);
+  const auto torch_stream = cuda_stream
+                                ? c10::cuda::getStreamFromExternal(cuda_stream, compute_device.index())
+                                : c10::cuda::getDefaultCUDAStream(compute_device.index());
+  c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
+
+  auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(compute_device);
+  auto corrected = torch::from_blob(const_cast<float*>(corrected_batch_device),
+                                    {static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+                                    float_options)
+                       .contiguous();
+  auto valid_mask_gpu = torch::from_blob(const_cast<uint8_t*>(valid_row_mask_batch.data()),
+                                         {static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), 1},
+                                         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+                            .to(compute_device, torch::kBool)
+                            .expand({static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), static_cast<int64_t>(cols)});
+
+  const int bg_freq = std::max(9, 2 * std::max(1, rows / 24) + 1);
+  const int bg_time = std::max(9, 2 * std::max(1, cols / 24) + 1);
+  auto background = uniform_filter_2d_nearest_torch_batch(corrected,
+                                                          std::max(1, bg_freq),
+                                                          std::max(1, bg_time));
+  auto residual_db = torch::clamp_min(corrected - background, 0.0);
+  auto residual_n = normalize_map01_quantile_torch_batch(residual_db, 0.05, 0.99);
+
+  const std::array<double, 3> scales = {0.8, 1.6, 3.2};
+  auto gate_max = torch::zeros_like(corrected, float_options);
+  for (double grad_sigma : scales) {
+    const double integ_sigma = std::max(1.0, 1.8 * grad_sigma);
+    auto grad_f = gaussian_first_derivative_rows_2d_torch_batch(residual_n, grad_sigma);
+    auto grad_t = gaussian_first_derivative_cols_2d_torch_batch(residual_n, grad_sigma);
+    auto j_ff = gaussian_blur_2d_torch_batch(grad_f * grad_f, integ_sigma, integ_sigma);
+    auto j_ft = gaussian_blur_2d_torch_batch(grad_f * grad_t, integ_sigma, integ_sigma);
+    auto j_tt = gaussian_blur_2d_torch_batch(grad_t * grad_t, integ_sigma, integ_sigma);
+
+    auto delta = torch::sqrt(torch::clamp_min((j_ff - j_tt) * (j_ff - j_tt) + 4.0f * (j_ft * j_ft), 0.0));
+    auto lambda1 = 0.5f * (j_ff + j_tt + delta);
+    auto lambda2 = 0.5f * (j_ff + j_tt - delta);
+    auto coherence = (lambda1 - lambda2) / torch::clamp_min(lambda1 + lambda2, 1.0e-6);
+    auto energy = lambda1 + lambda2;
+
+    auto coherence_n = normalize_map01_quantile_torch_batch(coherence, 0.05, 0.99);
+    auto energy_n = normalize_map01_quantile_torch_batch(energy, 0.05, 0.99);
+    auto gate_value = coherence_n * torch::sqrt(torch::clamp_min(energy_n, 0.0));
+    gate_max = torch::maximum(gate_max, gate_value);
+  }
+
+  auto gate = normalize_map01_quantile_torch_batch(gate_max, 0.05, 0.99).to(torch::kFloat32);
+  return torch::where(valid_mask_gpu, gate, torch::zeros_like(gate)).contiguous();
+}
+
+torch::Tensor project_aligned_map_to_output_torch_batch(const torch::Tensor& aligned_batch,
+                                                        int source_rows,
+                                                        int source_cols,
+                                                        int output_rows,
+                                                        int output_cols,
+                                                        bool resized_full_chunk) {
+  if (!aligned_batch.defined() || aligned_batch.dim() != 3) {
+    return {};
+  }
+  auto source_canvas = aligned_batch;
+  if (resized_full_chunk) {
+    source_canvas = torch::nn::functional::interpolate(
+                       aligned_batch.unsqueeze(1),
+                       torch::nn::functional::InterpolateFuncOptions()
+                           .size(std::vector<int64_t>{static_cast<int64_t>(source_rows), static_cast<int64_t>(source_cols)})
+                           .mode(torch::kBilinear)
+                           .align_corners(false))
+                       .squeeze(1)
+                       .contiguous();
+  }
+  if (source_canvas.size(1) == output_rows && source_canvas.size(2) == output_cols) {
+    return source_canvas.contiguous();
+  }
+  return torch::nn::functional::interpolate(
+             source_canvas.unsqueeze(1),
+             torch::nn::functional::InterpolateFuncOptions()
+                 .size(std::vector<int64_t>{static_cast<int64_t>(output_rows), static_cast<int64_t>(output_cols)})
+                 .mode(torch::kBilinear)
+                 .align_corners(false))
+      .squeeze(1)
+      .contiguous();
+}
+
+std::vector<HybridPostprocessResult> run_residual_veto_hybrid_gpu_batch_device_inputs(const torch::Tensor& dino_score_source_batch,
+                                                                                       const torch::Tensor& coherence_source_batch,
+                                                                                       const std::vector<uint8_t>& valid_mask_batch,
+                                                                                       int batch_size,
+                                                                                       int rows,
+                                                                                       int cols,
+                                                                                       bool use_fp16) {
+  const size_t sample_elements = static_cast<size_t>(std::max(rows, 0)) * static_cast<size_t>(std::max(cols, 0));
+  if (batch_size <= 0 || rows <= 0 || cols <= 0 || !dino_score_source_batch.defined() || !coherence_source_batch.defined() ||
+      dino_score_source_batch.dim() != 3 || coherence_source_batch.dim() != 3 ||
+      dino_score_source_batch.size(0) != batch_size || coherence_source_batch.size(0) != batch_size ||
+      dino_score_source_batch.size(1) != rows || coherence_source_batch.size(1) != rows ||
+      dino_score_source_batch.size(2) != cols || coherence_source_batch.size(2) != cols ||
+      valid_mask_batch.size() != static_cast<size_t>(batch_size) * sample_elements) {
+    throw std::runtime_error("invalid GPU batch hybrid postprocess inputs");
+  }
+  if (!torch::cuda::is_available()) {
+    throw std::runtime_error("CUDA is unavailable for GPU batch hybrid postprocess");
+  }
+
+  try {
+    std::vector<HybridPostprocessResult> results(static_cast<size_t>(batch_size));
+    for (auto& result : results) {
+      result.mask.assign(sample_elements, 0);
+    }
+    torch::InferenceMode inference_mode_guard(true);
+    const c10::Device compute_device(torch::kCUDA, 0);
+    const auto contrib_dtype = use_fp16 ? torch::kFloat16 : torch::kFloat32;
+    auto dino_source = dino_score_source_batch.to(compute_device, contrib_dtype).contiguous();
+    auto coherence_source = coherence_source_batch.to(compute_device, contrib_dtype).contiguous();
+    auto valid = torch::from_blob(const_cast<uint8_t*>(valid_mask_batch.data()),
+                                  {static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+                                  torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+                     .clone()
+                     .to(compute_device, torch::kBool);
+
+    auto dino_norm = normalize_map01_quantile_torch_batch(dino_source, 0.05, 0.95);
+    auto coherence_norm = normalize_map01_quantile_torch_batch(coherence_source, 0.05, 0.99);
+    auto contrib = (dino_norm * coherence_norm).contiguous();
+
+    auto base_norm = normalize_map01_masked_minmax_torch_batch(contrib, valid);
+    auto envelope_map = normalize_map01_masked_minmax_torch_batch(gaussian_blur_2d_torch_batch(base_norm, 6.0, 1.4), valid);
+    auto base_blur = gaussian_blur_2d_torch_batch(base_norm, 4.0, 1.0);
+    auto residual_penalty = normalize_map01_masked_minmax_torch_batch(gaussian_blur_2d_torch_batch(torch::abs(base_norm - base_blur), 2.0, 0.8), valid);
+    auto freq_curvature_penalty = normalize_map01_masked_minmax_torch_batch(torch::abs(gaussian_second_derivative_rows_2d_torch_batch(base_norm, 0.8)), valid);
+
+    auto keep_freq = normalize_map01_masked_minmax_torch_batch(envelope_map - 0.90 * freq_curvature_penalty, valid);
+    auto keep_res = normalize_map01_masked_minmax_torch_batch(envelope_map - 1.00 * residual_penalty, valid);
+    auto residual_veto_gate = torch::clamp((keep_res - 0.30) / 0.70, 0.0, 1.0);
+    auto combined_input = keep_freq * (0.35 + 0.65 * residual_veto_gate);
+    auto combined_score = normalize_map01_masked_minmax_torch_batch(combined_input, valid);
+
+    std::vector<torch::Tensor> final_masks;
+    final_masks.reserve(static_cast<size_t>(batch_size));
+    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+      auto sample_valid = valid[sample_index];
+      auto active_freq = keep_freq[sample_index].masked_select(sample_valid);
+      auto active_res = keep_res[sample_index].masked_select(sample_valid);
+      auto active_combined = combined_score[sample_index].masked_select(sample_valid);
+      auto& result = results[static_cast<size_t>(sample_index)];
+      result.seed_freq_threshold = active_freq.numel() > 0 ? scalar_quantile_tensor_torch(active_freq, 0.90).item<float>() : 1.0f;
+      result.seed_res_threshold = active_res.numel() > 0 ? scalar_quantile_tensor_torch(active_res, 0.82).item<float>() : 1.0f;
+      result.grow_freq_threshold = result.seed_freq_threshold;
+      result.grow_res_threshold = result.seed_res_threshold;
+      result.combined_threshold = active_combined.numel() > 0 ? scalar_quantile_tensor_torch(active_combined, 0.78).item<float>() : 1.0f;
+      auto seed_mask = torch::logical_and(sample_valid,
+                                          torch::logical_and(keep_freq[sample_index] >= result.seed_freq_threshold,
+                                                             keep_res[sample_index] >= result.seed_res_threshold));
+      auto final_mask = torch::logical_and(seed_mask,
+                                           torch::logical_and(sample_valid,
+                                                              combined_score[sample_index] >= static_cast<double>(result.combined_threshold) * 0.85));
+      final_masks.push_back(final_mask.to(torch::kUInt8));
+    }
+
+    auto combined_score_cpu = combined_score.to(torch::kCPU, torch::kFloat32).contiguous();
+    auto final_mask_batch_cpu = torch::stack(final_masks, 0).to(torch::kCPU, torch::kUInt8).contiguous();
+    const float* combined_score_ptr = combined_score_cpu.data_ptr<float>();
+    const uint8_t* final_mask_ptr = final_mask_batch_cpu.data_ptr<uint8_t>();
+    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+      auto& result = results[static_cast<size_t>(sample_index)];
+      const size_t offset = static_cast<size_t>(sample_index) * sample_elements;
+      result.combined_score.assign(combined_score_ptr + static_cast<std::ptrdiff_t>(offset),
+                                   combined_score_ptr + static_cast<std::ptrdiff_t>(offset + sample_elements));
+      std::vector<uint8_t> final_mask_vector(final_mask_ptr + static_cast<std::ptrdiff_t>(offset),
+                                             final_mask_ptr + static_cast<std::ptrdiff_t>(offset + sample_elements));
+      final_mask_vector = binary_closing_rect(final_mask_vector, rows, cols, 7, 3);
+      final_mask_vector = binary_fill_holes(final_mask_vector, rows, cols);
+      const auto valid_begin = valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(offset);
+      for (size_t index = 0; index < sample_elements; ++index) {
+        final_mask_vector[index] = (final_mask_vector[index] && valid_begin[static_cast<std::ptrdiff_t>(index)]) ? 1 : 0;
+      }
+      final_mask_vector = keep_large_components(final_mask_vector, rows, cols, 24, &result.component_count);
+      result.final_fraction = mean_mask_value(final_mask_vector);
+      result.connected_fraction = connected_fraction(final_mask_vector,
+                                                     std::vector<uint8_t>(valid_begin, valid_begin + static_cast<std::ptrdiff_t>(sample_elements)));
+      result.mask = std::move(final_mask_vector);
+    }
+    return results;
+  } catch (const std::exception& error) {
+    throw std::runtime_error(std::string("GPU batch hybrid postprocess failed: ") + error.what());
+  }
+}
+
+HybridPostprocessResult run_residual_veto_hybrid_gpu(const std::vector<float>& hybrid_dino_contrib,
+                                                     const std::vector<uint8_t>& valid_mask,
+                                                     int rows,
+                                                     int cols,
+                                                     bool use_fp16) {
+  HybridPostprocessResult result;
+  result.mask.assign(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
+  if (hybrid_dino_contrib.size() != result.mask.size() || valid_mask.size() != result.mask.size()) {
+    throw std::runtime_error("invalid GPU hybrid postprocess inputs");
+  }
+  if (!torch::cuda::is_available()) {
+    throw std::runtime_error("CUDA is unavailable for GPU hybrid postprocess");
+  }
+
+  try {
+    torch::InferenceMode inference_mode_guard(true);
+    const c10::Device compute_device(torch::kCUDA, 0);
+    const auto contrib_dtype = use_fp16 ? torch::kFloat16 : torch::kFloat32;
+    auto contrib = torch::from_blob(const_cast<float*>(hybrid_dino_contrib.data()),
+                                    {static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+                                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                       .clone()
+                       .to(compute_device, contrib_dtype);
+    auto valid = torch::from_blob(const_cast<uint8_t*>(valid_mask.data()),
+                                  {static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+                                  torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+                     .clone()
+                     .to(compute_device, torch::kBool);
+
+    auto base_norm = normalize_map01_masked_minmax_torch(contrib, valid);
+    auto envelope_map = normalize_map01_masked_minmax_torch(gaussian_blur_2d_torch(base_norm, 6.0, 1.4), valid);
+    auto base_blur = gaussian_blur_2d_torch(base_norm, 4.0, 1.0);
+    auto residual_penalty = normalize_map01_masked_minmax_torch(gaussian_blur_2d_torch(torch::abs(base_norm - base_blur), 2.0, 0.8), valid);
+    auto freq_curvature_penalty = normalize_map01_masked_minmax_torch(torch::abs(gaussian_second_derivative_rows_2d_torch(base_norm, 0.8)), valid);
+
+    auto keep_freq = normalize_map01_masked_minmax_torch(envelope_map - 0.90 * freq_curvature_penalty, valid);
+    auto keep_res = normalize_map01_masked_minmax_torch(envelope_map - 1.00 * residual_penalty, valid);
+    auto residual_veto_gate = torch::clamp((keep_res - 0.30) / 0.70, 0.0, 1.0);
+    auto combined_input = keep_freq * (0.35 + 0.65 * residual_veto_gate);
+    auto combined_score = normalize_map01_masked_minmax_torch(combined_input, valid);
+    result.combined_score = tensor_to_vector_float(combined_score);
+
+    auto active_freq = keep_freq.masked_select(valid);
+    auto active_res = keep_res.masked_select(valid);
+    auto active_combined = combined_score.masked_select(valid);
+    result.seed_freq_threshold = active_freq.numel() > 0 ? scalar_quantile_tensor_torch(active_freq, 0.90).item<float>() : 1.0f;
+    result.seed_res_threshold = active_res.numel() > 0 ? scalar_quantile_tensor_torch(active_res, 0.82).item<float>() : 1.0f;
+    result.grow_freq_threshold = result.seed_freq_threshold;
+    result.grow_res_threshold = result.seed_res_threshold;
+    result.combined_threshold = active_combined.numel() > 0 ? scalar_quantile_tensor_torch(active_combined, 0.78).item<float>() : 1.0f;
+
+    auto seed_mask = torch::logical_and(valid,
+                                        torch::logical_and(keep_freq >= result.seed_freq_threshold,
+                                                           keep_res >= result.seed_res_threshold));
+    auto final_mask = torch::logical_and(seed_mask,
+                                         torch::logical_and(valid,
+                                                            combined_score >= static_cast<double>(result.combined_threshold) * 0.85));
+
+    auto final_mask_cpu = final_mask.to(torch::kCPU, torch::kUInt8).contiguous();
+    std::vector<uint8_t> final_mask_vector(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
+    if (!final_mask_vector.empty()) {
+      std::memcpy(final_mask_vector.data(), final_mask_cpu.data_ptr<uint8_t>(), final_mask_vector.size() * sizeof(uint8_t));
+    }
+
+    final_mask_vector = binary_closing_rect(final_mask_vector, rows, cols, 7, 3);
+    final_mask_vector = binary_fill_holes(final_mask_vector, rows, cols);
+    for (size_t index = 0; index < final_mask_vector.size(); ++index) {
+      final_mask_vector[index] = (final_mask_vector[index] && valid_mask[index]) ? 1 : 0;
+    }
+    final_mask_vector = keep_large_components(final_mask_vector, rows, cols, 24, &result.component_count);
+    result.final_fraction = mean_mask_value(final_mask_vector);
+    result.connected_fraction = connected_fraction(final_mask_vector, valid_mask);
+    result.mask = std::move(final_mask_vector);
+    return result;
+  } catch (const std::exception& error) {
+    throw std::runtime_error(std::string("GPU hybrid postprocess failed: ") + error.what());
+  }
+}
+
+std::vector<HybridPostprocessResult> run_residual_veto_hybrid_gpu_batch(const std::vector<float>& hybrid_dino_contrib_batch,
+                                                                        const std::vector<uint8_t>& valid_mask_batch,
+                                                                        int batch_size,
+                                                                        int rows,
+                                                                        int cols,
+                                                                        bool use_fp16) {
+  std::vector<HybridPostprocessResult> results(static_cast<size_t>(std::max(batch_size, 0)));
+  const size_t sample_elements = static_cast<size_t>(std::max(rows, 0)) * static_cast<size_t>(std::max(cols, 0));
+  for (auto& result : results) {
+    result.mask.assign(sample_elements, 0);
+  }
+  if (batch_size <= 0 || rows <= 0 || cols <= 0 ||
+      hybrid_dino_contrib_batch.size() != static_cast<size_t>(batch_size) * sample_elements ||
+      valid_mask_batch.size() != static_cast<size_t>(batch_size) * sample_elements) {
+    return results;
+  }
+  if (!torch::cuda::is_available()) {
+    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+      const auto contrib_begin = hybrid_dino_contrib_batch.begin() + static_cast<std::ptrdiff_t>(sample_index * sample_elements);
+      const auto mask_begin = valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(sample_index * sample_elements);
+      results[static_cast<size_t>(sample_index)] = run_residual_veto_hybrid_gpu(
+          std::vector<float>(contrib_begin, contrib_begin + static_cast<std::ptrdiff_t>(sample_elements)),
+          std::vector<uint8_t>(mask_begin, mask_begin + static_cast<std::ptrdiff_t>(sample_elements)),
+          rows,
+          cols,
+          use_fp16);
+    }
+    return results;
+  }
+
+  try {
+    torch::InferenceMode inference_mode_guard(true);
+    const c10::Device compute_device(torch::kCUDA, 0);
+    const auto contrib_dtype = use_fp16 ? torch::kFloat16 : torch::kFloat32;
+    auto contrib = torch::from_blob(const_cast<float*>(hybrid_dino_contrib_batch.data()),
+                                    {static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+                                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                       .clone()
+                       .to(compute_device, contrib_dtype);
+    auto valid = torch::from_blob(const_cast<uint8_t*>(valid_mask_batch.data()),
+                                  {static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+                                  torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+                     .clone()
+                     .to(compute_device, torch::kBool);
+
+    auto base_norm = normalize_map01_masked_minmax_torch_batch(contrib, valid);
+    auto envelope_map = normalize_map01_masked_minmax_torch_batch(gaussian_blur_2d_torch_batch(base_norm, 6.0, 1.4), valid);
+    auto base_blur = gaussian_blur_2d_torch_batch(base_norm, 4.0, 1.0);
+    auto residual_penalty = normalize_map01_masked_minmax_torch_batch(gaussian_blur_2d_torch_batch(torch::abs(base_norm - base_blur), 2.0, 0.8), valid);
+    auto freq_curvature_penalty = normalize_map01_masked_minmax_torch_batch(torch::abs(gaussian_second_derivative_rows_2d_torch_batch(base_norm, 0.8)), valid);
+
+    auto keep_freq = normalize_map01_masked_minmax_torch_batch(envelope_map - 0.90 * freq_curvature_penalty, valid);
+    auto keep_res = normalize_map01_masked_minmax_torch_batch(envelope_map - 1.00 * residual_penalty, valid);
+    auto residual_veto_gate = torch::clamp((keep_res - 0.30) / 0.70, 0.0, 1.0);
+    auto combined_input = keep_freq * (0.35 + 0.65 * residual_veto_gate);
+    auto combined_score = normalize_map01_masked_minmax_torch_batch(combined_input, valid);
+
+    std::vector<torch::Tensor> final_masks;
+    final_masks.reserve(static_cast<size_t>(batch_size));
+    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+      auto sample_valid = valid[sample_index];
+      auto active_freq = keep_freq[sample_index].masked_select(sample_valid);
+      auto active_res = keep_res[sample_index].masked_select(sample_valid);
+      auto active_combined = combined_score[sample_index].masked_select(sample_valid);
+      auto& result = results[static_cast<size_t>(sample_index)];
+      result.seed_freq_threshold = active_freq.numel() > 0 ? scalar_quantile_tensor_torch(active_freq, 0.90).item<float>() : 1.0f;
+      result.seed_res_threshold = active_res.numel() > 0 ? scalar_quantile_tensor_torch(active_res, 0.82).item<float>() : 1.0f;
+      result.grow_freq_threshold = result.seed_freq_threshold;
+      result.grow_res_threshold = result.seed_res_threshold;
+      result.combined_threshold = active_combined.numel() > 0 ? scalar_quantile_tensor_torch(active_combined, 0.78).item<float>() : 1.0f;
+      auto seed_mask = torch::logical_and(sample_valid,
+                                          torch::logical_and(keep_freq[sample_index] >= result.seed_freq_threshold,
+                                                             keep_res[sample_index] >= result.seed_res_threshold));
+      auto final_mask = torch::logical_and(seed_mask,
+                                           torch::logical_and(sample_valid,
+                                                              combined_score[sample_index] >= static_cast<double>(result.combined_threshold) * 0.85));
+      final_masks.push_back(final_mask.to(torch::kUInt8));
+    }
+
+    auto combined_score_cpu = combined_score.to(torch::kCPU, torch::kFloat32).contiguous();
+    auto final_mask_batch_cpu = torch::stack(final_masks, 0).to(torch::kCPU, torch::kUInt8).contiguous();
+    const float* combined_score_ptr = combined_score_cpu.data_ptr<float>();
+    const uint8_t* final_mask_ptr = final_mask_batch_cpu.data_ptr<uint8_t>();
+    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+      auto& result = results[static_cast<size_t>(sample_index)];
+      const size_t offset = static_cast<size_t>(sample_index) * sample_elements;
+      result.combined_score.assign(combined_score_ptr + static_cast<std::ptrdiff_t>(offset),
+                                   combined_score_ptr + static_cast<std::ptrdiff_t>(offset + sample_elements));
+      std::vector<uint8_t> final_mask_vector(final_mask_ptr + static_cast<std::ptrdiff_t>(offset),
+                                             final_mask_ptr + static_cast<std::ptrdiff_t>(offset + sample_elements));
+      final_mask_vector = binary_closing_rect(final_mask_vector, rows, cols, 7, 3);
+      final_mask_vector = binary_fill_holes(final_mask_vector, rows, cols);
+      const auto valid_begin = valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(offset);
+      for (size_t index = 0; index < sample_elements; ++index) {
+        final_mask_vector[index] = (final_mask_vector[index] && valid_begin[static_cast<std::ptrdiff_t>(index)]) ? 1 : 0;
+      }
+      final_mask_vector = keep_large_components(final_mask_vector, rows, cols, 24, &result.component_count);
+      result.final_fraction = mean_mask_value(final_mask_vector);
+      result.connected_fraction = connected_fraction(final_mask_vector,
+                                                     std::vector<uint8_t>(valid_begin, valid_begin + static_cast<std::ptrdiff_t>(sample_elements)));
+      result.mask = std::move(final_mask_vector);
+    }
+    return results;
+  } catch (const std::exception&) {
+    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+      const auto contrib_begin = hybrid_dino_contrib_batch.begin() + static_cast<std::ptrdiff_t>(sample_index * sample_elements);
+      const auto mask_begin = valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(sample_index * sample_elements);
+      results[static_cast<size_t>(sample_index)] = run_residual_veto_hybrid(
+          std::vector<float>(contrib_begin, contrib_begin + static_cast<std::ptrdiff_t>(sample_elements)),
+          std::vector<uint8_t>(mask_begin, mask_begin + static_cast<std::ptrdiff_t>(sample_elements)),
+          rows,
+          cols);
+    }
+    return results;
+  }
+}
+
+void precompute_retry_chunk_hybrid_batch(std::vector<ChunkInferenceArtifacts>& artifacts_batch,
+                                         const ValidatorConfig& config,
+                                         StageProfiler* profiler,
+                                         bool verbose) {
+  if (artifacts_batch.empty()) {
+    return;
+  }
+  const int batch_size = static_cast<int>(artifacts_batch.size());
+  const int rows = artifacts_batch.front().result.src_rows;
+  const int cols = artifacts_batch.front().result.src_cols;
+  if (rows <= 0 || cols <= 0) {
+    return;
+  }
+
+  const size_t sample_elements = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  std::vector<float> hybrid_contrib_batch(static_cast<size_t>(batch_size) * sample_elements, 0.0f);
+  std::vector<uint8_t> valid_mask_batch(static_cast<size_t>(batch_size) * sample_elements, 0);
+  {
+    const size_t estimated_bytes = static_cast<size_t>(batch_size) * sample_elements * (sizeof(float) * 3 + sizeof(uint8_t));
+    ScopedStageProfile stage(profiler, "chunk_hybrid_support_batch", "run", -1, estimated_bytes, verbose);
+    const auto norm_start = std::chrono::steady_clock::now();
+    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+      auto& artifacts = artifacts_batch[static_cast<size_t>(sample_index)];
+      if (artifacts.keep_debug_artifacts || artifacts.result.src_rows != rows || artifacts.result.src_cols != cols ||
+          artifacts.grouped_dino_score_source.size() != sample_elements || artifacts.source_chunk_coherence_gate.size() != sample_elements ||
+          artifacts.source_chunk_valid_mask.size() != sample_elements) {
+        return;
+      }
+      const size_t offset = static_cast<size_t>(sample_index) * sample_elements;
+      auto* hybrid_contrib_output = hybrid_contrib_batch.data() + static_cast<std::ptrdiff_t>(offset);
+      const auto [dino_low, dino_high] = quantile_bounds_from_input(artifacts.grouped_dino_score_source, 5.0, 95.0);
+      normalize01_quantile_into(artifacts.grouped_dino_score_source,
+                                dino_low,
+                                dino_high,
+                                hybrid_contrib_output);
+      const auto [coherence_low, coherence_high] = quantile_bounds_from_input(artifacts.source_chunk_coherence_gate, 5.0, 99.0);
+      multiply_normalized_quantile_into(artifacts.source_chunk_coherence_gate,
+                                        coherence_low,
+                                        coherence_high,
+                                        hybrid_contrib_output);
+      std::copy(artifacts.source_chunk_valid_mask.begin(),
+                artifacts.source_chunk_valid_mask.end(),
+                valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+    record_timed_stage(profiler,
+                       "chunk_hybrid_norm_batch_cpu",
+                       "run",
+                       -1,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - norm_start).count());
+
+    const auto residual_veto_start = std::chrono::steady_clock::now();
+    auto hybrid_results = run_residual_veto_hybrid_gpu_batch(hybrid_contrib_batch,
+                                                             valid_mask_batch,
+                                                             batch_size,
+                                                             rows,
+                                                             cols,
+                                                             use_fp16_precision(config.hybrid_torch_dtype));
+    record_timed_stage(profiler,
+                       "chunk_hybrid_residual_veto_batch",
+                       "run",
+                       -1,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - residual_veto_start).count());
+    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+      artifacts_batch[static_cast<size_t>(sample_index)].precomputed_hybrid_result_source = std::move(hybrid_results[static_cast<size_t>(sample_index)]);
+      artifacts_batch[static_cast<size_t>(sample_index)].has_precomputed_hybrid_result = true;
+    }
+  }
 }
 
 std::vector<float> patch_mean_map(const std::vector<float>& input,
@@ -1695,15 +2797,18 @@ std::vector<float> project_aligned_map_to_output(const std::vector<float>& align
                                                  int row_offset,
                                                  int col_offset,
                                                  int output_rows,
-                                                 int output_cols) {
-  const auto source_canvas = embed_aligned_map_in_source_canvas(
-      aligned_map,
-      aligned_rows,
-      aligned_cols,
-      source_rows,
-      source_cols,
-      row_offset,
-      col_offset);
+                                                 int output_cols,
+                                                 bool resized_full_chunk = false) {
+  const auto source_canvas = resized_full_chunk
+                                 ? resize_bilinear(aligned_map, aligned_rows, aligned_cols, source_rows, source_cols)
+                                 : embed_aligned_map_in_source_canvas(
+                                       aligned_map,
+                                       aligned_rows,
+                                       aligned_cols,
+                                       source_rows,
+                                       source_cols,
+                                       row_offset,
+                                       col_offset);
   return resize_bilinear(source_canvas, source_rows, source_cols, output_rows, output_cols);
 }
 
@@ -1717,7 +2822,8 @@ std::vector<float> project_patch_map_to_output(const std::vector<float>& patch_m
                                                int row_offset,
                                                int col_offset,
                                                int output_rows,
-                                               int output_cols) {
+                                               int output_cols,
+                                               bool resized_full_chunk = false) {
   if (patch_rows <= 0 || patch_cols <= 0 ||
       patch_map.size() != static_cast<size_t>(patch_rows) * static_cast<size_t>(patch_cols)) {
     return std::vector<float>(static_cast<size_t>(std::max(output_rows, 0)) * static_cast<size_t>(std::max(output_cols, 0)), 0.0f);
@@ -1732,7 +2838,8 @@ std::vector<float> project_patch_map_to_output(const std::vector<float>& patch_m
       row_offset,
       col_offset,
       output_rows,
-      output_cols);
+      output_cols,
+      resized_full_chunk);
 }
 
 std::vector<uint8_t> resize_mask_nearest(const std::vector<uint8_t>& input,
@@ -1757,6 +2864,53 @@ std::vector<uint8_t> resize_mask_nearest(const std::vector<uint8_t>& input,
     }
   }
   return output;
+}
+
+struct LinearResizeSample {
+  int index0 = 0;
+  int index1 = 0;
+  float t = 0.0f;
+};
+
+std::vector<int> build_nearest_resize_indices(int input_size, int output_size) {
+  std::vector<int> indices(static_cast<size_t>(std::max(output_size, 0)), 0);
+  if (input_size <= 0 || output_size <= 0) {
+    return indices;
+  }
+  for (int output_index = 0; output_index < output_size; ++output_index) {
+    indices[static_cast<size_t>(output_index)] = std::min(input_size - 1,
+                                                          static_cast<int>((static_cast<int64_t>(output_index) * static_cast<int64_t>(input_size)) /
+                                                                           static_cast<int64_t>(std::max(output_size, 1))));
+  }
+  return indices;
+}
+
+std::vector<LinearResizeSample> build_linear_resize_samples(int input_size, int output_size) {
+  std::vector<LinearResizeSample> samples(static_cast<size_t>(std::max(output_size, 0)));
+  if (input_size <= 0 || output_size <= 0) {
+    return samples;
+  }
+  const float scale = output_size > 1 ? static_cast<float>(input_size - 1) / static_cast<float>(output_size - 1) : 0.0f;
+  for (int output_index = 0; output_index < output_size; ++output_index) {
+    const float input_f = scale * static_cast<float>(output_index);
+    const int index0 = clamp_value(static_cast<int>(std::floor(input_f)), 0, input_size - 1);
+    const int index1 = clamp_value(index0 + 1, 0, input_size - 1);
+    samples[static_cast<size_t>(output_index)] = LinearResizeSample{index0, index1, input_f - static_cast<float>(index0)};
+  }
+  return samples;
+}
+
+float sample_bilinear_resized_value(const std::vector<float>& input,
+                                    int input_cols,
+                                    const LinearResizeSample& row_sample,
+                                    const LinearResizeSample& col_sample) {
+  const float v00 = input[flat_index(input_cols, row_sample.index0, col_sample.index0)];
+  const float v01 = input[flat_index(input_cols, row_sample.index0, col_sample.index1)];
+  const float v10 = input[flat_index(input_cols, row_sample.index1, col_sample.index0)];
+  const float v11 = input[flat_index(input_cols, row_sample.index1, col_sample.index1)];
+  const float top = (1.0f - col_sample.t) * v00 + col_sample.t * v01;
+  const float bottom = (1.0f - col_sample.t) * v10 + col_sample.t * v11;
+  return (1.0f - row_sample.t) * top + row_sample.t * bottom;
 }
 
 DetectionBox scale_box_to_shape(const DetectionBox& box,
@@ -2644,46 +3798,164 @@ std::vector<float> structure_tensor_gate(const std::vector<float>& corrected_res
 ComponentLabelling label_components(const std::vector<uint8_t>& mask, int rows, int cols) {
   ComponentLabelling result;
   result.labels.assign(mask.size(), 0);
+  if (rows <= 0 || cols <= 0 || mask.empty()) {
+    return result;
+  }
+
+  std::vector<int> parent(mask.size() + 1, 0);
+  std::vector<int> rank(mask.size() + 1, 0);
   int next_label = 0;
-  constexpr std::array<int, 8> d_row = {-1, -1, -1, 0, 0, 1, 1, 1};
-  constexpr std::array<int, 8> d_col = {-1, 0, 1, -1, 1, -1, 0, 1};
-  std::vector<int> pending;
-  pending.reserve(mask.size());
+
+  auto find_root = [&](int label) {
+    int root = label;
+    while (parent[static_cast<size_t>(root)] != root) {
+      root = parent[static_cast<size_t>(root)];
+    }
+    while (parent[static_cast<size_t>(label)] != label) {
+      const int next = parent[static_cast<size_t>(label)];
+      parent[static_cast<size_t>(label)] = root;
+      label = next;
+    }
+    return root;
+  };
+
+  auto unite = [&](int lhs, int rhs) {
+    int root_lhs = find_root(lhs);
+    int root_rhs = find_root(rhs);
+    if (root_lhs == root_rhs) {
+      return root_lhs;
+    }
+    if (rank[static_cast<size_t>(root_lhs)] < rank[static_cast<size_t>(root_rhs)]) {
+      std::swap(root_lhs, root_rhs);
+    }
+    parent[static_cast<size_t>(root_rhs)] = root_lhs;
+    if (rank[static_cast<size_t>(root_lhs)] == rank[static_cast<size_t>(root_rhs)]) {
+      ++rank[static_cast<size_t>(root_lhs)];
+    }
+    return root_lhs;
+  };
+
   for (int row = 0; row < rows; ++row) {
     for (int col = 0; col < cols; ++col) {
-      const size_t index = flat_index(cols, row, col);
-      if (!mask[index] || result.labels[index] != 0) {
+      const size_t flat = flat_index(cols, row, col);
+      if (!mask[flat]) {
         continue;
       }
-      ++next_label;
-      int component_size = 0;
-      pending.clear();
-      pending.push_back(static_cast<int>(index));
-      size_t pending_head = 0;
-      result.labels[index] = next_label;
-      while (pending_head < pending.size()) {
-        const int flat = pending[pending_head++];
-        const int cur_row = flat / cols;
-        const int cur_col = flat % cols;
-        ++component_size;
-        for (size_t neighbor = 0; neighbor < d_row.size(); ++neighbor) {
-          const int next_row = cur_row + d_row[neighbor];
-          const int next_col = cur_col + d_col[neighbor];
-          if (next_row < 0 || next_row >= rows || next_col < 0 || next_col >= cols) {
-            continue;
-          }
-          const size_t next_flat = flat_index(cols, next_row, next_col);
-          if (!mask[next_flat] || result.labels[next_flat] != 0) {
-            continue;
-          }
-          result.labels[next_flat] = next_label;
-          pending.push_back(static_cast<int>(next_flat));
+
+      std::array<int, 4> neighbors = {0, 0, 0, 0};
+      size_t neighbor_count = 0;
+      auto maybe_add_neighbor = [&](int neighbor_row, int neighbor_col) {
+        if (neighbor_row < 0 || neighbor_row >= rows || neighbor_col < 0 || neighbor_col >= cols) {
+          return;
         }
+        const int label = result.labels[flat_index(cols, neighbor_row, neighbor_col)];
+        if (label > 0) {
+          neighbors[neighbor_count++] = label;
+        }
+      };
+      maybe_add_neighbor(row, col - 1);
+      maybe_add_neighbor(row - 1, col - 1);
+      maybe_add_neighbor(row - 1, col);
+      maybe_add_neighbor(row - 1, col + 1);
+
+      if (neighbor_count == 0) {
+        ++next_label;
+        parent[static_cast<size_t>(next_label)] = next_label;
+        rank[static_cast<size_t>(next_label)] = 0;
+        result.labels[flat] = next_label;
+      } else {
+        int assigned = neighbors[0];
+        for (size_t index = 1; index < neighbor_count; ++index) {
+          assigned = unite(assigned, neighbors[index]);
+        }
+        result.labels[flat] = assigned;
       }
-      result.sizes.push_back(component_size);
     }
   }
+
+  std::vector<int> root_to_compact(static_cast<size_t>(next_label + 1), 0);
+  for (size_t flat = 0; flat < result.labels.size(); ++flat) {
+    const int label = result.labels[flat];
+    if (label <= 0) {
+      continue;
+    }
+    const int root = find_root(label);
+    int compact = root_to_compact[static_cast<size_t>(root)];
+    if (compact == 0) {
+      compact = static_cast<int>(result.sizes.size()) + 1;
+      root_to_compact[static_cast<size_t>(root)] = compact;
+      result.sizes.push_back(0);
+    }
+    result.labels[flat] = compact;
+    ++result.sizes[static_cast<size_t>(compact - 1)];
+  }
   return result;
+}
+
+std::vector<uint8_t> binary_filter_rows(const std::vector<uint8_t>& mask,
+                                        int rows,
+                                        int cols,
+                                        int radius,
+                                        bool require_all) {
+  std::vector<uint8_t> output(mask.size(), 0);
+  if (rows <= 0 || cols <= 0) {
+    return output;
+  }
+  const int window = 2 * std::max(0, radius) + 1;
+  std::vector<int> prefix(static_cast<size_t>(cols + 1), 0);
+  for (int row = 0; row < rows; ++row) {
+    prefix[0] = 0;
+    for (int col = 0; col < cols; ++col) {
+      prefix[static_cast<size_t>(col + 1)] = prefix[static_cast<size_t>(col)] +
+                                             static_cast<int>(mask[flat_index(cols, row, col)] != 0);
+    }
+    for (int col = 0; col < cols; ++col) {
+      const int left = std::max(0, col - radius);
+      const int right = std::min(cols - 1, col + radius);
+      int active = prefix[static_cast<size_t>(right + 1)] - prefix[static_cast<size_t>(left)];
+      if (col - radius < 0 && mask[flat_index(cols, row, 0)]) {
+        active += -(col - radius);
+      }
+      if (col + radius >= cols && mask[flat_index(cols, row, cols - 1)]) {
+        active += col + radius - (cols - 1);
+      }
+      output[flat_index(cols, row, col)] = require_all ? static_cast<uint8_t>(active == window) : static_cast<uint8_t>(active > 0);
+    }
+  }
+  return output;
+}
+
+std::vector<uint8_t> binary_filter_cols(const std::vector<uint8_t>& mask,
+                                        int rows,
+                                        int cols,
+                                        int radius,
+                                        bool require_all) {
+  std::vector<uint8_t> output(mask.size(), 0);
+  if (rows <= 0 || cols <= 0) {
+    return output;
+  }
+  const int window = 2 * std::max(0, radius) + 1;
+  std::vector<int> prefix(static_cast<size_t>(rows + 1), 0);
+  for (int col = 0; col < cols; ++col) {
+    prefix[0] = 0;
+    for (int row = 0; row < rows; ++row) {
+      prefix[static_cast<size_t>(row + 1)] = prefix[static_cast<size_t>(row)] +
+                                             static_cast<int>(mask[flat_index(cols, row, col)] != 0);
+    }
+    for (int row = 0; row < rows; ++row) {
+      const int top = std::max(0, row - radius);
+      const int bottom = std::min(rows - 1, row + radius);
+      int active = prefix[static_cast<size_t>(bottom + 1)] - prefix[static_cast<size_t>(top)];
+      if (row - radius < 0 && mask[flat_index(cols, 0, col)]) {
+        active += -(row - radius);
+      }
+      if (row + radius >= rows && mask[flat_index(cols, rows - 1, col)]) {
+        active += row + radius - (rows - 1);
+      }
+      output[flat_index(cols, row, col)] = require_all ? static_cast<uint8_t>(active == window) : static_cast<uint8_t>(active > 0);
+    }
+  }
+  return output;
 }
 
 std::vector<uint8_t> keep_large_components(const std::vector<uint8_t>& mask,
@@ -2721,24 +3993,7 @@ std::vector<uint8_t> binary_dilate_rect(const std::vector<uint8_t>& mask,
                                         int kernel_cols) {
   const int row_radius = std::max(0, kernel_rows / 2);
   const int col_radius = std::max(0, kernel_cols / 2);
-  std::vector<uint8_t> output(mask.size(), 0);
-  for (int row = 0; row < rows; ++row) {
-    for (int col = 0; col < cols; ++col) {
-      bool active = false;
-      for (int d_row = -row_radius; d_row <= row_radius && !active; ++d_row) {
-        const int src_row = clamp_value(row + d_row, 0, rows - 1);
-        for (int d_col = -col_radius; d_col <= col_radius; ++d_col) {
-          const int src_col = clamp_value(col + d_col, 0, cols - 1);
-          if (mask[flat_index(cols, src_row, src_col)]) {
-            active = true;
-            break;
-          }
-        }
-      }
-      output[flat_index(cols, row, col)] = active ? 1 : 0;
-    }
-  }
-  return output;
+  return binary_filter_cols(binary_filter_rows(mask, rows, cols, col_radius, false), rows, cols, row_radius, false);
 }
 
 std::vector<uint8_t> binary_erode_rect(const std::vector<uint8_t>& mask,
@@ -2748,24 +4003,7 @@ std::vector<uint8_t> binary_erode_rect(const std::vector<uint8_t>& mask,
                                        int kernel_cols) {
   const int row_radius = std::max(0, kernel_rows / 2);
   const int col_radius = std::max(0, kernel_cols / 2);
-  std::vector<uint8_t> output(mask.size(), 0);
-  for (int row = 0; row < rows; ++row) {
-    for (int col = 0; col < cols; ++col) {
-      bool active = true;
-      for (int d_row = -row_radius; d_row <= row_radius && active; ++d_row) {
-        const int src_row = clamp_value(row + d_row, 0, rows - 1);
-        for (int d_col = -col_radius; d_col <= col_radius; ++d_col) {
-          const int src_col = clamp_value(col + d_col, 0, cols - 1);
-          if (!mask[flat_index(cols, src_row, src_col)]) {
-            active = false;
-            break;
-          }
-        }
-      }
-      output[flat_index(cols, row, col)] = active ? 1 : 0;
-    }
-  }
-  return output;
+  return binary_filter_cols(binary_filter_rows(mask, rows, cols, col_radius, true), rows, cols, row_radius, true);
 }
 
 std::vector<uint8_t> binary_closing_rect(const std::vector<uint8_t>& mask,
@@ -2907,6 +4145,224 @@ int component_envelope_area(const std::vector<uint8_t>& mask, int rows, int cols
   return area;
 }
 
+std::vector<DetectionBox> group_boxes_fast_only(const std::vector<uint8_t>& mask,
+                                                const std::vector<float>& score_map,
+                                                const std::vector<uint8_t>& valid_mask,
+                                                int rows,
+                                                int cols,
+                                                int bridge_freq_px,
+                                                int bridge_time_px,
+                                                int min_component_size,
+                                                int min_freq_span_px,
+                                                int min_time_span_px,
+                                                float min_density) {
+  std::vector<DetectionBox> boxes;
+  if (rows <= 0 || cols <= 0 || mask.size() != static_cast<size_t>(rows) * static_cast<size_t>(cols)) {
+    return boxes;
+  }
+
+  std::vector<uint8_t> active = mask;
+  std::vector<float> active_scores;
+  active_scores.reserve(score_map.size());
+  for (size_t index = 0; index < active.size(); ++index) {
+    if (index < valid_mask.size() && !valid_mask[index]) {
+      active[index] = 0;
+      continue;
+    }
+    if (active[index] && index < score_map.size()) {
+      active_scores.push_back(score_map[index]);
+    }
+  }
+  if (std::none_of(active.begin(), active.end(), [](uint8_t value) { return value != 0; })) {
+    return boxes;
+  }
+
+  struct FastComponentStats {
+    int min_row = std::numeric_limits<int>::max();
+    int max_row = -1;
+    int min_col = std::numeric_limits<int>::max();
+    int max_col = -1;
+    int filled_area = 0;
+    float score_sum = 0.0f;
+    float score_peak = 0.0f;
+  };
+
+  const auto labelled = label_components(active, rows, cols);
+  std::vector<FastComponentStats> stats(labelled.sizes.size());
+  for (size_t flat = 0; flat < labelled.labels.size(); ++flat) {
+    const int label = labelled.labels[flat];
+    if (label <= 0) {
+      continue;
+    }
+    auto& component = stats[static_cast<size_t>(label - 1)];
+    const int row = static_cast<int>(flat / static_cast<size_t>(cols));
+    const int col = static_cast<int>(flat % static_cast<size_t>(cols));
+    component.min_row = std::min(component.min_row, row);
+    component.max_row = std::max(component.max_row, row);
+    component.min_col = std::min(component.min_col, col);
+    component.max_col = std::max(component.max_col, col);
+    ++component.filled_area;
+    if (flat < score_map.size()) {
+      const float score = score_map[flat];
+      component.score_sum += score;
+      component.score_peak = std::max(component.score_peak, score);
+    }
+  }
+
+  const float peak_score_floor = quantile_from_values(active_scores, 0.50, 0.0f);
+  std::vector<DetectionBox> component_boxes;
+  component_boxes.reserve(stats.size());
+  for (size_t label_index = 0; label_index < stats.size(); ++label_index) {
+    const auto& component = stats[label_index];
+    if (component.filled_area <= 0 || component.max_row < component.min_row || component.max_col < component.min_col) {
+      continue;
+    }
+    DetectionBox box;
+    box.freq_start = component.min_row;
+    box.freq_stop = component.max_row + 1;
+    box.time_start = component.min_col;
+    box.time_stop = component.max_col + 1;
+    box.filled_area = component.filled_area;
+    const int freq_span = box.freq_stop - box.freq_start;
+    const int time_span = box.time_stop - box.time_start;
+    const int bbox_area = std::max(1, freq_span * time_span);
+    const float density = static_cast<float>(component.filled_area) / static_cast<float>(bbox_area);
+    box.density = density;
+    box.bbox_density = density;
+    box.envelope_density = density;
+    box.score_mean = component.filled_area > 0 ? component.score_sum / static_cast<float>(component.filled_area) : 0.0f;
+    box.score_peak = component.score_peak;
+    box.parent_component_id = static_cast<int>(label_index) + 1;
+    box.parent_component_ids = {box.parent_component_id};
+    component_boxes.push_back(std::move(box));
+  }
+
+  if (component_boxes.empty()) {
+    return boxes;
+  }
+
+  struct LocalBoxEvent {
+    int freq_start = 0;
+    int freq_stop = 0;
+    size_t index = 0;
+  };
+
+  struct LocalBoxDisjointSet {
+    std::vector<size_t> parent;
+    std::vector<uint16_t> rank;
+
+    explicit LocalBoxDisjointSet(size_t count) : parent(count), rank(count, 0) {
+      for (size_t index = 0; index < count; ++index) {
+        parent[index] = index;
+      }
+    }
+
+    size_t find(size_t index) {
+      size_t root = index;
+      while (parent[root] != root) {
+        root = parent[root];
+      }
+      while (parent[index] != index) {
+        const size_t next = parent[index];
+        parent[index] = root;
+        index = next;
+      }
+      return root;
+    }
+
+    void unite(size_t lhs, size_t rhs) {
+      lhs = find(lhs);
+      rhs = find(rhs);
+      if (lhs == rhs) {
+        return;
+      }
+      if (rank[lhs] < rank[rhs]) {
+        std::swap(lhs, rhs);
+      }
+      parent[rhs] = lhs;
+      if (rank[lhs] == rank[rhs]) {
+        ++rank[lhs];
+      }
+    }
+  };
+
+  auto axis_gap = [](int start_a, int stop_a, int start_b, int stop_b) {
+    if (stop_a < start_b) {
+      return start_b - stop_a;
+    }
+    if (stop_b < start_a) {
+      return start_a - stop_b;
+    }
+    return 0;
+  };
+
+  auto boxes_should_merge_fast = [&](const DetectionBox& lhs, const DetectionBox& rhs) {
+    const int freq_gap = axis_gap(lhs.freq_start, lhs.freq_stop, rhs.freq_start, rhs.freq_stop);
+    if (freq_gap > std::max(0, bridge_freq_px)) {
+      return false;
+    }
+    const int time_gap = axis_gap(lhs.time_start, lhs.time_stop, rhs.time_start, rhs.time_stop);
+    return time_gap <= std::max(0, bridge_time_px);
+  };
+
+  std::vector<LocalBoxEvent> events(component_boxes.size());
+  for (size_t index = 0; index < component_boxes.size(); ++index) {
+    events[index] = LocalBoxEvent{component_boxes[index].freq_start, component_boxes[index].freq_stop, index};
+  }
+  std::sort(events.begin(), events.end(), [](const LocalBoxEvent& lhs, const LocalBoxEvent& rhs) {
+    if (lhs.freq_start != rhs.freq_start) {
+      return lhs.freq_start < rhs.freq_start;
+    }
+    if (lhs.freq_stop != rhs.freq_stop) {
+      return lhs.freq_stop < rhs.freq_stop;
+    }
+    return lhs.index < rhs.index;
+  });
+
+  LocalBoxDisjointSet sets(component_boxes.size());
+  std::vector<size_t> active_indices;
+  active_indices.reserve(component_boxes.size());
+  for (const auto& event : events) {
+    const auto& current_box = component_boxes[event.index];
+    size_t write_index = 0;
+    for (size_t read_index = 0; read_index < active_indices.size(); ++read_index) {
+      const size_t active_index = active_indices[read_index];
+      if (component_boxes[active_index].freq_stop + std::max(0, bridge_freq_px) >= current_box.freq_start) {
+        active_indices[write_index++] = active_index;
+      }
+    }
+    active_indices.resize(write_index);
+    for (const size_t active_index : active_indices) {
+      if (boxes_should_merge_fast(component_boxes[active_index], current_box)) {
+        sets.unite(active_index, event.index);
+      }
+    }
+    active_indices.push_back(event.index);
+  }
+
+  std::vector<std::vector<DetectionBox>> merged_clusters(component_boxes.size());
+  for (size_t index = 0; index < component_boxes.size(); ++index) {
+    merged_clusters[sets.find(index)].push_back(component_boxes[index]);
+  }
+
+  boxes.reserve(merged_clusters.size());
+  for (auto& cluster : merged_clusters) {
+    if (cluster.empty()) {
+      continue;
+    }
+    DetectionBox box = merge_box_cluster(cluster);
+    if (box.filled_area < std::max(1, min_component_size) ||
+        (box.freq_stop - box.freq_start) < std::max(1, min_freq_span_px) ||
+        (box.time_stop - box.time_start) < std::max(1, min_time_span_px) ||
+        box.density < min_density ||
+        box.score_peak < peak_score_floor) {
+      continue;
+    }
+    boxes.push_back(std::move(box));
+  }
+  return boxes;
+}
+
 GroupingResult group_mask_regions(const std::vector<uint8_t>& mask,
                                   const std::vector<float>& score_map,
                                   const std::vector<uint8_t>& valid_mask,
@@ -2931,54 +4387,73 @@ GroupingResult group_mask_regions(const std::vector<uint8_t>& mask,
       result.seed_mask[index] = 0;
     }
   }
+  if (std::none_of(result.seed_mask.begin(), result.seed_mask.end(), [](uint8_t value) { return value != 0; })) {
+    result.bridged_mask = result.seed_mask;
+    result.grouped_mask = result.seed_mask;
+    return result;
+  }
+
+  struct ComponentStats {
+    int min_row = std::numeric_limits<int>::max();
+    int max_row = -1;
+    int min_col = std::numeric_limits<int>::max();
+    int max_col = -1;
+    int filled_area = 0;
+    float score_sum = 0.0f;
+    float score_peak = 0.0f;
+    bool keep = false;
+    std::vector<int> col_min_row;
+    std::vector<int> col_max_row;
+  };
+
+  auto build_component_stats = [&](const ComponentLabelling& labelled_state) {
+    std::vector<ComponentStats> stats(labelled_state.sizes.size());
+    for (size_t flat = 0; flat < labelled_state.labels.size(); ++flat) {
+      const int label = labelled_state.labels[flat];
+      if (label <= 0) {
+        continue;
+      }
+      auto& component = stats[static_cast<size_t>(label - 1)];
+      const int row = static_cast<int>(flat / static_cast<size_t>(cols));
+      const int col = static_cast<int>(flat % static_cast<size_t>(cols));
+      component.min_row = std::min(component.min_row, row);
+      component.max_row = std::max(component.max_row, row);
+      component.min_col = std::min(component.min_col, col);
+      component.max_col = std::max(component.max_col, col);
+      ++component.filled_area;
+      if (flat < score_map.size()) {
+        const float score = score_map[flat];
+        component.score_sum += score;
+        component.score_peak = std::max(component.score_peak, score);
+      }
+    }
+    return stats;
+  };
 
   if (!filter_detection_mask) {
     result.bridged_mask = result.seed_mask;
     const auto labelled = label_components(result.bridged_mask, rows, cols);
     result.component_labels.assign(labelled.labels.begin(), labelled.labels.end());
     result.grouped_mask = result.seed_mask;
-    for (size_t label_index = 0; label_index < labelled.sizes.size(); ++label_index) {
+    const auto component_stats = build_component_stats(labelled);
+    for (size_t label_index = 0; label_index < component_stats.size(); ++label_index) {
       const int component_id = static_cast<int>(label_index) + 1;
-      int min_row = rows;
-      int max_row = -1;
-      int min_col = cols;
-      int max_col = -1;
-      int filled_area = 0;
-      float score_peak = 0.0f;
-      float score_sum = 0.0f;
-      for (int row = 0; row < rows; ++row) {
-        for (int col = 0; col < cols; ++col) {
-          const size_t flat = flat_index(cols, row, col);
-          if (labelled.labels[flat] != component_id) {
-            continue;
-          }
-          min_row = std::min(min_row, row);
-          max_row = std::max(max_row, row);
-          min_col = std::min(min_col, col);
-          max_col = std::max(max_col, col);
-          ++filled_area;
-          if (flat < score_map.size()) {
-            const float score = score_map[flat];
-            score_sum += score;
-            score_peak = std::max(score_peak, score);
-          }
-        }
-      }
-      if (filled_area <= 0 || max_row < min_row || max_col < min_col) {
+      const auto& component = component_stats[label_index];
+      if (component.filled_area <= 0 || component.max_row < component.min_row || component.max_col < component.min_col) {
         continue;
       }
       DetectionBox box;
-      box.freq_start = min_row;
-      box.freq_stop = max_row + 1;
-      box.time_start = min_col;
-      box.time_stop = max_col + 1;
-      box.filled_area = filled_area;
+      box.freq_start = component.min_row;
+      box.freq_stop = component.max_row + 1;
+      box.time_start = component.min_col;
+      box.time_stop = component.max_col + 1;
+      box.filled_area = component.filled_area;
       const int bbox_area = std::max(1, (box.freq_stop - box.freq_start) * (box.time_stop - box.time_start));
-      box.bbox_density = static_cast<float>(filled_area) / static_cast<float>(bbox_area);
+      box.bbox_density = static_cast<float>(component.filled_area) / static_cast<float>(bbox_area);
       box.envelope_density = box.bbox_density;
       box.density = box.bbox_density;
-      box.score_mean = filled_area > 0 ? score_sum / static_cast<float>(filled_area) : 0.0f;
-      box.score_peak = score_peak;
+      box.score_mean = component.filled_area > 0 ? component.score_sum / static_cast<float>(component.filled_area) : 0.0f;
+      box.score_peak = component.score_peak;
       box.parent_component_id = component_id;
       box.parent_component_ids = {component_id};
       result.boxes.push_back(std::move(box));
@@ -2994,6 +4469,7 @@ GroupingResult group_mask_regions(const std::vector<uint8_t>& mask,
 
   const auto labelled = label_components(result.bridged_mask, rows, cols);
   result.component_labels.assign(labelled.labels.begin(), labelled.labels.end());
+  auto component_stats = build_component_stats(labelled);
   std::vector<float> active_scores;
   active_scores.reserve(score_map.size());
   for (size_t index = 0; index < score_map.size() && index < result.seed_mask.size(); ++index) {
@@ -3003,90 +4479,75 @@ GroupingResult group_mask_regions(const std::vector<uint8_t>& mask,
   }
   result.peak_score_floor = quantile_from_values(active_scores, 0.50, 0.0f);
 
+  for (auto& component : component_stats) {
+    if (component.filled_area <= 0 || component.max_row < component.min_row || component.max_col < component.min_col) {
+      continue;
+    }
+    const int local_cols = component.max_col - component.min_col + 1;
+    component.col_min_row.assign(static_cast<size_t>(local_cols), rows);
+    component.col_max_row.assign(static_cast<size_t>(local_cols), -1);
+  }
+
+  for (size_t flat = 0; flat < labelled.labels.size(); ++flat) {
+    const int label = labelled.labels[flat];
+    if (label <= 0) {
+      continue;
+    }
+    auto& component = component_stats[static_cast<size_t>(label - 1)];
+    if (component.filled_area <= 0 || component.max_row < component.min_row || component.max_col < component.min_col) {
+      continue;
+    }
+    const int row = static_cast<int>(flat / static_cast<size_t>(cols));
+    const int col = static_cast<int>(flat % static_cast<size_t>(cols));
+    const size_t local_col = static_cast<size_t>(col - component.min_col);
+    component.col_min_row[local_col] = std::min(component.col_min_row[local_col], row);
+    component.col_max_row[local_col] = std::max(component.col_max_row[local_col], row);
+  }
+
   result.grouped_mask.assign(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
 
-  for (size_t label_index = 0; label_index < labelled.sizes.size(); ++label_index) {
+  for (size_t label_index = 0; label_index < component_stats.size(); ++label_index) {
     const int component_id = static_cast<int>(label_index) + 1;
-    int min_row = rows;
-    int max_row = -1;
-    int min_col = cols;
-    int max_col = -1;
-    int filled_area = 0;
-    std::vector<float> component_scores;
-    std::vector<uint8_t> component_local_mask;
-
-    for (int row = 0; row < rows; ++row) {
-      for (int col = 0; col < cols; ++col) {
-        const size_t flat = flat_index(cols, row, col);
-        if (labelled.labels[flat] != component_id) {
-          continue;
-        }
-        min_row = std::min(min_row, row);
-        max_row = std::max(max_row, row);
-        min_col = std::min(min_col, col);
-        max_col = std::max(max_col, col);
-        ++filled_area;
-      }
-    }
-    if (filled_area <= 0 || max_row < min_row || max_col < min_col) {
+    auto& component = component_stats[label_index];
+    if (component.filled_area <= 0 || component.max_row < component.min_row || component.max_col < component.min_col) {
       continue;
     }
 
-    const int freq_start = min_row;
-    const int freq_stop = max_row + 1;
-    const int time_start = min_col;
-    const int time_stop = max_col + 1;
+    const int freq_start = component.min_row;
+    const int freq_stop = component.max_row + 1;
+    const int time_start = component.min_col;
+    const int time_stop = component.max_col + 1;
     const int freq_span = freq_stop - freq_start;
     const int time_span = time_stop - time_start;
-    const int local_rows = freq_span;
-    const int local_cols = time_span;
-    component_local_mask.assign(static_cast<size_t>(local_rows) * static_cast<size_t>(local_cols), 0);
-    for (int row = freq_start; row < freq_stop; ++row) {
-      for (int col = time_start; col < time_stop; ++col) {
-        const size_t src_flat = flat_index(cols, row, col);
-        if (labelled.labels[src_flat] != component_id) {
-          continue;
-        }
-        const size_t dst_flat = flat_index(local_cols, row - freq_start, col - time_start);
-        component_local_mask[dst_flat] = 1;
-        if (src_flat < score_map.size()) {
-          component_scores.push_back(score_map[src_flat]);
-        }
+    const int bbox_area = std::max(1, freq_span * time_span);
+    int envelope_area = 0;
+    for (size_t local_col = 0; local_col < component.col_min_row.size(); ++local_col) {
+      if (component.col_max_row[local_col] >= component.col_min_row[local_col]) {
+        envelope_area += component.col_max_row[local_col] - component.col_min_row[local_col] + 1;
       }
     }
-
-    const int bbox_area = std::max(1, freq_span * time_span);
-    const int envelope_area = std::max(1, component_envelope_area(component_local_mask, local_rows, local_cols));
-    const float bbox_density = static_cast<float>(filled_area) / static_cast<float>(bbox_area);
-    const float envelope_density = static_cast<float>(filled_area) / static_cast<float>(envelope_area);
+    envelope_area = std::max(1, envelope_area);
+    const float bbox_density = static_cast<float>(component.filled_area) / static_cast<float>(bbox_area);
+    const float envelope_density = static_cast<float>(component.filled_area) / static_cast<float>(envelope_area);
     const float density = envelope_density;
-    const float score_peak = component_scores.empty() ? 0.0f : *std::max_element(component_scores.begin(), component_scores.end());
-    const float score_mean = component_scores.empty() ? 0.0f : std::accumulate(component_scores.begin(), component_scores.end(), 0.0f) /
-                                                        static_cast<float>(component_scores.size());
+    const float score_peak = component.score_peak;
+    const float score_mean = component.filled_area > 0 ? component.score_sum / static_cast<float>(component.filled_area) : 0.0f;
 
-    const bool keep = filled_area >= std::max(1, min_component_size) &&
+    component.keep = component.filled_area >= std::max(1, min_component_size) &&
                       freq_span >= std::max(1, min_freq_span_px) &&
                       time_span >= std::max(1, min_time_span_px) &&
                       density >= min_density &&
                       score_peak >= result.peak_score_floor;
-    if (!keep) {
+    if (!component.keep) {
       continue;
     }
 
-    for (int row = freq_start; row < freq_stop; ++row) {
-      for (int col = time_start; col < time_stop; ++col) {
-        const size_t src_flat = flat_index(cols, row, col);
-        if (labelled.labels[src_flat] == component_id) {
-          result.grouped_mask[src_flat] = 1;
-        }
-      }
-    }
     DetectionBox box;
     box.freq_start = freq_start;
     box.freq_stop = freq_stop;
     box.time_start = time_start;
     box.time_stop = time_stop;
-    box.filled_area = filled_area;
+    box.filled_area = component.filled_area;
     box.density = density;
     box.bbox_density = bbox_density;
     box.envelope_density = envelope_density;
@@ -3095,6 +4556,16 @@ GroupingResult group_mask_regions(const std::vector<uint8_t>& mask,
     box.parent_component_id = component_id;
     box.parent_component_ids = {component_id};
     result.boxes.push_back(std::move(box));
+  }
+
+  for (size_t flat = 0; flat < labelled.labels.size(); ++flat) {
+    const int label = labelled.labels[flat];
+    if (label <= 0) {
+      continue;
+    }
+    if (component_stats[static_cast<size_t>(label - 1)].keep) {
+      result.grouped_mask[flat] = 1;
+    }
   }
   return result;
 }
@@ -3136,14 +4607,65 @@ bool boxes_overlap(const DetectionBox& box_a, const DetectionBox& box_b) {
          box_a.time_start < box_b.time_stop && box_b.time_start < box_a.time_stop;
 }
 
+bool boxes_share_source_chunk(const DetectionBox& box_a, const DetectionBox& box_b) {
+  if (box_a.source_chunk_indices.empty() || box_b.source_chunk_indices.empty()) {
+    return false;
+  }
+  for (int lhs_chunk : box_a.source_chunk_indices) {
+    for (int rhs_chunk : box_b.source_chunk_indices) {
+      if (lhs_chunk == rhs_chunk) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool boxes_should_merge(const DetectionBox& box_a, const DetectionBox& box_b) {
   if (!boxes_overlap(box_a, box_b)) {
+    return false;
+  }
+  if (boxes_share_source_chunk(box_a, box_b)) {
     return false;
   }
   const bool carrier_burst_pair =
       (box_a.split_role == "persistent_carrier" && box_b.split_role == "transient_wideband_burst") ||
       (box_b.split_role == "persistent_carrier" && box_a.split_role == "transient_wideband_burst");
   return !carrier_burst_pair;
+}
+
+struct ChunkOwnershipRange {
+  int row_start = 0;
+  int row_stop = 0;
+};
+
+std::vector<ChunkOwnershipRange> compute_chunk_row_ownership_ranges(const std::vector<ChunkRetryResult>& chunk_results) {
+  std::vector<ChunkOwnershipRange> ownership(chunk_results.size());
+  for (size_t index = 0; index < chunk_results.size(); ++index) {
+    ownership[index].row_start = chunk_results[index].row_start;
+    ownership[index].row_stop = chunk_results[index].row_stop;
+  }
+  for (size_t index = 0; index + 1 < chunk_results.size(); ++index) {
+    const auto& current = chunk_results[index];
+    const auto& next = chunk_results[index + 1];
+    if (current.row_stop <= next.row_start) {
+      continue;
+    }
+    const int split_row = clamp_value((current.row_stop + next.row_start) / 2,
+                                      next.row_start,
+                                      current.row_stop);
+    ownership[index].row_stop = std::min(ownership[index].row_stop, split_row);
+    ownership[index + 1].row_start = std::max(ownership[index + 1].row_start, split_row);
+  }
+  for (size_t index = 0; index < ownership.size(); ++index) {
+    ownership[index].row_start = clamp_value(ownership[index].row_start,
+                                             chunk_results[index].row_start,
+                                             chunk_results[index].row_stop);
+    ownership[index].row_stop = clamp_value(ownership[index].row_stop,
+                                            ownership[index].row_start,
+                                            chunk_results[index].row_stop);
+  }
+  return ownership;
 }
 
 DetectionBox merge_box_cluster(const std::vector<DetectionBox>& cluster) {
@@ -3187,60 +4709,277 @@ DetectionBox merge_box_cluster(const std::vector<DetectionBox>& cluster) {
   return merged;
 }
 
+void rasterize_box_mask(std::vector<uint8_t>& mask,
+                        int rows,
+                        int cols,
+                        const DetectionBox& box,
+                        const std::vector<uint8_t>* valid_row_mask = nullptr) {
+  const int freq_start = clamp_value(box.freq_start, 0, rows);
+  const int freq_stop = clamp_value(box.freq_stop, freq_start, rows);
+  const int time_start = clamp_value(box.time_start, 0, cols);
+  const int time_stop = clamp_value(box.time_stop, time_start, cols);
+  if (freq_stop <= freq_start || time_stop <= time_start) {
+    return;
+  }
+  for (int row = freq_start; row < freq_stop; ++row) {
+    if (valid_row_mask != nullptr && row < static_cast<int>(valid_row_mask->size()) && !(*valid_row_mask)[static_cast<size_t>(row)]) {
+      continue;
+    }
+    auto* row_begin = mask.data() + static_cast<std::ptrdiff_t>(flat_index(cols, row, time_start));
+    std::fill(row_begin, row_begin + static_cast<std::ptrdiff_t>(time_stop - time_start), static_cast<uint8_t>(1));
+  }
+}
+
+void rasterize_box_score_max(std::vector<float>& score_map,
+                             int rows,
+                             int cols,
+                             const DetectionBox& box,
+                             float value,
+                             const std::vector<uint8_t>* valid_row_mask = nullptr) {
+  const int freq_start = clamp_value(box.freq_start, 0, rows);
+  const int freq_stop = clamp_value(box.freq_stop, freq_start, rows);
+  const int time_start = clamp_value(box.time_start, 0, cols);
+  const int time_stop = clamp_value(box.time_stop, time_start, cols);
+  if (freq_stop <= freq_start || time_stop <= time_start) {
+    return;
+  }
+  for (int row = freq_start; row < freq_stop; ++row) {
+    if (valid_row_mask != nullptr && row < static_cast<int>(valid_row_mask->size()) && !(*valid_row_mask)[static_cast<size_t>(row)]) {
+      continue;
+    }
+    auto* row_begin = score_map.data() + static_cast<std::ptrdiff_t>(flat_index(cols, row, time_start));
+    auto* row_end = row_begin + static_cast<std::ptrdiff_t>(time_stop - time_start);
+    for (auto* cursor = row_begin; cursor != row_end; ++cursor) {
+      *cursor = std::max(*cursor, value);
+    }
+  }
+}
+
+struct BoxSweepEvent {
+  int freq_start = 0;
+  int freq_stop = 0;
+  size_t index = 0;
+};
+
+struct BoxDisjointSet {
+  std::vector<size_t> parent;
+  std::vector<uint16_t> rank;
+
+  explicit BoxDisjointSet(size_t count) : parent(count), rank(count, 0) {
+    for (size_t index = 0; index < count; ++index) {
+      parent[index] = index;
+    }
+  }
+
+  size_t find(size_t index) {
+    size_t root = index;
+    while (parent[root] != root) {
+      root = parent[root];
+    }
+    while (parent[index] != index) {
+      const size_t next = parent[index];
+      parent[index] = root;
+      index = next;
+    }
+    return root;
+  }
+
+  void unite(size_t lhs, size_t rhs) {
+    lhs = find(lhs);
+    rhs = find(rhs);
+    if (lhs == rhs) {
+      return;
+    }
+    if (rank[lhs] < rank[rhs]) {
+      std::swap(lhs, rhs);
+    }
+    parent[rhs] = lhs;
+    if (rank[lhs] == rank[rhs]) {
+      ++rank[lhs];
+    }
+  }
+};
+
+std::vector<DetectionBox> merge_projected_boxes(const std::vector<DetectionBox>& projected_boxes) {
+  if (projected_boxes.empty()) {
+    return {};
+  }
+
+  std::vector<BoxSweepEvent> sweep_boxes(projected_boxes.size());
+  for (size_t index = 0; index < projected_boxes.size(); ++index) {
+    sweep_boxes[index] = BoxSweepEvent{projected_boxes[index].freq_start, projected_boxes[index].freq_stop, index};
+  }
+  std::sort(sweep_boxes.begin(), sweep_boxes.end(), [](const BoxSweepEvent& lhs, const BoxSweepEvent& rhs) {
+    if (lhs.freq_start != rhs.freq_start) {
+      return lhs.freq_start < rhs.freq_start;
+    }
+    if (lhs.freq_stop != rhs.freq_stop) {
+      return lhs.freq_stop < rhs.freq_stop;
+    }
+    return lhs.index < rhs.index;
+  });
+
+  BoxDisjointSet sets(projected_boxes.size());
+  std::vector<size_t> active_indices;
+  active_indices.reserve(projected_boxes.size());
+
+  for (const auto& current : sweep_boxes) {
+    const auto& current_box = projected_boxes[current.index];
+
+    size_t write_index = 0;
+    for (size_t read_index = 0; read_index < active_indices.size(); ++read_index) {
+      const size_t active_index = active_indices[read_index];
+      if (projected_boxes[active_index].freq_stop > current_box.freq_start) {
+        active_indices[write_index++] = active_index;
+      }
+    }
+    active_indices.resize(write_index);
+
+    for (const size_t active_index : active_indices) {
+      if (boxes_should_merge(projected_boxes[active_index], current_box)) {
+        sets.unite(active_index, current.index);
+      }
+    }
+
+    active_indices.push_back(current.index);
+  }
+
+  std::vector<std::vector<DetectionBox>> clusters(projected_boxes.size());
+  for (size_t index = 0; index < projected_boxes.size(); ++index) {
+    clusters[sets.find(index)].push_back(projected_boxes[index]);
+  }
+
+  std::vector<DetectionBox> merged_boxes;
+  merged_boxes.reserve(projected_boxes.size());
+  for (auto& cluster : clusters) {
+    if (!cluster.empty()) {
+      merged_boxes.push_back(merge_box_cluster(cluster));
+    }
+  }
+  return merged_boxes;
+}
+
 std::vector<uint8_t> boxes_to_mask(const std::vector<DetectionBox>& boxes,
                                    int rows,
                                    int cols,
                                    const std::vector<uint8_t>& valid_row_mask) {
   std::vector<uint8_t> mask(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
   for (const auto& box : boxes) {
-    const int freq_start = clamp_value(box.freq_start, 0, rows);
-    const int freq_stop = clamp_value(box.freq_stop, freq_start, rows);
-    const int time_start = clamp_value(box.time_start, 0, cols);
-    const int time_stop = clamp_value(box.time_stop, time_start, cols);
-    for (int row = freq_start; row < freq_stop; ++row) {
-      for (int col = time_start; col < time_stop; ++col) {
-        mask[flat_index(cols, row, col)] = 1;
-      }
-    }
-  }
-  for (int row = 0; row < rows; ++row) {
-    const bool row_valid = row < static_cast<int>(valid_row_mask.size()) ? static_cast<bool>(valid_row_mask[static_cast<size_t>(row)]) : true;
-    if (row_valid) {
-      continue;
-    }
-    for (int col = 0; col < cols; ++col) {
-      mask[flat_index(cols, row, col)] = 0;
-    }
+    rasterize_box_mask(mask, rows, cols, box, &valid_row_mask);
   }
   return mask;
 }
 
 GlobalMergedResult build_global_merged_result(const std::vector<ChunkRetryResult>& chunk_results,
+                                              const ValidatorConfig& config,
                                               int global_rows,
                                               int global_cols,
                                               const std::vector<uint8_t>& source_valid_row_mask) {
   GlobalMergedResult result;
+  const auto ownership_ranges = compute_chunk_row_ownership_ranges(chunk_results);
   result.projected_grouped_mask.assign(static_cast<size_t>(global_rows) * static_cast<size_t>(global_cols), 0);
   result.projected_grouped_score.assign(static_cast<size_t>(global_rows) * static_cast<size_t>(global_cols), 0.0f);
+  result.stitched_final_mask.assign(static_cast<size_t>(global_rows) * static_cast<size_t>(global_cols), 0);
+  int deferred_group_cols = 0;
   for (const auto& chunk : chunk_results) {
-    for (size_t box_index = 0; box_index < chunk.grouped_boxes.size(); ++box_index) {
-      const auto& box = chunk.grouped_boxes[box_index];
-      DetectionBox projected_box = box;
-      projected_box.freq_start = chunk.row_start + box.freq_start;
-      projected_box.freq_stop = chunk.row_start + box.freq_stop;
-      projected_box.source_chunk_indices = {chunk.chunk_index};
-      result.projected_boxes.push_back(projected_box);
-      const int freq_start = clamp_value(projected_box.freq_start, 0, global_rows);
-      const int freq_stop = clamp_value(projected_box.freq_stop, freq_start, global_rows);
-      const int time_start = clamp_value(projected_box.time_start, 0, global_cols);
-      const int time_stop = clamp_value(projected_box.time_stop, time_start, global_cols);
-      for (int row = freq_start; row < freq_stop; ++row) {
-        for (int col = time_start; col < time_stop; ++col) {
-          const size_t global_flat = flat_index(global_cols, row, col);
-          result.projected_grouped_mask[global_flat] = 1;
-          result.projected_grouped_score[global_flat] = std::max(result.projected_grouped_score[global_flat], projected_box.score_mean);
+    if (chunk.grouped_boxes.empty() && !chunk.final_mask.empty() && !chunk.combined_score.empty() && chunk.dst_rows > 0 && chunk.dst_cols > 0) {
+      deferred_group_cols = std::max(deferred_group_cols, chunk.dst_cols);
+    }
+  }
+  std::vector<uint8_t> deferred_group_mask(static_cast<size_t>(global_rows) * static_cast<size_t>(std::max(1, deferred_group_cols)), 0);
+  std::vector<float> deferred_group_score(static_cast<size_t>(global_rows) * static_cast<size_t>(std::max(1, deferred_group_cols)), 0.0f);
+  bool has_deferred_group_inputs = false;
+  auto append_projected_box = [&](const DetectionBox& box) {
+    result.projected_boxes.push_back(box);
+  };
+  for (size_t chunk_index = 0; chunk_index < chunk_results.size(); ++chunk_index) {
+    const auto& chunk = chunk_results[chunk_index];
+    const int projected_rows = clamp_value(chunk.row_stop - chunk.row_start, 0, global_rows);
+    const int owned_row_start = clamp_value(ownership_ranges[chunk_index].row_start, chunk.row_start, chunk.row_stop);
+    const int owned_row_stop = clamp_value(ownership_ranges[chunk_index].row_stop, owned_row_start, chunk.row_stop);
+    const int owned_projected_row_start = owned_row_start - chunk.row_start;
+    const int owned_projected_row_stop = owned_row_stop - chunk.row_start;
+    const auto row_nearest_global = build_nearest_resize_indices(chunk.dst_rows, projected_rows);
+    if (!chunk.final_mask.empty() && chunk.dst_rows > 0 && chunk.dst_cols > 0 && projected_rows > 0 &&
+        owned_projected_row_stop > owned_projected_row_start) {
+      const auto col_nearest_global = build_nearest_resize_indices(chunk.dst_cols, global_cols);
+      for (int local_row = owned_projected_row_start; local_row < owned_projected_row_stop; ++local_row) {
+        const int global_row = chunk.row_start + local_row;
+        if (global_row < 0 || global_row >= global_rows) {
+          continue;
+        }
+        const int src_row_nearest = row_nearest_global[static_cast<size_t>(local_row)];
+        for (int col = 0; col < global_cols; ++col) {
+          const size_t global_flat = flat_index(global_cols, global_row, col);
+          const int src_col_nearest = col_nearest_global[static_cast<size_t>(col)];
+          if (chunk.final_mask[flat_index(chunk.dst_cols, src_row_nearest, src_col_nearest)]) {
+            result.stitched_final_mask[global_flat] = 1;
+          }
         }
       }
+    }
+    if (!chunk.grouped_mask_source.empty() && !chunk.combined_score.empty() && chunk.src_rows > 0 && chunk.src_cols > 0 && chunk.dst_rows > 0 && chunk.dst_cols > 0 && projected_rows > 0 && owned_projected_row_stop > owned_projected_row_start) {
+      const auto row_linear_global = build_linear_resize_samples(chunk.dst_rows, projected_rows);
+      const auto col_linear_global = build_linear_resize_samples(chunk.dst_cols, global_cols);
+      for (int local_row = owned_projected_row_start; local_row < owned_projected_row_stop; ++local_row) {
+        const int global_row = chunk.row_start + local_row;
+        if (global_row < 0 || global_row >= global_rows) {
+          continue;
+        }
+        const auto& row_sample = row_linear_global[static_cast<size_t>(local_row)];
+        for (int col = 0; col < global_cols; ++col) {
+          const size_t global_flat = flat_index(global_cols, global_row, col);
+          if (chunk.grouped_mask_source[flat_index(chunk.src_cols, local_row, col)]) {
+            result.projected_grouped_mask[global_flat] = 1;
+            result.projected_grouped_score[global_flat] = std::max(
+                result.projected_grouped_score[global_flat],
+                sample_bilinear_resized_value(chunk.combined_score,
+                                              chunk.dst_cols,
+                                              row_sample,
+                                              col_linear_global[static_cast<size_t>(col)]));
+          }
+        }
+      }
+    }
+    if (deferred_group_cols > 0 && chunk.grouped_boxes.empty() && !chunk.final_mask.empty() && !chunk.combined_score.empty() && chunk.dst_rows > 0 && chunk.dst_cols > 0 && projected_rows > 0 && owned_projected_row_stop > owned_projected_row_start) {
+      has_deferred_group_inputs = true;
+      const auto col_nearest_deferred = build_nearest_resize_indices(chunk.dst_cols, deferred_group_cols);
+      const auto row_linear_deferred = build_linear_resize_samples(chunk.dst_rows, projected_rows);
+      const auto col_linear_deferred = build_linear_resize_samples(chunk.dst_cols, deferred_group_cols);
+      for (int local_row = owned_projected_row_start; local_row < owned_projected_row_stop; ++local_row) {
+        const int global_row = chunk.row_start + local_row;
+        if (global_row < 0 || global_row >= global_rows) {
+          continue;
+        }
+        const int src_row_nearest = row_nearest_global[static_cast<size_t>(local_row)];
+        const auto& row_sample = row_linear_deferred[static_cast<size_t>(local_row)];
+        for (int col = 0; col < deferred_group_cols; ++col) {
+          const size_t global_flat = flat_index(deferred_group_cols, global_row, col);
+          const int src_col_nearest = col_nearest_deferred[static_cast<size_t>(col)];
+          if (chunk.final_mask[flat_index(chunk.dst_cols, src_row_nearest, src_col_nearest)]) {
+            deferred_group_mask[global_flat] = 1;
+            deferred_group_score[global_flat] = std::max(
+                deferred_group_score[global_flat],
+                sample_bilinear_resized_value(chunk.combined_score,
+                                              chunk.dst_cols,
+                                              row_sample,
+                                              col_linear_deferred[static_cast<size_t>(col)]));
+          }
+        }
+      }
+      continue;
+    }
+    for (size_t box_index = 0; box_index < chunk.grouped_boxes.size(); ++box_index) {
+      const auto& box = chunk.grouped_boxes[box_index];
+      DetectionBox projected_box = scale_box_to_shape(box,
+                                                      chunk.dst_rows,
+                                                      chunk.dst_cols,
+                                                      projected_rows,
+                                                      global_cols);
+      projected_box.freq_start = chunk.row_start + projected_box.freq_start;
+      projected_box.freq_stop = chunk.row_start + projected_box.freq_stop;
+      projected_box.source_chunk_indices = {chunk.chunk_index};
+      append_projected_box(projected_box);
     }
   }
   for (int row = 0; row < global_rows; ++row) {
@@ -3248,37 +4987,51 @@ GlobalMergedResult build_global_merged_result(const std::vector<ChunkRetryResult
     if (row_valid) {
       continue;
     }
+    auto* grouped_mask_row = result.projected_grouped_mask.data() + static_cast<std::ptrdiff_t>(flat_index(global_cols, row, 0));
+    std::fill(grouped_mask_row, grouped_mask_row + global_cols, static_cast<uint8_t>(0));
+    auto* grouped_score_row = result.projected_grouped_score.data() + static_cast<std::ptrdiff_t>(flat_index(global_cols, row, 0));
+    std::fill(grouped_score_row, grouped_score_row + global_cols, 0.0f);
+    auto* deferred_mask_row = deferred_group_mask.data() + static_cast<std::ptrdiff_t>(flat_index(deferred_group_cols, row, 0));
+    std::fill(deferred_mask_row, deferred_mask_row + deferred_group_cols, static_cast<uint8_t>(0));
+    auto* deferred_score_row = deferred_group_score.data() + static_cast<std::ptrdiff_t>(flat_index(deferred_group_cols, row, 0));
+    std::fill(deferred_score_row, deferred_score_row + deferred_group_cols, 0.0f);
+  }
+  for (int row = 0; row < global_rows; ++row) {
+    const bool row_valid = row < static_cast<int>(source_valid_row_mask.size()) ? static_cast<bool>(source_valid_row_mask[static_cast<size_t>(row)]) : true;
+    if (row_valid) {
+      continue;
+    }
     for (int col = 0; col < global_cols; ++col) {
-      const size_t global_flat = flat_index(global_cols, row, col);
-      result.projected_grouped_mask[global_flat] = 0;
-      result.projected_grouped_score[global_flat] = 0.0f;
+      result.stitched_final_mask[flat_index(global_cols, row, col)] = 0;
     }
   }
 
-  std::vector<uint8_t> visited(result.projected_boxes.size(), 0);
-  for (size_t start_index = 0; start_index < result.projected_boxes.size(); ++start_index) {
-    if (visited[start_index]) {
-      continue;
+  if (has_deferred_group_inputs) {
+    const auto global_valid_mask = resize_row_valid_mask(source_valid_row_mask, global_rows, deferred_group_cols);
+    const auto deferred_grouping = group_mask_regions(deferred_group_mask,
+                                                      deferred_group_score,
+                                                      global_valid_mask,
+                                                      global_rows,
+                                                      deferred_group_cols,
+                                                      config.filter_detection_mask,
+                                                      config.grouping_bridge_freq_px,
+                                                      config.grouping_bridge_time_px,
+                                                      config.grouping_min_component_size,
+                                                      config.grouping_min_freq_span_px,
+                                                      config.grouping_min_time_span_px,
+                                                      static_cast<float>(config.grouping_min_density),
+                                                      static_cast<float>(config.grouping_time_continuity_ratio));
+    for (const auto& source_box : deferred_grouping.boxes) {
+      auto projected_box = scale_box_to_shape(source_box,
+                                              global_rows,
+                                              deferred_group_cols,
+                                              global_rows,
+                                              global_cols);
+      append_projected_box(projected_box);
     }
-    visited[start_index] = 1;
-    std::vector<size_t> pending = {start_index};
-    std::vector<DetectionBox> cluster;
-    while (!pending.empty()) {
-      const size_t current = pending.back();
-      pending.pop_back();
-      cluster.push_back(result.projected_boxes[current]);
-      for (size_t other_index = 0; other_index < result.projected_boxes.size(); ++other_index) {
-        if (visited[other_index]) {
-          continue;
-        }
-        if (boxes_should_merge(result.projected_boxes[current], result.projected_boxes[other_index])) {
-          visited[other_index] = 1;
-          pending.push_back(other_index);
-        }
-      }
-    }
-    result.merged_boxes.push_back(merge_box_cluster(cluster));
   }
+
+  result.merged_boxes = merge_projected_boxes(result.projected_boxes);
   result.merged_box_mask = boxes_to_mask(result.merged_boxes, global_rows, global_cols, source_valid_row_mask);
   return result;
 }
@@ -3403,6 +5156,7 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
                                                   const ChunkPlanEntry& chunk,
                                                   const std::vector<float>& power_db,
                                                   const std::vector<float>& corrected_db,
+                                                  const float* corrected_full_frame_device,
                                                   int full_rows,
                                                   int full_cols,
                                                   double resolution_hz,
@@ -3432,12 +5186,17 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
   std::vector<float> power_chunk;
   std::vector<float> corrected_chunk;
   std::vector<uint8_t> source_chunk_valid_rows;
+  const bool need_power_chunk = runtime_config.compute_power_score;
   {
-    const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * sizeof(float) * 2 +
+    const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * sizeof(float) * (need_power_chunk ? 2 : 1) +
                                    static_cast<size_t>(result.src_rows) * sizeof(uint8_t);
     ScopedStageProfile stage(profiler, "chunk_extract_preprocess", "chunk", result.chunk_index, estimated_bytes, verbose);
-    power_chunk = slice_rows(power_db, full_rows, full_cols, chunk.row_start, chunk.row_stop);
-    corrected_chunk = slice_rows(corrected_db, full_rows, full_cols, chunk.row_start, chunk.row_stop);
+    if (need_power_chunk) {
+      power_chunk = slice_rows(power_db, full_rows, full_cols, chunk.row_start, chunk.row_stop);
+    }
+    if (keep_debug_artifacts || corrected_full_frame_device == nullptr) {
+      corrected_chunk = slice_rows(corrected_db, full_rows, full_cols, chunk.row_start, chunk.row_stop);
+    }
     source_chunk_valid_rows.assign(static_cast<size_t>(result.src_rows), 1);
     for (int row = 0; row < result.src_rows; ++row) {
       const int src_row = chunk.row_start + row;
@@ -3450,20 +5209,40 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
   {
     const size_t estimated_bytes = static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols) * sizeof(uint8_t);
     ScopedStageProfile stage(profiler, "chunk_valid_mask_resize", "chunk", result.chunk_index, estimated_bytes, verbose);
-    result.valid_mask = resize_row_valid_mask(source_chunk_valid_rows, result.dst_rows, result.dst_cols);
+    if (keep_debug_artifacts) {
+      result.valid_mask = resize_row_valid_mask(source_chunk_valid_rows, result.dst_rows, result.dst_cols);
+    }
   }
   const int runtime_rows = std::max(config.patch_size,
-                                    (std::max(1, result.src_rows) / std::max(1, config.patch_size)) * std::max(1, config.patch_size));
+                                    (std::max(config.patch_size, config.input_height) / std::max(1, config.patch_size)) * std::max(1, config.patch_size));
   const int runtime_cols = std::max(config.patch_size,
-                                    (std::max(1, result.src_cols) / std::max(1, config.patch_size)) * std::max(1, config.patch_size));
+                                    (std::max(config.patch_size, config.input_width) / std::max(1, config.patch_size)) * std::max(1, config.patch_size));
   result.ignore_bins_per_side = 0;
 
-  const size_t chunk_bytes = power_chunk.size() * sizeof(float);
+  const size_t chunk_elements = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols);
+  const size_t chunk_bytes = chunk_elements * sizeof(float);
   {
-    ScopedStageProfile stage(profiler, "chunk_gpu_upload", "chunk", result.chunk_index, chunk_bytes * 2, verbose);
-    gpu_workspace.ensure_capacity(power_chunk.size());
-    if (cudaMemcpyAsync(gpu_workspace.power_chunk_device, power_chunk.data(), chunk_bytes, cudaMemcpyHostToDevice, gpu_workspace.stream) != cudaSuccess ||
-        cudaMemcpyAsync(gpu_workspace.corrected_chunk_device, corrected_chunk.data(), chunk_bytes, cudaMemcpyHostToDevice, gpu_workspace.stream) != cudaSuccess) {
+    const size_t estimated_bytes = chunk_bytes * (need_power_chunk ? 2 : 1);
+    ScopedStageProfile stage(profiler, "chunk_gpu_upload", "chunk", result.chunk_index, estimated_bytes, verbose);
+    gpu_workspace.ensure_capacity(chunk_elements);
+    cudaError_t corrected_copy_status = cudaSuccess;
+    if (corrected_full_frame_device == nullptr) {
+      corrected_copy_status = cudaMemcpyAsync(gpu_workspace.corrected_chunk_device,
+                                              corrected_chunk.data(),
+                                              chunk_bytes,
+                                              cudaMemcpyHostToDevice,
+                                              gpu_workspace.stream);
+    } else {
+      copy_rows_device_to_device(corrected_full_frame_device,
+                                 full_cols,
+                                 chunk.row_start,
+                                 result.src_rows,
+                                 gpu_workspace.corrected_chunk_device,
+                                 gpu_workspace.stream);
+    }
+    if ((need_power_chunk &&
+         cudaMemcpyAsync(gpu_workspace.power_chunk_device, power_chunk.data(), chunk_bytes, cudaMemcpyHostToDevice, gpu_workspace.stream) != cudaSuccess) ||
+        corrected_copy_status != cudaSuccess) {
       throw std::runtime_error("failed to upload chunk tensors for offline DINO validator");
     }
   }
@@ -3477,7 +5256,7 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
   runtime_input.cuda_stream = gpu_workspace.stream;
   runtime_input.resolution_hz = resolution_hz;
   runtime_input.span_hz = result.span_hz;
-  runtime_input.power_db_device = gpu_workspace.power_chunk_device;
+  runtime_input.power_db_device = need_power_chunk ? gpu_workspace.power_chunk_device : nullptr;
   runtime_input.corrected_db_device = gpu_workspace.corrected_chunk_device;
 
   auto chunk_runtime_config = runtime_config;
@@ -3489,6 +5268,10 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
     ScopedStageProfile stage(profiler, "chunk_torch_runtime", "chunk", result.chunk_index, chunk_bytes * 2, verbose);
     runtime_result = runtime.run(chunk_runtime_config, runtime_input);
   }
+  record_timed_stage(profiler, "chunk_model_prep", "chunk", result.chunk_index, runtime_result.timing.model_prep_ms);
+  record_timed_stage(profiler, "chunk_torch_forward", "chunk", result.chunk_index, runtime_result.timing.torch_forward_ms);
+  record_timed_stage(profiler, "chunk_dino_score", "chunk", result.chunk_index, runtime_result.timing.dino_score_ms);
+  record_timed_stage(profiler, "chunk_score_to_cpu", "chunk", result.chunk_index, runtime_result.timing.score_to_cpu_ms);
 
   if (!runtime_result.success) {
     throw std::runtime_error("chunk DINO runtime failed at " + runtime_result.error_stage + ": " + runtime_result.error_message + " (" + runtime_result.error_detail + ")");
@@ -3525,28 +5308,35 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
   {
     const size_t estimated_bytes = static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols) * sizeof(float) * 3;
     ScopedStageProfile stage(profiler, "chunk_score_projection", "chunk", result.chunk_index, estimated_bytes, verbose);
-    raw_aligned_score = resize_bilinear(runtime_result.score_map,
-                                        runtime_rows,
-                                        runtime_cols,
-                                        runtime_result.aligned_rows,
-                                        runtime_result.aligned_cols);
-    if (!runtime_result.patch_features.empty() && result.patch_rows > 0 && result.patch_cols > 0 && result.feature_dim > 0) {
-      const auto raw_patch_score = raw_feature_energy_score_patch(runtime_result.patch_features,
-                                                                  result.patch_rows,
-                                                                  result.patch_cols,
-                                                                  result.feature_dim);
-      raw_dino_score_map = project_patch_map_to_output(raw_patch_score,
-                                                       result.patch_rows,
-                                                       result.patch_cols,
-                                                       runtime_result.aligned_rows,
-                                                       runtime_result.aligned_cols,
-                                                       result.src_rows,
-                                                       result.src_cols,
-                                                       runtime_row_offset,
-                                                       runtime_col_offset,
-                                                       result.dst_rows,
-                                                       result.dst_cols);
+    if (runtime_rows == runtime_result.aligned_rows && runtime_cols == runtime_result.aligned_cols) {
+      raw_aligned_score = std::move(runtime_result.score_map);
     } else {
+      raw_aligned_score = resize_bilinear(runtime_result.score_map,
+                                          runtime_rows,
+                                          runtime_cols,
+                                          runtime_result.aligned_rows,
+                                          runtime_result.aligned_cols);
+    }
+    if (!runtime_result.patch_features.empty() && result.patch_rows > 0 && result.patch_cols > 0 && result.feature_dim > 0) {
+      if (keep_debug_artifacts) {
+        const auto raw_patch_score = raw_feature_energy_score_patch(runtime_result.patch_features,
+                                                                    result.patch_rows,
+                                                                    result.patch_cols,
+                                                                    result.feature_dim);
+        raw_dino_score_map = project_patch_map_to_output(raw_patch_score,
+                                                         result.patch_rows,
+                                                         result.patch_cols,
+                                                         runtime_result.aligned_rows,
+                                                         runtime_result.aligned_cols,
+                                                         result.src_rows,
+                                                         result.src_cols,
+                                                         runtime_row_offset,
+                                                         runtime_col_offset,
+                                                         result.dst_rows,
+                                                         result.dst_cols,
+                                                         runtime_result.input_resized_to_target);
+      }
+    } else if (keep_debug_artifacts) {
       raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
                                                          runtime_result.aligned_rows,
                                                          runtime_result.aligned_cols,
@@ -3555,32 +5345,36 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
                                                          runtime_row_offset,
                                                          runtime_col_offset,
                                                          result.dst_rows,
-                                                         result.dst_cols);
+                                                         result.dst_cols,
+                                                         runtime_result.input_resized_to_target);
     }
-    grouped_score_patch = normalize01_quantile(raw_aligned_score, 5.0, 95.0);
-    if (keep_debug_artifacts && !runtime_result.patch_features.empty() && result.patch_rows > 0 && result.patch_cols > 0 && result.feature_dim > 0) {
-      const auto seed_patch = dino_seed_patch_map(corrected_chunk,
-                                                  result.src_rows,
-                                                  result.src_cols,
-                                                  runtime_rows,
-                                                  runtime_cols,
-                                                  result.patch_rows,
-                                                  result.patch_cols);
-      const auto grouped_patch = grouped_dino_from_patch_features(runtime_result.patch_features,
-                                                                  result.patch_rows,
-                                                                  result.patch_cols,
-                                                                  result.feature_dim,
-                                                                  seed_patch,
-                                                                  config,
-                                                                  verbose && keep_debug_artifacts,
-                                                                  "debug_chunk_grouped_patch");
-      if (!grouped_patch.score_patch.empty()) {
-        grouped_score_patch = grouped_patch.score_patch;
-        grouped_score_rows = result.patch_rows;
-        grouped_score_cols = result.patch_cols;
-        grouped_score_is_patch_grid = true;
-      }
+    if (runtime_result.patch_features.empty() || result.patch_rows <= 0 || result.patch_cols <= 0 || result.feature_dim <= 0) {
+      throw std::runtime_error("debug chunk grouped score requires patch features");
     }
+    const size_t debug_estimated_bytes = static_cast<size_t>(result.patch_rows) * static_cast<size_t>(result.patch_cols) * sizeof(float) * 8;
+    ScopedStageProfile debug_stage(profiler, "chunk_grouped_patch_debug", "chunk", result.chunk_index, debug_estimated_bytes, verbose);
+    const auto seed_patch = dino_seed_patch_map(corrected_chunk,
+                                                result.src_rows,
+                                                result.src_cols,
+                                                runtime_rows,
+                                                runtime_cols,
+                                                result.patch_rows,
+                                                result.patch_cols);
+    const auto grouped_patch = grouped_dino_from_patch_features(runtime_result.patch_features,
+                                                                result.patch_rows,
+                                                                result.patch_cols,
+                                                                result.feature_dim,
+                                                                seed_patch,
+                                                                config,
+                                                                verbose && keep_debug_artifacts,
+                                                                "debug_chunk_grouped_patch");
+    if (grouped_patch.score_patch.empty()) {
+      throw std::runtime_error("debug chunk grouped patch score is empty");
+    }
+    grouped_score_patch = grouped_patch.score_patch;
+    grouped_score_rows = result.patch_rows;
+    grouped_score_cols = result.patch_cols;
+    grouped_score_is_patch_grid = true;
   }
   if (keep_debug_artifacts) {
     result.raw_dino_score_map = raw_dino_score_map;
@@ -3590,32 +5384,28 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
   {
     const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * sizeof(float) * 2;
     ScopedStageProfile stage(profiler, "chunk_grouped_score_remap", "chunk", result.chunk_index, estimated_bytes, verbose);
-    grouped_dino_score_source = grouped_score_is_patch_grid
-                                    ? project_patch_map_to_output(grouped_score_patch,
-                                                                  grouped_score_rows,
-                                                                  grouped_score_cols,
-                                                                  runtime_result.aligned_rows,
-                                                                  runtime_result.aligned_cols,
-                                                                  result.src_rows,
-                                                                  result.src_cols,
-                                                                  runtime_row_offset,
-                                                                  runtime_col_offset,
-                                                                  result.src_rows,
-                                                                  result.src_cols)
-                                    : project_aligned_map_to_output(grouped_score_patch,
-                                                                    grouped_score_rows,
-                                                                    grouped_score_cols,
-                                                                    result.src_rows,
-                                                                    result.src_cols,
-                                                                    runtime_row_offset,
-                                                                    runtime_col_offset,
-                                                                    result.src_rows,
-                                                                    result.src_cols);
-    grouped_dino_score_map = resize_bilinear(grouped_dino_score_source,
-                                             result.src_rows,
-                                             result.src_cols,
-                                             result.dst_rows,
-                                             result.dst_cols);
+    if (!grouped_score_is_patch_grid) {
+      throw std::runtime_error("debug chunk grouped score must come from patch-feature grouping");
+    }
+    grouped_dino_score_source = project_patch_map_to_output(grouped_score_patch,
+                                                            grouped_score_rows,
+                                                            grouped_score_cols,
+                                                            runtime_result.aligned_rows,
+                                                            runtime_result.aligned_cols,
+                                                            result.src_rows,
+                                                            result.src_cols,
+                                                            runtime_row_offset,
+                                                            runtime_col_offset,
+                                                            result.src_rows,
+                                                            result.src_cols,
+                                                            runtime_result.input_resized_to_target);
+    if (keep_debug_artifacts) {
+      grouped_dino_score_map = resize_bilinear(grouped_dino_score_source,
+                                               result.src_rows,
+                                               result.src_cols,
+                                               result.dst_rows,
+                                               result.dst_cols);
+    }
   }
   if (keep_debug_artifacts) {
     result.dino_score_map = grouped_dino_score_map;
@@ -3628,17 +5418,19 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
     const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * (sizeof(uint8_t) + sizeof(float)) +
                                    static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols) * sizeof(float);
     ScopedStageProfile stage(profiler, "chunk_coherence", "chunk", result.chunk_index, estimated_bytes, verbose);
-    source_chunk_valid_mask = resize_row_valid_mask(source_chunk_valid_rows, result.src_rows, result.src_cols);
     source_chunk_coherence_gate = structure_tensor_gate_gpu(gpu_workspace.corrected_chunk_device,
                                                             result.src_rows,
                                                             result.src_cols,
-                                                            source_chunk_valid_mask,
+                                                            source_chunk_valid_rows,
                                                             gpu_workspace.stream);
-    coherence_gate = resize_bilinear(source_chunk_coherence_gate,
-                                     result.src_rows,
-                                     result.src_cols,
-                                     result.dst_rows,
-                                     result.dst_cols);
+    source_chunk_valid_mask = resize_row_valid_mask(source_chunk_valid_rows, result.src_rows, result.src_cols);
+    if (keep_debug_artifacts) {
+      coherence_gate = resize_bilinear(source_chunk_coherence_gate,
+                                       result.src_rows,
+                                       result.src_cols,
+                                       result.dst_rows,
+                                       result.dst_cols);
+    }
   }
   if (keep_debug_artifacts) {
     result.coherence_gate = coherence_gate;
@@ -3651,6 +5443,332 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
   return artifacts;
 }
 
+std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::ops::DinoTorchRuntime& runtime,
+                                                                     const holoscan::ops::DinoTorchRuntimeConfig& runtime_config,
+                                                                     const ValidatorConfig& config,
+                                                                     const std::vector<ChunkPlanEntry>& chunks,
+                                                                     const std::vector<float>& power_db,
+                                                                     const std::vector<float>& corrected_db,
+                                                                     const float* corrected_full_frame_device,
+                                                                     int full_rows,
+                                                                     int full_cols,
+                                                                     double resolution_hz,
+                                                                     const std::vector<uint8_t>& source_valid_row_mask,
+                                                                     ChunkGpuWorkspace& gpu_workspace,
+                                                                     StageProfiler* profiler,
+                                                                     bool verbose) {
+  std::vector<ChunkInferenceArtifacts> artifacts_batch(chunks.size());
+  if (chunks.empty()) {
+    return artifacts_batch;
+  }
+  if (runtime_config.compute_power_score) {
+    throw std::runtime_error("batched chunk inference currently requires compute_power_score=false");
+  }
+
+  const int uniform_rows = chunk_row_count(chunks.front());
+  const int src_cols = full_cols;
+  if (uniform_rows <= 0 || src_cols <= 0) {
+    return artifacts_batch;
+  }
+  for (const auto& chunk : chunks) {
+    if (chunk_row_count(chunk) != uniform_rows) {
+      throw std::runtime_error("batched chunk inference requires uniform chunk row counts");
+    }
+  }
+
+  const size_t batch_size = chunks.size();
+  const size_t chunk_elements = static_cast<size_t>(uniform_rows) * static_cast<size_t>(src_cols);
+  const size_t total_elements = batch_size * chunk_elements;
+  std::vector<float> corrected_batch;
+  if (corrected_full_frame_device == nullptr) {
+    corrected_batch.assign(total_elements, 0.0f);
+  }
+  std::vector<std::vector<uint8_t>> source_chunk_valid_rows(batch_size, std::vector<uint8_t>(static_cast<size_t>(uniform_rows), 1));
+
+  {
+    const size_t estimated_bytes = total_elements * sizeof(float) + batch_size * static_cast<size_t>(uniform_rows) * sizeof(uint8_t);
+    ScopedStageProfile stage(profiler, "chunk_extract_preprocess_batch", "run", -1, estimated_bytes, verbose);
+    for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+      auto& artifacts = artifacts_batch[batch_index];
+      auto& result = artifacts.result;
+      const auto& chunk = chunks[batch_index];
+      artifacts.keep_debug_artifacts = false;
+      result.chunk_index = chunk.chunk_index;
+      result.row_start = chunk.row_start;
+      result.row_stop = chunk.row_stop;
+      result.src_rows = uniform_rows;
+      result.src_cols = src_cols;
+      result.dst_rows = config.input_height;
+      result.dst_cols = config.input_width;
+      result.freq_start_hz = chunk.freq_start_hz;
+      result.freq_stop_hz = chunk.freq_stop_hz;
+      result.span_hz = std::max(0.0, chunk.freq_stop_hz - chunk.freq_start_hz);
+
+      if (corrected_full_frame_device == nullptr) {
+        auto corrected_chunk = slice_rows(corrected_db, full_rows, full_cols, chunk.row_start, chunk.row_stop);
+        std::copy(corrected_chunk.begin(),
+                  corrected_chunk.end(),
+                  corrected_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * chunk_elements));
+      }
+      for (int row = 0; row < uniform_rows; ++row) {
+        const int src_row = chunk.row_start + row;
+        if (src_row >= 0 && src_row < static_cast<int>(source_valid_row_mask.size())) {
+          source_chunk_valid_rows[batch_index][static_cast<size_t>(row)] = source_valid_row_mask[static_cast<size_t>(src_row)];
+        }
+      }
+    }
+  }
+
+  const int runtime_rows = std::max(config.patch_size,
+                                    (std::max(config.patch_size, config.input_height) / std::max(1, config.patch_size)) * std::max(1, config.patch_size));
+  const int runtime_cols = std::max(config.patch_size,
+                                    (std::max(config.patch_size, config.input_width) / std::max(1, config.patch_size)) * std::max(1, config.patch_size));
+
+  {
+    const size_t estimated_bytes = total_elements * sizeof(float);
+    ScopedStageProfile stage(profiler, "chunk_gpu_upload_batch", "run", -1, estimated_bytes, verbose);
+    gpu_workspace.ensure_capacity(total_elements);
+    cudaError_t corrected_copy_status = cudaSuccess;
+    if (corrected_full_frame_device == nullptr) {
+      corrected_copy_status = cudaMemcpyAsync(gpu_workspace.corrected_chunk_device,
+                                              corrected_batch.data(),
+                                              total_elements * sizeof(float),
+                                              cudaMemcpyHostToDevice,
+                                              gpu_workspace.stream);
+    } else {
+      for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+        copy_rows_device_to_device(corrected_full_frame_device,
+                                   full_cols,
+                                   chunks[batch_index].row_start,
+                                   uniform_rows,
+                                   gpu_workspace.corrected_chunk_device + batch_index * chunk_elements,
+                                   gpu_workspace.stream);
+      }
+    }
+    if (corrected_copy_status != cudaSuccess) {
+      throw std::runtime_error("failed to upload corrected batch tensors for offline DINO validator");
+    }
+  }
+
+  holoscan::ops::DinoTorchRuntimeBatchInput runtime_input;
+  runtime_input.batch_size = static_cast<int>(batch_size);
+  runtime_input.src_rows = uniform_rows;
+  runtime_input.src_cols = src_cols;
+  runtime_input.dst_rows = runtime_rows;
+  runtime_input.dst_cols = runtime_cols;
+  runtime_input.patch_size = config.patch_size;
+  runtime_input.cuda_stream = gpu_workspace.stream;
+  runtime_input.resolution_hz = resolution_hz;
+  runtime_input.span_hz = static_cast<double>(uniform_rows) * resolution_hz;
+  runtime_input.corrected_db_batch_device = gpu_workspace.corrected_chunk_device;
+
+  auto chunk_runtime_config = runtime_config;
+  chunk_runtime_config.ignore_sideband_hz = 0.0;
+  chunk_runtime_config.return_pre_model_gray = false;
+  chunk_runtime_config.return_patch_features = true;
+  chunk_runtime_config.return_final_mask_device = false;
+  holoscan::ops::DinoTorchRuntimeBatchResult runtime_result;
+  {
+    ScopedStageProfile stage(profiler, "chunk_torch_runtime_batch", "run", -1, total_elements * sizeof(float), verbose);
+    runtime_result = runtime.run_batch(chunk_runtime_config, runtime_input);
+  }
+  record_timed_stage(profiler, "chunk_model_prep_batch", "run", -1, runtime_result.timing.model_prep_ms);
+  record_timed_stage(profiler, "chunk_torch_forward_batch", "run", -1, runtime_result.timing.torch_forward_ms);
+  record_timed_stage(profiler, "chunk_dino_score_batch", "run", -1, runtime_result.timing.dino_score_ms);
+  record_timed_stage(profiler, "chunk_score_to_cpu_batch", "run", -1, runtime_result.timing.score_to_cpu_ms);
+  if (!runtime_result.success) {
+    throw std::runtime_error("batched chunk DINO runtime failed at " + runtime_result.error_stage + ": " + runtime_result.error_message + " (" + runtime_result.error_detail + ")");
+  }
+
+  const size_t runtime_elements = static_cast<size_t>(runtime_rows) * static_cast<size_t>(runtime_cols);
+  std::vector<uint8_t> source_valid_row_mask_batch(batch_size * static_cast<size_t>(uniform_rows), 1);
+  for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+    std::copy(source_chunk_valid_rows[batch_index].begin(),
+              source_chunk_valid_rows[batch_index].end(),
+              source_valid_row_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * static_cast<size_t>(uniform_rows)));
+  }
+  std::vector<uint8_t> source_valid_mask_batch(total_elements, 0);
+  for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+    for (int row = 0; row < uniform_rows; ++row) {
+      const uint8_t row_valid = source_chunk_valid_rows[batch_index][static_cast<size_t>(row)];
+      std::fill_n(source_valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * chunk_elements + static_cast<size_t>(row) * static_cast<size_t>(src_cols)),
+                  src_cols,
+                  row_valid);
+    }
+  }
+
+  std::vector<float> source_coherence_batch;
+  torch::Tensor source_coherence_batch_tensor;
+  {
+    const size_t estimated_bytes = total_elements * (sizeof(uint8_t) + sizeof(float));
+    const auto coherence_start = std::chrono::steady_clock::now();
+    source_coherence_batch_tensor = structure_tensor_gate_gpu_batch_tensor(gpu_workspace.corrected_chunk_device,
+                                                                           static_cast<int>(batch_size),
+                                                                           uniform_rows,
+                                                                           src_cols,
+                                                                           source_valid_row_mask_batch,
+                                                                           gpu_workspace.stream);
+    if (!source_coherence_batch_tensor.defined()) {
+      source_coherence_batch = structure_tensor_gate_gpu_batch(gpu_workspace.corrected_chunk_device,
+                                                               static_cast<int>(batch_size),
+                                                               uniform_rows,
+                                                               src_cols,
+                                                               source_valid_row_mask_batch,
+                                                               gpu_workspace.stream);
+    }
+    const double coherence_elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - coherence_start).count();
+    const double per_chunk_elapsed_ms = batch_size > 0 ? coherence_elapsed_ms / static_cast<double>(batch_size) : 0.0;
+    for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+      record_timed_stage(profiler,
+                         "chunk_coherence",
+                         "chunk",
+                         chunks[batch_index].chunk_index,
+                         per_chunk_elapsed_ms);
+    }
+  }
+  if (!source_coherence_batch_tensor.defined() && source_coherence_batch.size() != total_elements) {
+    throw std::runtime_error("unexpected batched coherence map size returned from GPU helper");
+  }
+
+  if (runtime_result.score_maps_device != nullptr && source_coherence_batch_tensor.defined()) {
+    torch::InferenceMode inference_mode_guard(true);
+    const c10::Device compute_device(torch::kCUDA, 0);
+    const auto torch_stream = gpu_workspace.stream
+                                  ? c10::cuda::getStreamFromExternal(gpu_workspace.stream, compute_device.index())
+                                  : c10::cuda::getDefaultCUDAStream(compute_device.index());
+    c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
+    auto runtime_score_batch = torch::from_blob(const_cast<float*>(runtime_result.score_maps_device),
+                          {static_cast<int64_t>(batch_size), static_cast<int64_t>(runtime_rows), static_cast<int64_t>(runtime_cols)},
+                          torch::TensorOptions().dtype(torch::kFloat32).device(compute_device))
+                     .contiguous();
+    auto grouped_score_batch = normalize_map01_quantile_torch_batch(runtime_score_batch, 0.05, 0.95);
+    auto grouped_score_source_batch = project_aligned_map_to_output_torch_batch(grouped_score_batch,
+                                          uniform_rows,
+                                          src_cols,
+                                          uniform_rows,
+                                          src_cols,
+                                          runtime_result.input_resized_to_target);
+    auto hybrid_results = run_residual_veto_hybrid_gpu_batch_device_inputs(grouped_score_source_batch,
+                                                                           source_coherence_batch_tensor,
+                                                                           source_valid_mask_batch,
+                                                                           static_cast<int>(batch_size),
+                                                                           uniform_rows,
+                                                                           src_cols,
+                                                                           use_fp16_precision(config.hybrid_torch_dtype));
+    if (hybrid_results.size() != batch_size) {
+      throw std::runtime_error("GPU batch hybrid postprocess returned an unexpected result count");
+    }
+    record_timed_stage(profiler, "chunk_hybrid_norm_batch_cpu", "run", -1, 0.0);
+    for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+      auto& artifacts = artifacts_batch[batch_index];
+      auto& result = artifacts.result;
+      result.ignore_bins_per_side = 0;
+      result.dino_threshold = batch_index < runtime_result.dino_thresholds.size()
+                                  ? runtime_result.dino_thresholds[batch_index]
+                                  : chunk_runtime_config.pipeline_final_threshold;
+      result.runtime_final_threshold = batch_index < runtime_result.final_thresholds.size()
+                                           ? runtime_result.final_thresholds[batch_index]
+                                           : result.dino_threshold;
+      artifacts.source_chunk_valid_mask.assign(
+          source_valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * chunk_elements),
+          source_valid_mask_batch.begin() + static_cast<std::ptrdiff_t>((batch_index + 1) * chunk_elements));
+      artifacts.precomputed_hybrid_result_source = std::move(hybrid_results[batch_index]);
+      artifacts.has_precomputed_hybrid_result = true;
+    }
+    return artifacts_batch;
+  }
+
+  if (source_coherence_batch.empty() && source_coherence_batch_tensor.defined()) {
+    auto source_coherence_batch_cpu = source_coherence_batch_tensor.to(torch::kCPU, torch::kFloat32).contiguous();
+    source_coherence_batch.resize(static_cast<size_t>(source_coherence_batch_cpu.numel()), 0.0f);
+    if (!source_coherence_batch.empty()) {
+      std::memcpy(source_coherence_batch.data(), source_coherence_batch_cpu.data_ptr<float>(), source_coherence_batch.size() * sizeof(float));
+    }
+  }
+
+  if (source_coherence_batch.size() != total_elements) {
+    throw std::runtime_error("unexpected batched coherence map size returned from GPU helper");
+  }
+
+  if (runtime_result.score_maps.size() != batch_size * runtime_elements) {
+    throw std::runtime_error("unexpected batched DINO score map size returned from runtime");
+  }
+
+  for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+    auto& artifacts = artifacts_batch[batch_index];
+    auto& result = artifacts.result;
+    result.ignore_bins_per_side = 0;
+    result.dino_threshold = batch_index < runtime_result.dino_thresholds.size()
+                                ? runtime_result.dino_thresholds[batch_index]
+                                : chunk_runtime_config.pipeline_final_threshold;
+    result.runtime_final_threshold = batch_index < runtime_result.final_thresholds.size()
+                                         ? runtime_result.final_thresholds[batch_index]
+                                         : result.dino_threshold;
+
+    const int runtime_row_offset = 0;
+    const int runtime_col_offset = 0;
+    std::vector<float> raw_aligned_score(runtime_result.score_maps.begin() + static_cast<std::ptrdiff_t>(batch_index * runtime_elements),
+                                         runtime_result.score_maps.begin() + static_cast<std::ptrdiff_t>((batch_index + 1) * runtime_elements));
+    std::vector<float> grouped_score_patch;
+    {
+      const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * sizeof(float);
+      ScopedStageProfile stage(profiler, "chunk_score_projection", "chunk", result.chunk_index, estimated_bytes, verbose);
+      if (runtime_result.patch_features_batch.empty() || runtime_result.patch_rows <= 0 || runtime_result.patch_cols <= 0 || runtime_result.feature_dim <= 0) {
+        throw std::runtime_error("batched grouped score requires patch features");
+      }
+      const size_t patch_count = static_cast<size_t>(runtime_result.patch_rows) * static_cast<size_t>(runtime_result.patch_cols);
+      const size_t feature_dim = static_cast<size_t>(runtime_result.feature_dim);
+      const size_t sample_offset = batch_index * patch_count * feature_dim;
+      if (sample_offset + patch_count * feature_dim > runtime_result.patch_features_batch.size()) {
+        throw std::runtime_error("batched grouped score patch feature slice is out of range");
+      }
+      const auto corrected_chunk = slice_rows(corrected_db, full_rows, full_cols, chunks[batch_index].row_start, chunks[batch_index].row_stop);
+      const auto seed_patch = dino_seed_patch_map(corrected_chunk,
+                                                  result.src_rows,
+                                                  result.src_cols,
+                                                  runtime_rows,
+                                                  runtime_cols,
+                                                  runtime_result.patch_rows,
+                                                  runtime_result.patch_cols);
+      const std::vector<float> patch_features_sample(
+          runtime_result.patch_features_batch.begin() + static_cast<std::ptrdiff_t>(sample_offset),
+          runtime_result.patch_features_batch.begin() + static_cast<std::ptrdiff_t>(sample_offset + patch_count * feature_dim));
+      const auto grouped_patch = grouped_dino_from_patch_features(patch_features_sample,
+                                                                  runtime_result.patch_rows,
+                                                                  runtime_result.patch_cols,
+                                                                  runtime_result.feature_dim,
+                                                                  seed_patch,
+                                                                  config,
+                                                                  verbose,
+                                                                  "batch_chunk_grouped_patch");
+      if (grouped_patch.score_patch.empty()) {
+        throw std::runtime_error("batched grouped patch score is empty");
+      }
+      grouped_score_patch = grouped_patch.score_patch;
+      artifacts.grouped_dino_score_source = project_patch_map_to_output(grouped_score_patch,
+                                                                        runtime_result.patch_rows,
+                                                                        runtime_result.patch_cols,
+                                                                        runtime_result.aligned_rows,
+                                                                        runtime_result.aligned_cols,
+                                                                        result.src_rows,
+                                                                        result.src_cols,
+                                                                        runtime_row_offset,
+                                                                        runtime_col_offset,
+                                                                        result.src_rows,
+                                                                        result.src_cols,
+                                                                        runtime_result.input_resized_to_target);
+    }
+
+    artifacts.source_chunk_valid_mask.assign(
+        source_valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * chunk_elements),
+        source_valid_mask_batch.begin() + static_cast<std::ptrdiff_t>((batch_index + 1) * chunk_elements));
+    artifacts.source_chunk_coherence_gate.assign(
+        source_coherence_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * chunk_elements),
+        source_coherence_batch.begin() + static_cast<std::ptrdiff_t>((batch_index + 1) * chunk_elements));
+  }
+  return artifacts_batch;
+}
+
 ChunkRetryResult finalize_retry_chunk_postprocess(const ValidatorConfig& config,
                                                   ChunkInferenceArtifacts artifacts,
                                                   StageProfiler* profiler,
@@ -3659,30 +5777,114 @@ ChunkRetryResult finalize_retry_chunk_postprocess(const ValidatorConfig& config,
   std::vector<float> hybrid_contrib_source;
   std::vector<float> hybrid_contrib;
   HybridPostprocessResult hybrid_result_source;
-  {
+  if (artifacts.has_precomputed_hybrid_result && !artifacts.keep_debug_artifacts) {
+    hybrid_result_source = std::move(artifacts.precomputed_hybrid_result_source);
+  } else {
     const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * sizeof(float) * 4 +
-                                   static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols) * sizeof(float);
+                                   (artifacts.keep_debug_artifacts ? static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols) * sizeof(float) : 0);
     ScopedStageProfile stage(profiler, "chunk_hybrid_support", "chunk", result.chunk_index, estimated_bytes, verbose);
+    const auto dino_norm_start = std::chrono::steady_clock::now();
     const auto dino_score_norm_source = normalize01_quantile(artifacts.grouped_dino_score_source, 5.0, 95.0);
+    record_timed_stage(profiler,
+                       "chunk_hybrid_dino_norm",
+                       "chunk",
+                       result.chunk_index,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dino_norm_start).count());
+
+    const auto coherence_norm_start = std::chrono::steady_clock::now();
     const auto coherence_gate_norm_source = normalize01_quantile(artifacts.source_chunk_coherence_gate, 5.0, 99.0);
+    record_timed_stage(profiler,
+                       "chunk_hybrid_coherence_norm",
+                       "chunk",
+                       result.chunk_index,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - coherence_norm_start).count());
+
+    const auto multiply_start = std::chrono::steady_clock::now();
     hybrid_contrib_source.assign(artifacts.grouped_dino_score_source.size(), 0.0f);
     for (size_t index = 0; index < hybrid_contrib_source.size(); ++index) {
       hybrid_contrib_source[index] = dino_score_norm_source[index] * coherence_gate_norm_source[index];
     }
-    hybrid_contrib = resize_bilinear(hybrid_contrib_source,
-                                     result.src_rows,
-                                     result.src_cols,
-                                     result.dst_rows,
-                                     result.dst_cols);
-    hybrid_result_source = run_residual_veto_hybrid(hybrid_contrib_source,
-                                                    artifacts.source_chunk_valid_mask,
-                                                    result.src_rows,
-                                                    result.src_cols);
+    record_timed_stage(profiler,
+                       "chunk_hybrid_contrib_multiply",
+                       "chunk",
+                       result.chunk_index,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - multiply_start).count());
+
+    if (artifacts.keep_debug_artifacts) {
+      hybrid_contrib = resize_bilinear(hybrid_contrib_source,
+                                       result.src_rows,
+                                       result.src_cols,
+                                       result.dst_rows,
+                                       result.dst_cols);
+    }
+
+    const auto residual_veto_start = std::chrono::steady_clock::now();
+    hybrid_result_source = run_residual_veto_hybrid_gpu(hybrid_contrib_source,
+                                                        artifacts.source_chunk_valid_mask,
+                                                        result.src_rows,
+                                                        result.src_cols,
+                                                        use_fp16_precision(config.hybrid_torch_dtype));
+    record_timed_stage(profiler,
+                       "chunk_hybrid_residual_veto",
+                       "chunk",
+                       result.chunk_index,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - residual_veto_start).count());
   }
   if (artifacts.keep_debug_artifacts) {
     result.hybrid_contrib = hybrid_contrib;
   }
 
+  result.seed_freq_threshold = hybrid_result_source.seed_freq_threshold;
+  result.seed_res_threshold = hybrid_result_source.seed_res_threshold;
+  result.combined_threshold = hybrid_result_source.combined_threshold;
+  result.final_fraction = hybrid_result_source.final_fraction;
+  result.connected_fraction = hybrid_result_source.connected_fraction;
+  result.component_count = hybrid_result_source.component_count;
+  result.final_mask_source = hybrid_result_source.mask;
+  result.final_mask = resize_mask_nearest(hybrid_result_source.mask,
+                                          result.src_rows,
+                                          result.src_cols,
+                                          result.dst_rows,
+                                          result.dst_cols);
+  result.combined_score = resize_bilinear(hybrid_result_source.combined_score,
+                                          result.src_rows,
+                                          result.src_cols,
+                                          result.dst_rows,
+                                          result.dst_cols);
+  if (!artifacts.keep_debug_artifacts && config.fast_boxes_only_non_debug_grouping) {
+    {
+      const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * (sizeof(uint8_t) + sizeof(int)) +
+                                     sizeof(DetectionBox) * 8;
+      ScopedStageProfile stage(profiler, "chunk_group_boxes_fast", "chunk", result.chunk_index, estimated_bytes, verbose);
+      result.grouped_boxes = group_boxes_fast_only(hybrid_result_source.mask,
+                                                   hybrid_result_source.combined_score,
+                                                   artifacts.source_chunk_valid_mask,
+                                                   result.src_rows,
+                                                   result.src_cols,
+                                                   config.grouping_bridge_freq_px,
+                                                   config.grouping_bridge_time_px,
+                                                   config.grouping_min_component_size,
+                                                   config.grouping_min_freq_span_px,
+                                                   config.grouping_min_time_span_px,
+                                                   static_cast<float>(config.grouping_min_density));
+    }
+    for (auto& box : result.grouped_boxes) {
+      box = scale_box_to_shape(box,
+                               result.src_rows,
+                               result.src_cols,
+                               result.dst_rows,
+                               result.dst_cols);
+    }
+    result.grouped_box_count = static_cast<int>(result.grouped_boxes.size());
+    result.grouped_mask_source = hybrid_result_source.mask;
+    result.grouped_mask = resize_mask_nearest(hybrid_result_source.mask,
+                                              result.src_rows,
+                                              result.src_cols,
+                                              result.dst_rows,
+                                              result.dst_cols);
+    result.bridged_mask.clear();
+    return result;
+  }
   GroupingResult grouping_source;
   {
     const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * (sizeof(uint8_t) * 3 + sizeof(int)) +
@@ -3694,50 +5896,48 @@ ChunkRetryResult finalize_retry_chunk_postprocess(const ValidatorConfig& config,
                                          result.src_rows,
                                          result.src_cols,
                                          config.filter_detection_mask,
-                                         33,
-                                         5,
-                                         24,
-                                         18,
-                                         2,
-                                         0.06f,
-                                         0.85f);
+                                         config.grouping_bridge_freq_px,
+                                         config.grouping_bridge_time_px,
+                                         config.grouping_min_component_size,
+                                         config.grouping_min_freq_span_px,
+                                         config.grouping_min_time_span_px,
+                                         static_cast<float>(config.grouping_min_density),
+                                         static_cast<float>(config.grouping_time_continuity_ratio));
   }
-  result.seed_freq_threshold = hybrid_result_source.seed_freq_threshold;
-  result.seed_res_threshold = hybrid_result_source.seed_res_threshold;
-  result.combined_threshold = hybrid_result_source.combined_threshold;
-  result.final_fraction = hybrid_result_source.final_fraction;
-  result.connected_fraction = hybrid_result_source.connected_fraction;
-  result.component_count = hybrid_result_source.component_count;
-  result.final_mask = resize_mask_nearest(hybrid_result_source.mask,
-                                          result.src_rows,
-                                          result.src_cols,
-                                          result.dst_rows,
-                                          result.dst_cols);
-  result.combined_score = resize_bilinear(hybrid_result_source.combined_score,
-                                          result.src_rows,
-                                          result.src_cols,
-                                          result.dst_rows,
-                                          result.dst_cols);
-  result.bridged_mask = resize_mask_nearest(grouping_source.bridged_mask,
-                                            result.src_rows,
-                                            result.src_cols,
-                                            result.dst_rows,
-                                            result.dst_cols);
+  result.grouped_mask_source = grouping_source.grouped_mask;
   result.grouped_mask = resize_mask_nearest(grouping_source.grouped_mask,
                                             result.src_rows,
                                             result.src_cols,
                                             result.dst_rows,
                                             result.dst_cols);
-  result.grouped_boxes.clear();
-  result.grouped_boxes.reserve(grouping_source.boxes.size());
-  for (const auto& source_box : grouping_source.boxes) {
-    result.grouped_boxes.push_back(scale_box_to_shape(source_box,
-                                                      result.src_rows,
-                                                      result.src_cols,
-                                                      result.dst_rows,
-                                                      result.dst_cols));
+  if (artifacts.keep_debug_artifacts) {
+    result.bridged_mask = resize_mask_nearest(grouping_source.bridged_mask,
+                                              result.src_rows,
+                                              result.src_cols,
+                                              result.dst_rows,
+                                              result.dst_cols);
+    result.grouped_boxes.clear();
+    result.grouped_boxes.reserve(grouping_source.boxes.size());
+    for (const auto& source_box : grouping_source.boxes) {
+      result.grouped_boxes.push_back(scale_box_to_shape(source_box,
+                                                        result.src_rows,
+                                                        result.src_cols,
+                                                        result.dst_rows,
+                                                        result.dst_cols));
+    }
+    result.grouped_box_count = static_cast<int>(result.grouped_boxes.size());
+  } else {
+    result.grouped_boxes.clear();
+    result.grouped_boxes.reserve(grouping_source.boxes.size());
+    for (const auto& source_box : grouping_source.boxes) {
+      result.grouped_boxes.push_back(scale_box_to_shape(source_box,
+                                                        result.src_rows,
+                                                        result.src_cols,
+                                                        result.dst_rows,
+                                                        result.dst_cols));
+    }
+    result.grouped_box_count = static_cast<int>(result.grouped_boxes.size());
   }
-  result.grouped_box_count = static_cast<int>(result.grouped_boxes.size());
   return result;
 }
 
@@ -3758,8 +5958,6 @@ void discard_non_debug_chunk_payload(ChunkRetryResult& chunk_result) {
   chunk_result.hybrid_contrib.shrink_to_fit();
   chunk_result.valid_mask.clear();
   chunk_result.valid_mask.shrink_to_fit();
-  chunk_result.final_mask.clear();
-  chunk_result.final_mask.shrink_to_fit();
   chunk_result.bridged_mask.clear();
   chunk_result.bridged_mask.shrink_to_fit();
 }
@@ -3829,19 +6027,40 @@ std::string format_bytes_json(size_t bytes) {
   return std::to_string(bytes);
 }
 
-void write_stage_profile_json(const std::filesystem::path& path, const StageProfiler& profiler) {
-  std::ofstream out(path, std::ios::binary);
-  if (!out.is_open()) {
-    throw std::runtime_error("failed to open stage profile output");
+bool is_debug_phase_reassigned_stage(const StageProfileEntry& entry) {
+  return entry.scope == "run" &&
+         (entry.stage == "load_tensor" || entry.stage == "artifact_serialization");
+}
+
+std::vector<StageProfileEntry> collect_phase_entries(const StageProfiler& full_pass_profiler,
+                                                     const StageProfiler& debug_rerun_profiler,
+                                                     bool debug_phase) {
+  std::vector<StageProfileEntry> phase_entries;
+  const auto& full_entries = full_pass_profiler.entries();
+  const auto& debug_entries = debug_rerun_profiler.entries();
+  phase_entries.reserve(full_entries.size() + debug_entries.size());
+  for (const auto& entry : full_entries) {
+    const bool reassign_to_debug = is_debug_phase_reassigned_stage(entry);
+    if ((debug_phase && reassign_to_debug) || (!debug_phase && !reassign_to_debug)) {
+      phase_entries.push_back(entry);
+    }
   }
-  const auto aggregates = profiler.aggregate();
-  out << std::fixed << std::setprecision(6);
-  out << "{\n";
-  out << "  \"entry_count\": " << profiler.entries().size() << ",\n";
-  out << "  \"entries\": [\n";
-  for (size_t index = 0; index < profiler.entries().size(); ++index) {
-    const auto& entry = profiler.entries()[index];
-    out << "    {\"stage\": \"" << json_escape(entry.stage)
+  if (debug_phase) {
+    phase_entries.insert(phase_entries.end(), debug_entries.begin(), debug_entries.end());
+  }
+  return phase_entries;
+}
+
+void write_stage_profile_object_json(std::ostream& out,
+                                     const std::vector<StageProfileEntry>& entries,
+                                     const std::vector<StageAggregateEntry>& aggregates,
+                                     const std::string& indent,
+                                     const std::string& entry_phase = std::string()) {
+  out << indent << "\"entry_count\": " << entries.size() << ",\n";
+  out << indent << "\"entries\": [\n";
+  for (size_t index = 0; index < entries.size(); ++index) {
+    const auto& entry = entries[index];
+    out << indent << "  {\"stage\": \"" << json_escape(entry.stage)
         << "\", \"scope\": \"" << json_escape(entry.scope)
         << "\", \"chunk_index\": " << entry.chunk_index
         << ", \"elapsed_ms\": " << entry.elapsed_ms
@@ -3852,17 +6071,21 @@ void write_stage_profile_json(const std::filesystem::path& path, const StageProf
         << ", \"hwm_after_kb\": " << entry.hwm_after_kb
         << ", \"hwm_delta_kb\": " << entry.hwm_delta_kb
         << ", \"component_estimated_bytes\": " << format_bytes_json(entry.component_estimated_bytes)
-        << ", \"failed\": " << (entry.failed ? "true" : "false") << "}";
-    if (index + 1 != profiler.entries().size()) {
+        << ", \"failed\": " << (entry.failed ? "true" : "false");
+    if (!entry_phase.empty()) {
+      out << ", \"phase\": \"" << json_escape(entry_phase) << "\"";
+    }
+    out << "}";
+    if (index + 1 != entries.size()) {
       out << ",";
     }
     out << "\n";
   }
-  out << "  ],\n";
-  out << "  \"aggregates\": [\n";
+  out << indent << "],\n";
+  out << indent << "\"aggregates\": [\n";
   for (size_t index = 0; index < aggregates.size(); ++index) {
     const auto& entry = aggregates[index];
-    out << "    {\"stage\": \"" << json_escape(entry.stage)
+    out << indent << "  {\"stage\": \"" << json_escape(entry.stage)
         << "\", \"scope\": \"" << json_escape(entry.scope)
         << "\", \"count\": " << entry.count
         << ", \"failure_count\": " << entry.failure_count
@@ -3871,24 +6094,59 @@ void write_stage_profile_json(const std::filesystem::path& path, const StageProf
         << ", \"max_ms\": " << entry.max_ms
         << ", \"max_rss_after_kb\": " << entry.max_rss_after_kb
         << ", \"max_hwm_after_kb\": " << entry.max_hwm_after_kb
-        << ", \"max_component_estimated_bytes\": " << format_bytes_json(entry.max_component_estimated_bytes)
-        << "}";
+        << ", \"max_component_estimated_bytes\": " << format_bytes_json(entry.max_component_estimated_bytes);
+    if (!entry_phase.empty()) {
+      out << ", \"phase\": \"" << json_escape(entry_phase) << "\"";
+    }
+    out << "}";
     if (index + 1 != aggregates.size()) {
       out << ",";
     }
     out << "\n";
   }
-  out << "  ]\n";
+  out << indent << "]\n";
+}
+
+void write_stage_profile_json(const std::filesystem::path& path,
+                              const StageProfiler& full_pass_profiler,
+                              const StageProfiler& debug_rerun_profiler) {
+  std::ofstream out(path, std::ios::binary);
+  if (!out.is_open()) {
+    throw std::runtime_error("failed to open stage profile output");
+  }
+  const auto& full_entries = full_pass_profiler.entries();
+  const auto& debug_entries = debug_rerun_profiler.entries();
+  const auto full_phase_entries = collect_phase_entries(full_pass_profiler, debug_rerun_profiler, false);
+  const auto debug_phase_entries = collect_phase_entries(full_pass_profiler, debug_rerun_profiler, true);
+  std::vector<StageProfileEntry> merged_entries;
+  merged_entries.reserve(full_entries.size() + debug_entries.size());
+  merged_entries.insert(merged_entries.end(), full_entries.begin(), full_entries.end());
+  merged_entries.insert(merged_entries.end(), debug_entries.begin(), debug_entries.end());
+  const auto merged_aggregates = aggregate_stage_entries(merged_entries);
+  const auto full_aggregates = aggregate_stage_entries(full_phase_entries);
+  const auto debug_aggregates = aggregate_stage_entries(debug_phase_entries);
+  out << std::fixed << std::setprecision(6);
+  out << "{\n";
+  write_stage_profile_object_json(out, merged_entries, merged_aggregates, "  ");
+  out << ",\n  \"phases\": {\n";
+  out << "    \"full_pass\": {\n";
+  write_stage_profile_object_json(out, full_phase_entries, full_aggregates, "      ", "full_pass");
+  out << "    },\n";
+  out << "    \"debug_rerun\": {\n";
+  write_stage_profile_object_json(out, debug_phase_entries, debug_aggregates, "      ", "debug_rerun");
+  out << "    }\n";
+  out << "  }\n";
   out << "}\n";
 }
 
-void print_stage_hotspots(const StageProfiler& profiler, std::ostream& out, size_t limit) {
-  const auto aggregates = profiler.aggregate();
-  out << "  stage hotspots:\n";
+void print_stage_hotspots_from_aggregates(const std::vector<StageAggregateEntry>& aggregates,
+                                          std::ostream& out,
+                                          size_t limit,
+                                          std::string_view indent) {
   const size_t count = std::min(limit, aggregates.size());
   for (size_t index = 0; index < count; ++index) {
     const auto& entry = aggregates[index];
-    out << "    [" << (index + 1) << "] scope=" << entry.scope
+    out << indent << "[" << (index + 1) << "] scope=" << entry.scope
         << " stage=" << entry.stage
         << " total_ms=" << std::fixed << std::setprecision(3) << entry.total_ms
         << " mean_ms=" << entry.mean_ms
@@ -3900,6 +6158,31 @@ void print_stage_hotspots(const StageProfiler& profiler, std::ostream& out, size
       out << " failures=" << entry.failure_count;
     }
     out << "\n";
+  }
+}
+
+void print_stage_phase_summary(const std::vector<StageProfileEntry>& phase_entries,
+                               std::ostream& out,
+                               size_t limit,
+                               std::string_view label) {
+  const auto aggregates = aggregate_stage_entries(phase_entries);
+  out << "    " << label << ":\n";
+  if (aggregates.empty()) {
+    out << "      (no entries)\n";
+    return;
+  }
+  for (const std::string_view scope_name : {std::string_view("run"), std::string_view("chunk")}) {
+    std::vector<StageAggregateEntry> scoped;
+    for (const auto& aggregate : aggregates) {
+      if (aggregate.scope == scope_name) {
+        scoped.push_back(aggregate);
+      }
+    }
+    if (scoped.empty()) {
+      continue;
+    }
+    out << "      " << scope_name << " stages:\n";
+    print_stage_hotspots_from_aggregates(scoped, out, limit, "        ");
   }
 }
 
@@ -3944,7 +6227,7 @@ ValidatorOptions parse_arguments(int argc, char** argv) {
     } else if (arg == "--output-dir" && index + 1 < argc) {
       options.output_dir = argv[++index];
     } else if (arg == "--debug-chunk-index" && index + 1 < argc) {
-      options.debug_chunk_index = std::stoi(argv[++index]);
+      options.debug_chunk_index = parse_int_or_throw(argv[++index], "--debug-chunk-index");
     } else if (arg == "--verbose") {
       options.verbose = true;
     } else if (arg == "--subsection-only-validation") {
@@ -4001,8 +6284,14 @@ int main(int argc, char** argv) {
     {
       const size_t estimated_bytes = static_cast<size_t>(tensor.rows) * static_cast<size_t>(tensor.cols) * sizeof(float) * 2;
       ScopedStageProfile stage(&profiler, "frontend_correction", "run", -1, estimated_bytes, options.verbose);
-      power_db = power_db_from_tensor(tensor);
-      corrected_db = frontend_corrected_db(power_db, tensor.rows, tensor.cols, config, frontend_reference_level);
+      {
+        ScopedStageProfile power_stage(&profiler, "power_db_from_tensor", "run", -1, estimated_bytes / 2, options.verbose);
+        power_db = power_db_from_tensor(tensor);
+      }
+      {
+        ScopedStageProfile correction_stage(&profiler, "frontend_correction_apply", "run", -1, estimated_bytes, options.verbose);
+        corrected_db = frontend_corrected_db(power_db, tensor.rows, tensor.cols, config, frontend_reference_level);
+      }
     }
 
     double resolution_hz = config.resolution_hz;
@@ -4016,23 +6305,23 @@ int main(int argc, char** argv) {
     {
       const size_t estimated_bytes = static_cast<size_t>(tensor.rows) * (sizeof(uint8_t) + sizeof(double)) + sizeof(ChunkPlanEntry) * 128;
       ScopedStageProfile stage(&profiler, "chunk_planning", "run", -1, estimated_bytes, options.verbose);
-      source_ignore_info = compute_ignore_sideband_rows(
+      source_freq_axis_hz = build_frequency_axis_hz(tensor.rows, resolution_hz);
+      const auto planned_selection = select_uniform_chunk_plan_with_minimal_sideband_trim(
           tensor.rows,
           chunk_bin_hz,
           0.0,
           16,
           (std::isfinite(resolution_hz) && resolution_hz > 0.0 && config.ignore_sideband_hz > 0.0)
               ? std::optional<double>(config.ignore_sideband_hz)
-              : std::nullopt);
-      source_freq_axis_hz = build_frequency_axis_hz(tensor.rows, resolution_hz);
-      chunk_plan = build_frequency_chunks(
-          source_freq_axis_hz,
-          config.chunk_bandwidth_hz,
-          config.chunk_overlap_hz,
-          16,
-          source_ignore_info.valid_row_mask,
-          config.uncalibrated_chunk_fraction,
-          config.uncalibrated_overlap_fraction);
+          : std::nullopt,
+        source_freq_axis_hz,
+        config.chunk_bandwidth_hz,
+        config.chunk_overlap_hz,
+        16,
+        config.uncalibrated_chunk_fraction,
+        config.uncalibrated_overlap_fraction);
+      source_ignore_info = planned_selection.ignore_info;
+      chunk_plan = planned_selection.chunk_plan;
     }
     const int ignore_bins_per_side = source_ignore_info.applied_bins;
 
@@ -4068,64 +6357,182 @@ int main(int argc, char** argv) {
     runtime_config.pipeline_gap_floor = config.pipeline_gap_floor;
     runtime_config.pipeline_power_rescue_floor = config.pipeline_power_rescue_floor;
     runtime_config.pipeline_power_rescue_gain = config.pipeline_power_rescue_gain;
+    runtime_config.legacy_fast_gray_preprocess = config.legacy_fast_gray_preprocess;
+    const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_plan.size() - 1)));
+    const size_t max_runtime_batch_size = static_cast<size_t>(std::max(1, config.runtime_batch_size));
     ChunkGpuWorkspace gpu_workspace;
     {
-      ScopedStageProfile stage(&profiler, "runtime_warmup", "run", -1, 0, options.verbose);
-      runtime.warmup(runtime_config, config.input_height, config.input_width, config.patch_size, gpu_workspace.stream);
+      const size_t corrected_elements = static_cast<size_t>(tensor.rows) * static_cast<size_t>(tensor.cols);
+      const size_t estimated_bytes = corrected_elements * sizeof(float);
+      ScopedStageProfile stage(&profiler, "corrected_full_frame_upload", "run", -1, estimated_bytes, options.verbose);
+      gpu_workspace.ensure_full_frame_capacity(corrected_elements);
+      if (cudaMemcpyAsync(gpu_workspace.corrected_full_frame_device,
+                          corrected_db.data(),
+                          estimated_bytes,
+                          cudaMemcpyHostToDevice,
+                          gpu_workspace.stream) != cudaSuccess) {
+        throw std::runtime_error("failed to upload full corrected tensor for offline DINO validator");
+      }
     }
-    const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_plan.size() - 1)));
+    {
+      ScopedStageProfile stage(&profiler, "runtime_warmup", "run", -1, 0, options.verbose);
+      std::vector<std::pair<int, int>> warmup_shapes;
+      auto add_warmup_shape = [&](int rows, int batch_size) {
+        const int clamped_rows = std::max(1, rows);
+        const int clamped_batch = std::max(1, batch_size);
+        const std::pair<int, int> shape {clamped_rows, clamped_batch};
+        if (std::find(warmup_shapes.begin(), warmup_shapes.end(), shape) == warmup_shapes.end()) {
+          warmup_shapes.push_back(shape);
+        }
+      };
+
+      std::vector<ChunkPlanEntry> pending_warmup_batch;
+      auto flush_warmup_batch = [&]() {
+        if (pending_warmup_batch.empty()) {
+          return;
+        }
+        add_warmup_shape(chunk_row_count(pending_warmup_batch.front()), static_cast<int>(pending_warmup_batch.size()));
+        pending_warmup_batch.clear();
+      };
+
+      for (size_t chunk_index = 0; chunk_index < chunk_plan.size(); ++chunk_index) {
+        const auto& chunk = chunk_plan[chunk_index];
+        if (!pending_warmup_batch.empty() &&
+            chunk_row_count(pending_warmup_batch.front()) != chunk_row_count(chunk)) {
+          flush_warmup_batch();
+        }
+        pending_warmup_batch.push_back(chunk);
+        if (pending_warmup_batch.size() >= max_runtime_batch_size) {
+          flush_warmup_batch();
+        }
+      }
+      flush_warmup_batch();
+      if (!chunk_plan.empty()) {
+        add_warmup_shape(chunk_row_count(chunk_plan[debug_chunk_index]), 1);
+      }
+
+      if (warmup_shapes.empty()) {
+        add_warmup_shape(config.input_height, 1);
+      }
+      for (const auto& warmup_shape : warmup_shapes) {
+        runtime.warmup(runtime_config,
+                       warmup_shape.first,
+                       tensor.cols,
+                       config.input_height,
+                       config.input_width,
+                       config.patch_size,
+                       warmup_shape.second,
+                       gpu_workspace.stream);
+      }
+    }
     std::vector<ChunkRetryResult> chunk_results(chunk_plan.size());
-    std::vector<std::future<std::pair<size_t, ChunkRetryResult>>> pending_postprocess;
+    StageProfiler debug_profiler;
+    std::optional<ChunkRetryResult> debug_chunk_result;
+    std::vector<std::future<std::vector<std::pair<size_t, ChunkRetryResult>>>> pending_postprocess;
     const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
     const size_t max_inflight_postprocess = std::max<size_t>(1, std::min<size_t>(4, static_cast<size_t>(hw_threads > 1 ? hw_threads - 1 : 1)));
     {
       ScopedStageProfile stage(&profiler, "chunk_loop_total", "run", -1, 0, options.verbose);
-      for (size_t chunk_index = 0; chunk_index < chunk_plan.size(); ++chunk_index) {
-        const auto& chunk = chunk_plan[chunk_index];
-        auto inference = run_retry_chunk_inference(
-            runtime,
-            runtime_config,
-            config,
-            chunk,
-            power_db,
-            corrected_db,
-            tensor.rows,
-            tensor.cols,
-            resolution_hz,
-            source_ignore_info.valid_row_mask,
-            gpu_workspace,
-            &profiler,
-            chunk_index == debug_chunk_index,
-            options.verbose);
+      std::vector<ChunkPlanEntry> pending_runtime_batch;
+      std::vector<size_t> pending_runtime_indices;
+      auto flush_runtime_batch = [&]() {
+        if (pending_runtime_batch.empty()) {
+          return;
+        }
+        auto batched_inference = run_retry_chunk_inference_batch(runtime,
+                                                                 runtime_config,
+                                                                 config,
+                                                                 pending_runtime_batch,
+                                                                 power_db,
+                                                                 corrected_db,
+                                                                 gpu_workspace.corrected_full_frame_device,
+                                                                 tensor.rows,
+                                                                 tensor.cols,
+                                                                 resolution_hz,
+                                                                 source_ignore_info.valid_row_mask,
+                                                                 gpu_workspace,
+                                                                 &profiler,
+                                                                 options.verbose);
+        auto mapped_indices = pending_runtime_indices;
         pending_postprocess.push_back(std::async(std::launch::async,
-                                                 [&, chunk_index, inference = std::move(inference)]() mutable {
-                                                   auto chunk_result = finalize_retry_chunk_postprocess(config,
-                                                                                                       std::move(inference),
-                                                                                                       &profiler,
-                                                                                                       options.verbose);
-                                                   if (chunk_index != debug_chunk_index) {
+                                                 [&, mapped_indices = std::move(mapped_indices), batched_inference = std::move(batched_inference)]() mutable {
+                                                   precompute_retry_chunk_hybrid_batch(batched_inference, config, &profiler, options.verbose);
+                                                   std::vector<std::pair<size_t, ChunkRetryResult>> completed_results;
+                                                   completed_results.reserve(batched_inference.size());
+                                                   for (size_t batch_index = 0; batch_index < batched_inference.size(); ++batch_index) {
+                                                     auto chunk_result = finalize_retry_chunk_postprocess(config,
+                                                                                                         std::move(batched_inference[batch_index]),
+                                                                                                         &profiler,
+                                                                                                         options.verbose);
                                                      ScopedStageProfile chunk_stage(&profiler, "chunk_drop_non_debug_payload", "chunk", chunk_result.chunk_index, 0, options.verbose);
                                                      discard_non_debug_chunk_payload(chunk_result);
+                                                     completed_results.emplace_back(mapped_indices[batch_index], std::move(chunk_result));
                                                    }
-                                                   return std::make_pair(chunk_index, std::move(chunk_result));
+                                                   return completed_results;
                                                  }));
         if (pending_postprocess.size() >= max_inflight_postprocess) {
-          auto completed = pending_postprocess.front().get();
+          auto completed_batch = pending_postprocess.front().get();
           pending_postprocess.erase(pending_postprocess.begin());
+          for (auto& completed : completed_batch) {
+            chunk_results[completed.first] = std::move(completed.second);
+          }
+        }
+        pending_runtime_batch.clear();
+        pending_runtime_indices.clear();
+      };
+
+      for (size_t chunk_index = 0; chunk_index < chunk_plan.size(); ++chunk_index) {
+        const auto& chunk = chunk_plan[chunk_index];
+        if (!pending_runtime_batch.empty() &&
+            chunk_row_count(pending_runtime_batch.front()) != chunk_row_count(chunk)) {
+          flush_runtime_batch();
+        }
+        pending_runtime_batch.push_back(chunk);
+        pending_runtime_indices.push_back(chunk_index);
+        if (pending_runtime_batch.size() >= max_runtime_batch_size) {
+          flush_runtime_batch();
+        }
+      }
+      flush_runtime_batch();
+      while (!pending_postprocess.empty()) {
+        auto completed_batch = pending_postprocess.front().get();
+        pending_postprocess.erase(pending_postprocess.begin());
+        for (auto& completed : completed_batch) {
           chunk_results[completed.first] = std::move(completed.second);
         }
       }
-      for (auto& future : pending_postprocess) {
-        auto completed = future.get();
-        chunk_results[completed.first] = std::move(completed.second);
-      }
     }
+
+    if (!chunk_plan.empty()) {
+      ScopedStageProfile stage(&debug_profiler, "debug_chunk_rerun_total", "run", -1, 0, options.verbose);
+      auto debug_inference = run_retry_chunk_inference(runtime,
+                                                       runtime_config,
+                                                       config,
+                                                       chunk_plan[debug_chunk_index],
+                                                       power_db,
+                                                       corrected_db,
+                                                       gpu_workspace.corrected_full_frame_device,
+                                                       tensor.rows,
+                                                       tensor.cols,
+                                                       resolution_hz,
+                                                       source_ignore_info.valid_row_mask,
+                                                       gpu_workspace,
+                                                       &debug_profiler,
+                                                       true,
+                                                       options.verbose);
+      debug_chunk_result = finalize_retry_chunk_postprocess(config,
+                                                            std::move(debug_inference),
+                                                            &debug_profiler,
+                                                            options.verbose);
+    }
+
     GlobalMergedResult global_merged;
     {
       const size_t estimated_bytes = static_cast<size_t>(tensor.rows) * static_cast<size_t>(tensor.cols) * (sizeof(uint8_t) * 2 + sizeof(float));
       ScopedStageProfile stage(&profiler, "global_merge", "run", -1, estimated_bytes, options.verbose);
       global_merged = build_global_merged_result(
           chunk_results,
+          config,
           tensor.rows,
           tensor.cols,
           source_ignore_info.valid_row_mask);
@@ -4158,12 +6565,13 @@ int main(int argc, char** argv) {
                                      static_cast<size_t>(config.input_height) * static_cast<size_t>(config.input_width) * sizeof(float);
       ScopedStageProfile stage(&profiler, "artifact_serialization", "run", -1, estimated_bytes, options.verbose);
       write_npy_2d(corrected_resized_path, corrected_resized.data(), corrected_resized.size() * sizeof(float), config.input_height, config.input_width, "<f4");
-      std::vector<float> final_mask_float(global_merged.merged_box_mask.size(), 0.0f);
-      for (size_t index = 0; index < global_merged.merged_box_mask.size(); ++index) {
-        final_mask_float[index] = global_merged.merged_box_mask[index] ? 1.0f : 0.0f;
+      const auto& final_output_mask = global_merged.stitched_final_mask;
+      std::vector<float> final_mask_float(final_output_mask.size(), 0.0f);
+      for (size_t index = 0; index < final_output_mask.size(); ++index) {
+        final_mask_float[index] = final_output_mask[index] ? 1.0f : 0.0f;
       }
       write_npy_2d(final_mask_path, final_mask_float.data(), final_mask_float.size() * sizeof(float), tensor.rows, tensor.cols, "<f4");
-      write_pgm(final_mask_pgm, mask_to_u8(global_merged.merged_box_mask), tensor.cols, tensor.rows);
+      write_pgm(final_mask_pgm, mask_to_u8(final_output_mask), tensor.cols, tensor.rows);
       std::vector<float> projected_grouped_mask_float(global_merged.projected_grouped_mask.size(), 0.0f);
       for (size_t index = 0; index < global_merged.projected_grouped_mask.size(); ++index) {
         projected_grouped_mask_float[index] = global_merged.projected_grouped_mask[index] ? 1.0f : 0.0f;
@@ -4213,6 +6621,10 @@ int main(int argc, char** argv) {
       const auto debug_grouped_mask_pgm = chunk_debug_dir / "chunk_grouped_mask.pgm";
       const auto debug_final_mask_path = chunk_debug_dir / "chunk_final_mask.npy";
       const auto debug_final_mask_pgm = chunk_debug_dir / "chunk_final_mask.pgm";
+      const auto debug_final_mask_source_path = chunk_debug_dir / "chunk_final_mask_source.npy";
+      const auto debug_final_mask_source_pgm = chunk_debug_dir / "chunk_final_mask_source.pgm";
+      const auto debug_final_mask_projected_path = chunk_debug_dir / "chunk_final_mask_projected.npy";
+      const auto debug_final_mask_projected_pgm = chunk_debug_dir / "chunk_final_mask_projected.pgm";
       const auto debug_grouped_boxes_path = chunk_debug_dir / "chunk_grouped_boxes.json";
 
       write_npy_2d(debug_corrected_path,
@@ -4365,7 +6777,7 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"patch_rows\": " << debug_chunk.patch_rows << ",\n";
       debug_summary_out << "  \"patch_cols\": " << debug_chunk.patch_cols << ",\n";
       debug_summary_out << "  \"feature_dim\": " << debug_chunk.feature_dim << ",\n";
-      debug_summary_out << "  \"artifact_contract\": \"chunk_no_extra_sideband_crop_v2\",\n";
+      debug_summary_out << "  \"artifact_contract\": \"chunk_fixed_detector_grid_v1\",\n";
       debug_summary_out << "  \"corrected_resized_npy\": \"" << json_escape(debug_corrected_path.string()) << "\",\n";
       debug_summary_out << "  \"runtime_input_gray_npy\": \"" << json_escape(debug_runtime_input_gray_path.string()) << "\",\n";
       debug_summary_out << "  \"dino_score_npy\": \"" << json_escape(debug_dino_score_path.string()) << "\",\n";
@@ -4537,9 +6949,262 @@ int main(int argc, char** argv) {
         merged_boxes_out << "\n";
       }
       merged_boxes_out << "  ]\n}\n";
-
-      write_stage_profile_json(stage_profile_path, profiler);
     }
+
+    const auto debug_chunk_summary_path = chunk_debug_dir / "chunk_debug_summary.json";
+    std::filesystem::create_directories(chunk_debug_dir);
+    if (debug_chunk_result.has_value()) {
+      const auto& debug_chunk = *debug_chunk_result;
+      const ChunkRetryResult& stitched_debug_chunk =
+          (debug_chunk_index < chunk_results.size()) ? chunk_results[debug_chunk_index] : debug_chunk;
+      const auto debug_corrected_path = chunk_debug_dir / "chunk_corrected_resized.npy";
+      const auto debug_runtime_input_gray_path = chunk_debug_dir / "chunk_runtime_input_gray.npy";
+      const auto debug_dino_score_path = chunk_debug_dir / "chunk_dino_score.npy";
+      const auto debug_raw_dino_score_path = chunk_debug_dir / "chunk_dino_score_raw.npy";
+      const auto debug_coherence_gate_path = chunk_debug_dir / "chunk_coherence_gate.npy";
+      const auto debug_hybrid_contrib_path = chunk_debug_dir / "chunk_hybrid_contrib.npy";
+      const auto debug_combined_score_path = chunk_debug_dir / "chunk_combined_score.npy";
+      const auto debug_patch_features_path = chunk_debug_dir / "chunk_patch_features.npy";
+      const auto debug_valid_mask_path = chunk_debug_dir / "chunk_valid_mask.npy";
+      const auto debug_bridged_mask_path = chunk_debug_dir / "chunk_bridged_mask.npy";
+      const auto debug_grouped_mask_path = chunk_debug_dir / "chunk_grouped_mask.npy";
+      const auto debug_grouped_mask_pgm = chunk_debug_dir / "chunk_grouped_mask.pgm";
+      const auto debug_final_mask_path = chunk_debug_dir / "chunk_final_mask.npy";
+      const auto debug_final_mask_pgm = chunk_debug_dir / "chunk_final_mask.pgm";
+      const auto debug_final_mask_source_path = chunk_debug_dir / "chunk_final_mask_source.npy";
+      const auto debug_final_mask_source_pgm = chunk_debug_dir / "chunk_final_mask_source.pgm";
+      const auto debug_final_mask_projected_path = chunk_debug_dir / "chunk_final_mask_projected.npy";
+      const auto debug_final_mask_projected_pgm = chunk_debug_dir / "chunk_final_mask_projected.pgm";
+      const auto debug_grouped_boxes_path = chunk_debug_dir / "chunk_grouped_boxes.json";
+
+      const size_t estimated_bytes = static_cast<size_t>(debug_chunk.dst_rows) * static_cast<size_t>(debug_chunk.dst_cols) * (sizeof(float) * 8 + sizeof(uint8_t) * 3);
+      ScopedStageProfile stage(&debug_profiler, "debug_artifact_serialization", "run", -1, estimated_bytes, options.verbose);
+
+      write_npy_2d(debug_corrected_path,
+                   debug_chunk.corrected_resized.data(),
+                   debug_chunk.corrected_resized.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_npy_2d(debug_runtime_input_gray_path,
+                   debug_chunk.runtime_input_gray.data(),
+                   debug_chunk.runtime_input_gray.size() * sizeof(float),
+                   std::max(1, debug_chunk.runtime_input_gray_rows),
+                   std::max(1, debug_chunk.runtime_input_gray_cols),
+                   "<f4");
+      write_npy_2d(debug_dino_score_path,
+                   debug_chunk.dino_score_map.data(),
+                   debug_chunk.dino_score_map.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_npy_2d(debug_raw_dino_score_path,
+                   debug_chunk.raw_dino_score_map.data(),
+                   debug_chunk.raw_dino_score_map.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_npy_2d(debug_coherence_gate_path,
+                   debug_chunk.coherence_gate.data(),
+                   debug_chunk.coherence_gate.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_npy_2d(debug_hybrid_contrib_path,
+                   debug_chunk.hybrid_contrib.data(),
+                   debug_chunk.hybrid_contrib.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      write_npy_2d(debug_combined_score_path,
+                   debug_chunk.combined_score.data(),
+                   debug_chunk.combined_score.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      if (!debug_chunk.patch_features.empty() && debug_chunk.patch_rows > 0 && debug_chunk.patch_cols > 0 && debug_chunk.feature_dim > 0) {
+        write_npy_2d(debug_patch_features_path,
+                     debug_chunk.patch_features.data(),
+                     debug_chunk.patch_features.size() * sizeof(float),
+                     debug_chunk.patch_rows * debug_chunk.patch_cols,
+                     debug_chunk.feature_dim,
+                     "<f4");
+      }
+
+      std::vector<float> debug_valid_mask_float(debug_chunk.valid_mask.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.valid_mask.size(); ++index) {
+        debug_valid_mask_float[index] = debug_chunk.valid_mask[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_valid_mask_path,
+                   debug_valid_mask_float.data(),
+                   debug_valid_mask_float.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      std::vector<float> debug_bridged_mask_float(debug_chunk.bridged_mask.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.bridged_mask.size(); ++index) {
+        debug_bridged_mask_float[index] = debug_chunk.bridged_mask[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_bridged_mask_path,
+                   debug_bridged_mask_float.data(),
+                   debug_bridged_mask_float.size() * sizeof(float),
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
+                   "<f4");
+      std::vector<float> debug_grouped_mask_float(stitched_debug_chunk.grouped_mask.size(), 0.0f);
+      for (size_t index = 0; index < stitched_debug_chunk.grouped_mask.size(); ++index) {
+        debug_grouped_mask_float[index] = stitched_debug_chunk.grouped_mask[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_grouped_mask_path,
+                   debug_grouped_mask_float.data(),
+                   debug_grouped_mask_float.size() * sizeof(float),
+                   stitched_debug_chunk.dst_rows,
+                   stitched_debug_chunk.dst_cols,
+                   "<f4");
+      write_pgm(debug_grouped_mask_pgm,
+                mask_to_u8(stitched_debug_chunk.grouped_mask),
+                stitched_debug_chunk.dst_cols,
+                stitched_debug_chunk.dst_rows);
+      std::vector<float> debug_final_mask_float(stitched_debug_chunk.final_mask.size(), 0.0f);
+      for (size_t index = 0; index < stitched_debug_chunk.final_mask.size(); ++index) {
+        debug_final_mask_float[index] = stitched_debug_chunk.final_mask[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_final_mask_path,
+                   debug_final_mask_float.data(),
+                   debug_final_mask_float.size() * sizeof(float),
+                   stitched_debug_chunk.dst_rows,
+                   stitched_debug_chunk.dst_cols,
+                   "<f4");
+      write_pgm(debug_final_mask_pgm,
+                mask_to_u8(stitched_debug_chunk.final_mask),
+                stitched_debug_chunk.dst_cols,
+                stitched_debug_chunk.dst_rows);
+      std::vector<float> debug_final_mask_source_float(debug_chunk.final_mask_source.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.final_mask_source.size(); ++index) {
+        debug_final_mask_source_float[index] = debug_chunk.final_mask_source[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_final_mask_source_path,
+                   debug_final_mask_source_float.data(),
+                   debug_final_mask_source_float.size() * sizeof(float),
+                   debug_chunk.src_rows,
+                   debug_chunk.src_cols,
+                   "<f4");
+      write_pgm(debug_final_mask_source_pgm,
+                mask_to_u8(debug_chunk.final_mask_source),
+                debug_chunk.src_cols,
+                debug_chunk.src_rows);
+      std::vector<uint8_t> debug_final_mask_projected(static_cast<size_t>(debug_chunk.src_rows) * static_cast<size_t>(tensor.cols), 0);
+      if (!stitched_debug_chunk.final_mask.empty() && stitched_debug_chunk.dst_rows > 0 && stitched_debug_chunk.dst_cols > 0) {
+        const auto projected_row_nearest = build_nearest_resize_indices(stitched_debug_chunk.dst_rows, debug_chunk.src_rows);
+        const auto projected_col_nearest = build_nearest_resize_indices(stitched_debug_chunk.dst_cols, tensor.cols);
+        for (int projected_row = 0; projected_row < debug_chunk.src_rows; ++projected_row) {
+          const int src_row_nearest = projected_row_nearest[static_cast<size_t>(projected_row)];
+          for (int col = 0; col < tensor.cols; ++col) {
+            const int src_col_nearest = projected_col_nearest[static_cast<size_t>(col)];
+            debug_final_mask_projected[flat_index(tensor.cols, projected_row, col)] =
+                stitched_debug_chunk.final_mask[flat_index(stitched_debug_chunk.dst_cols, src_row_nearest, src_col_nearest)] ? 1 : 0;
+          }
+        }
+      }
+      std::vector<float> debug_final_mask_projected_float(debug_final_mask_projected.size(), 0.0f);
+      for (size_t index = 0; index < debug_final_mask_projected.size(); ++index) {
+        debug_final_mask_projected_float[index] = debug_final_mask_projected[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_final_mask_projected_path,
+                   debug_final_mask_projected_float.data(),
+                   debug_final_mask_projected_float.size() * sizeof(float),
+                   debug_chunk.src_rows,
+                   tensor.cols,
+                   "<f4");
+      write_pgm(debug_final_mask_projected_pgm,
+                mask_to_u8(debug_final_mask_projected),
+                tensor.cols,
+                debug_chunk.src_rows);
+
+      {
+        std::ofstream debug_grouped_boxes_out(debug_grouped_boxes_path, std::ios::binary);
+        if (!debug_grouped_boxes_out.is_open()) {
+          throw std::runtime_error("failed to open chunk grouped boxes output");
+        }
+        debug_grouped_boxes_out << std::fixed << std::setprecision(6);
+        debug_grouped_boxes_out << "{\n  \"box_count\": " << stitched_debug_chunk.grouped_boxes.size() << ",\n  \"boxes\": [\n";
+        for (size_t index = 0; index < stitched_debug_chunk.grouped_boxes.size(); ++index) {
+          const auto& box = stitched_debug_chunk.grouped_boxes[index];
+          debug_grouped_boxes_out << "    {\"freq_start\": " << box.freq_start
+                                  << ", \"freq_stop\": " << box.freq_stop
+                                  << ", \"time_start\": " << box.time_start
+                                  << ", \"time_stop\": " << box.time_stop
+                                  << ", \"filled_area\": " << box.filled_area
+                                  << ", \"density\": " << box.density
+                                  << ", \"score_mean\": " << box.score_mean
+                                  << ", \"score_peak\": " << box.score_peak
+                                  << ", \"split_role\": \"" << json_escape(box.split_role) << "\""
+                                  << ", \"split_applied\": " << (box.split_applied ? "true" : "false")
+                                  << ", \"parent_component_id\": " << box.parent_component_id
+                                  << "}";
+          if (index + 1 != stitched_debug_chunk.grouped_boxes.size()) {
+            debug_grouped_boxes_out << ",";
+          }
+          debug_grouped_boxes_out << "\n";
+        }
+        debug_grouped_boxes_out << "  ]\n}\n";
+      }
+
+      std::ofstream debug_summary_out(debug_chunk_summary_path, std::ios::binary);
+      if (!debug_summary_out.is_open()) {
+        throw std::runtime_error("failed to open chunk debug summary output");
+      }
+      debug_summary_out << std::fixed << std::setprecision(6);
+      debug_summary_out << "{\n";
+      debug_summary_out << "  \"chunk_index\": " << stitched_debug_chunk.chunk_index << ",\n";
+      debug_summary_out << "  \"row_start\": " << stitched_debug_chunk.row_start << ",\n";
+      debug_summary_out << "  \"row_stop\": " << stitched_debug_chunk.row_stop << ",\n";
+      debug_summary_out << "  \"src_rows\": " << stitched_debug_chunk.src_rows << ",\n";
+      debug_summary_out << "  \"src_cols\": " << stitched_debug_chunk.src_cols << ",\n";
+      debug_summary_out << "  \"freq_start_hz\": " << stitched_debug_chunk.freq_start_hz << ",\n";
+      debug_summary_out << "  \"freq_stop_hz\": " << stitched_debug_chunk.freq_stop_hz << ",\n";
+      debug_summary_out << "  \"ignore_bins_per_side\": " << stitched_debug_chunk.ignore_bins_per_side << ",\n";
+      debug_summary_out << "  \"dino_threshold\": " << stitched_debug_chunk.dino_threshold << ",\n";
+      debug_summary_out << "  \"runtime_final_threshold\": " << stitched_debug_chunk.runtime_final_threshold << ",\n";
+      debug_summary_out << "  \"seed_freq_threshold\": " << stitched_debug_chunk.seed_freq_threshold << ",\n";
+      debug_summary_out << "  \"seed_res_threshold\": " << stitched_debug_chunk.seed_res_threshold << ",\n";
+      debug_summary_out << "  \"combined_threshold\": " << stitched_debug_chunk.combined_threshold << ",\n";
+      debug_summary_out << "  \"final_fraction\": " << stitched_debug_chunk.final_fraction << ",\n";
+      debug_summary_out << "  \"connected_fraction\": " << stitched_debug_chunk.connected_fraction << ",\n";
+      debug_summary_out << "  \"component_count\": " << stitched_debug_chunk.component_count << ",\n";
+      debug_summary_out << "  \"grouped_box_count\": " << stitched_debug_chunk.grouped_box_count << ",\n";
+      debug_summary_out << "  \"runtime_input_gray_rows\": " << debug_chunk.runtime_input_gray_rows << ",\n";
+      debug_summary_out << "  \"runtime_input_gray_cols\": " << debug_chunk.runtime_input_gray_cols << ",\n";
+      debug_summary_out << "  \"patch_rows\": " << debug_chunk.patch_rows << ",\n";
+      debug_summary_out << "  \"patch_cols\": " << debug_chunk.patch_cols << ",\n";
+      debug_summary_out << "  \"feature_dim\": " << debug_chunk.feature_dim << ",\n";
+      debug_summary_out << "  \"legacy_fast_gray_preprocess\": " << (config.legacy_fast_gray_preprocess ? "true" : "false") << ",\n";
+      debug_summary_out << "  \"artifact_contract\": \"chunk_fixed_detector_grid_v1\",\n";
+      debug_summary_out << "  \"mask_source\": \"stitched_chunk_result\",\n";
+      debug_summary_out << "  \"diagnostic_tensor_source\": \"debug_chunk_rerun\",\n";
+      debug_summary_out << "  \"corrected_resized_npy\": \"" << json_escape(debug_corrected_path.string()) << "\",\n";
+      debug_summary_out << "  \"runtime_input_gray_npy\": \"" << json_escape(debug_runtime_input_gray_path.string()) << "\",\n";
+      debug_summary_out << "  \"dino_score_npy\": \"" << json_escape(debug_dino_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"dino_score_raw_npy\": \"" << json_escape(debug_raw_dino_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"coherence_gate_npy\": \"" << json_escape(debug_coherence_gate_path.string()) << "\",\n";
+      debug_summary_out << "  \"hybrid_contrib_npy\": \"" << json_escape(debug_hybrid_contrib_path.string()) << "\",\n";
+      debug_summary_out << "  \"combined_score_npy\": \"" << json_escape(debug_combined_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"patch_features_npy\": \"" << json_escape(debug_patch_features_path.string()) << "\",\n";
+      debug_summary_out << "  \"valid_mask_npy\": \"" << json_escape(debug_valid_mask_path.string()) << "\",\n";
+      debug_summary_out << "  \"bridged_mask_npy\": \"" << json_escape(debug_bridged_mask_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_mask_npy\": \"" << json_escape(debug_grouped_mask_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_mask_pgm\": \"" << json_escape(debug_grouped_mask_pgm.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_boxes_json\": \"" << json_escape(debug_grouped_boxes_path.string()) << "\",\n";
+      debug_summary_out << "  \"final_mask_npy\": \"" << json_escape(debug_final_mask_path.string()) << "\",\n";
+      debug_summary_out << "  \"final_mask_pgm\": \"" << json_escape(debug_final_mask_pgm.string()) << "\",\n";
+      debug_summary_out << "  \"final_mask_source_npy\": \"" << json_escape(debug_final_mask_source_path.string()) << "\",\n";
+      debug_summary_out << "  \"final_mask_source_pgm\": \"" << json_escape(debug_final_mask_source_pgm.string()) << "\",\n";
+      debug_summary_out << "  \"final_mask_projected_npy\": \"" << json_escape(debug_final_mask_projected_path.string()) << "\",\n";
+      debug_summary_out << "  \"final_mask_projected_pgm\": \"" << json_escape(debug_final_mask_projected_pgm.string()) << "\"\n";
+      debug_summary_out << "}\n";
+    }
+
+    write_stage_profile_json(stage_profile_path, profiler, debug_profiler);
 
     MaskComparison live_comparison;
     if (options.live_mask_path.has_value()) {
@@ -4583,9 +7248,11 @@ int main(int argc, char** argv) {
     summary << "  \"chunk_overlap_hz\": " << config.chunk_overlap_hz << ",\n";
     summary << "  \"frontend_reference_level\": " << frontend_reference_level << ",\n";
     summary << "  \"runtime_backend_used\": \"" << json_escape(runtime_config.inference_backend) << "\",\n";
-    if (!chunk_results.empty()) {
-      const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_results.size() - 1)));
-      const auto& debug_chunk = chunk_results[debug_chunk_index];
+    summary << "  \"legacy_fast_gray_preprocess\": " << (config.legacy_fast_gray_preprocess ? "true" : "false") << ",\n";
+    summary << "  \"debug_chunk_rerun_enabled\": true,\n";
+    summary << "  \"debug_chunk_summary_json\": \"" << json_escape(debug_chunk_summary_path.string()) << "\",\n";
+    if (debug_chunk_result.has_value()) {
+      const auto& debug_chunk = *debug_chunk_result;
       summary << "  \"debug_chunk_index\": " << debug_chunk.chunk_index << ",\n";
       summary << "  \"debug_chunk_dino_threshold\": " << debug_chunk.dino_threshold << ",\n";
       summary << "  \"debug_chunk_runtime_final_threshold\": " << debug_chunk.runtime_final_threshold << ",\n";
@@ -4626,11 +7293,11 @@ int main(int argc, char** argv) {
       std::cout << "  ignore bins/side: " << ignore_bins_per_side << "\n";
       std::cout << "  chunk count: " << chunk_plan.size() << "\n";
       std::cout << "  subsection-only validation: " << (options.subsection_only_validation ? "true" : "false") << "\n";
+      std::cout << "  legacy fast gray preprocess: " << (config.legacy_fast_gray_preprocess ? "true" : "false") << "\n";
       std::cout << "  projected grouped boxes: " << global_merged.projected_boxes.size() << "\n";
       std::cout << "  merged grouped boxes: " << global_merged.merged_boxes.size() << "\n";
-      if (!chunk_results.empty()) {
-        const size_t debug_chunk_index = static_cast<size_t>(clamp_value(options.debug_chunk_index, 0, static_cast<int>(chunk_results.size() - 1)));
-        const auto& debug_chunk = chunk_results[debug_chunk_index];
+      if (debug_chunk_result.has_value()) {
+        const auto& debug_chunk = *debug_chunk_result;
         std::cout << "  debug chunk: " << debug_chunk.chunk_index
                   << " rows=(" << debug_chunk.row_start << ", " << debug_chunk.row_stop << ")\n";
         std::cout << "  debug chunk thresholds: freq=" << debug_chunk.seed_freq_threshold
@@ -4644,7 +7311,9 @@ int main(int argc, char** argv) {
         std::cout << "  live mask agreement: " << live_comparison.pixel_agreement
                   << " IoU=" << live_comparison.intersection_over_union << "\n";
       }
-      print_stage_hotspots(profiler, std::cout, 10);
+      std::cout << "  timing summary:\n";
+      print_stage_phase_summary(collect_phase_entries(profiler, debug_profiler, false), std::cout, 10, "full pass");
+      print_stage_phase_summary(collect_phase_entries(profiler, debug_profiler, true), std::cout, 10, "debug rerun only");
       std::cout << "  stage profile: " << stage_profile_path << "\n";
       std::cout << "  summary: " << summary_path << "\n";
     }

@@ -5,6 +5,7 @@
 #include "coherent_power_signal_detector.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -39,6 +40,20 @@ struct SnapshotMetadata {
   std::filesystem::path tensor_snapshot_path;
   std::optional<std::filesystem::path> power_db_snapshot_path;
   holoscan::ops::CoherentPowerReferenceConfig config;
+};
+
+struct ValidationWorkEstimate {
+  int ignore_bins_per_side = 0;
+  int valid_rows = 0;
+  int chunk_rows = 0;
+  int overlap_rows = 0;
+  int chunk_count = 0;
+  int first_chunk_rows = 0;
+  int background_kernel_rows = 0;
+  int background_kernel_cols = 0;
+  int local_power_kernel_rows = 9;
+  int local_power_kernel_cols = 33;
+  double background_box_samples = 0.0;
 };
 
 template <typename T>
@@ -232,6 +247,87 @@ bool write_pgm(const std::filesystem::path& path, const std::vector<uint8_t>& im
   return out.good();
 }
 
+ValidationWorkEstimate estimate_validation_work(const SnapshotMetadata& metadata) {
+  ValidationWorkEstimate estimate;
+  if (metadata.rows <= 0 || metadata.cols <= 0) {
+    return estimate;
+  }
+
+  if (metadata.config.ignore_sideband_percent > 0.0) {
+    estimate.ignore_bins_per_side = static_cast<int>(std::floor(static_cast<double>(metadata.rows) * metadata.config.ignore_sideband_percent / 100.0));
+    estimate.ignore_bins_per_side = std::clamp(estimate.ignore_bins_per_side, 0, std::max(0, (metadata.rows - 16) / 2));
+  } else if (metadata.resolution_hz > 0.0 && metadata.config.ignore_sideband_hz > 0.0) {
+    estimate.ignore_bins_per_side = static_cast<int>(std::ceil(metadata.config.ignore_sideband_hz / metadata.resolution_hz));
+    estimate.ignore_bins_per_side = std::clamp(estimate.ignore_bins_per_side, 0, std::max(0, (metadata.rows - 16) / 2));
+  }
+
+  estimate.valid_rows = std::max(0, metadata.rows - 2 * estimate.ignore_bins_per_side);
+  if (estimate.valid_rows <= 0) {
+    return estimate;
+  }
+
+  if (metadata.resolution_hz > 0.0 && metadata.config.chunk_bandwidth_hz > 0.0) {
+    estimate.chunk_rows = std::clamp(
+        static_cast<int>(std::llround(metadata.config.chunk_bandwidth_hz / metadata.resolution_hz)),
+        16,
+        metadata.rows);
+    estimate.overlap_rows = std::clamp(
+        static_cast<int>(std::llround(metadata.config.chunk_overlap_hz / metadata.resolution_hz)),
+        0,
+        std::max(0, estimate.chunk_rows - 1));
+  } else {
+    estimate.chunk_rows = std::clamp(
+        static_cast<int>(std::llround(static_cast<double>(estimate.valid_rows) * metadata.config.uncalibrated_chunk_fraction)),
+        16,
+        estimate.valid_rows);
+    estimate.overlap_rows = std::clamp(
+        static_cast<int>(std::llround(static_cast<double>(estimate.chunk_rows) * metadata.config.uncalibrated_overlap_fraction)),
+        0,
+        std::max(0, estimate.chunk_rows - 1));
+  }
+
+  const int step_rows = std::max(1, estimate.chunk_rows - estimate.overlap_rows);
+  for (int start_index = 0; start_index < estimate.valid_rows; start_index += step_rows) {
+    const int stop_index = std::min(start_index + estimate.chunk_rows, estimate.valid_rows);
+    if (stop_index - start_index < 16) {
+      if (estimate.chunk_count > 0) {
+        break;
+      }
+      continue;
+    }
+    ++estimate.chunk_count;
+    if (estimate.first_chunk_rows == 0) {
+      estimate.first_chunk_rows = stop_index - start_index;
+    }
+    if (stop_index >= estimate.valid_rows) {
+      break;
+    }
+  }
+
+  estimate.background_kernel_rows = std::max(9, 2 * std::max(1, estimate.first_chunk_rows / 24) + 1);
+  estimate.background_kernel_cols = std::max(9, 2 * std::max(1, metadata.cols / 24) + 1);
+  estimate.background_box_samples = static_cast<double>(estimate.first_chunk_rows) *
+                                    static_cast<double>(metadata.cols) *
+                                    static_cast<double>(estimate.background_kernel_rows) *
+                                    static_cast<double>(estimate.background_kernel_cols);
+  return estimate;
+}
+
+std::string format_large_count(double value) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(1);
+  if (value >= 1.0e9) {
+    out << (value / 1.0e9) << "e9";
+  } else if (value >= 1.0e6) {
+    out << (value / 1.0e6) << "e6";
+  } else if (value >= 1.0e3) {
+    out << (value / 1.0e3) << "e3";
+  } else {
+    out << value;
+  }
+  return out.str();
+}
+
 bool write_npy_2d(const std::filesystem::path& path,
                   const void* payload,
                   size_t payload_bytes,
@@ -320,15 +416,60 @@ ValidatorOptions parse_arguments(int argc, char** argv) {
 
 int main(int argc, char** argv) {
   try {
+    const auto run_start = std::chrono::steady_clock::now();
+    auto stage_start = run_start;
+    auto log_stage = [&](const std::string& message) {
+      std::cout << message << std::endl;
+    };
+    auto log_stage_done = [&](const std::string& stage_name) {
+      const auto now = std::chrono::steady_clock::now();
+      const double stage_ms = std::chrono::duration<double, std::milli>(now - stage_start).count();
+      const double total_ms = std::chrono::duration<double, std::milli>(now - run_start).count();
+      std::cout << "[offline_coherent_power_validator] " << stage_name << " completed in " << std::fixed
+                << std::setprecision(1) << stage_ms << " ms"
+                << " (total " << total_ms << " ms)" << std::endl;
+      stage_start = now;
+    };
+
     const ValidatorOptions options = parse_arguments(argc, argv);
+    if (options.verbose) {
+      log_stage("[offline_coherent_power_validator] loading snapshot metadata...");
+    }
     const SnapshotMetadata metadata = load_snapshot_metadata(options.metadata_path);
+    if (options.verbose) {
+      log_stage_done("snapshot metadata load");
+      log_stage("[offline_coherent_power_validator] creating output directory...");
+    }
     std::filesystem::create_directories(options.output_dir);
+    if (options.verbose) {
+      log_stage_done("output directory setup");
+      log_stage("[offline_coherent_power_validator] loading tensor snapshot...");
+    }
 
     const NpyArray2D tensor_array = load_npy_2d(metadata.tensor_snapshot_path);
     if (tensor_array.rows != metadata.rows || tensor_array.cols != metadata.cols) {
       throw std::runtime_error("snapshot tensor shape does not match metadata sidecar");
     }
     const auto tensor = to_complex_tensor(tensor_array);
+    if (options.verbose) {
+      log_stage_done("tensor snapshot load");
+      const ValidationWorkEstimate estimate = estimate_validation_work(metadata);
+      std::cout << "[offline_coherent_power_validator] tensor shape "
+                << metadata.rows << "x" << metadata.cols
+                << ", valid_rows=" << estimate.valid_rows
+                << ", ignore_bins_per_side=" << estimate.ignore_bins_per_side
+                << ", chunk_count=" << estimate.chunk_count
+                << ", first_chunk_rows=" << estimate.first_chunk_rows
+                << ", chunk_overlap_rows=" << estimate.overlap_rows
+                << std::endl;
+      std::cout << "[offline_coherent_power_validator] first-chunk background box filter "
+                << estimate.background_kernel_rows << "x" << estimate.background_kernel_cols
+                << ", local-power box filter "
+                << estimate.local_power_kernel_rows << "x" << estimate.local_power_kernel_cols
+                << ", estimated background samples=" << format_large_count(estimate.background_box_samples)
+                << std::endl;
+      log_stage("[offline_coherent_power_validator] running coherent reference validation...");
+    }
 
     const auto result = holoscan::ops::run_coherent_power_reference_validation(
         tensor,
@@ -336,6 +477,10 @@ int main(int argc, char** argv) {
         metadata.cols,
         metadata.resolution_hz,
         metadata.config);
+    if (options.verbose) {
+      log_stage_done("coherent reference validation");
+      log_stage("[offline_coherent_power_validator] writing validator artifacts...");
+    }
 
     std::optional<double> max_abs_power_db_diff;
     std::optional<double> mean_abs_power_db_diff;
@@ -412,6 +557,9 @@ int main(int argc, char** argv) {
     summary << "  \"corrected_preview_pgm\": \"" << corrected_pgm.string() << "\",\n";
     summary << "  \"final_mask_pgm\": \"" << mask_pgm.string() << "\"\n";
     summary << "}\n";
+    if (options.verbose) {
+      log_stage_done("artifact write");
+    }
 
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "Coherent power offline validation\n";

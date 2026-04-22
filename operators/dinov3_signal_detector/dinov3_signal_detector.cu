@@ -2073,9 +2073,11 @@ void DinoV3SignalDetector::initialize() {
       runtime_config.pipeline_power_rescue_gain = pipeline_power_rescue_gain_.get();
 
       torch_runtime_->warmup(runtime_config,
-                            std::max(1, input_height_.get()),
-                            std::max(1, input_width_.get()),
-                            std::max(1, patch_size_.get()));
+                std::max(1, input_height_.get()),
+                std::max(1, input_width_.get()),
+                std::max(1, input_height_.get()),
+                std::max(1, input_width_.get()),
+                std::max(1, patch_size_.get()));
     }
     HOLOSCAN_LOG_INFO(
         "DINO hybrid detector runtime enabled. model_name='{}' repo='{}' weights='{}' script='{}'",

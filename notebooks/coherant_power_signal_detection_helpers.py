@@ -59,6 +59,36 @@ def input_kind_requires_display_transpose(input_kind: str | None) -> bool:
     return input_kind in {"pgm", "tensor_npy"}
 
 
+def _tensor_metadata_candidates(input_path: Path) -> list[Path]:
+    candidates = [
+        input_path.with_suffix(".json"),
+        input_path.parent / f"{input_path.stem}.json",
+    ]
+    if input_path.parent.name == "tensors":
+        candidates.append(
+            input_path.parent.parent
+            / "coherent_power_validator_artifacts"
+            / input_path.stem
+            / "coherent_power_input_snapshot.json"
+        )
+    return candidates
+
+
+def resolve_tensor_axis_order(input_path: str | Path) -> str:
+    path = Path(input_path)
+    for candidate in _tensor_metadata_candidates(path):
+        if not candidate.exists():
+            continue
+        try:
+            metadata = json.loads(candidate.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        axis_order = str(metadata.get("tensor_axis_order") or "").strip().lower()
+        if axis_order in {"frequency_time", "time_frequency"}:
+            return axis_order
+    return "frequency_time"
+
+
 def has_calibrated_frequency_axis(input_record: dict[str, Any]) -> bool:
     calibrated = input_record.get("frequency_axis_calibrated")
     if calibrated is not None:
@@ -291,8 +321,15 @@ def load_input_record(
                 height=int(tensor_target_height),
                 resample=Image.BILINEAR,
             )
-        sxx_db = np.ascontiguousarray(display_power_db.T)
-        time_axis_s = np.arange(display_power_db.shape[0], dtype=np.float32)
+        tensor_axis_order = resolve_tensor_axis_order(input_path)
+        if tensor_axis_order == "frequency_time":
+            sxx_db = np.ascontiguousarray(display_power_db)
+            time_axis_s = np.arange(display_power_db.shape[1], dtype=np.float32)
+            display_transposed = False
+        else:
+            sxx_db = np.ascontiguousarray(display_power_db.T)
+            time_axis_s = np.arange(display_power_db.shape[0], dtype=np.float32)
+            display_transposed = True
         center_frequency_hz = None
         sample_rate_hz = None
         freq_axis_hz = np.arange(sxx_db.shape[0], dtype=np.float32)
@@ -301,12 +338,13 @@ def load_input_record(
             "input_path": str(input_path),
             "sxx_db": sxx_db.astype(np.float32),
             "display_sxx_db": display_power_db.astype(np.float32),
-            "display_transposed": True,
+            "display_transposed": display_transposed,
             "frequency_axis_calibrated": False,
             "freq_axis_hz": freq_axis_hz.astype(np.float32),
             "time_axis_s": time_axis_s,
             "center_frequency_hz": center_frequency_hz,
             "sample_rate_hz": sample_rate_hz,
+            "tensor_axis_order": tensor_axis_order,
             "raw_tensor_shape": tuple(int(v) for v in complex_tensor.shape),
             "resized_tensor_shape": tuple(int(v) for v in display_power_db.shape),
             "annotations": [],
@@ -468,6 +506,7 @@ def build_frequency_chunks(
     chunk_overlap_hz: float,
     min_rows: int = 16,
     valid_row_mask: np.ndarray | None = None,
+    calibrated_axis: bool = False,
     uncalibrated_chunk_fraction: float = 0.40,
     uncalibrated_overlap_fraction: float = 0.20,
 ) -> list[dict[str, Any]]:
@@ -495,7 +534,17 @@ def build_frequency_chunks(
         raise ValueError("chunk_bandwidth_hz must be larger than chunk_overlap_hz")
 
     freq_span = float(freq_max - freq_min)
-    if freq_span <= 0.0 or chunk_bandwidth_hz >= freq_span:
+    if chunk_bandwidth_hz >= freq_span:
+        if calibrated_axis or freq_span > 0.0:
+            return [{
+                "chunk_index": 0,
+                "row_start": int(valid_idx[0]),
+                "row_stop": int(valid_idx[-1]) + 1,
+                "freq_start_hz": float(freq_axis_hz[valid_idx[0]]),
+                "freq_stop_hz": float(freq_axis_hz[valid_idx[-1]]),
+            }]
+
+    if freq_span <= 0.0:
         valid_count = int(valid_idx.size)
         chunk_fraction = float(np.clip(uncalibrated_chunk_fraction, 0.10, 1.0))
         overlap_fraction = float(np.clip(uncalibrated_overlap_fraction, 0.0, 0.95))
@@ -1642,6 +1691,7 @@ def run_coherent_power_pipeline(
         chunk_overlap_hz=cfg.chunk_overlap_hz,
         min_rows=16,
         valid_row_mask=valid_row_mask,
+        calibrated_axis=calibrated_axis,
         uncalibrated_chunk_fraction=cfg.uncalibrated_chunk_fraction,
         uncalibrated_overlap_fraction=cfg.uncalibrated_overlap_fraction,
     )
@@ -1795,8 +1845,33 @@ def _draw_signal_boxes(
         )
 
 
-def _show_debug_panel(ax, panel: np.ndarray, title: str, display_transposed: bool, cmap: str, vmin=None, vmax=None):
-    display_panel = panel.T if display_transposed else panel
+def _expected_display_shape(reference: np.ndarray, display_transposed: bool) -> tuple[int, int]:
+    reference = np.asarray(reference)
+    return reference.T.shape if display_transposed else reference.shape
+
+
+def _orient_panel_for_display(panel: np.ndarray, reference: np.ndarray, display_transposed: bool) -> np.ndarray:
+    panel = np.asarray(panel)
+    expected_shape = _expected_display_shape(reference, display_transposed)
+    if panel.shape == expected_shape:
+        return panel
+    if panel.ndim == 2 and panel.T.shape == expected_shape:
+        return panel.T
+    return panel.T if display_transposed else panel
+
+
+def _show_debug_panel(
+    ax,
+    panel: np.ndarray,
+    title: str,
+    display_transposed: bool,
+    cmap: str,
+    vmin=None,
+    vmax=None,
+    reference: np.ndarray | None = None,
+):
+    reference_panel = panel if reference is None else reference
+    display_panel = _orient_panel_for_display(panel, reference_panel, display_transposed)
     ax.imshow(display_panel, aspect="auto", origin="lower", cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
     ax.set_title(title)
     _set_spectrogram_axis_labels(ax, display_transposed)
@@ -1817,8 +1892,8 @@ def _show_debug_overlay(
 ):
     if mask_cmap is not None:
         overlay_cmap = mask_cmap
-    display_base = base.T if display_transposed else base
-    display_overlay = overlay.T if display_transposed else overlay
+    display_base = _orient_panel_for_display(base, base, display_transposed)
+    display_overlay = _orient_panel_for_display(overlay, base, display_transposed)
     ax.imshow(display_base, aspect="auto", origin="lower", cmap="gray", vmin=base_vmin, vmax=base_vmax, interpolation="nearest")
     ax.imshow(np.where(display_overlay, 1.0, np.nan), aspect="auto", origin="lower", cmap=overlay_cmap, alpha=overlay_alpha, interpolation="nearest")
     _draw_signal_boxes(ax, boxes, display_transposed)
@@ -1914,10 +1989,10 @@ def plot_merged_detection(pipeline_result: dict[str, Any], figsize: tuple[int, i
             input_kind_requires_display_transpose(pipeline_result["input_record"].get("input_kind")),
         )
     )
-    display_corrected = corrected_sxx_db.T if display_transposed else corrected_sxx_db
-    display_score = merged_score.T if display_transposed else merged_score
-    display_mask = merged_mask.T if display_transposed else merged_mask
-    display_support = merged_support.T if display_transposed else merged_support
+    display_corrected = _orient_panel_for_display(corrected_sxx_db, corrected_sxx_db, display_transposed)
+    display_score = _orient_panel_for_display(merged_score, corrected_sxx_db, display_transposed)
+    display_mask = _orient_panel_for_display(merged_mask, corrected_sxx_db, display_transposed)
+    display_support = _orient_panel_for_display(merged_support, corrected_sxx_db, display_transposed)
     vmin, vmax = _display_db_window(corrected_sxx_db)
     fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
     axes[0].imshow(display_corrected, aspect="auto", origin="lower", cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")
@@ -1969,10 +2044,10 @@ def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] 
     vmin, vmax = _display_db_window(corrected_sxx_db)
     fig, axes = plt.subplots(1, 5, figsize=figsize, constrained_layout=True)
     _show_debug_panel(axes[0], corrected_sxx_db, "Input spectrogram", display_transposed, "viridis", vmin, vmax)
-    _show_debug_panel(axes[1], merged_coherence, "Merged coherence", display_transposed, "plasma", 0.0, 1.0)
-    _show_debug_panel(axes[2], merged_power, "Merged normalized power", display_transposed, "cividis", 0.0, 1.0)
-    _show_debug_panel(axes[3], merged_score, "Merged coherence + power score", display_transposed, "magma", 0.0, 1.0)
-    support_display = merged_support.T if display_transposed else merged_support
+    _show_debug_panel(axes[1], merged_coherence, "Merged coherence", display_transposed, "plasma", 0.0, 1.0, reference=corrected_sxx_db)
+    _show_debug_panel(axes[2], merged_power, "Merged normalized power", display_transposed, "cividis", 0.0, 1.0, reference=corrected_sxx_db)
+    _show_debug_panel(axes[3], merged_score, "Merged coherence + power score", display_transposed, "magma", 0.0, 1.0, reference=corrected_sxx_db)
+    support_display = _orient_panel_for_display(merged_support, corrected_sxx_db, display_transposed)
     axes[3].imshow(np.where(support_display, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.18, interpolation="nearest")
     _draw_signal_boxes(axes[3], merged_boxes, display_transposed)
     _show_debug_overlay(axes[4], corrected_sxx_db, merged_mask, "Grouped final overlay", display_transposed, vmin, vmax, boxes=merged_boxes)

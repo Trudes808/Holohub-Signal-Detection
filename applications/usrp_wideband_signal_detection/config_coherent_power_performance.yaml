@@ -42,7 +42,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 25000
+        num_bufs: 131072
         buf_size: 4096
       - name: "CH2_CHDR_Headers_RX_CPU"
         kind: "huge"
@@ -56,7 +56,7 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 25000
+        num_bufs: 131072
         buf_size: 4096
 
     interfaces:

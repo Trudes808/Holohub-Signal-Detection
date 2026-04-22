@@ -220,8 +220,8 @@ coherent_power_signal_detector:
   chunk_overlap_hz: 6250000.0
   uncalibrated_chunk_fraction: 0.40
   uncalibrated_overlap_fraction: 0.20
-  ignore_sideband_percent: 0.0
-  ignore_sideband_hz: 7000000.0
+  ignore_sideband_percent: 10.0
+  ignore_sideband_hz: 0.0
   frontend_row_q: 25.0
   frontend_reference_q: 75.0
   frontend_smooth_sigma: 12.0

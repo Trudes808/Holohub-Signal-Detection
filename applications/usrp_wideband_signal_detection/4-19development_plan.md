@@ -1,5 +1,53 @@
 # DINO Retry Chunk-Merge Port Plan
 
+## Progress Update 2026-04-21T10:46:38-05:00
+
+- The first uniform-chunk sideband-trim search was wrong for calibrated frequency axes. It searched for any fully uniform plan using the existing Hz-threshold chunk builder, and for the current 20,480-row capture that path only becomes perfectly uniform after trimming almost the entire band away.
+- The calibrated uniform-chunk logic now derives chunk rows and overlap rows directly from the configured bandwidth and overlap in bins, then increases ignored sideband bins only enough to make the retained valid rows tile evenly into full-size chunks.
+- For the current single-channel validation capture, that means the planner now lands near the expected operating point instead of collapsing to a tiny residual band: `ignore_bins_per_side` moves from `287` to `512`, retained rows become `19456`, chunk count becomes `25`, and every planned chunk is `1024` rows tall.
+- The same calibrated uniform-chunk rule has been mirrored into the shared Python retry helper so the notebook and comparison scripts rebuild the same plan as the offline performance validator.
+
+## Progress Update 2026-04-21T11:11:43-05:00
+
+- The next runtime experiment is now wired into the offline performance validator: instead of feeding DINO a chunk-sized patch-aligned input, the validator now downsamples the full chunk to the fixed detector grid before the Torch forward path.
+- For the current validation config, that means the DINO model input is driven at the existing detector-grid scale (`input_height x input_width`, currently `256x512`) instead of the prior near-source chunk scale (`1024x1024` for most uniform chunks).
+- This experiment changes the runtime contract for the selected debug chunk as well, so the chunk-debug artifact bundle now advertises a dedicated contract string and the notebook helper reconstructs the same fixed-grid Python runtime input before comparing pre-model grayscale and runtime raw or grouped DINO maps.
+- The purpose of this pass is to measure how much of the full-run bottleneck was truly tied to large DINO forward shapes, then compare the resulting validation drift against the current chunk-level notebook and comparison report before deciding whether a capped-input path is viable for the non-debug full-run route.
+
+## Progress Update 2026-04-21T10:12:34-05:00
+
+- The immediate focus is back on the offline validator, not the live Holoscan operator. The current goal is to push down full all-chunk runtime until the remaining algorithmic risks are clearer, then port the proven path.
+- The next optimization sequence is now explicit:
+   1. batch only naturally equal-sized planned spectrogram subsections so batching is efficient without rewriting the chunk plan,
+   2. batch non-debug chunk Torch inference through the shared runtime while keeping the selected debug chunk on the single-item parity path,
+   3. replace the current `group_mask_regions` hot path with faster primitives rather than carrying the older brute-force morphology and flood-fill style cost profile.
+- The performance validator now keeps the original chunk plan intact, batches only non-debug chunks that already share the same row count, and keeps the debug chunk on the existing artifact-rich path so notebook parity remains apples-to-apples.
+- The grouping hot path has also been reworked around faster separable binary morphology and a union-find connected-components pass so the next full-run measurement can show whether grouping is still a dominant CPU stage after those replacements.
+- TensorRT remains a high-upside option for the Torch runtime bottleneck, but it is explicitly deferred for now. Keep it on the plan as a later route if batched LibTorch forward still leaves `chunk_torch_runtime` dominant after the current offline-validator changes.
+- Hold the more aggressive fused hybrid-support plus grouping rewrite for a later pass. Keep it noted as a follow-on option if the current batch plus grouping changes are not enough.
+- Hold chunk-count reduction and overlap redesign for now as well. Keep it in notes as a higher-risk recall tradeoff once the batched uniform-chunk baseline is measured.
+
+## Notes 2026-04-21T10:21:47-05:00
+
+Historical comparison against commit `36dd9f67` suggests the earlier fast Torch behavior was not just a "better Torch version" effect. The largest differences appear to come from how Torch was being driven and how much surrounding work was attached to each call.
+
+Most important observations:
+
+- The historical fast path appears to have run Torch at the detector grid or another much smaller fixed working size, while the current offline validator feeds Torch chunk-sized tensors whose `dst_rows` and `dst_cols` are derived from each chunk's source dimensions.
+- The historical fast path kept the score map on device in the operator fast backend (`return_final_mask=false`, `return_final_mask_device=true`), while the current offline validator requests CPU score-map materialization (`return_final_mask=true`, `return_final_mask_device=false`) so downstream projection and validation logic can consume host vectors.
+- The older fast path used a much lighter pre-model image construction step based on direct quantile normalization of the resized tensor, while the current runtime uses the heavier `signal_agnostic_dino_gray(...)` preprocessing path before model execution.
+- The older path also used cheaper quantile selection behavior (`kthvalue` style semantics). That cheaper selection path has now been reintroduced in the current performance branch, so quantile work is no longer the leading runtime delta in the latest measurements; the dominant remaining costs have shifted to batched Torch forward, hybrid-support or residual-veto postprocess, and chunk coherence generation.
+- The current offline validator is also solving a more validation-faithful problem than the older fast live path: chunk-local parity surfaces, chunk projection, chunk hybrid support, and CPU grouping all remain in play, so not all of the observed runtime delta belongs to Torch forward itself.
+
+Likely causes to try next:
+
+1. Test whether Torch can be run on a smaller fixed detector-grid input again for the offline validator path, or at least on a smaller capped chunk working size, without breaking the needed validation contract.
+2. Add an experiment that keeps the runtime score map on device for the non-debug full-run path and delays or avoids CPU materialization until a later stage that truly requires host access.
+3. Add a simplified pre-model image construction experiment that temporarily replaces `signal_agnostic_dino_gray(...)` with the older lightweight normalized-grayscale path, then compare both runtime and validation drift.
+4. Reintroduce a cheaper quantile path for the full-run non-debug route, such as `kthvalue`-style thresholding, and measure whether the recovered speed is material relative to any parity loss.
+5. Separate measured Torch cost from measured surrounding runtime cost more explicitly by breaking `chunk_torch_runtime` into at least `model_prep`, `torch_forward`, `dino_score`, and `score_to_cpu` summaries in the offline validator reports.
+6. If the smaller-input and GPU-resident-score experiments recover most of the old performance, prioritize those before reopening the deferred TensorRT path.
+
 ## Progress Update 2026-04-21T07:41:24-05:00
 
 - Added first-pass stage profiling to `offline_dino_validator_performance.cpp` for both run-level stages and per-chunk stages.
@@ -474,6 +522,10 @@ Recommended scheme:
 7. Keep chunk-local coherence gate and retry-support operations on device where practical.
 8. Move only compact metadata back to host for grouping if grouping remains host-side initially.
 9. Once parity is stable, consider moving grouping and merge to GPU if runtime throughput requires it.
+
+Live-operator implementation note:
+
+When this validator/reference path is ported into the live DINO operator, replace the remaining Torch-driven frontend-correction and coherence helper stages with custom CUDA implementations modeled after the coherent-power fast path. Treat the current validator work as the parity reference, but target dedicated CUDA kernels for the live operator so chunk-local preprocessing and coherence stay device-native with lower framework overhead.
 
 Practical note:
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,8 @@ APP_DIR = WORKSPACE_ROOT / "holohub-dev" / "applications" / "usrp_wideband_signa
 REFERENCE_REPO = WORKSPACE_ROOT / "Dinov3-RF-Signal-Detection"
 DEFAULT_CONFIG_PATH = APP_DIR / "config_torchscript_validation_capture_single_channel.yaml"
 DEFAULT_ARTIFACT_ROOT = Path("/tmp/usrp_spectrograms/dino_validator_artifacts")
+DEFAULT_NOTEBOOK_CACHE_ROOT = WORKSPACE_ROOT / "holohub-dev" / "notebooks" / "validator_artifacts"
+PYTHON_FULL_FRAME_MASK_CACHE_VERSION = 1
 
 
 def _load_module(module_name: str, module_path: Path):
@@ -135,8 +139,157 @@ def load_json(path: str | Path) -> Any:
         return json.load(file)
 
 
+def write_json_atomic(path: str | Path, payload: Any) -> None:
+    resolved_path = Path(path).expanduser().resolve()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = resolved_path.with_name(resolved_path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, sort_keys=True)
+        file.write("\n")
+    tmp_path.replace(resolved_path)
+
+
+def save_npy_atomic(path: str | Path, array: np.ndarray) -> None:
+    resolved_path = Path(path).expanduser().resolve()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = resolved_path.with_name(resolved_path.name + ".tmp")
+    with tmp_path.open("wb") as file:
+        np.save(file, np.asarray(array), allow_pickle=False)
+    tmp_path.replace(resolved_path)
+
+
+def file_signature(path: str | Path) -> dict[str, Any]:
+    resolved_path = Path(path).expanduser().resolve()
+    stat = resolved_path.stat()
+    return {
+        "path": str(resolved_path),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def python_full_frame_mask_cache_paths(tensor_path: str | Path) -> tuple[Path, Path]:
+    resolved_tensor_path = Path(tensor_path).expanduser().resolve()
+    path_digest = hashlib.sha1(str(resolved_tensor_path).encode("utf-8")).hexdigest()[:12]
+    cache_dir = DEFAULT_NOTEBOOK_CACHE_ROOT / f"{resolved_tensor_path.stem}_{path_digest}"
+    return (
+        cache_dir / "python_full_frame_final_mask.npy",
+        cache_dir / "python_full_frame_final_mask_cache.json",
+    )
+
+
+def python_full_frame_mask_cache_metadata(
+    *,
+    tensor_path: str | Path,
+    config_path: str | Path,
+    weights_path: str | Path,
+    dino_device: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": PYTHON_FULL_FRAME_MASK_CACHE_VERSION,
+        "tensor": file_signature(tensor_path),
+        "config": file_signature(config_path),
+        "weights": file_signature(weights_path),
+        "dino_device": str(dino_device),
+    }
+
+
+def load_cached_python_full_frame_final_mask(
+    *,
+    tensor_path: str | Path,
+    config_path: str | Path,
+    weights_path: str | Path,
+    dino_device: str,
+) -> dict[str, Any] | None:
+    cache_npy_path, cache_meta_path = python_full_frame_mask_cache_paths(tensor_path)
+    if not cache_npy_path.exists() or not cache_meta_path.exists():
+        return None
+    try:
+        cached_meta = load_json(cache_meta_path)
+    except Exception:
+        return None
+    expected_meta = python_full_frame_mask_cache_metadata(
+        tensor_path=tensor_path,
+        config_path=config_path,
+        weights_path=weights_path,
+        dino_device=dino_device,
+    )
+    if cached_meta != expected_meta:
+        return None
+    try:
+        final_mask = np.asarray(np.load(cache_npy_path, allow_pickle=False), dtype=bool)
+    except Exception:
+        return None
+    return {
+        "final_mask": final_mask,
+        "cache_used": True,
+        "cache_path": cache_npy_path,
+        "cache_metadata_path": cache_meta_path,
+    }
+
+
+def save_python_full_frame_final_mask_cache(
+    *,
+    tensor_path: str | Path,
+    config_path: str | Path,
+    weights_path: str | Path,
+    dino_device: str,
+    final_mask: np.ndarray,
+) -> dict[str, Any]:
+    cache_npy_path, cache_meta_path = python_full_frame_mask_cache_paths(tensor_path)
+    cache_meta = python_full_frame_mask_cache_metadata(
+        tensor_path=tensor_path,
+        config_path=config_path,
+        weights_path=weights_path,
+        dino_device=dino_device,
+    )
+    save_npy_atomic(cache_npy_path, np.asarray(final_mask, dtype=np.uint8))
+    write_json_atomic(cache_meta_path, cache_meta)
+    return {
+        "cache_used": False,
+        "cache_path": cache_npy_path,
+        "cache_metadata_path": cache_meta_path,
+    }
+
+
+def load_npy_checked(path: str | Path) -> np.ndarray:
+    resolved_path = Path(path).expanduser().resolve()
+    last_error: Exception | None = None
+    for attempt in range(6):
+        try:
+            return np.load(resolved_path, allow_pickle=False)
+        except (FileNotFoundError, ValueError) as exc:
+            last_error = exc
+            if attempt == 5:
+                break
+            time.sleep(0.5)
+
+    size_bytes = resolved_path.stat().st_size if resolved_path.exists() else 0
+    if isinstance(last_error, FileNotFoundError):
+        raise RuntimeError(
+            "Offline validator artifact bundle is missing files because the run is still in progress or the bundle is incomplete. "
+            f"Expected {resolved_path}. Wait for the validator run to finish and rerun Cell 3, or write the new run to a different output directory."
+        ) from last_error
+    raise RuntimeError(
+        "Offline validator artifact bundle appears to be incomplete or still being written. "
+        f"Failed to load {resolved_path} ({size_bytes} bytes) after retrying for 3 seconds. "
+        "Wait for the validator run to finish and rerun Cell 3, or write the new run to a different output directory."
+    ) from last_error
+
+
 def load_bool_npy(path: str | Path) -> np.ndarray:
-    return np.asarray(np.load(Path(path).expanduser().resolve(), allow_pickle=False), dtype=np.float32) >= 0.5
+    return np.asarray(load_npy_checked(path), dtype=np.float32) >= 0.5
+
+
+def load_float32_npy(path: str | Path) -> np.ndarray:
+    return np.asarray(load_npy_checked(path), dtype=np.float32)
+
+
+def try_load_bool_npy(path: str | Path) -> tuple[np.ndarray | None, str | None]:
+    try:
+        return load_bool_npy(path), None
+    except RuntimeError as exc:
+        return None, str(exc)
 
 
 def normalize01_masked(array: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -389,6 +542,87 @@ def resize_mask_to_shape(mask: np.ndarray, target_shape: tuple[int, int]) -> np.
     return resized >= 0.5
 
 
+def stitch_chunk_mask_to_full_frame(
+    full_mask: np.ndarray,
+    chunk_mask: np.ndarray,
+    *,
+    row_start: int,
+    row_stop: int,
+) -> None:
+    full_rows, full_cols = tuple(int(v) for v in full_mask.shape)
+    row_start = int(np.clip(row_start, 0, full_rows))
+    row_stop = int(np.clip(row_stop, row_start, full_rows))
+    if row_stop <= row_start:
+        return
+    projected = resize_mask_to_shape(np.asarray(chunk_mask, dtype=bool), (row_stop - row_start, full_cols))
+    full_mask[row_start:row_stop, :] = np.logical_or(full_mask[row_start:row_stop, :], projected)
+
+
+def build_python_full_frame_final_mask(
+    python_bundle: dict[str, Any],
+    retry_helper,
+    *,
+    tensor_path: str | Path,
+    config_path: str | Path,
+) -> dict[str, Any]:
+    cached = load_cached_python_full_frame_final_mask(
+        tensor_path=tensor_path,
+        config_path=config_path,
+        weights_path=python_bundle["config"]["weights_path"],
+        dino_device=python_bundle["dino_device"],
+    )
+    if cached is not None:
+        return cached
+
+    corrected_sxx_db = np.asarray(python_bundle["correction"]["corrected_sxx_db"], dtype=np.float32)
+    valid_row_mask = np.asarray(python_bundle["correction"]["valid_row_mask"], dtype=bool)
+    full_final_mask = np.zeros(corrected_sxx_db.shape, dtype=bool)
+
+    for chunk in python_bundle["chunk_plan"]:
+        row_start = int(chunk["row_start"])
+        row_stop = int(chunk["row_stop"])
+        corrected_chunk = np.asarray(corrected_sxx_db[row_start:row_stop, :], dtype=np.float32)
+        if corrected_chunk.size == 0:
+            continue
+        local_valid_row_mask = np.asarray(valid_row_mask[row_start:row_stop], dtype=bool)
+        valid_score_mask = np.repeat(local_valid_row_mask[:, None], corrected_chunk.shape[1], axis=1)
+        valid_values = corrected_chunk[valid_score_mask] if np.any(valid_score_mask) else corrected_chunk.reshape(-1)
+        dino_db_min = float(np.percentile(valid_values, 2.0))
+        dino_db_max = float(np.percentile(valid_values, 98.0))
+        python_retry = build_python_retry_hybrid_products(
+            retry_helper,
+            corrected_chunk,
+            valid_score_mask,
+            dino_repo_dir=python_bundle["config"]["model_repo_path"],
+            dino_weights_path=python_bundle["config"]["weights_path"],
+            dino_model_name=python_bundle["config"]["model_name"],
+            dino_device=python_bundle["dino_device"],
+            min_component_size=python_bundle["config"]["min_component_size"],
+            dino_db_min=dino_db_min,
+            dino_db_max=dino_db_max,
+        )
+        python_support = build_retry_frequency_support_mask(python_retry["hybrid_dino_contrib"], valid_score_mask)
+        stitch_chunk_mask_to_full_frame(
+            full_final_mask,
+            python_support["final_mask"],
+            row_start=row_start,
+            row_stop=row_stop,
+        )
+
+    full_final_mask[~valid_row_mask, :] = False
+    cache_info = save_python_full_frame_final_mask_cache(
+        tensor_path=tensor_path,
+        config_path=config_path,
+        weights_path=python_bundle["config"]["weights_path"],
+        dino_device=python_bundle["dino_device"],
+        final_mask=full_final_mask,
+    )
+    return {
+        "final_mask": full_final_mask,
+        **cache_info,
+    }
+
+
 def mask_metrics(lhs: np.ndarray, rhs: np.ndarray) -> dict[str, float]:
     lhs = np.asarray(lhs, dtype=bool)
     rhs = np.asarray(rhs, dtype=bool)
@@ -499,7 +733,31 @@ def build_python_expected_dino_runtime_input(
     target_shape: tuple[int, int],
     db_min: float,
     db_max: float,
+    runtime_contract: str = "",
 ) -> dict[str, Any] | None:
+    if runtime_contract == "chunk_fixed_detector_grid_v1":
+        expected_rows = (int(target_shape[0]) // int(patch_size)) * int(patch_size)
+        expected_cols = (int(target_shape[1]) // int(patch_size)) * int(patch_size)
+        if expected_rows < int(patch_size) or expected_cols < int(patch_size):
+            return None
+        python_runtime_chunk = resize_array_to_shape(np.asarray(corrected_chunk, dtype=np.float32), (expected_rows, expected_cols), order=1)
+        dino_input_debug = build_signal_agnostic_input_debug(
+            retry_helper,
+            python_runtime_chunk,
+            target_shape,
+            db_min=db_min,
+            db_max=db_max,
+        )
+        return {
+            "row_start": 0,
+            "row_stop": int(corrected_chunk.shape[0]),
+            "expected_shape": (int(expected_rows), int(expected_cols)),
+            "runtime_chunk": np.asarray(python_runtime_chunk, dtype=np.float32),
+            "input_gray": np.asarray(dino_input_debug["input_gray"], dtype=np.float32),
+            "fixed_gray": np.asarray(dino_input_debug["fixed_gray"], dtype=np.float32),
+            "maps_full_chunk": True,
+        }
+
     local_ignore_info = retry_helper.compute_ignore_sideband_rows(
         np.asarray(chunk_freq_axis_hz, dtype=np.float32),
         ignore_sideband_percent=0.0,
@@ -535,6 +793,7 @@ def build_python_expected_dino_runtime_input(
         "runtime_chunk": np.asarray(python_runtime_chunk, dtype=np.float32),
         "input_gray": np.asarray(dino_input_debug["input_gray"], dtype=np.float32),
         "fixed_gray": np.asarray(dino_input_debug["fixed_gray"], dtype=np.float32),
+        "maps_full_chunk": False,
     }
 
 
@@ -546,6 +805,7 @@ def embed_runtime_crop_to_chunk_grid(
     expected_shape: tuple[int, int],
     target_shape: tuple[int, int],
     order: int,
+    maps_full_chunk: bool = False,
 ) -> np.ndarray:
     runtime_map = np.asarray(runtime_map, dtype=np.float32)
     source_rows, source_cols = (int(value) for value in source_shape)
@@ -554,6 +814,9 @@ def embed_runtime_crop_to_chunk_grid(
         raise ValueError(
             f"Runtime map shape {runtime_map.shape} does not match expected runtime crop {(expected_rows, expected_cols)}"
         )
+
+    if maps_full_chunk:
+        return resize_array_to_shape(runtime_map, target_shape, order=order)
 
     canvas = np.zeros((source_rows, source_cols), dtype=np.float32)
     safe_row_start = max(0, min(source_rows, int(row_start)))
@@ -626,20 +889,20 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
     row_stop = int(debug_summary["row_stop"])
     mapped_row_start = max(0, min(output_rows - 1, int(np.floor(row_start * output_rows / max(canonical_rows, 1)))))
     mapped_row_stop = max(mapped_row_start + 1, min(output_rows, int(np.ceil(row_stop * output_rows / max(canonical_rows, 1)))))
-    chunk_dino_score = np.load(output_path / "chunk_debug" / "chunk_dino_score.npy", allow_pickle=False).astype(np.float32)
+    chunk_dino_score = load_float32_npy(output_path / "chunk_debug" / "chunk_dino_score.npy")
     chunk_dino_score_raw_path = output_path / "chunk_debug" / "chunk_dino_score_raw.npy"
-    chunk_dino_score_raw = np.load(chunk_dino_score_raw_path, allow_pickle=False).astype(np.float32) if chunk_dino_score_raw_path.exists() else chunk_dino_score.copy()
-    chunk_combined_score = np.load(output_path / "chunk_debug" / "chunk_combined_score.npy", allow_pickle=False).astype(np.float32)
+    chunk_dino_score_raw = load_float32_npy(chunk_dino_score_raw_path) if chunk_dino_score_raw_path.exists() else chunk_dino_score.copy()
+    chunk_combined_score = load_float32_npy(output_path / "chunk_debug" / "chunk_combined_score.npy")
     runtime_input_gray_path = output_path / "chunk_debug" / "chunk_runtime_input_gray.npy"
     chunk_grouped_mask = load_bool_npy(output_path / "chunk_debug" / "chunk_grouped_mask.npy")
     chunk_grouped_combined_score = np.where(chunk_grouped_mask, chunk_combined_score, 0.0).astype(np.float32)
     chunk_grouped_dino_score = np.where(chunk_grouped_mask, chunk_dino_score, 0.0).astype(np.float32)
     chunk_grouped_raw_dino_score = np.where(chunk_grouped_mask, chunk_dino_score_raw, 0.0).astype(np.float32)
-    runtime_input_gray = np.load(runtime_input_gray_path, allow_pickle=False).astype(np.float32) if runtime_input_gray_path.exists() else None
+    runtime_input_gray = load_float32_npy(runtime_input_gray_path) if runtime_input_gray_path.exists() else None
     runtime_input_gray_rows = int(debug_summary.get("runtime_input_gray_rows", 0) or 0)
     runtime_input_gray_cols = int(debug_summary.get("runtime_input_gray_cols", 0) or 0)
     patch_features_path = output_path / "chunk_debug" / "chunk_patch_features.npy"
-    patch_features = np.load(patch_features_path, allow_pickle=False).astype(np.float32) if patch_features_path.exists() else None
+    patch_features = load_float32_npy(patch_features_path) if patch_features_path.exists() else None
     patch_rows = int(debug_summary.get("patch_rows", 0) or 0)
     patch_cols = int(debug_summary.get("patch_cols", 0) or 0)
     feature_dim = int(debug_summary.get("feature_dim", 0) or 0)
@@ -664,18 +927,24 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
     if runtime_input_gray is not None and runtime_input_gray_rows > 0 and runtime_input_gray_cols > 0:
         src_rows = int(debug_summary.get("src_rows", runtime_input_gray_rows) or runtime_input_gray_rows)
         src_cols = int(debug_summary.get("src_cols", runtime_input_gray_cols) or runtime_input_gray_cols)
-        ignore_bins_per_side = int(debug_summary.get("ignore_bins_per_side", 0) or 0)
-        if ignore_bins_per_side == 0 and runtime_input_gray_rows < src_rows:
+        if runtime_input_gray_rows > src_rows or runtime_input_gray_cols > src_cols:
             artifact_warnings.append(
-                f"C++ runtime_input_gray shape is {(runtime_input_gray_rows, runtime_input_gray_cols)} for a {(src_rows, src_cols)} chunk even though ignore_bins_per_side=0; this is the legacy extra-runtime-crop signature."
+                f"C++ runtime_input_gray shape {(runtime_input_gray_rows, runtime_input_gray_cols)} exceeds the source chunk shape {(src_rows, src_cols)}."
             )
     if not patch_features_path.exists() or not has_patch_feature_grouping:
         artifact_warnings.append(
             "chunk_debug/chunk_patch_features.npy is missing or inconsistent, so the saved C++ grouped DINO surface is not a verified patch-feature grouping result."
         )
-    if artifact_contract and artifact_contract != "chunk_no_extra_sideband_crop_v2":
+    if artifact_contract and artifact_contract not in {"chunk_no_extra_sideband_crop_v2", "chunk_fixed_detector_grid_v1"}:
         artifact_warnings.append(
-            f"Chunk artifact contract is '{artifact_contract}' instead of 'chunk_no_extra_sideband_crop_v2'."
+            f"Chunk artifact contract is '{artifact_contract}' instead of a supported runtime contract."
+        )
+
+    full_frame_final_mask, full_frame_final_mask_error = try_load_bool_npy(output_path / "offline_final_mask.npy")
+    if full_frame_final_mask_error is not None:
+        artifact_warnings.append(
+            "Offline full-frame final mask is unavailable, so the notebook will skip the full-frame final-mask comparison. "
+            + full_frame_final_mask_error
         )
 
     return {
@@ -689,11 +958,11 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
         "selected_chunk": chunk_results_by_index[chunk_index],
         "selected_plan_entry": chunk_plan_by_index[chunk_index],
         "full_frame": {
-            "corrected_resized": np.load(output_path / "offline_corrected_resized.npy", allow_pickle=False).astype(np.float32),
-            "final_mask": load_bool_npy(output_path / "offline_final_mask.npy"),
+            "corrected_resized": load_float32_npy(output_path / "offline_corrected_resized.npy"),
+            "final_mask": full_frame_final_mask,
         },
         "chunk_debug": {
-            "corrected_resized": np.load(output_path / "chunk_debug" / "chunk_corrected_resized.npy", allow_pickle=False).astype(np.float32),
+            "corrected_resized": load_float32_npy(output_path / "chunk_debug" / "chunk_corrected_resized.npy"),
             "runtime_input_gray": runtime_input_gray,
             "runtime_input_gray_rows": runtime_input_gray_rows,
             "runtime_input_gray_cols": runtime_input_gray_cols,
@@ -709,8 +978,8 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
             "grouped_dino_score": chunk_grouped_dino_score,
             "grouped_combined_score": chunk_grouped_combined_score,
             "grouped_raw_dino_score": chunk_grouped_raw_dino_score,
-            "coherence_gate": np.load(output_path / "chunk_debug" / "chunk_coherence_gate.npy", allow_pickle=False).astype(np.float32),
-            "hybrid_contrib": np.load(output_path / "chunk_debug" / "chunk_hybrid_contrib.npy", allow_pickle=False).astype(np.float32),
+            "coherence_gate": load_float32_npy(output_path / "chunk_debug" / "chunk_coherence_gate.npy"),
+            "hybrid_contrib": load_float32_npy(output_path / "chunk_debug" / "chunk_hybrid_contrib.npy"),
             "combined_score": chunk_combined_score,
             "valid_mask": load_bool_npy(output_path / "chunk_debug" / "chunk_valid_mask.npy"),
             "bridged_mask": load_bool_npy(output_path / "chunk_debug" / "chunk_bridged_mask.npy"),
@@ -778,12 +1047,18 @@ def build_python_chunk_reference(
     )
 
     freq_axis_hz = np.asarray(input_record["freq_axis_hz"], dtype=np.float32)
-    ignore_info = retry_helper.compute_ignore_sideband_rows(
+    planning = retry_helper.build_frequency_chunks_with_minimal_uniform_sideband_trim(
         freq_axis_hz,
+        chunk_bandwidth_hz=float(active_cfg.chunk_bandwidth_hz),
+        chunk_overlap_hz=float(active_cfg.chunk_overlap_hz),
         ignore_sideband_percent=float(active_cfg.ignore_sideband_percent),
         min_keep_rows=16,
         ignore_sideband_hz=active_cfg.ignore_sideband_hz,
+        min_rows=16,
+        uncalibrated_chunk_fraction=float(active_cfg.uncalibrated_chunk_fraction),
+        uncalibrated_overlap_fraction=float(active_cfg.uncalibrated_overlap_fraction),
     )
+    ignore_info = planning["ignore_info"]
     correction = retry_helper.apply_global_frontend_correction(
         np.asarray(input_record["sxx_db"], dtype=np.float32),
         row_q=float(active_cfg.frontend_row_q),
@@ -793,7 +1068,6 @@ def build_python_chunk_reference(
         valid_row_mask=np.asarray(ignore_info["valid_row_mask"], dtype=bool),
     )
     corrected_sxx_db = np.asarray(correction["corrected_sxx_db"], dtype=np.float32)
-
     chunk_plan = retry_helper.build_frequency_chunks(
         freq_axis_hz,
         chunk_bandwidth_hz=float(active_cfg.chunk_bandwidth_hz),
@@ -874,6 +1148,12 @@ def build_chunk_comparison_bundle(
     cpp_bundle = load_cpp_artifact_bundle(resolved_output_dir, debug_chunk_index, workspace_root)
     python_bundle = build_python_chunk_reference(resolved_tensor_path, config_path, debug_chunk_index, dino_device, workspace_root)
     retry_helper = load_retry_helper_module(workspace_root)
+    python_full = build_python_full_frame_final_mask(
+        python_bundle,
+        retry_helper,
+        tensor_path=resolved_tensor_path,
+        config_path=Path(config_path).expanduser().resolve(),
+    )
 
     cpp_chunk = cpp_bundle["chunk_debug"]
     target_shape = tuple(int(value) for value in cpp_chunk["corrected_resized"].shape)
@@ -920,6 +1200,7 @@ def build_chunk_comparison_bundle(
         target_shape=target_shape,
         db_min=python_bundle["dino_db_min"],
         db_max=python_bundle["dino_db_max"],
+        runtime_contract=str(cpp_chunk.get("artifact_contract", "") or ""),
     )
     python_runtime_retry = None
     python_runtime_raw_variants = None
@@ -951,6 +1232,7 @@ def build_chunk_comparison_bundle(
             expected_shape=tuple(int(value) for value in python_expected_runtime_input["expected_shape"]),
             target_shape=target_shape,
             order=1,
+            maps_full_chunk=bool(python_expected_runtime_input.get("maps_full_chunk", False)),
         )
         python_runtime_mapped_grouped = embed_runtime_crop_to_chunk_grid(
             np.asarray(python_runtime_raw_variants["grouped_pixel_score"], dtype=np.float32),
@@ -959,20 +1241,26 @@ def build_chunk_comparison_bundle(
             expected_shape=tuple(int(value) for value in python_expected_runtime_input["expected_shape"]),
             target_shape=target_shape,
             order=1,
+            maps_full_chunk=bool(python_expected_runtime_input.get("maps_full_chunk", False)),
         )
     artifact_warnings = list(cpp_bundle.get("artifact_warnings", []))
+    artifact_errors = [
+        warning
+        for warning in artifact_warnings
+        if not warning.startswith("Offline full-frame final mask is unavailable")
+    ]
     if python_expected_runtime_input is not None:
         expected_runtime_shape = tuple(int(value) for value in python_expected_runtime_input["expected_shape"])
         if cpp_runtime_shape is None or cpp_runtime_shape[0] <= 0 or cpp_runtime_shape[1] <= 0:
-            artifact_warnings.append(
+            artifact_errors.append(
                 f"Expected a C++ runtime grayscale dump for runtime crop {expected_runtime_shape}, but the artifact bundle does not contain a valid runtime_input_gray shape."
             )
         elif cpp_runtime_shape != expected_runtime_shape:
-            artifact_warnings.append(
+            artifact_errors.append(
                 f"C++ runtime grayscale shape {cpp_runtime_shape} does not match the Python-expected runtime crop {expected_runtime_shape}."
             )
-    if artifact_warnings:
-        formatted_warnings = "\n".join(f"- {warning}" for warning in artifact_warnings)
+    if artifact_errors:
+        formatted_warnings = "\n".join(f"- {warning}" for warning in artifact_errors)
         raise RuntimeError(
             "Offline validator artifact bundle is stale or was produced by a mismatched validator binary, so this notebook comparison would not be apples-to-apples:\n"
             f"{formatted_warnings}\n"
@@ -1036,6 +1324,11 @@ def build_chunk_comparison_bundle(
         "final_mask": mask_metrics(cpp_chunk["final_mask"], python_mapped["final_mask"]),
         "bridged_mask": mask_metrics(cpp_chunk["bridged_mask"], python_mapped["bridged_mask"]),
         "grouped_mask": mask_metrics(cpp_chunk["grouped_mask"], python_mapped["grouped_mask"]),
+    }
+    full_frame_metrics = {
+        "final_mask": None
+        if cpp_bundle["full_frame"]["final_mask"] is None
+        else mask_metrics(cpp_bundle["full_frame"]["final_mask"], python_full["final_mask"]),
     }
 
     coherence_diagnostics = {
@@ -1106,8 +1399,10 @@ def build_chunk_comparison_bundle(
             "runtime_input_gray": cpp_runtime_input_gray,
         },
         "python": python_bundle,
+        "python_full": python_full,
         "python_mapped": python_mapped,
         "metrics": cpp_metrics,
+        "full_frame_metrics": full_frame_metrics,
         "coherence_diagnostics": coherence_diagnostics,
         "dino_diagnostics": dino_diagnostics,
         "box_summary": box_summary,
@@ -1138,6 +1433,7 @@ def scale_box_to_shape(box: dict[str, Any], source_shape: tuple[int, int], targe
 def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
     cpp_bundle = comparison["cpp"]
     python_bundle = comparison["python"]
+    python_full = comparison["python_full"]
     python_mapped = comparison["python_mapped"]
     cpp_chunk = cpp_bundle["chunk_debug"]
     cpp_full = cpp_bundle["full_frame"]
@@ -1154,6 +1450,14 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
         {
             "metric": "chunk_count",
             "value": int(cpp_bundle["summary"]["chunk_count"]),
+        },
+        {
+            "metric": "cpp_full_final_mask_available",
+            "value": int(cpp_full["final_mask"] is not None),
+        },
+        {
+            "metric": "python_full_final_mask_cache_used",
+            "value": int(bool(python_full.get("cache_used", False))),
         },
         {
             "metric": "dino_input_mae",
@@ -1184,6 +1488,10 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
             "value": float(comparison["metrics"]["final_mask"]["iou"]),
         },
         {
+            "metric": "full_frame_final_mask_iou",
+            "value": None if comparison["full_frame_metrics"]["final_mask"] is None else float(comparison["full_frame_metrics"]["final_mask"]["iou"]),
+        },
+        {
             "metric": "mapped_bridged_mask_iou",
             "value": float(comparison["metrics"]["bridged_mask"]["iou"]),
         },
@@ -1204,6 +1512,13 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
             "value": int(has_patch_feature_grouping),
         },
     ]
+    for warning_index, warning in enumerate(cpp_bundle.get("artifact_warnings", []), start=1):
+        summary_rows.append(
+            {
+                "metric": f"artifact_warning_{warning_index}",
+                "value": warning,
+            }
+        )
 
     script_report_rows = []
     if script_report is not None:
@@ -1222,8 +1537,18 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
 
     overview_panels = [
         ("Offline corrected resized", cpp_full["corrected_resized"], "magma"),
-        ("Offline final mask", cpp_full["final_mask"].astype(np.float32), "gray"),
     ]
+    if cpp_full["final_mask"] is not None:
+        overview_panels.append(("Offline final mask", cpp_full["final_mask"].astype(np.float32), "gray"))
+    else:
+        overview_panels.append(
+            (
+                "Offline final mask unavailable",
+                np.full_like(np.asarray(cpp_full["corrected_resized"], dtype=np.float32), np.nan, dtype=np.float32),
+                "gray",
+            )
+        )
+    overview_panels.append(("Python full final mask", python_full["final_mask"].astype(np.float32), "gray"))
 
     coherence_variants = [
         {

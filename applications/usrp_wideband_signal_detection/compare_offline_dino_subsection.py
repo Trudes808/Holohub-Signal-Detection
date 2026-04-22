@@ -150,21 +150,18 @@ def main() -> int:
     if np.isfinite(resolution_hz) and resolution_hz > 0.0:
         input_record["freq_axis_hz"] = np.arange(rows, dtype=np.float32) * np.float32(resolution_hz)
 
-    ignore_info = helper.compute_ignore_sideband_rows(
-        np.asarray(input_record["freq_axis_hz"], dtype=np.float32),
-        ignore_sideband_percent=0.0,
-        min_keep_rows=16,
-        ignore_sideband_hz=config_values["ignore_sideband_hz"] if config_values["ignore_sideband_hz"] > 0.0 else None,
-    )
-    chunk_plan = helper.build_frequency_chunks(
+    planning = helper.build_frequency_chunks_with_minimal_uniform_sideband_trim(
         np.asarray(input_record["freq_axis_hz"], dtype=np.float32),
         chunk_bandwidth_hz=config_values["chunk_bandwidth_hz"],
         chunk_overlap_hz=config_values["chunk_overlap_hz"],
+        ignore_sideband_percent=0.0,
+        min_keep_rows=16,
+        ignore_sideband_hz=config_values["ignore_sideband_hz"] if config_values["ignore_sideband_hz"] > 0.0 else None,
         min_rows=16,
-        valid_row_mask=np.asarray(ignore_info["valid_row_mask"], dtype=bool),
         uncalibrated_chunk_fraction=config_values["uncalibrated_chunk_fraction"],
         uncalibrated_overlap_fraction=config_values["uncalibrated_overlap_fraction"],
     )
+    chunk_plan = planning["chunk_plan"]
 
     debug_chunk_index = int(debug_summary.get("chunk_index", args.debug_chunk_index if args.debug_chunk_index is not None else 13))
     if args.debug_chunk_index is not None and args.debug_chunk_index != debug_chunk_index:
