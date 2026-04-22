@@ -1,5 +1,230 @@
 # DINO Retry Chunk-Merge Port Plan
 
+## Progress Update 2026-04-22T12:00:00-05:00
+
+- The current source of truth for porting is now the cleaned `offline_dino_validator_performance.cpp` path, not the older whole-frame validator path and not the earlier partially-wired live operator reference branch.
+- Port only the live algorithm that remains after the recent cleanup passes: source-coordinate chunk planning, per-chunk Torch runtime execution, raw DINO energy with positional deweighting, residual-veto hybrid support, fast chunk grouping, global projection and merge, and the selected debug-chunk rerun path that preserves notebook parity artifacts.
+- Do not port the removed grouped-DINO implementation subtree, its stale config knobs, or any earlier prototype branch behavior such as inverted raw DINO hybrid input. Those are historical only and should stay out of the operator port.
+- The validated DINO hybrid source for the port is the deweighted raw DINO energy path using the current positional-trend deweighting contract. Grouped-DINO debug artifact arrays may remain as zero-filled compatibility outputs where the notebook contract still expects them, but they are not part of the live decision path.
+- The immediate goal is now a faithful Holoscan operator port of the proven offline performance-validator path under the single-channel performance configuration, followed by focused parity and timing checks before any new optimization or multi-channel expansion.
+
+## Holoscan Operator Port Plan
+
+This section supersedes the older live-port notes below whenever they conflict with the current offline performance-validator truth.
+
+### Operator Source Of Truth
+
+Port from these behaviors in priority order:
+
+1. `offline_dino_validator_performance.cpp` main all-chunks path.
+2. `offline_dino_validator_performance.cpp` selected debug-chunk rerun and artifact-export path.
+3. `dinov3_torch_runtime.cpp` and `dinov3_torch_runtime.hpp` only where the current validator runtime contract is already shared and correct.
+4. The active single-channel validation and performance configs only after they are trimmed to the current live config surface.
+
+Do not treat the older `offline_dino_validator.cpp` whole-frame path, removed grouped-DINO helpers, or deprecated backend split behavior as source of truth for the port.
+
+### Port Invariants
+
+The operator port must preserve these behaviors exactly before any operator-specific optimization work begins.
+
+1. Chunk planning remains in source spectrogram coordinates.
+2. Frontend correction is applied once on the full frame before chunk extraction.
+3. Each chunk runs the same DINO runtime preprocessing and score-map contract as the offline performance validator.
+4. The live DINO hybrid source is deweighted raw DINO energy, not grouped-DINO score and not inverted raw DINO energy.
+5. Positional deweighting follows the current trend-only contract used by the validator.
+6. Chunk-local hybrid support and residual-veto behavior must match the validator outputs on the same capture and config.
+7. Chunk grouping uses the same fast grouping path as the validator main route.
+8. Projection and merge produce the final global mask in source spectrogram coordinates.
+9. The selected debug-chunk path must remain available so the operator can emit parity artifacts for one chosen chunk when needed.
+10. Any notebook-expected grouped artifact fields that no longer drive decisions may be emitted as compatibility placeholders rather than reviving deleted grouped-DINO logic.
+
+### Operator Non-Goals
+
+Do not expand scope during the first operator port.
+
+1. Do not restore grouped-DINO grouping, PCA, affinity scoring, or grouped seed prior logic.
+2. Do not reopen the deprecated fast or prototype backend split just to make the first port easier.
+3. Do not introduce TensorRT, new CUDA kernels, or GPU-only merge logic until the straight validator-faithful operator path is proven.
+4. Do not optimize away debug artifact hooks before operator parity is established.
+5. Do not scale to the two-channel 500 MSps workflow until the single-channel operator path matches the offline validator closely enough to trust timing and mask differences.
+
+### Files To Touch During The Port
+
+Primary operator surfaces:
+
+1. `operators/dinov3_signal_detector/dinov3_signal_detector.hpp`
+2. `operators/dinov3_signal_detector/dinov3_signal_detector.cu`
+3. `operators/dinov3_signal_detector/dinov3_torch_runtime.hpp`
+4. `operators/dinov3_signal_detector/dinov3_torch_runtime.cpp`
+
+Primary validator references:
+
+1. `applications/usrp_wideband_signal_detection/offline_dino_validator_performance.cpp`
+2. `applications/usrp_wideband_signal_detection/run_offline_dino_validator_performance.sh`
+3. active single-channel validation and performance YAMLs under `applications/usrp_wideband_signal_detection/`
+
+Parity and debugging support:
+
+1. `notebooks/torchscript_dino_signal_detector_validation_v2_helpers.py`
+2. `notebooks/torchscript_dino_signal_detector_validation_v2.ipynb`
+
+### Phase O0: Freeze The Operator Contract
+
+Tasks:
+
+1. Document the exact offline-validator entry points that compute chunk planning, chunk runtime input preparation, raw DINO deweighting, hybrid support, grouping, and merge.
+2. Enumerate the minimal config surface that still affects the live path after cleanup, including chunk geometry, sideband handling, runtime batch size, residual-veto thresholds, grouping thresholds, and debug-chunk selection.
+3. Mark all operator branches that are now deprecated because they disagree with the validator truth.
+4. Decide which operator outputs are required in the always-on path versus the debug-only parity path.
+
+Exit criteria:
+
+- one written contract exists for operator inputs, outputs, configs, and debug artifacts
+- every still-live operator branch can be classified as keep, replace, or delete before code motion starts
+
+### Phase O1: Extract The Minimal Shared Logic Boundary
+
+Tasks:
+
+1. Identify the smallest helper boundary that can be shared between the offline performance validator and the operator without dragging notebook-only or file-I/O concerns into operator code.
+2. Move only stable algorithmic helpers first: chunk-plan metadata, chunk projection helpers, score-map projection or resize helpers, residual-veto support helpers, and fast grouping helpers if they are already runtime-safe.
+3. Keep artifact serialization, JSON summaries, and notebook-only compatibility shaping in the validator layer.
+4. Preserve the existing validator behavior while extracting shared helpers by rerunning focused validation after each extraction.
+
+Exit criteria:
+
+- the operator can call shared algorithm helpers without depending on validator-specific artifact or CLI code
+- the validator still produces the same outputs after helper extraction
+
+### Phase O2: Port Frame-Level Setup Into The Operator
+
+Tasks:
+
+1. Port the validated full-frame setup order: input tensor handling, frontend correction, valid-row derivation, and source-coordinate chunk planning.
+2. Ensure the operator plans chunks from the corrected full-frame spectrogram once per frame, not from a reduced detector grid.
+3. Keep per-frame plan metadata accessible for both runtime execution and debug reporting.
+4. Remove or bypass any remaining operator path that still assumes one whole-frame DINO call or a reduced-grid primary output contract.
+
+Exit criteria:
+
+- the operator produces the same chunk count, row spans, and valid-row clipping as the validator on the same capture and config
+
+### Phase O3: Port Per-Chunk Torch Runtime Execution
+
+Tasks:
+
+1. Match the validator’s current chunk-runtime input contract exactly, including current resize or detector-grid handling, sideband treatment, and patch-grid alignment semantics.
+2. Reuse the shared `DinoTorchRuntime` contract where it is already correct instead of rebuilding a separate operator-only DINO interface.
+3. Port the current raw DINO score handling, including any score-map resize or remap back into chunk-local source coordinates.
+4. Preserve batching behavior for naturally equal-sized non-debug chunks if that is already part of the current validator truth, while keeping the selected debug chunk on the artifact-rich parity path.
+
+Exit criteria:
+
+- per-chunk operator DINO score maps match validator outputs for the same chunks within the accepted tolerance
+
+### Phase O4: Port Chunk-Local Hybrid Postprocess
+
+Tasks:
+
+1. Port the current coherence generation order and grid contract used by the performance validator.
+2. Port the deweighted raw DINO energy computation exactly as validated, including trend-only positional deweighting.
+3. Port the current hybrid-support and residual-veto stages, including `keep_freq`, `keep_res`, residual gating, seed selection, and final local mask generation.
+4. Keep debug-only intermediate surfaces available for the selected chunk so the notebook comparison can remain stage-by-stage.
+
+Exit criteria:
+
+- chunk-local operator intermediates and final masks line up with validator artifacts for a chosen debug chunk
+
+### Phase O5: Port Fast Chunk Grouping
+
+Tasks:
+
+1. Port the validator’s current fast grouping path rather than any deleted grouped-DINO or earlier brute-force grouping implementation.
+2. Preserve only the box fields and grouped-mask outputs that the operator downstream and notebook parity flow still need.
+3. Keep `grouping_min_component_size` and other still-live grouping controls aligned between validator and operator configs.
+4. Ensure grouping works on the current chunk-local final mask and score support surfaces, not on historical grouped-DINO panels.
+
+Exit criteria:
+
+- chunk-local grouped masks and grouped boxes match the validator’s fast grouping behavior on the same inputs
+
+### Phase O6: Port Projection And Global Merge
+
+Tasks:
+
+1. Project chunk-local outputs back into global source coordinates using the same chunk metadata and overlap handling as the validator.
+2. Port the current merged score or mask accumulation logic exactly before introducing any operator-specific acceleration.
+3. Build the operator’s final global mask in source spectrogram coordinates.
+4. Keep enough merge metadata available to compare projected chunk outputs and merged outputs against validator artifacts.
+
+Exit criteria:
+
+- final operator mask and merged box outputs agree with the validator on frozen captures within the accepted parity window
+
+### Phase O7: Add Operator Debug And Parity Hooks
+
+Tasks:
+
+1. Add a debug mode that can emit one selected chunk’s intermediate artifacts from inside the operator using the same contract the notebook already understands.
+2. Keep grouped compatibility arrays available as zeros or placeholders where the notebook still expects those fields, without reintroducing deleted grouped-DINO computation.
+3. Expose enough metadata to compare operator chunk planning, DINO score maps, hybrid intermediates, grouping, and merge back to the offline validator.
+4. Make debug artifact emission opt-in so the normal operator path stays lean.
+
+Exit criteria:
+
+- one operator rerun can be compared directly against the existing notebook and validator artifact workflow for a chosen chunk
+
+### Phase O8: Remove Stale Operator Branches
+
+Tasks:
+
+1. Delete or hard-deprecate any operator branch that still uses the old whole-frame reduced-grid path once the validator-faithful chunked path is proven.
+2. Remove stale config knobs that no longer affect the live path so operator configs match the cleaned validator surface.
+3. Update comments, README notes, and config docs so they describe the current chunked reference path instead of historical prototype behavior.
+
+Exit criteria:
+
+- the operator contains one clear validated reference path instead of a mix of partially obsolete branches
+
+### Phase O9: Validate Before Optimizing
+
+Validation order:
+
+1. single chosen debug chunk parity against the offline performance validator
+2. full single-channel frame parity against the offline performance validator
+3. single-channel live timing comparison with debug disabled
+4. repeated-run stability check on the same capture and config
+5. only after those pass, widen to multi-channel or deeper optimization work
+
+Required parity checks:
+
+1. chunk plan row spans and chunk count
+2. chunk-local DINO score map
+3. chunk-local coherence gate
+4. chunk-local hybrid contribution and residual-veto intermediates
+5. chunk-local final mask
+6. chunk-local grouped mask and grouped boxes
+7. projected global mask and merged global mask
+8. final operator output boxes or mask summaries consumed downstream
+
+### Phase O10: Post-Port Optimization Queue
+
+These are explicitly after the faithful port is complete:
+
+1. keep more score-map and intermediate surfaces on device for non-debug chunks
+2. reuse chunk staging buffers more aggressively inside the operator
+3. replace remaining host-side preprocessing or coherence helpers with dedicated CUDA kernels
+4. revisit fixed-grid DINO input versus chunk-sized runtime input only after parity is frozen in the operator
+5. consider TensorRT only if the validator-faithful operator path still leaves Torch forward dominant
+
+### Immediate Next Tasks For The Operator Port
+
+1. Audit `dinov3_signal_detector.cu` and `dinov3_signal_detector.hpp` against the current offline performance-validator control flow and mark every disagreement.
+2. Identify the minimal set of helpers that should be shared first from `offline_dino_validator_performance.cpp`.
+3. Trim the operator config surface so it matches the cleaned validator surface before porting more logic.
+4. Port the frame-level chunk planner and per-chunk metadata flow into the operator before touching grouping or merge.
+5. Add a selected debug-chunk parity mode in the operator early so every later stage can be checked against the notebook without rebuilding ad hoc tooling.
+
 ## Progress Update 2026-04-21T10:46:38-05:00
 
 - The first uniform-chunk sideband-trim search was wrong for calibrated frequency axes. It searched for any fully uniform plan using the existing Hz-threshold chunk builder, and for the current 20,480-row capture that path only becomes perfectly uniform after trimming almost the entire band away.

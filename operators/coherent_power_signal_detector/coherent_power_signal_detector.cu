@@ -2599,12 +2599,10 @@ bool local_relative_power_support_map_cuda(const float* sxx_db_local,
   return true;
 }
 
-bool multi_scale_structure_tensor_gate_cuda(const float* sxx_db_local,
-                                            int rows,
-                                            int cols,
-                                            std::vector<float>& coherence_max,
-                                            std::vector<float>& energy_max,
-                                            std::vector<float>& gate) {
+bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
+                                                 int rows,
+                                                 int cols,
+                                                 std::vector<float>& coherence_max) {
   const int total = rows * cols;
   if (total <= 0 || sxx_db_local == nullptr) {
     return false;
@@ -2662,8 +2660,7 @@ bool multi_scale_structure_tensor_gate_cuda(const float* sxx_db_local,
                       static_cast<size_t>(total) * sizeof(float),
                       cudaMemcpyDeviceToDevice,
                       stream) != cudaSuccess ||
-      cudaMemsetAsync(d6, 0, static_cast<size_t>(total) * sizeof(float), stream) != cudaSuccess ||
-      cudaMemsetAsync(d7, 0, static_cast<size_t>(total) * sizeof(float), stream) != cudaSuccess) {
+      cudaMemsetAsync(d6, 0, static_cast<size_t>(total) * sizeof(float), stream) != cudaSuccess) {
     return false;
   }
 
@@ -2699,38 +2696,15 @@ bool multi_scale_structure_tensor_gate_cuda(const float* sxx_db_local,
       return false;
     }
     normalize_map01_device_inplace(d3, total, 5.0f, 99.0f, 0.0f, 1.0f, scratch.histogram_buffers[0], stream);
-    normalize_map01_device_inplace(d4, total, 5.0f, 99.0f, 0.0f, 1.0f, scratch.histogram_buffers[0], stream);
     coherent_power_elementwise_max_inplace_kernel<<<total_blocks, total_threads, 0, stream>>>(d3, total, d6);
     if (cudaGetLastError() != cudaSuccess) {
       return false;
     }
-    coherent_power_elementwise_max_inplace_kernel<<<total_blocks, total_threads, 0, stream>>>(d4, total, d7);
-    if (cudaGetLastError() != cudaSuccess) {
-      return false;
-    }
   }
-
-  coherent_power_structure_gate_kernel<<<total_blocks, total_threads, 0, stream>>>(d6, d7, total, d5);
-  if (cudaGetLastError() != cudaSuccess) {
-    return false;
-  }
-  normalize_map01_device_inplace(d5, total, 5.0f, 99.0f, 0.0f, 1.0f, scratch.histogram_buffers[0], stream);
 
   coherence_max.assign(static_cast<size_t>(total), 0.0f);
-  energy_max.assign(static_cast<size_t>(total), 0.0f);
-  gate.assign(static_cast<size_t>(total), 0.0f);
   if (cudaMemcpyAsync(coherence_max.data(),
                       d6,
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyDeviceToHost,
-                      stream) != cudaSuccess ||
-      cudaMemcpyAsync(energy_max.data(),
-                      d7,
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyDeviceToHost,
-                      stream) != cudaSuccess ||
-      cudaMemcpyAsync(gate.data(),
-                      d5,
                       static_cast<size_t>(total) * sizeof(float),
                       cudaMemcpyDeviceToHost,
                       stream) != cudaSuccess ||
@@ -3641,6 +3615,7 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
                                                  int cols,
                                                  const ChunkPlanEntry& chunk,
                                                  const std::vector<uint8_t>& chunk_valid_row_mask,
+                                                 bool capture_host_power_map,
                                                  double coherence_weight,
                                                  double power_weight,
                                                  const std::string& power_assist_mode,
@@ -3676,15 +3651,11 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
   const size_t chunk_size = static_cast<size_t>(rows) * static_cast<size_t>(cols);
 
   std::vector<float> coherence_px;
-  std::vector<float> energy_px;
-  std::vector<float> gate_px;
   result.stage_ms[kChunkStructureTensorStage] = time_chunk_stage_ms([&] {
-    if (!multi_scale_structure_tensor_gate_cuda(corrected_chunk, rows, cols, coherence_px, energy_px, gate_px)) {
+    if (!multi_scale_structure_tensor_coherence_cuda(corrected_chunk, rows, cols, coherence_px)) {
       throw std::runtime_error("CUDA structure-tensor path failed in detect_chunk_coherent_power");
     }
   });
-  (void)energy_px;
-  (void)gate_px;
   result.coherence_px = coherence_px;
   (void)coherence_weight;
   (void)power_weight;
@@ -3725,12 +3696,14 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
                               result.score_threshold);
   });
 
-  result.power_px.assign(chunk_size, 0.0f);
-  if (cudaMemcpy(result.power_px.data(),
-                 power_px_device,
-                 chunk_size * sizeof(float),
-                 cudaMemcpyDeviceToHost) != cudaSuccess) {
-    throw std::runtime_error("chunk power-assist readback failed");
+  if (capture_host_power_map) {
+    result.power_px.assign(chunk_size, 0.0f);
+    if (cudaMemcpy(result.power_px.data(),
+                   power_px_device,
+                   chunk_size * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+      throw std::runtime_error("chunk power-assist readback failed");
+    }
   }
 
   result.stage_ms[kChunkMaskSmoothStage] = time_chunk_stage_ms([&] {
@@ -3765,6 +3738,7 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
 PipelineSummary run_reference_pipeline(const float* power_db,
                                        int src_rows,
                                        int src_cols,
+                                       bool populate_merged_maps,
                                        int ignore_bins_per_side,
                                        double resolution_hz,
                                        double chunk_bandwidth_hz,
@@ -3866,6 +3840,7 @@ PipelineSummary run_reference_pipeline(const float* power_db,
                                                     src_cols,
                                                     chunk,
                                                     chunk_valid_row_mask,
+                                                    populate_merged_maps,
                                                     coherence_weight,
                                                     power_weight,
                                                     power_assist_mode,
@@ -3912,7 +3887,9 @@ PipelineSummary run_reference_pipeline(const float* power_db,
   }
   summary.reference_stage_ms[kReferenceChunkSumStage] = chunk_sum_ms;
   summary.reference_stage_ms[kReferenceChunkMaxStage] = chunk_max_ms;
-  populate_reference_merged_maps(chunk_results, src_rows, src_cols, valid_row_mask, summary);
+  if (populate_merged_maps) {
+    populate_reference_merged_maps(chunk_results, src_rows, src_cols, valid_row_mask, summary);
+  }
 
   GroupingResult merged_grouping;
   summary.reference_stage_ms[kReferenceMergeStage] = time_reference_stage_ms([&] {
@@ -3947,6 +3924,7 @@ PipelineSummary run_reference_pipeline(const float* power_db,
 PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
                                                  int src_rows,
                                                  int src_cols,
+                                                 bool populate_merged_maps,
                                                  int ignore_bins_per_side,
                                                  double resolution_hz,
                                                  double chunk_bandwidth_hz,
@@ -4030,6 +4008,7 @@ PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
                                                     src_cols,
                                                     chunk,
                                                     chunk_valid_row_mask,
+                                                    populate_merged_maps,
                                                     coherence_weight,
                                                     power_weight,
                                                     power_assist_mode,
@@ -4076,7 +4055,9 @@ PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
   }
   summary.reference_stage_ms[kReferenceChunkSumStage] = chunk_sum_ms;
   summary.reference_stage_ms[kReferenceChunkMaxStage] = chunk_max_ms;
-  populate_reference_merged_maps(chunk_results, src_rows, src_cols, valid_row_mask, summary);
+  if (populate_merged_maps) {
+    populate_reference_merged_maps(chunk_results, src_rows, src_cols, valid_row_mask, summary);
+  }
 
   GroupingResult merged_grouping;
   summary.reference_stage_ms[kReferenceMergeStage] = time_reference_stage_ms([&] {
@@ -4165,6 +4146,7 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
   const auto summary = run_reference_pipeline(result.power_db.data(),
                                               src_rows,
                                               src_cols,
+                                              true,
                                               ignore_bins_per_side,
                                               resolution_hz,
                                               config.chunk_bandwidth_hz,
@@ -4836,8 +4818,9 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       const double frontend_stage_ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frontend_start).count();
       pipeline_summary = run_reference_pipeline_corrected(buffers.power_db_host,
-                                                          src_rows,
-                                                          src_cols,
+                          src_rows,
+                          src_cols,
+                          false,
                                                           ignore_bins_per_side,
                                                           resolution_hz,
                                                           chunk_bandwidth_hz_.get(),
