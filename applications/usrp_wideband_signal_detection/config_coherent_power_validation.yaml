@@ -228,6 +228,16 @@ coherent_power_signal_detector:
   frontend_max_boost_db: 12.0
   coherence_weight: 0.55
   power_weight: 0.45
+  power_assist_mode: "hybrid"
+  power_floor_time_q: 25.0
+  power_floor_global_q: 30.0
+  power_excess_start_db: 3.0
+  power_excess_full_db: 15.0
+  power_local_blend: 0.25
+  coherence_gate_start: 0.15
+  coherence_gate_full: 0.45
+  coherence_bridge_bias: 0.05
+  coherence_power_joint_weight: 0.70
   coherence_power_support_q: 0.82
   coherence_power_q: 0.92
   min_component_size: 6

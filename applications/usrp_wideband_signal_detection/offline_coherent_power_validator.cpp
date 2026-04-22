@@ -42,6 +42,16 @@ struct SnapshotMetadata {
   holoscan::ops::CoherentPowerReferenceConfig config;
 };
 
+std::string normalize_tensor_axis_order(std::string axis_order) {
+  std::transform(axis_order.begin(), axis_order.end(), axis_order.begin(), [](unsigned char value) {
+    return static_cast<char>(std::tolower(value));
+  });
+  if (axis_order == "time_frequency" || axis_order == "frequency_time") {
+    return axis_order;
+  }
+  return "frequency_time";
+}
+
 struct ValidationWorkEstimate {
   int ignore_bins_per_side = 0;
   int valid_rows = 0;
@@ -110,7 +120,7 @@ SnapshotMetadata load_snapshot_metadata(const std::filesystem::path& metadata_pa
   metadata.resolution_hz = extract_number<double>(text, "resolution_hz").value_or(0.0);
   metadata.sample_rate_hz = extract_number<double>(text, "sample_rate_hz").value_or(0.0);
   metadata.span_hz = extract_number<double>(text, "span_hz").value_or(0.0);
-  metadata.tensor_axis_order = extract_string(text, "tensor_axis_order").value_or("");
+  metadata.tensor_axis_order = normalize_tensor_axis_order(extract_string(text, "tensor_axis_order").value_or(""));
 
   const auto tensor_path = extract_string(text, "tensor_snapshot_path");
   if (!tensor_path) {
@@ -137,9 +147,20 @@ SnapshotMetadata load_snapshot_metadata(const std::filesystem::path& metadata_pa
   metadata.config.frontend_max_boost_db = extract_number<double>(text, "frontend_max_boost_db").value_or(metadata.config.frontend_max_boost_db);
   metadata.config.coherence_weight = extract_number<double>(text, "coherence_weight").value_or(metadata.config.coherence_weight);
   metadata.config.power_weight = extract_number<double>(text, "power_weight").value_or(metadata.config.power_weight);
+  metadata.config.power_assist_mode = extract_string(text, "power_assist_mode").value_or(metadata.config.power_assist_mode);
+  metadata.config.power_floor_time_q = extract_number<double>(text, "power_floor_time_q").value_or(metadata.config.power_floor_time_q);
+  metadata.config.power_floor_global_q = extract_number<double>(text, "power_floor_global_q").value_or(metadata.config.power_floor_global_q);
+  metadata.config.power_excess_start_db = extract_number<double>(text, "power_excess_start_db").value_or(metadata.config.power_excess_start_db);
+  metadata.config.power_excess_full_db = extract_number<double>(text, "power_excess_full_db").value_or(metadata.config.power_excess_full_db);
+  metadata.config.power_local_blend = extract_number<double>(text, "power_local_blend").value_or(metadata.config.power_local_blend);
+  metadata.config.coherence_gate_start = extract_number<double>(text, "coherence_gate_start").value_or(metadata.config.coherence_gate_start);
+  metadata.config.coherence_gate_full = extract_number<double>(text, "coherence_gate_full").value_or(metadata.config.coherence_gate_full);
+  metadata.config.coherence_bridge_bias = extract_number<double>(text, "coherence_bridge_bias").value_or(metadata.config.coherence_bridge_bias);
+  metadata.config.coherence_power_joint_weight = extract_number<double>(text, "coherence_power_joint_weight").value_or(metadata.config.coherence_power_joint_weight);
   metadata.config.coherence_power_support_q = extract_number<double>(text, "coherence_power_support_q").value_or(metadata.config.coherence_power_support_q);
   metadata.config.coherence_power_q = extract_number<double>(text, "coherence_power_q").value_or(metadata.config.coherence_power_q);
   metadata.config.min_component_size = extract_number<int>(text, "min_component_size").value_or(metadata.config.min_component_size);
+  metadata.config.filter_detection_mask = extract_bool(text, "filter_detection_mask").value_or(metadata.config.filter_detection_mask);
   metadata.config.grouping_seed_score_q = extract_number<double>(text, "grouping_seed_score_q").value_or(metadata.config.grouping_seed_score_q);
   metadata.config.grouping_bridge_freq_px = extract_number<int>(text, "grouping_bridge_freq_px").value_or(metadata.config.grouping_bridge_freq_px);
   metadata.config.grouping_bridge_time_px = extract_number<int>(text, "grouping_bridge_time_px").value_or(metadata.config.grouping_bridge_time_px);
@@ -224,6 +245,31 @@ std::vector<holoscan::ops::coherent_power_complex> to_complex_tensor(const NpyAr
     float components[2] {};
     std::memcpy(components, array.payload.data() + index * sizeof(float) * 2, sizeof(components));
     output[index] = holoscan::ops::coherent_power_complex(components[0], components[1]);
+  }
+  return output;
+}
+
+std::vector<holoscan::ops::coherent_power_complex> transpose_complex_tensor(
+    const std::vector<holoscan::ops::coherent_power_complex>& input,
+    int rows,
+    int cols) {
+  std::vector<holoscan::ops::coherent_power_complex> output(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+  for (int row = 0; row < rows; ++row) {
+    for (int col = 0; col < cols; ++col) {
+      output[static_cast<size_t>(col) * static_cast<size_t>(rows) + static_cast<size_t>(row)] =
+          input[static_cast<size_t>(row) * static_cast<size_t>(cols) + static_cast<size_t>(col)];
+    }
+  }
+  return output;
+}
+
+std::vector<float> transpose_float_matrix(const std::vector<float>& input, int rows, int cols) {
+  std::vector<float> output(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0.0f);
+  for (int row = 0; row < rows; ++row) {
+    for (int col = 0; col < cols; ++col) {
+      output[static_cast<size_t>(col) * static_cast<size_t>(rows) + static_cast<size_t>(row)] =
+          input[static_cast<size_t>(row) * static_cast<size_t>(cols) + static_cast<size_t>(col)];
+    }
   }
   return output;
 }
@@ -450,12 +496,21 @@ int main(int argc, char** argv) {
     if (tensor_array.rows != metadata.rows || tensor_array.cols != metadata.cols) {
       throw std::runtime_error("snapshot tensor shape does not match metadata sidecar");
     }
-    const auto tensor = to_complex_tensor(tensor_array);
+    auto tensor = to_complex_tensor(tensor_array);
+    int validator_rows = metadata.rows;
+    int validator_cols = metadata.cols;
+    if (metadata.tensor_axis_order == "time_frequency") {
+      tensor = transpose_complex_tensor(tensor, metadata.rows, metadata.cols);
+      validator_rows = metadata.cols;
+      validator_cols = metadata.rows;
+    }
     if (options.verbose) {
       log_stage_done("tensor snapshot load");
       const ValidationWorkEstimate estimate = estimate_validation_work(metadata);
       std::cout << "[offline_coherent_power_validator] tensor shape "
                 << metadata.rows << "x" << metadata.cols
+                << " (axis order " << metadata.tensor_axis_order << ", validator grid "
+                << validator_rows << "x" << validator_cols << ")"
                 << ", valid_rows=" << estimate.valid_rows
                 << ", ignore_bins_per_side=" << estimate.ignore_bins_per_side
                 << ", chunk_count=" << estimate.chunk_count
@@ -473,8 +528,8 @@ int main(int argc, char** argv) {
 
     const auto result = holoscan::ops::run_coherent_power_reference_validation(
         tensor,
-        metadata.rows,
-        metadata.cols,
+      validator_rows,
+      validator_cols,
         metadata.resolution_hz,
         metadata.config);
     if (options.verbose) {
@@ -486,7 +541,10 @@ int main(int argc, char** argv) {
     std::optional<double> mean_abs_power_db_diff;
     if (metadata.power_db_snapshot_path.has_value()) {
       const auto power_db_array = load_npy_2d(*metadata.power_db_snapshot_path);
-      const auto saved_power_db = to_float_matrix(power_db_array);
+      auto saved_power_db = to_float_matrix(power_db_array);
+      if (metadata.tensor_axis_order == "time_frequency") {
+        saved_power_db = transpose_float_matrix(saved_power_db, metadata.rows, metadata.cols);
+      }
       if (saved_power_db.size() == result.power_db.size()) {
         double max_diff = 0.0;
         double total_diff = 0.0;
@@ -502,6 +560,9 @@ int main(int argc, char** argv) {
 
     const auto power_db_npy = options.output_dir / "offline_power_db.npy";
     const auto corrected_npy = options.output_dir / "offline_corrected_sxx_db.npy";
+    const auto merged_coherence_npy = options.output_dir / "offline_merged_coherence.npy";
+    const auto merged_power_npy = options.output_dir / "offline_merged_power.npy";
+    const auto merged_score_npy = options.output_dir / "offline_merged_score.npy";
     const auto mask_npy = options.output_dir / "offline_final_mask.npy";
     const auto power_db_pgm = options.output_dir / "offline_power_db_preview.pgm";
     const auto corrected_pgm = options.output_dir / "offline_corrected_preview.pgm";
@@ -511,6 +572,9 @@ int main(int argc, char** argv) {
 
     write_npy_2d(power_db_npy, result.power_db.data(), result.power_db.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
     write_npy_2d(corrected_npy, result.corrected_sxx_db.data(), result.corrected_sxx_db.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
+    write_npy_2d(merged_coherence_npy, result.merged_coherence.data(), result.merged_coherence.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
+    write_npy_2d(merged_power_npy, result.merged_power.data(), result.merged_power.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
+    write_npy_2d(merged_score_npy, result.merged_score.data(), result.merged_score.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
     write_npy_2d(mask_npy, result.final_mask.data(), result.final_mask.size() * sizeof(float), result.dst_rows, result.dst_cols, "<f4");
 
     const auto power_db_preview = normalize_to_u8(result.power_db);
@@ -552,6 +616,9 @@ int main(int argc, char** argv) {
     }
     summary << "  \"power_db_npy\": \"" << power_db_npy.string() << "\",\n";
     summary << "  \"corrected_sxx_db_npy\": \"" << corrected_npy.string() << "\",\n";
+    summary << "  \"merged_coherence_npy\": \"" << merged_coherence_npy.string() << "\",\n";
+    summary << "  \"merged_power_npy\": \"" << merged_power_npy.string() << "\",\n";
+    summary << "  \"merged_score_npy\": \"" << merged_score_npy.string() << "\",\n";
     summary << "  \"final_mask_npy\": \"" << mask_npy.string() << "\",\n";
     summary << "  \"power_db_preview_pgm\": \"" << power_db_pgm.string() << "\",\n";
     summary << "  \"corrected_preview_pgm\": \"" << corrected_pgm.string() << "\",\n";

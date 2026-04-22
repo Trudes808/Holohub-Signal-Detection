@@ -203,10 +203,13 @@ sections = parse_required_sections(config_path)
 fft = sections["fft"]
 coherent = sections["coherent_power_signal_detector"]
 
+tensor_axis_order = "time_frequency" if rows < cols else "frequency_time"
+freq_bins = cols if tensor_axis_order == "time_frequency" else rows
+
 span_hz = float(fft.get("span", 0.0))
 resolution_hz = float(fft.get("resolution", 0.0))
-if resolution_hz <= 0.0 and span_hz > 0.0 and rows > 0:
-    resolution_hz = span_hz / float(rows)
+if resolution_hz <= 0.0 and span_hz > 0.0 and freq_bins > 0:
+  resolution_hz = span_hz / float(freq_bins)
 
 config_keys = [
     "chunk_bandwidth_hz",
@@ -221,9 +224,20 @@ config_keys = [
     "frontend_max_boost_db",
     "coherence_weight",
     "power_weight",
+    "power_assist_mode",
+    "power_floor_time_q",
+    "power_floor_global_q",
+    "power_excess_start_db",
+    "power_excess_full_db",
+    "power_local_blend",
+    "coherence_gate_start",
+    "coherence_gate_full",
+    "coherence_bridge_bias",
+    "coherence_power_joint_weight",
     "coherence_power_support_q",
     "coherence_power_q",
     "min_component_size",
+    "filter_detection_mask",
     "grouping_seed_score_q",
     "grouping_bridge_freq_px",
     "grouping_bridge_time_px",
@@ -242,7 +256,7 @@ metadata = {
     "resolution_hz": resolution_hz,
     "sample_rate_hz": span_hz,
     "span_hz": span_hz,
-    "tensor_axis_order": "frequency_time",
+    "tensor_axis_order": tensor_axis_order,
     "tensor_snapshot_path": container_tensor_path,
     "power_db_snapshot_path": None,
     "config": {key: coherent[key] for key in config_keys if key in coherent},

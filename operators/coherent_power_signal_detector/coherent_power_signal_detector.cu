@@ -130,6 +130,8 @@ struct DetectionBox {
 
 struct DetectionChunkResult {
   ChunkPlanEntry chunk;
+  std::vector<float> coherence_px;
+  std::vector<float> power_px;
   std::vector<float> score_px;
   std::vector<uint8_t> mask_px;
   std::vector<uint8_t> grouped_mask;
@@ -263,6 +265,8 @@ ChunkWorkerPool& chunk_worker_pool() {
 }
 
 struct ReferenceMergeScratch {
+  std::vector<float> merged_coherence_sum;
+  std::vector<float> merged_power_sum;
   std::vector<float> merged_score_sum;
   std::vector<float> merged_weight;
   std::vector<float> combined_score;
@@ -278,6 +282,8 @@ struct ReferenceMergeScratch {
       return;
     }
     frame_size = requested_size;
+    merged_coherence_sum.assign(frame_size, 0.0f);
+    merged_power_sum.assign(frame_size, 0.0f);
     merged_score_sum.assign(frame_size, 0.0f);
     merged_weight.assign(frame_size, 0.0f);
     combined_score.assign(frame_size, 0.0f);
@@ -291,6 +297,8 @@ struct ReferenceMergeScratch {
 
   void begin_frame() {
     for (const size_t index : active_indices) {
+      merged_coherence_sum[index] = 0.0f;
+      merged_power_sum[index] = 0.0f;
       merged_score_sum[index] = 0.0f;
       merged_weight[index] = 0.0f;
       combined_score[index] = 0.0f;
@@ -315,6 +323,9 @@ struct GroupingResult {
 };
 
 struct PipelineSummary {
+  std::vector<float> merged_coherence;
+  std::vector<float> merged_power;
+  std::vector<float> merged_score;
   std::vector<float> final_mask;
   int subsection_count = 0;
   int grouped_box_count = 0;
@@ -358,6 +369,92 @@ int compute_ignore_bins_per_side(int rows,
 
 std::string json_bool(bool value) {
   return value ? "true" : "false";
+}
+
+std::vector<float> chunk_blend_weights(int length) {
+  if (length <= 0) {
+    return {};
+  }
+  if (length <= 2) {
+    return std::vector<float>(static_cast<size_t>(length), 1.0f);
+  }
+  std::vector<float> weights(static_cast<size_t>(length), 1.0f);
+  const double denom = static_cast<double>(length - 1);
+  float max_value = 0.0f;
+  for (int index = 0; index < length; ++index) {
+    const float value = static_cast<float>(0.5 - 0.5 * std::cos((2.0 * M_PI * static_cast<double>(index)) / denom));
+    weights[static_cast<size_t>(index)] = value;
+    max_value = std::max(max_value, value);
+  }
+  if (max_value <= 0.0f) {
+    std::fill(weights.begin(), weights.end(), 1.0f);
+    return weights;
+  }
+  for (float& value : weights) {
+    value = 0.2f + 0.8f * (value / max_value);
+  }
+  return weights;
+}
+
+void populate_reference_merged_maps(const std::vector<DetectionChunkResult>& chunk_results,
+                                    int rows,
+                                    int cols,
+                                    const std::vector<uint8_t>& valid_row_mask,
+                                    PipelineSummary& summary) {
+  const size_t frame_size = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  auto& scratch = reference_merge_scratch();
+  scratch.ensure_capacity(frame_size);
+  scratch.begin_frame();
+
+  for (const auto& chunk_result : chunk_results) {
+    const int row_start = chunk_result.chunk.row_start;
+    const int row_stop = chunk_result.chunk.row_stop;
+    const int chunk_rows = row_stop - row_start;
+    const auto weights = chunk_blend_weights(chunk_rows);
+    for (int local_row = 0; local_row < chunk_rows; ++local_row) {
+      const float row_weight = weights[static_cast<size_t>(local_row)];
+      for (int col = 0; col < cols; ++col) {
+        const size_t local_index = static_cast<size_t>(local_row) * static_cast<size_t>(cols) + static_cast<size_t>(col);
+        if (local_index >= chunk_result.valid_score_mask.size() || !chunk_result.valid_score_mask[local_index]) {
+          continue;
+        }
+        const size_t global_index =
+            static_cast<size_t>(row_start + local_row) * static_cast<size_t>(cols) + static_cast<size_t>(col);
+        if (scratch.merged_weight[global_index] == 0.0f) {
+          scratch.active_indices.push_back(global_index);
+        }
+        scratch.merged_coherence_sum[global_index] += chunk_result.coherence_px[local_index] * row_weight;
+        scratch.merged_power_sum[global_index] += chunk_result.power_px[local_index] * row_weight;
+        scratch.merged_score_sum[global_index] += chunk_result.score_px[local_index] * row_weight;
+        scratch.merged_weight[global_index] += row_weight;
+      }
+    }
+  }
+
+  summary.merged_coherence.assign(frame_size, 0.0f);
+  summary.merged_power.assign(frame_size, 0.0f);
+  summary.merged_score.assign(frame_size, 0.0f);
+  for (const size_t index : scratch.active_indices) {
+    const float weight = scratch.merged_weight[index];
+    if (weight <= 0.0f) {
+      continue;
+    }
+    summary.merged_coherence[index] = scratch.merged_coherence_sum[index] / weight;
+    summary.merged_power[index] = scratch.merged_power_sum[index] / weight;
+    summary.merged_score[index] = scratch.merged_score_sum[index] / weight;
+  }
+
+  for (int row = 0; row < rows; ++row) {
+    if (valid_row_mask[static_cast<size_t>(row)]) {
+      continue;
+    }
+    for (int col = 0; col < cols; ++col) {
+      const size_t index = static_cast<size_t>(row) * static_cast<size_t>(cols) + static_cast<size_t>(col);
+      summary.merged_coherence[index] = 0.0f;
+      summary.merged_power[index] = 0.0f;
+      summary.merged_score[index] = 0.0f;
+    }
+  }
 }
 
 std::string json_escape(const std::string& value) {
@@ -3588,6 +3685,7 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
   });
   (void)energy_px;
   (void)gate_px;
+  result.coherence_px = coherence_px;
   (void)coherence_weight;
   (void)power_weight;
   const float* power_px_device = nullptr;
@@ -3626,6 +3724,14 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
                               result.support_threshold,
                               result.score_threshold);
   });
+
+  result.power_px.assign(chunk_size, 0.0f);
+  if (cudaMemcpy(result.power_px.data(),
+                 power_px_device,
+                 chunk_size * sizeof(float),
+                 cudaMemcpyDeviceToHost) != cudaSuccess) {
+    throw std::runtime_error("chunk power-assist readback failed");
+  }
 
   result.stage_ms[kChunkMaskSmoothStage] = time_chunk_stage_ms([&] {
     for (size_t index = 0; index < result.score_px.size(); ++index) {
@@ -3806,6 +3912,7 @@ PipelineSummary run_reference_pipeline(const float* power_db,
   }
   summary.reference_stage_ms[kReferenceChunkSumStage] = chunk_sum_ms;
   summary.reference_stage_ms[kReferenceChunkMaxStage] = chunk_max_ms;
+  populate_reference_merged_maps(chunk_results, src_rows, src_cols, valid_row_mask, summary);
 
   GroupingResult merged_grouping;
   summary.reference_stage_ms[kReferenceMergeStage] = time_reference_stage_ms([&] {
@@ -3969,6 +4076,7 @@ PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
   }
   summary.reference_stage_ms[kReferenceChunkSumStage] = chunk_sum_ms;
   summary.reference_stage_ms[kReferenceChunkMaxStage] = chunk_max_ms;
+  populate_reference_merged_maps(chunk_results, src_rows, src_cols, valid_row_mask, summary);
 
   GroupingResult merged_grouping;
   summary.reference_stage_ms[kReferenceMergeStage] = time_reference_stage_ms([&] {
@@ -4092,6 +4200,9 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
                                               config.grouping_min_time_span_px,
                                               config.grouping_min_density,
                                               config.grouping_time_continuity_ratio);
+  result.merged_coherence = summary.merged_coherence;
+  result.merged_power = summary.merged_power;
+  result.merged_score = summary.merged_score;
   result.final_mask = summary.final_mask;
   result.grouped_box_count = summary.grouped_box_count;
   result.merged_threshold = summary.merged_threshold;

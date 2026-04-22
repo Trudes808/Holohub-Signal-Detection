@@ -69,6 +69,9 @@ struct CoherentPowerReferenceResult {
   float seed_threshold = 0.0f;
   std::vector<float> power_db;
   std::vector<float> corrected_sxx_db;
+  std::vector<float> merged_coherence;
+  std::vector<float> merged_power;
+  std::vector<float> merged_score;
   std::vector<float> final_mask;
 };
 

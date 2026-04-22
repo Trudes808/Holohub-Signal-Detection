@@ -179,9 +179,6 @@ dinov3_signal_detector:
   texture_q: 0.90
   texture_k: 6
   power_q: 0.90
-  dino_group_k: 8
-  dino_group_spatial_weight: 0.35
-  dino_group_score_q: 0.60
   pipeline_final_threshold: 0.20
   pipeline_final_threshold_no_speckle: 0.10
   pipeline_gap_floor: 0.10
@@ -220,7 +217,6 @@ coherent_power_signal_detector:
   power_weight: 0.45
   coherence_power_support_q: 0.82
   coherence_power_q: 0.92
-  min_component_size: 6
   filter_detection_mask: true
   grouping_seed_score_q: 0.72
   grouping_bridge_freq_px: 33

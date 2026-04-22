@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -42,6 +42,7 @@ class CoherentPowerConfig:
     coherence_power_support_q: float = 0.82
     coherence_power_q: float = 0.92
     min_component_size: int = 6
+    filter_detection_mask: bool = True
     grouping_seed_score_q: float = 0.72
     grouping_bridge_freq_px: int = 33
     grouping_bridge_time_px: int = 5
@@ -50,6 +51,12 @@ class CoherentPowerConfig:
     grouping_min_time_span_px: int = 2
     grouping_min_density: float = 0.06
     grouping_time_continuity_ratio: float = 0.85
+
+
+def _coherent_power_config_from_metadata(config_data: dict[str, Any]) -> CoherentPowerConfig:
+    valid_keys = {field.name for field in fields(CoherentPowerConfig)}
+    filtered_config = {key: value for key, value in config_data.items() if key in valid_keys}
+    return CoherentPowerConfig(**filtered_config)
 
 
 def infer_input_kind(input_path: str | Path, explicit_kind: str = "auto") -> str:
@@ -1389,15 +1396,33 @@ def _boxes_overlap(box_a: dict[str, Any], box_b: dict[str, Any]) -> bool:
     )
 
 
-def _boxes_should_merge(box_a: dict[str, Any], box_b: dict[str, Any]) -> bool:
-    if not _boxes_overlap(box_a, box_b):
-        return False
-
+def _boxes_should_merge(
+    box_a: dict[str, Any],
+    box_b: dict[str, Any],
+    bridge_freq_px: int = 0,
+    bridge_time_px: int = 0,
+) -> bool:
     role_a = str(box_a.get("split_role", "unsplit"))
     role_b = str(box_b.get("split_role", "unsplit"))
     if {role_a, role_b} == {"persistent_carrier", "transient_wideband_burst"}:
         return False
-    return True
+
+    freq_pad = max(0, int(bridge_freq_px)) // 2
+    time_pad = max(0, int(bridge_time_px))
+    expanded_a_freq_start = int(box_a["freq_start"]) - freq_pad
+    expanded_a_freq_stop = int(box_a["freq_stop"]) + freq_pad
+    expanded_b_freq_start = int(box_b["freq_start"]) - freq_pad
+    expanded_b_freq_stop = int(box_b["freq_stop"]) + freq_pad
+    expanded_a_time_start = int(box_a["time_start"]) - time_pad
+    expanded_a_time_stop = int(box_a["time_stop"]) + time_pad
+    expanded_b_time_start = int(box_b["time_start"]) - time_pad
+    expanded_b_time_stop = int(box_b["time_stop"]) + time_pad
+    return (
+        expanded_a_freq_start < expanded_b_freq_stop
+        and expanded_b_freq_start < expanded_a_freq_stop
+        and expanded_a_time_start < expanded_b_time_stop
+        and expanded_b_time_start < expanded_a_time_stop
+    )
 
 
 def _merge_box_cluster(cluster: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1540,6 +1565,7 @@ def _merge_projected_subsection_boxes(
     chunk_results: list[dict[str, Any]],
     merged_score: np.ndarray,
     valid_row_mask: np.ndarray | None = None,
+    filter_detection_mask: bool = True,
     bridge_freq_px: int = 33,
     bridge_time_px: int = 5,
     min_component_size: int = 24,
@@ -1548,13 +1574,12 @@ def _merge_projected_subsection_boxes(
     min_density: float = 0.06,
     time_continuity_ratio: float = 0.85,
 ) -> dict[str, Any]:
-    merged_score = np.asarray(merged_score, dtype=np.float32)
     source_mask, projected_boxes = _project_chunk_grouped_masks_to_global(
         chunk_results,
         global_shape,
         valid_row_mask=valid_row_mask,
     )
-    if not np.any(source_mask):
+    if not projected_boxes:
         return {
             "boxes": [],
             "grouped_mask": np.zeros(global_shape, dtype=bool),
@@ -1562,74 +1587,48 @@ def _merge_projected_subsection_boxes(
             "source_mask": source_mask.astype(bool),
         }
 
-    if any(bool(box.get("split_applied", False)) for box in projected_boxes):
-        merged_boxes: list[dict[str, Any]] = []
-        visited = [False] * len(projected_boxes)
-        for start_index in range(len(projected_boxes)):
-            if visited[start_index]:
-                continue
-            pending = [start_index]
-            visited[start_index] = True
-            cluster_indices: list[int] = []
-            while pending:
-                current_index = pending.pop()
-                cluster_indices.append(current_index)
-                current_box = projected_boxes[current_index]
-                for other_index, other_box in enumerate(projected_boxes):
-                    if visited[other_index]:
-                        continue
-                    if _boxes_should_merge(current_box, other_box):
-                        visited[other_index] = True
-                        pending.append(other_index)
-
-            cluster = [projected_boxes[index] for index in cluster_indices]
-            merged_boxes.append(_merge_box_cluster(cluster))
-
-        grouped_mask = _boxes_to_mask(global_shape, merged_boxes, valid_row_mask=valid_row_mask)
-        return {
-            "boxes": merged_boxes,
-            "grouped_mask": grouped_mask.astype(bool),
-            "source_boxes": projected_boxes,
-            "source_mask": source_mask.astype(bool),
-            "grouping": None,
-        }
-
-    grouping = group_signal_mask_regions(
-        source_mask,
-        score_map=merged_score,
-        valid_row_mask=valid_row_mask,
-        bridge_freq_px=bridge_freq_px,
-        bridge_time_px=bridge_time_px,
-        min_component_size=min_component_size,
-        min_freq_span_px=min_freq_span_px,
-        min_time_span_px=min_time_span_px,
-        min_density=min_density,
-        time_continuity_ratio=time_continuity_ratio,
-    )
     merged_boxes: list[dict[str, Any]] = []
-    for box in grouping["boxes"]:
-        overlapping_source_boxes = [
-            source_box
-            for source_box in projected_boxes
-            if _boxes_overlap(box, source_box)
-        ]
-        merged_boxes.append({
-            **box,
-            "source_box_count": len(overlapping_source_boxes),
-            "source_chunk_indices": sorted({
-                int(chunk_index)
-                for source_box in overlapping_source_boxes
-                for chunk_index in source_box.get("source_chunk_indices", [])
-            }),
-        })
+    visited = [False] * len(projected_boxes)
+    for start_index in range(len(projected_boxes)):
+        if visited[start_index]:
+            continue
+        pending = [start_index]
+        visited[start_index] = True
+        cluster_indices: list[int] = []
+        while pending:
+            current_index = pending.pop()
+            cluster_indices.append(current_index)
+            current_box = projected_boxes[current_index]
+            for other_index, other_box in enumerate(projected_boxes):
+                if visited[other_index]:
+                    continue
+                if _boxes_should_merge(
+                    current_box,
+                    other_box,
+                    bridge_freq_px=bridge_freq_px if filter_detection_mask else 0,
+                    bridge_time_px=bridge_time_px if filter_detection_mask else 0,
+                ):
+                    visited[other_index] = True
+                    pending.append(other_index)
 
-    grouped_mask = np.asarray(grouping["grouped_mask"], dtype=bool)
+        cluster = [projected_boxes[index] for index in cluster_indices]
+        merged_box = _merge_box_cluster(cluster)
+        keep_box = (
+            int(merged_box.get("filled_area", 0)) >= int(min_component_size)
+            and int(merged_box.get("freq_span", 0)) >= int(min_freq_span_px)
+            and int(merged_box.get("time_span", 0)) >= int(min_time_span_px)
+            and float(merged_box.get("density", 0.0)) >= float(min_density)
+        )
+        if keep_box:
+            merged_boxes.append(merged_box)
+
+    grouped_mask = _boxes_to_mask(global_shape, merged_boxes, valid_row_mask=valid_row_mask)
     return {
         "boxes": merged_boxes,
         "grouped_mask": grouped_mask.astype(bool),
         "source_boxes": projected_boxes,
         "source_mask": source_mask.astype(bool),
-        "grouping": grouping,
+        "grouping": None,
     }
 
 
@@ -1642,6 +1641,7 @@ def merge_chunk_results(
     coherence_weight: float = 0.55,
     power_weight: float = 0.45,
     coherence_power_joint_weight: float = 0.70,
+    filter_detection_mask: bool = True,
     grouping_seed_score_q: float = 0.72,
     grouping_bridge_freq_px: int = 33,
     grouping_bridge_time_px: int = 5,
@@ -1747,6 +1747,7 @@ def merge_chunk_results(
         chunk_results=chunk_results,
         merged_score=merged_score,
         valid_row_mask=valid_row_mask,
+        filter_detection_mask=filter_detection_mask,
         bridge_freq_px=grouping_bridge_freq_px,
         bridge_time_px=grouping_bridge_time_px,
         min_component_size=max(int(grouping_min_component_size), int(min_component_size)),
@@ -1756,26 +1757,8 @@ def merge_chunk_results(
         time_continuity_ratio=grouping_time_continuity_ratio,
     )
     merged_boxes = list(merged_box_groups["boxes"])
-    if merged_boxes:
-        merged_mask = np.asarray(merged_box_groups["grouped_mask"], dtype=bool)
-        merged_region_groups = None
-    else:
-        merged_region_groups = build_grouped_detection_regions(
-            merged_score=merged_score,
-            merged_mask=raw_merged_mask,
-            merged_support=merged_support,
-            valid_row_mask=valid_row_mask,
-            seed_score_q=grouping_seed_score_q,
-            bridge_freq_px=grouping_bridge_freq_px,
-            bridge_time_px=grouping_bridge_time_px,
-            min_component_size=max(int(grouping_min_component_size), int(min_component_size)),
-            min_freq_span_px=grouping_min_freq_span_px,
-            min_time_span_px=grouping_min_time_span_px,
-            min_density=grouping_min_density,
-            time_continuity_ratio=grouping_time_continuity_ratio,
-        )
-        merged_mask = np.asarray(merged_region_groups["grouped_mask"], dtype=bool)
-        merged_boxes = list(merged_region_groups["boxes"])
+    merged_mask = np.asarray(merged_box_groups["grouped_mask"], dtype=bool)
+    merged_region_groups = None
     return {
         "merged_score": merged_score.astype(np.float32),
         "merged_mask": merged_mask.astype(bool),
@@ -1921,6 +1904,7 @@ def run_coherent_power_pipeline(
         coherence_weight=cfg.coherence_weight,
         power_weight=cfg.power_weight,
         coherence_power_joint_weight=cfg.coherence_power_joint_weight,
+        filter_detection_mask=cfg.filter_detection_mask,
         grouping_seed_score_q=cfg.grouping_seed_score_q,
         grouping_bridge_freq_px=cfg.grouping_bridge_freq_px,
         grouping_bridge_time_px=cfg.grouping_bridge_time_px,
@@ -2059,8 +2043,8 @@ def load_offline_coherent_overlay_context(
     tensor_path: str | Path,
     summary_path: str | Path,
     *,
-    target_chunk_rows: int = 1024,
-    target_overlap_rows: int = 256,
+    target_chunk_rows: int | None = None,
+    target_overlap_rows: int | None = None,
     tensor_axis_order_override: str | None = None,
 ) -> dict[str, Any]:
     tensor_path = Path(tensor_path)
@@ -2071,22 +2055,27 @@ def load_offline_coherent_overlay_context(
     summary = json.loads(summary_path.read_text())
     summary["metadata_path"] = str(_resolve_artifact_path(summary["metadata_path"]))
     summary["corrected_sxx_db_npy"] = str(_resolve_artifact_path(summary["corrected_sxx_db_npy"]))
+    summary["merged_coherence_npy"] = str(_resolve_artifact_path(summary["merged_coherence_npy"]))
+    summary["merged_power_npy"] = str(_resolve_artifact_path(summary["merged_power_npy"]))
+    summary["merged_score_npy"] = str(_resolve_artifact_path(summary["merged_score_npy"]))
     summary["final_mask_npy"] = str(_resolve_artifact_path(summary["final_mask_npy"]))
 
     metadata = json.loads(Path(summary["metadata_path"]).read_text())
-    coherent_cfg = CoherentPowerConfig(**metadata["config"])
+    coherent_cfg = _coherent_power_config_from_metadata(metadata["config"])
     input_record, power_db_snapshot, tensor_axis_order = _build_overlay_input_record(
         tensor_path,
         metadata,
         tensor_axis_order_override=tensor_axis_order_override,
     )
 
-    active_cfg = adapt_chunk_config_for_input_record(
-        input_record,
-        coherent_cfg,
-        target_chunk_rows=target_chunk_rows,
-        target_overlap_rows=target_overlap_rows,
-    )
+    active_cfg = coherent_cfg
+    if target_chunk_rows is not None and target_overlap_rows is not None:
+        active_cfg = adapt_chunk_config_for_input_record(
+            input_record,
+            coherent_cfg,
+            target_chunk_rows=target_chunk_rows,
+            target_overlap_rows=target_overlap_rows,
+        )
     pipeline_result = run_coherent_power_pipeline(input_record, active_cfg)
 
     display_transposed = bool(
@@ -2097,8 +2086,13 @@ def load_offline_coherent_overlay_context(
     )
     raw_sxx_db = np.asarray(input_record["sxx_db"], dtype=np.float32)
     corrected_db_raw = np.load(summary["corrected_sxx_db_npy"], allow_pickle=False).astype(np.float32)
+    cpp_merged_coherence_raw = np.load(summary["merged_coherence_npy"], allow_pickle=False).astype(np.float32)
+    cpp_merged_power_raw = np.load(summary["merged_power_npy"], allow_pickle=False).astype(np.float32)
+    cpp_merged_score_raw = np.load(summary["merged_score_npy"], allow_pickle=False).astype(np.float32)
     final_mask_raw = np.load(summary["final_mask_npy"], allow_pickle=False).astype(np.float32)
     merged_coherence = np.asarray(pipeline_result["merged_coherence"], dtype=np.float32)
+    merged_power = np.asarray(pipeline_result["merged_power"], dtype=np.float32)
+    merged_score = np.asarray(pipeline_result["merged_score"], dtype=np.float32)
     ignore_bins_per_side = int(summary.get("ignore_bins_per_side", 0))
     valid_row_mask = np.asarray(
         pipeline_result.get(
@@ -2110,8 +2104,13 @@ def load_offline_coherent_overlay_context(
 
     tensor_power_db = _display_oriented(raw_sxx_db, display_transposed)
     corrected_db = _match_display_reference(corrected_db_raw, tensor_power_db)
+    cpp_merged_coherence = _match_display_reference(cpp_merged_coherence_raw, tensor_power_db)
+    cpp_merged_power = _match_display_reference(cpp_merged_power_raw, tensor_power_db)
+    cpp_merged_score = _match_display_reference(cpp_merged_score_raw, tensor_power_db)
     display_mask = _match_display_reference(final_mask_raw, tensor_power_db, is_mask=True)
     display_coherence = _display_oriented(merged_coherence, display_transposed)
+    display_power = _display_oriented(merged_power, display_transposed)
+    display_score = _display_oriented(merged_score, display_transposed)
     main_plot_transposed = _actual_display_transposed(tensor_power_db, raw_sxx_db, display_transposed)
 
     diagnostics = {
@@ -2123,6 +2122,9 @@ def load_offline_coherent_overlay_context(
         "tensor_analysis_shape": tuple(int(v) for v in raw_sxx_db.shape),
         "tensor_display_shape": tuple(int(v) for v in tensor_power_db.shape),
         "corrected_db_raw_shape": tuple(int(v) for v in corrected_db_raw.shape),
+        "cpp_merged_coherence_shape": tuple(int(v) for v in cpp_merged_coherence_raw.shape),
+        "cpp_merged_power_shape": tuple(int(v) for v in cpp_merged_power_raw.shape),
+        "cpp_merged_score_shape": tuple(int(v) for v in cpp_merged_score_raw.shape),
         "display_coherence_shape": tuple(int(v) for v in display_coherence.shape),
         "active_chunk_bandwidth_mhz": round(active_cfg.chunk_bandwidth_hz / 1e6, 3),
         "active_chunk_overlap_mhz": round(active_cfg.chunk_overlap_hz / 1e6, 3),
@@ -2143,12 +2145,22 @@ def load_offline_coherent_overlay_context(
         "power_db_snapshot": power_db_snapshot,
         "raw_sxx_db": raw_sxx_db,
         "corrected_db_raw": corrected_db_raw,
+        "cpp_merged_coherence_raw": cpp_merged_coherence_raw,
+        "cpp_merged_power_raw": cpp_merged_power_raw,
+        "cpp_merged_score_raw": cpp_merged_score_raw,
         "final_mask_raw": final_mask_raw,
         "merged_coherence": merged_coherence,
+        "merged_power": merged_power,
+        "merged_score": merged_score,
         "tensor_power_db": tensor_power_db,
         "corrected_db": corrected_db,
+        "cpp_merged_coherence": cpp_merged_coherence,
+        "cpp_merged_power": cpp_merged_power,
+        "cpp_merged_score": cpp_merged_score,
         "display_mask": display_mask,
         "display_coherence": display_coherence,
+        "display_power": display_power,
+        "display_score": display_score,
         "display_transposed": display_transposed,
         "main_plot_transposed": main_plot_transposed,
         "ignore_bins_per_side": ignore_bins_per_side,
@@ -2157,34 +2169,37 @@ def load_offline_coherent_overlay_context(
     }
 
 
-def plot_offline_coherent_overlay(
+def plot_cpp_offline_validation_maps(
     overlay_context: dict[str, Any],
-    figsize: tuple[int, int] = (26, 6),
+    figsize: tuple[int, int] = (30, 6),
 ):
     raw_sxx_db = np.asarray(overlay_context["raw_sxx_db"], dtype=np.float32)
-    tensor_power_db = np.asarray(overlay_context["tensor_power_db"], dtype=np.float32)
     corrected_db = np.asarray(overlay_context["corrected_db"], dtype=np.float32)
-    display_coherence = np.asarray(overlay_context["display_coherence"], dtype=np.float32)
+    cpp_merged_coherence = np.asarray(overlay_context["cpp_merged_coherence"], dtype=np.float32)
+    cpp_merged_power = np.asarray(overlay_context["cpp_merged_power"], dtype=np.float32)
+    cpp_merged_score = np.asarray(overlay_context["cpp_merged_score"], dtype=np.float32)
     display_mask = np.asarray(overlay_context["display_mask"], dtype=np.float32)
     ignore_bins_per_side = int(overlay_context.get("ignore_bins_per_side", 0))
     requested_display_transposed = bool(overlay_context.get("display_transposed", overlay_context.get("main_plot_transposed", False)))
-    main_plot_transposed = _actual_display_transposed(tensor_power_db, raw_sxx_db, requested_display_transposed)
+    main_plot_transposed = _actual_display_transposed(corrected_db, raw_sxx_db, requested_display_transposed)
     valid_row_mask = np.asarray(
         overlay_context.get("valid_row_mask", np.ones(raw_sxx_db.shape[0], dtype=bool)),
         dtype=bool,
     )
 
-    fig, axes = plt.subplots(1, 4, figsize=figsize, constrained_layout=True)
+    fig, axes = plt.subplots(1, 5, figsize=figsize, constrained_layout=True)
     raw_vmin, raw_vmax = _display_db_window(raw_sxx_db)
-    axes[0].imshow(tensor_power_db, aspect="auto", origin="lower", vmin=raw_vmin, vmax=raw_vmax, interpolation="nearest")
-    axes[0].set_title("Frozen tensor power")
-    axes[1].imshow(corrected_db, aspect="auto", origin="lower", vmin=raw_vmin, vmax=raw_vmax, interpolation="nearest")
-    axes[1].set_title("Offline coherent corrected power")
-    axes[2].imshow(display_coherence, aspect="auto", origin="lower", cmap="plasma", vmin=0.0, vmax=1.0, interpolation="nearest")
-    axes[2].set_title("Python merged raw coherence map")
-    axes[3].imshow(corrected_db, aspect="auto", origin="lower", cmap="gray", vmin=raw_vmin, vmax=raw_vmax, interpolation="nearest")
-    axes[3].imshow(np.ma.masked_where(display_mask <= 0.5, display_mask), aspect="auto", origin="lower", cmap="autumn", alpha=0.45, interpolation="nearest")
-    axes[3].set_title("C++ final mask overlay")
+    axes[0].imshow(corrected_db, aspect="auto", origin="lower", vmin=raw_vmin, vmax=raw_vmax, interpolation="nearest")
+    axes[0].set_title("C++ corrected wideband spectrogram")
+    axes[1].imshow(cpp_merged_coherence, aspect="auto", origin="lower", cmap="plasma", vmin=0.0, vmax=1.0, interpolation="nearest")
+    axes[1].set_title("C++ merged coherence")
+    axes[2].imshow(cpp_merged_power, aspect="auto", origin="lower", cmap="cividis", vmin=0.0, vmax=1.0, interpolation="nearest")
+    axes[2].set_title("C++ merged power assist")
+    axes[3].imshow(cpp_merged_score, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=1.0, interpolation="nearest")
+    axes[3].set_title("C++ coherence + power assist")
+    axes[4].imshow(corrected_db, aspect="auto", origin="lower", cmap="gray", vmin=raw_vmin, vmax=raw_vmax, interpolation="nearest")
+    axes[4].imshow(np.ma.masked_where(display_mask <= 0.5, display_mask), aspect="auto", origin="lower", cmap="autumn", alpha=0.45, interpolation="nearest")
+    axes[4].set_title("C++ final overlay")
 
     ignored_rows = np.flatnonzero(~valid_row_mask)
     if ignored_rows.size == 0 and ignore_bins_per_side > 0:
@@ -2198,6 +2213,60 @@ def plot_offline_coherent_overlay(
     for axis in axes:
         _shade_ignored_rows(axis, ignored_rows, main_plot_transposed)
         _set_spectrogram_axis_labels(axis, main_plot_transposed)
+    return fig, axes
+
+
+def plot_offline_coherent_overlay(
+    overlay_context: dict[str, Any],
+    figsize: tuple[int, int] = (30, 6),
+):
+    return plot_cpp_offline_validation_maps(overlay_context, figsize=figsize)
+
+
+def plot_python_offline_validation_maps(
+    pipeline_result: dict[str, Any],
+    figsize: tuple[int, int] = (30, 6),
+):
+    corrected_sxx_db = np.asarray(pipeline_result["corrected_sxx_db"], dtype=np.float32)
+    merged_coherence = np.asarray(pipeline_result["merged_coherence"], dtype=np.float32)
+    merged_power = np.asarray(pipeline_result["merged_power"], dtype=np.float32)
+    merged_score = np.asarray(pipeline_result["merged_score"], dtype=np.float32)
+    merged_mask = np.asarray(pipeline_result["merged_mask"], dtype=bool)
+    merged_boxes = list(pipeline_result.get("merged_boxes", []))
+    valid_row_mask = np.asarray(pipeline_result.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
+    display_transposed = bool(
+        pipeline_result["input_record"].get(
+            "display_transposed",
+            input_kind_requires_display_transpose(pipeline_result["input_record"].get("input_kind")),
+        )
+    )
+    display_corrected = _orient_panel_for_display(corrected_sxx_db, corrected_sxx_db, display_transposed)
+    display_coherence = _orient_panel_for_display(merged_coherence, corrected_sxx_db, display_transposed)
+    display_power = _orient_panel_for_display(merged_power, corrected_sxx_db, display_transposed)
+    display_score = _orient_panel_for_display(merged_score, corrected_sxx_db, display_transposed)
+    display_mask = _orient_panel_for_display(merged_mask, corrected_sxx_db, display_transposed)
+    actual_display_transposed = _actual_display_transposed(display_corrected, corrected_sxx_db, display_transposed)
+    vmin, vmax = _display_db_window(corrected_sxx_db)
+
+    fig, axes = plt.subplots(1, 5, figsize=figsize, constrained_layout=True)
+    axes[0].imshow(display_corrected, aspect="auto", origin="lower", cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")
+    axes[0].set_title("Python corrected wideband spectrogram")
+    axes[1].imshow(display_coherence, aspect="auto", origin="lower", cmap="plasma", vmin=0.0, vmax=1.0, interpolation="nearest")
+    axes[1].set_title("Python merged coherence")
+    axes[2].imshow(display_power, aspect="auto", origin="lower", cmap="cividis", vmin=0.0, vmax=1.0, interpolation="nearest")
+    axes[2].set_title("Python merged power assist")
+    axes[3].imshow(display_score, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=1.0, interpolation="nearest")
+    axes[3].set_title("Python coherence + power assist")
+    axes[4].imshow(display_corrected, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
+    axes[4].imshow(np.where(display_mask, 1.0, np.nan), aspect="auto", origin="lower", cmap="autumn", alpha=0.55, interpolation="nearest")
+    axes[4].set_title(f"Python final overlay ({len(merged_boxes)} boxes)")
+
+    for ax in axes:
+        _draw_signal_boxes(ax, merged_boxes, actual_display_transposed)
+    ignored_rows = np.flatnonzero(~valid_row_mask)
+    for ax in axes:
+        _shade_ignored_rows(ax, ignored_rows, actual_display_transposed)
+        _set_spectrogram_axis_labels(ax, actual_display_transposed)
     return fig, axes
 
 
@@ -2432,13 +2501,13 @@ def plot_merged_detection(pipeline_result: dict[str, Any], figsize: tuple[int, i
     vmin, vmax = _display_db_window(corrected_sxx_db)
     fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
     axes[0].imshow(display_corrected, aspect="auto", origin="lower", cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")
-    axes[0].set_title("Corrected wideband spectrogram")
+    axes[0].set_title("Python replay corrected spectrogram")
     axes[1].imshow(display_score, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=1.0, interpolation="nearest")
     axes[1].imshow(np.where(display_support, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.18, interpolation="nearest")
-    axes[1].set_title("Merged coherence-power score + support")
+    axes[1].set_title("Python replay merged coherence-power score + support")
     axes[2].imshow(display_corrected, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
     axes[2].imshow(np.where(display_mask, 1.0, np.nan), aspect="auto", origin="lower", cmap="autumn", alpha=0.55, interpolation="nearest")
-    axes[2].set_title(f"Grouped detection overlay ({len(merged_boxes)} boxes)")
+    axes[2].set_title(f"Python replay grouped final overlay ({len(merged_boxes)} boxes)")
     _draw_signal_boxes(axes[0], merged_boxes, actual_display_transposed)
     _draw_signal_boxes(axes[1], merged_boxes, actual_display_transposed)
     _draw_signal_boxes(axes[2], merged_boxes, actual_display_transposed)
@@ -2467,15 +2536,15 @@ def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] 
     vmin, vmax = _display_db_window(corrected_sxx_db)
     power_mode = str(pipeline_result.get("power_assist_mode", "hybrid")).replace("_", " ")
     fig, axes = plt.subplots(1, 5, figsize=figsize, constrained_layout=True)
-    _show_debug_panel(axes[0], corrected_sxx_db, "Input spectrogram", display_transposed, "viridis", vmin, vmax)
-    _show_debug_panel(axes[1], merged_coherence, "Merged coherence", display_transposed, "plasma", 0.0, 1.0, reference=corrected_sxx_db)
-    _show_debug_panel(axes[2], merged_power, f"Merged power assist ({power_mode})", display_transposed, "cividis", 0.0, 1.0, reference=corrected_sxx_db)
-    _show_debug_panel(axes[3], merged_score, "Merged coherence + power score", display_transposed, "magma", 0.0, 1.0, reference=corrected_sxx_db)
+    _show_debug_panel(axes[0], corrected_sxx_db, "Python replay corrected spectrogram", display_transposed, "viridis", vmin, vmax)
+    _show_debug_panel(axes[1], merged_coherence, "Python replay merged coherence", display_transposed, "plasma", 0.0, 1.0, reference=corrected_sxx_db)
+    _show_debug_panel(axes[2], merged_power, f"Python replay merged power assist ({power_mode})", display_transposed, "cividis", 0.0, 1.0, reference=corrected_sxx_db)
+    _show_debug_panel(axes[3], merged_score, "Python replay merged coherence + power score", display_transposed, "magma", 0.0, 1.0, reference=corrected_sxx_db)
     support_display = _orient_panel_for_display(merged_support, corrected_sxx_db, display_transposed)
     actual_display_transposed = _actual_display_transposed(support_display, corrected_sxx_db, display_transposed)
     axes[3].imshow(np.where(support_display, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.18, interpolation="nearest")
     _draw_signal_boxes(axes[3], merged_boxes, actual_display_transposed)
-    _show_debug_overlay(axes[4], corrected_sxx_db, merged_mask, "Grouped final overlay", display_transposed, vmin, vmax, boxes=merged_boxes)
+    _show_debug_overlay(axes[4], corrected_sxx_db, merged_mask, "Python replay grouped final overlay", display_transposed, vmin, vmax, boxes=merged_boxes)
     return fig, axes
 
 

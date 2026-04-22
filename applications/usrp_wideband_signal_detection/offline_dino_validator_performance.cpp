@@ -73,10 +73,6 @@ struct ValidatorConfig {
   double dino_coherence_gate_floor = 0.25;
   double dino_coherence_gate_span_db = 3.0;
   double power_q = 0.90;
-  int dino_group_k = 8;
-  double dino_group_spatial_weight = 0.35;
-  double dino_group_score_q = 0.60;
-  int min_component_size = 6;
   bool filter_detection_mask = true;
   int grouping_bridge_freq_px = 33;
   int grouping_bridge_time_px = 5;
@@ -189,36 +185,6 @@ struct GroupingResult {
 struct ComponentLabelling {
   std::vector<int> labels;
   std::vector<int> sizes;
-};
-
-struct DinoComponentSummaryRow {
-  int cluster = 0;
-  float size_fraction = 0.0f;
-  float support_mean = 0.0f;
-  float support_peak = 0.0f;
-  float internal_aff = 0.0f;
-  float boundary_aff = 0.0f;
-  float seed_mean = 0.0f;
-  float smoothness = 0.0f;
-  float combined_score = 0.0f;
-  float size_penalty = 0.0f;
-};
-
-struct GroupedDinoPatchResult {
-  std::vector<uint8_t> mask_patch;
-  std::vector<float> score_patch;
-  std::vector<float> seed_norm_map;
-  std::vector<float> seed_persistence_map;
-  std::vector<float> seed_contrast_map;
-  std::vector<uint8_t> active_mask_patch;
-  std::vector<uint8_t> label_map_patch;
-  std::vector<uint8_t> label_map_pre_smooth_patch;
-  std::vector<int> cluster_map;
-  std::vector<float> support_map;
-  std::vector<float> support_selected_raw_map;
-  std::vector<float> cluster_quality_map;
-  std::vector<float> selected_support_map;
-  float threshold = 0.0f;
 };
 
 ComponentLabelling label_components(const std::vector<uint8_t>& mask, int rows, int cols);
@@ -728,10 +694,6 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.dino_coherence_gate_floor = extract_number<double>(text, "dino_coherence_gate_floor").value_or(config.dino_coherence_gate_floor);
   config.dino_coherence_gate_span_db = extract_number<double>(text, "dino_coherence_gate_span_db").value_or(config.dino_coherence_gate_span_db);
   config.power_q = extract_number<double>(text, "power_q").value_or(config.power_q);
-  config.dino_group_k = extract_number<int>(text, "dino_group_k").value_or(config.dino_group_k);
-  config.dino_group_spatial_weight = extract_number<double>(text, "dino_group_spatial_weight").value_or(config.dino_group_spatial_weight);
-  config.dino_group_score_q = extract_number<double>(text, "dino_group_score_q").value_or(config.dino_group_score_q);
-  config.min_component_size = extract_number<int>(text, "min_component_size").value_or(config.min_component_size);
   config.filter_detection_mask = extract_bool(text, "filter_detection_mask").value_or(config.filter_detection_mask);
   config.grouping_bridge_freq_px = extract_number<int>(text, "grouping_bridge_freq_px").value_or(config.grouping_bridge_freq_px);
   config.grouping_bridge_time_px = extract_number<int>(text, "grouping_bridge_time_px").value_or(config.grouping_bridge_time_px);
@@ -1833,28 +1795,6 @@ double dense_square_matrix_mib(int size) {
   return bytes / (1024.0 * 1024.0);
 }
 
-void log_grouped_patch_memory(bool verbose,
-                              std::string_view stage,
-                              const char* debug_label,
-                              int patch_rows,
-                              int patch_cols,
-                              int feature_dim) {
-  if (!verbose) {
-    return;
-  }
-  const int patch_count = std::max(0, patch_rows * patch_cols);
-  const auto memory = read_process_memory_snapshot();
-  std::cerr << "[offline_dino_validator_performance] grouped_patch_memory stage=" << stage
-            << " label=" << debug_label
-            << " patch_grid=" << patch_rows << "x" << patch_cols
-            << " patch_count=" << patch_count
-            << " feature_dim=" << feature_dim
-            << " dense_matrix_mib=" << std::fixed << std::setprecision(1) << dense_square_matrix_mib(patch_count)
-            << " rss_mib=" << (static_cast<double>(memory.vm_rss_kib) / 1024.0)
-            << " hwm_mib=" << (static_cast<double>(memory.vm_hwm_kib) / 1024.0)
-            << "\n";
-}
-
 torch::Tensor vector_to_tensor_2d(const std::vector<float>& input, int rows, int cols) {
   if (rows <= 0 || cols <= 0 || input.size() != static_cast<size_t>(rows) * static_cast<size_t>(cols)) {
     return torch::zeros({std::max(rows, 0), std::max(cols, 0)}, torch::TensorOptions().dtype(torch::kFloat32));
@@ -2672,74 +2612,6 @@ std::vector<float> patch_mean_map(const std::vector<float>& input,
   return output;
 }
 
-struct DinoSeedPatchComponents {
-  std::vector<float> seed_patch;
-  std::vector<float> persistence_patch;
-  std::vector<float> contrast_patch;
-};
-
-DinoSeedPatchComponents dino_seed_patch_components(const std::vector<float>& spectrogram_db,
-                                                   int src_rows,
-                                                   int src_cols,
-                                                   int runtime_rows,
-                                                   int runtime_cols,
-                                                   int patch_rows,
-                                                   int patch_cols) {
-  std::vector<float> rel_db(static_cast<size_t>(runtime_rows) * static_cast<size_t>(runtime_cols), 0.0f);
-  std::vector<float> linear_values;
-  linear_values.reserve(rel_db.size());
-  for (int row = 0; row < runtime_rows; ++row) {
-    for (int col = 0; col < runtime_cols; ++col) {
-      const float db = spectrogram_db[flat_index(src_cols, row, col)];
-      linear_values.push_back(std::pow(10.0f, db / 10.0f));
-    }
-  }
-  const float p_floor = std::max(quantile_from_values(linear_values, 0.30, 1.0e-20f), 1.0e-20f);
-  for (int row = 0; row < runtime_rows; ++row) {
-    for (int col = 0; col < runtime_cols; ++col) {
-      const float db = spectrogram_db[flat_index(src_cols, row, col)];
-      const float p_lin = std::pow(10.0f, db / 10.0f);
-      const float value = 10.0f * std::log10(std::max(p_lin, 1.0e-20f) / p_floor);
-      rel_db[flat_index(runtime_cols, row, col)] = clamp_value(value, -10.0f, 25.0f);
-    }
-  }
-  const auto persistence_px = box_mean_cols(rel_db, runtime_rows, runtime_cols, 3);
-  const auto local_avg = box_mean_2d(rel_db, runtime_rows, runtime_cols, 2, 2);
-  std::vector<float> contrast_px(rel_db.size(), 0.0f);
-  for (size_t index = 0; index < contrast_px.size(); ++index) {
-    contrast_px[index] = rel_db[index] - local_avg[index];
-  }
-  const auto persistence_n = normalize01_quantile(persistence_px, 5.0, 95.0);
-  const auto contrast_n = normalize01_quantile(contrast_px, 5.0, 95.0);
-  std::vector<float> seed_px(rel_db.size(), 0.0f);
-  for (size_t index = 0; index < seed_px.size(); ++index) {
-    seed_px[index] = 0.65f * persistence_n[index] + 0.35f * contrast_n[index];
-  }
-  DinoSeedPatchComponents result;
-  result.seed_patch = patch_mean_map(seed_px, runtime_rows, runtime_cols, patch_rows, patch_cols);
-  result.persistence_patch = patch_mean_map(persistence_n, runtime_rows, runtime_cols, patch_rows, patch_cols);
-  result.contrast_patch = patch_mean_map(contrast_n, runtime_rows, runtime_cols, patch_rows, patch_cols);
-  return result;
-}
-
-std::vector<float> dino_seed_patch_map(const std::vector<float>& spectrogram_db,
-                                       int src_rows,
-                                       int src_cols,
-                                       int runtime_rows,
-                                       int runtime_cols,
-                                       int patch_rows,
-                                       int patch_cols) {
-  return dino_seed_patch_components(
-      spectrogram_db,
-      src_rows,
-      src_cols,
-      runtime_rows,
-      runtime_cols,
-      patch_rows,
-      patch_cols)
-      .seed_patch;
-}
-
 std::vector<float> suppress_raw_dino_positional_features(const float* patch_features,
                                                          size_t patch_features_size,
                                                          int patch_rows,
@@ -3050,24 +2922,6 @@ std::shared_ptr<const PositionalSuppressionCache> get_positional_suppression_cac
   return inserted ? cache : iter->second;
 }
 
-std::vector<float> pca_project_features(const std::vector<float>& patch_features,
-                                        int patch_count,
-                                        int feature_dim) {
-  if (patch_count <= 1 || feature_dim <= 0 || patch_features.size() != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
-    return patch_features;
-  }
-  const int out_dim = std::min({12, feature_dim, patch_count - 1});
-  if (out_dim < 1) {
-    return patch_features;
-  }
-  const auto x = vector_to_tensor_2d(patch_features, patch_count, feature_dim);
-  const auto centered = x - x.mean(0, true);
-  const auto svd = torch::linalg_svd(centered, false);
-  const auto u = std::get<0>(svd).narrow(1, 0, out_dim);
-  const auto s = std::get<1>(svd).narrow(0, 0, out_dim).unsqueeze(0);
-  return tensor_to_vector_float(u * s);
-}
-
 std::vector<float> remove_positional_trend(const std::vector<float>& features,
                                            int patch_count,
                                            int feature_dim,
@@ -3177,7 +3031,6 @@ std::vector<float> suppress_raw_dino_positional_features(const float* patch_feat
   }
   const float clamped = clamp_value(suppression, 0.0f, 1.0f);
   auto suppressed = remove_positional_trend(patch_feature_vector, patch_count, feature_dim, patch_rows, patch_cols);
-  suppressed = remove_position_correlated_components(suppressed, patch_count, feature_dim, patch_rows, patch_cols);
   if (clamped >= 1.0f) {
     return suppressed;
   }
@@ -3199,77 +3052,6 @@ std::vector<float> suppress_raw_dino_positional_features(const std::vector<float
                                                patch_cols,
                                                feature_dim,
                                                suppression);
-}
-
-std::vector<float> row_normalize_square_matrix(const std::vector<float>& input, int size) {
-  std::vector<float> output(input.size(), 0.0f);
-  for (int row = 0; row < size; ++row) {
-    float row_sum = 0.0f;
-    for (int col = 0; col < size; ++col) {
-      row_sum += input[flat_index(size, row, col)];
-    }
-    row_sum = std::max(row_sum, 1.0e-6f);
-    for (int col = 0; col < size; ++col) {
-      output[flat_index(size, row, col)] = input[flat_index(size, row, col)] / row_sum;
-    }
-  }
-  return output;
-}
-
-std::vector<float> feature_affinity_matrix(const std::vector<float>& features,
-                                           int patch_count,
-                                           int feature_dim,
-                                           int k) {
-  std::vector<float> normalized(features.size(), 0.0f);
-  for (int row = 0; row < patch_count; ++row) {
-    float norm = 0.0f;
-    for (int col = 0; col < feature_dim; ++col) {
-      const float value = features[flat_index(feature_dim, row, col)];
-      norm += value * value;
-    }
-    norm = std::sqrt(std::max(norm, 1.0e-12f));
-    for (int col = 0; col < feature_dim; ++col) {
-      normalized[flat_index(feature_dim, row, col)] = features[flat_index(feature_dim, row, col)] / norm;
-    }
-  }
-  const int neighbors = std::min(std::max(1, k), std::max(1, patch_count - 1));
-  std::vector<std::vector<std::pair<float, int>>> top_neighbors(static_cast<size_t>(patch_count));
-  std::vector<float> positive_distances;
-  for (int row = 0; row < patch_count; ++row) {
-    std::vector<std::pair<float, int>> ranked;
-    ranked.reserve(static_cast<size_t>(patch_count - 1));
-    for (int col = 0; col < patch_count; ++col) {
-      if (col == row) {
-        continue;
-      }
-      float dot = 0.0f;
-      for (int feat = 0; feat < feature_dim; ++feat) {
-        dot += normalized[flat_index(feature_dim, row, feat)] * normalized[flat_index(feature_dim, col, feat)];
-      }
-      const float distance = std::max(0.0f, 1.0f - dot);
-      ranked.emplace_back(distance, col);
-    }
-    std::partial_sort(ranked.begin(), ranked.begin() + neighbors, ranked.end());
-    top_neighbors[static_cast<size_t>(row)].assign(ranked.begin(), ranked.begin() + neighbors);
-    for (int idx = 0; idx < neighbors; ++idx) {
-      if (ranked[static_cast<size_t>(idx)].first > 0.0f) {
-        positive_distances.push_back(ranked[static_cast<size_t>(idx)].first);
-      }
-    }
-  }
-  const float sigma = std::max(quantile_from_values(positive_distances, 0.50, 1.0f), 1.0e-3f);
-  std::vector<float> affinity(static_cast<size_t>(patch_count) * static_cast<size_t>(patch_count), 0.0f);
-  for (int row = 0; row < patch_count; ++row) {
-    affinity[flat_index(patch_count, row, row)] = 1.0f;
-    for (const auto& neighbor : top_neighbors[static_cast<size_t>(row)]) {
-      const int col = neighbor.second;
-      const float distance = neighbor.first;
-      const float weight = std::exp(-((distance * distance) / (2.0f * sigma * sigma)));
-      affinity[flat_index(patch_count, row, col)] = std::max(affinity[flat_index(patch_count, row, col)], weight);
-      affinity[flat_index(patch_count, col, row)] = std::max(affinity[flat_index(patch_count, col, row)], weight);
-    }
-  }
-  return affinity;
 }
 
 std::vector<float> mutual_knn_affinity(const std::vector<float>& affinity, int patch_count, int top_k, float keep_q) {
@@ -3552,306 +3334,6 @@ float mask_smoothness(const std::vector<uint8_t>& mask, int patch_rows, int patc
   const float edge_disagreement = 0.5f * ((v_count > 0 ? v_disagree / static_cast<float>(v_count) : 0.0f) +
                                           (h_count > 0 ? h_disagree / static_cast<float>(h_count) : 0.0f));
   return 1.0f - edge_disagreement;
-}
-
-std::vector<DinoComponentSummaryRow> component_summary_table(const std::vector<float>& local_aff,
-                                                             const std::vector<int>& component_map,
-                                                             const std::vector<float>& support_map,
-                                                             const std::vector<float>& seed_norm,
-                                                             int patch_rows,
-                                                             int patch_cols) {
-  constexpr float kGroupedComponentSeedWeight = 0.0f;
-  const int patch_count = patch_rows * patch_cols;
-  int max_label = 0;
-  for (int label : component_map) {
-    max_label = std::max(max_label, label);
-  }
-  std::vector<DinoComponentSummaryRow> rows;
-  for (int label = 1; label <= max_label; ++label) {
-    std::vector<int> indices;
-    std::vector<uint8_t> mask(static_cast<size_t>(patch_count), 0);
-    for (int idx = 0; idx < patch_count; ++idx) {
-      if (component_map[static_cast<size_t>(idx)] == label) {
-        indices.push_back(idx);
-        mask[static_cast<size_t>(idx)] = 1;
-      }
-    }
-    if (indices.empty()) {
-      continue;
-    }
-    float internal_sum = 0.0f;
-    int internal_count = 0;
-    for (size_t ii = 0; ii < indices.size(); ++ii) {
-      for (size_t jj = ii + 1; jj < indices.size(); ++jj) {
-        internal_sum += local_aff[flat_index(patch_count, indices[ii], indices[jj])];
-        ++internal_count;
-      }
-    }
-    std::vector<float> support_values;
-    float support_mean = 0.0f;
-    float seed_mean = 0.0f;
-    for (int idx : indices) {
-      support_values.push_back(support_map[static_cast<size_t>(idx)]);
-      support_mean += support_map[static_cast<size_t>(idx)];
-      seed_mean += seed_norm[static_cast<size_t>(idx)];
-    }
-    DinoComponentSummaryRow row;
-    row.cluster = label;
-    row.size_fraction = static_cast<float>(indices.size()) / static_cast<float>(patch_count);
-    row.support_mean = support_mean / static_cast<float>(indices.size());
-    row.support_peak = quantile_from_values(support_values, 0.90, 0.0f);
-    row.internal_aff = internal_count > 0 ? internal_sum / static_cast<float>(internal_count) : 0.0f;
-    row.boundary_aff = component_boundary_affinity(local_aff, mask, patch_rows, patch_cols);
-    row.seed_mean = seed_mean / static_cast<float>(indices.size());
-    row.smoothness = mask_smoothness(mask, patch_rows, patch_cols);
-    rows.push_back(row);
-  }
-  if (rows.empty()) {
-    return rows;
-  }
-  std::vector<float> support_mean_vals;
-  std::vector<float> support_peak_vals;
-  std::vector<float> internal_vals;
-  std::vector<float> boundary_gap_vals;
-  std::vector<float> seed_vals;
-  std::vector<float> smooth_vals;
-  std::vector<float> size_vals;
-  for (const auto& row : rows) {
-    support_mean_vals.push_back(row.support_mean);
-    support_peak_vals.push_back(row.support_peak);
-    internal_vals.push_back(row.internal_aff);
-    boundary_gap_vals.push_back(row.internal_aff - row.boundary_aff);
-    seed_vals.push_back(row.seed_mean);
-    smooth_vals.push_back(row.smoothness);
-    size_vals.push_back(row.size_fraction);
-  }
-  const auto support_mean_n = normalize_vector01(support_mean_vals);
-  const auto support_peak_n = normalize_vector01(support_peak_vals);
-  const auto internal_n = normalize_vector01(internal_vals);
-  const auto boundary_gap_n = normalize_vector01(boundary_gap_vals);
-  const auto seed_n = normalize_vector01(seed_vals);
-  const auto smooth_n = normalize_vector01(smooth_vals);
-  for (size_t index = 0; index < rows.size(); ++index) {
-    const float size_penalty = clamp_value((size_vals[index] - 0.30f) / 0.20f, 0.0f, 1.0f);
-    rows[index].size_penalty = size_penalty;
-    rows[index].combined_score = 0.35f * support_mean_n[index] +
-                                 0.20f * support_peak_n[index] +
-                                 0.20f * internal_n[index] +
-                                 0.15f * boundary_gap_n[index] +
-                                 kGroupedComponentSeedWeight * seed_n[index] +
-                                 0.05f * smooth_n[index] -
-                                 0.10f * size_penalty;
-  }
-  std::sort(rows.begin(), rows.end(), [](const DinoComponentSummaryRow& lhs, const DinoComponentSummaryRow& rhs) {
-    return lhs.combined_score > rhs.combined_score;
-  });
-  return rows;
-}
-
-std::vector<int> select_signal_components(const std::vector<DinoComponentSummaryRow>& component_rows) {
-  if (component_rows.empty()) {
-    return {};
-  }
-  const float best_score = component_rows.front().combined_score;
-  const float score_floor = std::max(0.35f, 0.72f * best_score);
-  std::vector<int> selected;
-  for (const auto& row : component_rows) {
-    if (row.combined_score < score_floor) {
-      continue;
-    }
-    if (row.size_fraction > 0.45f && row.combined_score < 0.95f * best_score) {
-      continue;
-    }
-    selected.push_back(row.cluster);
-    if (selected.size() >= 3) {
-      break;
-    }
-  }
-  if (selected.empty()) {
-    selected.push_back(component_rows.front().cluster);
-  }
-  return selected;
-}
-
-std::vector<uint8_t> smooth_binary_label_map(const std::vector<uint8_t>& label_map,
-                                             int patch_rows,
-                                             int patch_cols,
-                                             int iters,
-                                             int min_component_size) {
-  auto output = label_map;
-  for (int iter = 0; iter < std::max(0, iters); ++iter) {
-    std::vector<float> float_map(output.begin(), output.end());
-    const auto avg = box_mean_2d(float_map, patch_rows, patch_cols, 1, 1);
-    for (size_t index = 0; index < output.size(); ++index) {
-      output[index] = avg[index] >= 0.5f ? 1 : 0;
-    }
-  }
-  const auto labelled = label_components(output, patch_rows, patch_cols);
-  if (!labelled.sizes.empty()) {
-    std::vector<uint8_t> small_mask(output.size(), 0);
-    for (size_t index = 0; index < labelled.labels.size(); ++index) {
-      const int label = labelled.labels[index];
-      if (label > 0 && labelled.sizes[static_cast<size_t>(label - 1)] < std::max(1, min_component_size)) {
-        small_mask[index] = 1;
-      }
-    }
-    std::vector<float> float_map(output.begin(), output.end());
-    const auto neigh = box_mean_2d(float_map, patch_rows, patch_cols, 1, 1);
-    for (size_t index = 0; index < output.size(); ++index) {
-      if (small_mask[index] != 0) {
-        output[index] = neigh[index] >= 0.5f ? 1 : 0;
-      }
-    }
-  }
-  return output;
-}
-
-GroupedDinoPatchResult grouped_dino_from_patch_features(const std::vector<float>& patch_features,
-                                                        int patch_rows,
-                                                        int patch_cols,
-                                                        int feature_dim,
-                                                        const std::vector<float>& seed_patch,
-                                                        const ValidatorConfig& config,
-                                                        bool verbose,
-                                                        const char* debug_label) {
-  constexpr float kGroupedScoreSeedWeight = 0.0f;
-  GroupedDinoPatchResult result;
-  const int patch_count = patch_rows * patch_cols;
-  result.mask_patch.assign(static_cast<size_t>(patch_count), 0);
-  result.score_patch.assign(static_cast<size_t>(patch_count), 0.0f);
-  result.seed_norm_map.assign(static_cast<size_t>(patch_count), 0.0f);
-  result.label_map_patch.assign(static_cast<size_t>(patch_count), 0);
-  result.cluster_map.assign(static_cast<size_t>(patch_count), 0);
-  result.support_map.assign(static_cast<size_t>(patch_count), 0.0f);
-  result.cluster_quality_map.assign(static_cast<size_t>(patch_count), 0.0f);
-  result.selected_support_map.assign(static_cast<size_t>(patch_count), 0.0f);
-  if (patch_count <= 0 || feature_dim <= 0 || patch_features.size() != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
-    return result;
-  }
-
-  log_grouped_patch_memory(verbose, "start", debug_label, patch_rows, patch_cols, feature_dim);
-
-  auto x = pca_project_features(patch_features, patch_count, feature_dim);
-  const int reduced_dim = std::max(1, static_cast<int>(x.size()) / std::max(1, patch_count));
-  log_grouped_patch_memory(verbose, "after_pca", debug_label, patch_rows, patch_cols, reduced_dim);
-  x = remove_positional_trend(x, patch_count, reduced_dim, patch_rows, patch_cols);
-  x = remove_position_correlated_components(x, patch_count, reduced_dim, patch_rows, patch_cols);
-  std::vector<float> feature_mean(static_cast<size_t>(reduced_dim), 0.0f);
-  for (int row = 0; row < patch_count; ++row) {
-    for (int col = 0; col < reduced_dim; ++col) {
-      feature_mean[static_cast<size_t>(col)] += x[flat_index(reduced_dim, row, col)];
-    }
-  }
-  for (float& value : feature_mean) {
-    value /= static_cast<float>(patch_count);
-  }
-  for (int row = 0; row < patch_count; ++row) {
-    float norm = 0.0f;
-    for (int col = 0; col < reduced_dim; ++col) {
-      float& value = x[flat_index(reduced_dim, row, col)];
-      value -= feature_mean[static_cast<size_t>(col)];
-      norm += value * value;
-    }
-    norm = std::sqrt(std::max(norm, 1.0e-6f));
-    for (int col = 0; col < reduced_dim; ++col) {
-      x[flat_index(reduced_dim, row, col)] /= norm;
-    }
-  }
-
-  const auto full_aff = feature_affinity_matrix(x, patch_count, reduced_dim, config.dino_group_k);
-  log_grouped_patch_memory(verbose, "after_full_aff", debug_label, patch_rows, patch_cols, reduced_dim);
-  auto local_aff = mutual_knn_affinity(full_aff, patch_count, config.dino_group_k, 0.40f);
-  local_aff = inject_spatial_shortcuts(local_aff, full_aff, patch_rows, patch_cols, static_cast<float>(config.dino_group_spatial_weight));
-  log_grouped_patch_memory(verbose, "after_local_aff", debug_label, patch_rows, patch_cols, reduced_dim);
-  const auto seed_norm = normalize01_quantile(seed_patch, 5.0, 95.0);
-  result.seed_norm_map = seed_norm;
-  result.seed_persistence_map = seed_patch;
-  result.seed_contrast_map = seed_patch;
-  result.support_map = local_affinity_score_map(local_aff, patch_rows, patch_cols);
-  log_grouped_patch_memory(verbose, "after_support_map", debug_label, patch_rows, patch_cols, reduced_dim);
-  const auto components = connected_affinity_components(local_aff, result.support_map, patch_rows, patch_cols);
-  result.cluster_map = components.first;
-  result.active_mask_patch = components.second;
-  const auto component_rows = component_summary_table(local_aff, result.cluster_map, result.support_map, seed_norm, patch_rows, patch_cols);
-  const auto selected_components = select_signal_components(component_rows);
-  if (!selected_components.empty()) {
-    for (size_t index = 0; index < result.label_map_patch.size(); ++index) {
-      result.label_map_patch[index] = std::find(selected_components.begin(), selected_components.end(), result.cluster_map[index]) != selected_components.end() ? 1 : 0;
-    }
-  } else {
-    const float fallback_threshold = quantile_from_values(result.support_map, 0.80, 1.0f);
-    for (size_t index = 0; index < result.label_map_patch.size(); ++index) {
-      result.label_map_patch[index] = result.support_map[index] >= fallback_threshold ? 1 : 0;
-      result.cluster_map[index] = result.label_map_patch[index] != 0 ? 1 : 0;
-    }
-  }
-  result.label_map_pre_smooth_patch = result.label_map_patch;
-  result.label_map_patch = smooth_binary_label_map(result.label_map_patch, patch_rows, patch_cols, 2, config.min_component_size);
-  std::vector<float> support_selected(result.support_map.size(), 0.0f);
-  for (size_t index = 0; index < support_selected.size(); ++index) {
-    support_selected[index] = result.support_map[index] * static_cast<float>(result.label_map_patch[index]);
-  }
-  result.support_selected_raw_map = support_selected;
-  result.selected_support_map = normalize01_quantile(box_mean_2d(support_selected, patch_rows, patch_cols, 1, 1), 5.0, 95.0);
-  if (!component_rows.empty()) {
-    std::vector<float> component_scores;
-    for (const auto& row : component_rows) {
-      component_scores.push_back(std::max(0.0f, row.combined_score));
-    }
-    const auto component_scores_n = normalize_vector01(component_scores);
-    for (size_t row_index = 0; row_index < component_rows.size(); ++row_index) {
-      for (size_t index = 0; index < result.cluster_map.size(); ++index) {
-        if (result.cluster_map[index] == component_rows[row_index].cluster) {
-          result.cluster_quality_map[index] = component_scores_n[row_index];
-        }
-      }
-    }
-  }
-  for (size_t index = 0; index < result.score_patch.size(); ++index) {
-    result.score_patch[index] = 0.70f * result.selected_support_map[index] +
-                                0.20f * result.cluster_quality_map[index] +
-                                kGroupedScoreSeedWeight * seed_norm[index];
-  }
-  result.score_patch = normalize01_quantile(result.score_patch, 5.0, 95.0);
-
-  std::vector<float> candidate_scores;
-  for (size_t index = 0; index < result.score_patch.size(); ++index) {
-    if (result.label_map_patch[index] != 0) {
-      candidate_scores.push_back(result.score_patch[index]);
-    }
-  }
-  const double score_q = clamp_value(config.dino_group_score_q, 0.50, 0.95);
-  if (candidate_scores.size() >= 4) {
-    result.threshold = quantile_from_values(candidate_scores, score_q, 1.0f);
-    for (size_t index = 0; index < result.mask_patch.size(); ++index) {
-      result.mask_patch[index] = (result.label_map_patch[index] != 0 && result.score_patch[index] >= result.threshold) ? 1 : 0;
-    }
-    const float fraction = result.mask_patch.empty() ? 0.0f : static_cast<float>(std::count(result.mask_patch.begin(), result.mask_patch.end(), 1)) / static_cast<float>(result.mask_patch.size());
-    if (fraction < 0.02f) {
-      const float fallback_threshold = quantile_from_values(result.selected_support_map, 0.75, 1.0f);
-      std::vector<uint8_t> fallback_mask(result.mask_patch.size(), 0);
-      for (size_t index = 0; index < fallback_mask.size(); ++index) {
-        fallback_mask[index] = result.selected_support_map[index] >= fallback_threshold ? 1 : 0;
-      }
-      std::vector<float> fallback_scores;
-      for (size_t index = 0; index < fallback_mask.size(); ++index) {
-        if (fallback_mask[index] != 0) {
-          fallback_scores.push_back(result.score_patch[index]);
-        }
-      }
-      result.threshold = fallback_scores.empty() ? quantile_from_values(result.score_patch, score_q, 1.0f)
-                                                 : quantile_from_values(fallback_scores, std::min(score_q, 0.80), 1.0f);
-      result.mask_patch = std::move(fallback_mask);
-    }
-  } else {
-    result.threshold = quantile_from_values(result.score_patch, score_q, 1.0f);
-    for (size_t index = 0; index < result.mask_patch.size(); ++index) {
-      result.mask_patch[index] = result.score_patch[index] >= result.threshold ? 1 : 0;
-    }
-  }
-  result.mask_patch = smooth_binary_label_map(result.mask_patch, patch_rows, patch_cols, 1, std::max(2, config.min_component_size / 2));
-  log_grouped_patch_memory(verbose, "done", debug_label, patch_rows, patch_cols, reduced_dim);
-  return result;
 }
 
 std::vector<float> structure_tensor_gate(const std::vector<float>& corrected_resized,
@@ -6504,9 +5986,6 @@ int main(int argc, char** argv) {
     runtime_config.frontend_correction_edge_taper_sigma = config.frontend_correction_edge_taper_sigma;
     runtime_config.frontend_correction_edge_target_drop_db = config.frontend_correction_edge_target_drop_db;
     runtime_config.power_q = config.power_q;
-    runtime_config.dino_group_k = config.dino_group_k;
-    runtime_config.dino_group_spatial_weight = config.dino_group_spatial_weight;
-    runtime_config.dino_group_score_q = config.dino_group_score_q;
     runtime_config.pipeline_final_threshold = config.pipeline_final_threshold;
     runtime_config.pipeline_gap_floor = config.pipeline_gap_floor;
     runtime_config.pipeline_power_rescue_floor = config.pipeline_power_rescue_floor;
