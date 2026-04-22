@@ -67,7 +67,7 @@ Likely causes to try next:
 ## Progress Update 2026-04-20T20:08:53-05:00
 
 - Live-operator porting is now active. The immediate rollout target is the true DINO operator under the single-channel performance configuration before scaling back up to the 2-channel 500 MSps case.
-- The first live correction is to remove the stale `fast_gpu` mask-generation split. Live runs now need to follow the same validated residual-veto hybrid contract as offline validation, while still using the existing GPU-resident runtime score map and GPU hybrid helper wherever available.
+- The first live correction is to remove the stale `fast_low_fidelity_mode` mask-generation split. Live runs now need to follow the same validated residual-veto hybrid contract as offline validation, while still using the existing GPU-resident runtime score map and GPU hybrid helper wherever available.
 - `config_torchscript_performance_single_channel.yaml` is being aligned to `backend_mode: reference` so performance bring-up starts from the same backend contract used for validation.
 - The live operator now treats any non-`reference` backend request as deprecated and falls back to the validated reference path instead of preserving a separate prototype-mode branch in operator logic.
 - The active two-channel and single-channel performance configs now both advertise `backend_mode: reference` so live bring-up starts from the same mask-generation contract used by offline validation.

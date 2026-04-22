@@ -85,7 +85,7 @@ Primary operator reference implementation to mirror structurally:
 The current implementation now has two coherent detector variants that must be evaluated differently:
 
 - `backend_mode: "reference"` is the notebook-faithful path and should be verified for algorithmic parity against `run_coherent_power_pipeline(...)` in `coherant_power_signal_detection_helpers.py`
-- `backend_mode: "fast_gpu"` is the realtime path and should be verified for operational usefulness, stability, and broad detection agreement rather than exact numeric parity with the notebook
+- `backend_mode: "fast_low_fidelity_mode"` is the realtime path and should be verified for operational usefulness, stability, and broad detection agreement rather than exact numeric parity with the notebook
 
 Current verification state as of 2026-04-14:
 
@@ -121,7 +121,7 @@ These differences are expected today and should not be treated as bugs unless we
 - the fast GPU backend is not notebook-faithful:
   - it does not run chunk planning, chunk-local notebook grouping, merged global grouping, or final box rasterization
   - it uses a simplified local score path built from frontend correction, directional local means, local background subtraction, thresholding, and mask cleanup
-  - it emits `coherent_power_fast_gpu_v1` metadata and is intended to trade exact parity for sustained realtime throughput
+  - it emits `coherent_power_fast_low_fidelity_v1` metadata and is intended to trade exact parity for sustained realtime throughput
 - the fast frontend reference calculation is approximate:
   - the fast path uses a device-side approximation for the frontend reference level instead of the notebook's exact percentile over the smoothed row response
 - some notebook diagnostics are intentionally absent from the runtime operator:
@@ -152,7 +152,7 @@ These differences are expected today and should not be treated as bugs unless we
    - Require semantic agreement on final mask and grouped boxes, with only small tolerance for threshold drift due to Python vs C++ numerics and implementation details.
 
 4. Fast-backend usefulness validation
-   - Compare `backend_mode: "fast_gpu"` against the notebook/reference backend on the same fixed captures.
+  - Compare `backend_mode: "fast_low_fidelity_mode"` against the notebook/reference backend on the same fixed captures.
    - Verify that strong signals are still detected, false negatives remain acceptable, and mask morphology remains usable for the downstream task even though exact box parity is not expected.
   - Status 2026-04-14: config review complete. `config_coherent_power_performance.yaml` is confirmed to point at the current coherent fast-GPU path and to retain the latest coherent thresholds/grouping settings while using throughput-oriented knobs (`emit_stride: 4`, no artifact saves, reduced batching).
 

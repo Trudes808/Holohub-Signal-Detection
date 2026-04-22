@@ -307,6 +307,15 @@ cd applications/usrp_wideband_signal_detection
 CONFIG_NAME=old_configs/config_coherent_power_realtime_guarded.yaml ./run_coherent_power_performance.sh
 ```
 
+To sample stage timings from the live notebook-faithful coherent reference path without running the detector on every FFT batch:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+./run_coherent_power_reference_timing.sh
+```
+
+That profile keeps `backend_mode: "reference"`, enables `timing_summary_enable`, and raises coherent `emit_stride` to `32` so the timing synchronizations are sparse enough to inspect the live path without completely collapsing throughput.
+
 To run the coherent detector with an explicit config through the same sudo/docker flow:
 
 ```bash

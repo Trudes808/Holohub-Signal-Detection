@@ -170,7 +170,7 @@ dinov3_signal_detector:
   emit_stride: 1
   mask_threshold_db: -20.0
   log_detections: false
-  backend_mode: "fast_gpu"
+  backend_mode: "fast_low_fidelity_mode"
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0

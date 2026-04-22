@@ -90,6 +90,7 @@ struct ValidatorConfig {
   double pipeline_gap_floor = 0.10;
   double pipeline_power_rescue_floor = 0.10;
   double pipeline_power_rescue_gain = 2.0;
+  bool hybrid_use_inverted_raw_dino_energy = false;
   std::string inference_backend = "torchscript";
   std::string model_script_path = "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts";
   std::string torchscript_init_mode = "load_cuda_eval";
@@ -208,6 +209,9 @@ struct DinoComponentSummaryRow {
 struct GroupedDinoPatchResult {
   std::vector<uint8_t> mask_patch;
   std::vector<float> score_patch;
+  std::vector<float> seed_norm_map;
+  std::vector<float> seed_persistence_map;
+  std::vector<float> seed_contrast_map;
   std::vector<uint8_t> label_map_patch;
   std::vector<int> cluster_map;
   std::vector<float> support_map;
@@ -267,6 +271,11 @@ struct ChunkRetryResult {
   std::vector<float> corrected_resized;
   std::vector<float> raw_dino_score_map;
   std::vector<float> dino_score_map;
+  std::vector<float> grouped_seed_score_map;
+  std::vector<float> grouped_seed_persistence_map;
+  std::vector<float> grouped_seed_contrast_map;
+  std::vector<float> grouped_selected_support_map;
+  std::vector<float> grouped_cluster_quality_map;
   std::vector<float> coherence_gate;
   std::vector<float> hybrid_contrib;
   std::vector<uint8_t> valid_mask;
@@ -360,6 +369,7 @@ struct ChunkInferenceArtifacts {
   std::vector<float> corrected_chunk;
   std::vector<uint8_t> source_chunk_valid_mask;
   std::vector<float> grouped_dino_score_source;
+  std::vector<float> raw_dino_score_source;
   std::vector<float> source_chunk_coherence_gate;
   HybridPostprocessResult precomputed_hybrid_result_source;
   bool has_precomputed_hybrid_result = false;
@@ -726,6 +736,7 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.pipeline_gap_floor = extract_number<double>(text, "pipeline_gap_floor").value_or(config.pipeline_gap_floor);
   config.pipeline_power_rescue_floor = extract_number<double>(text, "pipeline_power_rescue_floor").value_or(config.pipeline_power_rescue_floor);
   config.pipeline_power_rescue_gain = extract_number<double>(text, "pipeline_power_rescue_gain").value_or(config.pipeline_power_rescue_gain);
+  config.hybrid_use_inverted_raw_dino_energy = extract_bool(text, "hybrid_use_inverted_raw_dino_energy").value_or(config.hybrid_use_inverted_raw_dino_energy);
   config.inference_backend = extract_yaml_string(text, "inference_backend").value_or(config.inference_backend);
   config.model_script_path = extract_yaml_string(text, "model_script_path").value_or(config.model_script_path);
   config.torchscript_init_mode = extract_yaml_string(text, "torchscript_init_mode").value_or(config.torchscript_init_mode);
@@ -2382,7 +2393,9 @@ std::vector<HybridPostprocessResult> run_residual_veto_hybrid_gpu_batch_device_i
     auto final_mask_batch_cpu = torch::stack(final_masks, 0).to(torch::kCPU, torch::kUInt8).contiguous();
     const float* combined_score_ptr = combined_score_cpu.data_ptr<float>();
     const uint8_t* final_mask_ptr = final_mask_batch_cpu.data_ptr<uint8_t>();
-    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+    const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    const size_t max_parallel = std::max<size_t>(1, std::min<size_t>(static_cast<size_t>(batch_size), static_cast<size_t>(hw_threads)));
+    auto process_sample = [&](int sample_index) {
       auto& result = results[static_cast<size_t>(sample_index)];
       const size_t offset = static_cast<size_t>(sample_index) * sample_elements;
       result.combined_score.assign(combined_score_ptr + static_cast<std::ptrdiff_t>(offset),
@@ -2392,14 +2405,34 @@ std::vector<HybridPostprocessResult> run_residual_veto_hybrid_gpu_batch_device_i
       final_mask_vector = binary_closing_rect(final_mask_vector, rows, cols, 7, 3);
       final_mask_vector = binary_fill_holes(final_mask_vector, rows, cols);
       const auto valid_begin = valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(offset);
+      const std::vector<uint8_t> sample_valid_mask(valid_begin,
+                                                   valid_begin + static_cast<std::ptrdiff_t>(sample_elements));
       for (size_t index = 0; index < sample_elements; ++index) {
-        final_mask_vector[index] = (final_mask_vector[index] && valid_begin[static_cast<std::ptrdiff_t>(index)]) ? 1 : 0;
+        final_mask_vector[index] = (final_mask_vector[index] && sample_valid_mask[index]) ? 1 : 0;
       }
       final_mask_vector = keep_large_components(final_mask_vector, rows, cols, 24, &result.component_count);
       result.final_fraction = mean_mask_value(final_mask_vector);
-      result.connected_fraction = connected_fraction(final_mask_vector,
-                                                     std::vector<uint8_t>(valid_begin, valid_begin + static_cast<std::ptrdiff_t>(sample_elements)));
+      result.connected_fraction = connected_fraction(final_mask_vector, sample_valid_mask);
       result.mask = std::move(final_mask_vector);
+    };
+
+    if (max_parallel == 1) {
+      for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+        process_sample(sample_index);
+      }
+    } else {
+      std::vector<std::future<void>> pending;
+      pending.reserve(max_parallel);
+      for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
+        pending.push_back(std::async(std::launch::async, process_sample, sample_index));
+        if (pending.size() >= max_parallel) {
+          pending.front().get();
+          pending.erase(pending.begin());
+        }
+      }
+      for (auto& task : pending) {
+        task.get();
+      }
     }
     return results;
   } catch (const std::exception& error) {
@@ -2616,6 +2649,11 @@ void precompute_retry_chunk_hybrid_batch(std::vector<ChunkInferenceArtifacts>& a
   if (rows <= 0 || cols <= 0) {
     return;
   }
+  if (std::all_of(artifacts_batch.begin(), artifacts_batch.end(), [](const ChunkInferenceArtifacts& artifacts) {
+        return artifacts.has_precomputed_hybrid_result;
+      })) {
+    return;
+  }
 
   const size_t sample_elements = static_cast<size_t>(rows) * static_cast<size_t>(cols);
   std::vector<float> hybrid_contrib_batch(static_cast<size_t>(batch_size) * sample_elements, 0.0f);
@@ -2633,11 +2671,19 @@ void precompute_retry_chunk_hybrid_batch(std::vector<ChunkInferenceArtifacts>& a
       }
       const size_t offset = static_cast<size_t>(sample_index) * sample_elements;
       auto* hybrid_contrib_output = hybrid_contrib_batch.data() + static_cast<std::ptrdiff_t>(offset);
-      const auto [dino_low, dino_high] = quantile_bounds_from_input(artifacts.grouped_dino_score_source, 5.0, 95.0);
-      normalize01_quantile_into(artifacts.grouped_dino_score_source,
+      const bool use_inverted_raw_dino_energy = config.hybrid_use_inverted_raw_dino_energy &&
+                                                artifacts.raw_dino_score_source.size() == sample_elements;
+      const auto& hybrid_dino_source = use_inverted_raw_dino_energy ? artifacts.raw_dino_score_source : artifacts.grouped_dino_score_source;
+      const auto [dino_low, dino_high] = quantile_bounds_from_input(hybrid_dino_source, 5.0, 95.0);
+      normalize01_quantile_into(hybrid_dino_source,
                                 dino_low,
                                 dino_high,
                                 hybrid_contrib_output);
+      if (use_inverted_raw_dino_energy) {
+        for (size_t element_index = 0; element_index < sample_elements; ++element_index) {
+          hybrid_contrib_output[element_index] = 1.0f - hybrid_contrib_output[element_index];
+        }
+      }
       const auto [coherence_low, coherence_high] = quantile_bounds_from_input(artifacts.source_chunk_coherence_gate, 5.0, 99.0);
       multiply_normalized_quantile_into(artifacts.source_chunk_coherence_gate,
                                         coherence_low,
@@ -2701,13 +2747,19 @@ std::vector<float> patch_mean_map(const std::vector<float>& input,
   return output;
 }
 
-std::vector<float> dino_seed_patch_map(const std::vector<float>& spectrogram_db,
-                                       int src_rows,
-                                       int src_cols,
-                                       int runtime_rows,
-                                       int runtime_cols,
-                                       int patch_rows,
-                                       int patch_cols) {
+struct DinoSeedPatchComponents {
+  std::vector<float> seed_patch;
+  std::vector<float> persistence_patch;
+  std::vector<float> contrast_patch;
+};
+
+DinoSeedPatchComponents dino_seed_patch_components(const std::vector<float>& spectrogram_db,
+                                                   int src_rows,
+                                                   int src_cols,
+                                                   int runtime_rows,
+                                                   int runtime_cols,
+                                                   int patch_rows,
+                                                   int patch_cols) {
   std::vector<float> rel_db(static_cast<size_t>(runtime_rows) * static_cast<size_t>(runtime_cols), 0.0f);
   std::vector<float> linear_values;
   linear_values.reserve(rel_db.size());
@@ -2738,7 +2790,29 @@ std::vector<float> dino_seed_patch_map(const std::vector<float>& spectrogram_db,
   for (size_t index = 0; index < seed_px.size(); ++index) {
     seed_px[index] = 0.65f * persistence_n[index] + 0.35f * contrast_n[index];
   }
-  return patch_mean_map(seed_px, runtime_rows, runtime_cols, patch_rows, patch_cols);
+  DinoSeedPatchComponents result;
+  result.seed_patch = patch_mean_map(seed_px, runtime_rows, runtime_cols, patch_rows, patch_cols);
+  result.persistence_patch = patch_mean_map(persistence_n, runtime_rows, runtime_cols, patch_rows, patch_cols);
+  result.contrast_patch = patch_mean_map(contrast_n, runtime_rows, runtime_cols, patch_rows, patch_cols);
+  return result;
+}
+
+std::vector<float> dino_seed_patch_map(const std::vector<float>& spectrogram_db,
+                                       int src_rows,
+                                       int src_cols,
+                                       int runtime_rows,
+                                       int runtime_cols,
+                                       int patch_rows,
+                                       int patch_cols) {
+  return dino_seed_patch_components(
+      spectrogram_db,
+      src_rows,
+      src_cols,
+      runtime_rows,
+      runtime_cols,
+      patch_rows,
+      patch_cols)
+      .seed_patch;
 }
 
 std::vector<float> raw_feature_energy_score_patch(const std::vector<float>& patch_features,
@@ -3117,11 +3191,10 @@ std::vector<float> feature_affinity_matrix(const std::vector<float>& features,
       normalized[flat_index(feature_dim, row, col)] = features[flat_index(feature_dim, row, col)] / norm;
     }
   }
-  std::vector<float> cosine_dist(static_cast<size_t>(patch_count) * static_cast<size_t>(patch_count), 1.0f);
   const int neighbors = std::min(std::max(1, k), std::max(1, patch_count - 1));
+  std::vector<std::vector<std::pair<float, int>>> top_neighbors(static_cast<size_t>(patch_count));
   std::vector<float> positive_distances;
   for (int row = 0; row < patch_count; ++row) {
-    cosine_dist[flat_index(patch_count, row, row)] = 0.0f;
     std::vector<std::pair<float, int>> ranked;
     ranked.reserve(static_cast<size_t>(patch_count - 1));
     for (int col = 0; col < patch_count; ++col) {
@@ -3133,10 +3206,10 @@ std::vector<float> feature_affinity_matrix(const std::vector<float>& features,
         dot += normalized[flat_index(feature_dim, row, feat)] * normalized[flat_index(feature_dim, col, feat)];
       }
       const float distance = std::max(0.0f, 1.0f - dot);
-      cosine_dist[flat_index(patch_count, row, col)] = distance;
       ranked.emplace_back(distance, col);
     }
     std::partial_sort(ranked.begin(), ranked.begin() + neighbors, ranked.end());
+    top_neighbors[static_cast<size_t>(row)].assign(ranked.begin(), ranked.begin() + neighbors);
     for (int idx = 0; idx < neighbors; ++idx) {
       if (ranked[static_cast<size_t>(idx)].first > 0.0f) {
         positive_distances.push_back(ranked[static_cast<size_t>(idx)].first);
@@ -3147,18 +3220,9 @@ std::vector<float> feature_affinity_matrix(const std::vector<float>& features,
   std::vector<float> affinity(static_cast<size_t>(patch_count) * static_cast<size_t>(patch_count), 0.0f);
   for (int row = 0; row < patch_count; ++row) {
     affinity[flat_index(patch_count, row, row)] = 1.0f;
-    std::vector<std::pair<float, int>> ranked;
-    ranked.reserve(static_cast<size_t>(patch_count - 1));
-    for (int col = 0; col < patch_count; ++col) {
-      if (col == row) {
-        continue;
-      }
-      ranked.emplace_back(cosine_dist[flat_index(patch_count, row, col)], col);
-    }
-    std::partial_sort(ranked.begin(), ranked.begin() + neighbors, ranked.end());
-    for (int idx = 0; idx < neighbors; ++idx) {
-      const int col = ranked[static_cast<size_t>(idx)].second;
-      const float distance = ranked[static_cast<size_t>(idx)].first;
+    for (const auto& neighbor : top_neighbors[static_cast<size_t>(row)]) {
+      const int col = neighbor.second;
+      const float distance = neighbor.first;
       const float weight = std::exp(-((distance * distance) / (2.0f * sigma * sigma)));
       affinity[flat_index(patch_count, row, col)] = std::max(affinity[flat_index(patch_count, row, col)], weight);
       affinity[flat_index(patch_count, col, row)] = std::max(affinity[flat_index(patch_count, col, row)], weight);
@@ -3256,31 +3320,11 @@ std::vector<float> inject_spatial_shortcuts(const std::vector<float>& local_aff,
 
 std::vector<float> local_affinity_score_map(const std::vector<float>& local_aff, int patch_rows, int patch_cols) {
   const int patch_count = patch_rows * patch_cols;
-  const auto trans = row_normalize_square_matrix(local_aff, patch_count);
-  std::vector<float> trans2(static_cast<size_t>(patch_count) * static_cast<size_t>(patch_count), 0.0f);
-  std::vector<float> trans3(static_cast<size_t>(patch_count) * static_cast<size_t>(patch_count), 0.0f);
-  for (int row = 0; row < patch_count; ++row) {
-    for (int mid = 0; mid < patch_count; ++mid) {
-      const float left = trans[flat_index(patch_count, row, mid)];
-      if (left == 0.0f) {
-        continue;
-      }
-      for (int col = 0; col < patch_count; ++col) {
-        trans2[flat_index(patch_count, row, col)] += left * trans[flat_index(patch_count, mid, col)];
-      }
-    }
-  }
-  for (int row = 0; row < patch_count; ++row) {
-    for (int mid = 0; mid < patch_count; ++mid) {
-      const float left = trans2[flat_index(patch_count, row, mid)];
-      if (left == 0.0f) {
-        continue;
-      }
-      for (int col = 0; col < patch_count; ++col) {
-        trans3[flat_index(patch_count, row, col)] += left * trans[flat_index(patch_count, mid, col)];
-      }
-    }
-  }
+  struct SparseEdge {
+    int col = 0;
+    float weight = 0.0f;
+  };
+  std::vector<std::vector<SparseEdge>> trans_rows(static_cast<size_t>(patch_count));
   std::vector<float> weighted_degree(static_cast<size_t>(patch_count), 0.0f);
   std::vector<float> two_hop_return(static_cast<size_t>(patch_count), 0.0f);
   std::vector<float> three_hop_return(static_cast<size_t>(patch_count), 0.0f);
@@ -3288,11 +3332,43 @@ std::vector<float> local_affinity_score_map(const std::vector<float>& local_aff,
   for (int idx = 0; idx < patch_count; ++idx) {
     float degree = 0.0f;
     for (int col = 0; col < patch_count; ++col) {
-      degree += local_aff[flat_index(patch_count, idx, col)];
+      const float value = local_aff[flat_index(patch_count, idx, col)];
+      degree += value;
+      if (value > 0.0f) {
+        trans_rows[static_cast<size_t>(idx)].push_back({col, value});
+      }
     }
+    degree = std::max(degree, 1.0e-6f);
     weighted_degree[static_cast<size_t>(idx)] = degree - 1.0f;
-    two_hop_return[static_cast<size_t>(idx)] = trans2[flat_index(patch_count, idx, idx)];
-    three_hop_return[static_cast<size_t>(idx)] = trans3[flat_index(patch_count, idx, idx)];
+    for (auto& edge : trans_rows[static_cast<size_t>(idx)]) {
+      edge.weight /= degree;
+    }
+  }
+  auto edge_weight = [&trans_rows](int row, int target_col) {
+    for (const auto& edge : trans_rows[static_cast<size_t>(row)]) {
+      if (edge.col == target_col) {
+        return edge.weight;
+      }
+    }
+    return 0.0f;
+  };
+  for (int idx = 0; idx < patch_count; ++idx) {
+    float two_hop = 0.0f;
+    float three_hop = 0.0f;
+    for (const auto& edge1 : trans_rows[static_cast<size_t>(idx)]) {
+      const float back_to_idx = edge_weight(edge1.col, idx);
+      if (back_to_idx > 0.0f) {
+        two_hop += edge1.weight * back_to_idx;
+      }
+      for (const auto& edge2 : trans_rows[static_cast<size_t>(edge1.col)]) {
+        const float close_cycle = edge_weight(edge2.col, idx);
+        if (close_cycle > 0.0f) {
+          three_hop += edge1.weight * edge2.weight * close_cycle;
+        }
+      }
+    }
+    two_hop_return[static_cast<size_t>(idx)] = two_hop;
+    three_hop_return[static_cast<size_t>(idx)] = three_hop;
   }
   for (int row = 0; row < patch_rows; ++row) {
     for (int col = 0; col < patch_cols; ++col) {
@@ -3443,6 +3519,7 @@ std::vector<DinoComponentSummaryRow> component_summary_table(const std::vector<f
                                                              const std::vector<float>& seed_norm,
                                                              int patch_rows,
                                                              int patch_cols) {
+  constexpr float kGroupedComponentSeedWeight = 0.0f;
   const int patch_count = patch_rows * patch_cols;
   int max_label = 0;
   for (int label : component_map) {
@@ -3520,7 +3597,7 @@ std::vector<DinoComponentSummaryRow> component_summary_table(const std::vector<f
                                  0.20f * support_peak_n[index] +
                                  0.20f * internal_n[index] +
                                  0.15f * boundary_gap_n[index] +
-                                 0.05f * seed_n[index] +
+                                 kGroupedComponentSeedWeight * seed_n[index] +
                                  0.05f * smooth_n[index] -
                                  0.10f * size_penalty;
   }
@@ -3596,10 +3673,12 @@ GroupedDinoPatchResult grouped_dino_from_patch_features(const std::vector<float>
                                                         const ValidatorConfig& config,
                                                         bool verbose,
                                                         const char* debug_label) {
+  constexpr float kGroupedScoreSeedWeight = 0.0f;
   GroupedDinoPatchResult result;
   const int patch_count = patch_rows * patch_cols;
   result.mask_patch.assign(static_cast<size_t>(patch_count), 0);
   result.score_patch.assign(static_cast<size_t>(patch_count), 0.0f);
+  result.seed_norm_map.assign(static_cast<size_t>(patch_count), 0.0f);
   result.label_map_patch.assign(static_cast<size_t>(patch_count), 0);
   result.cluster_map.assign(static_cast<size_t>(patch_count), 0);
   result.support_map.assign(static_cast<size_t>(patch_count), 0.0f);
@@ -3644,6 +3723,9 @@ GroupedDinoPatchResult grouped_dino_from_patch_features(const std::vector<float>
   local_aff = inject_spatial_shortcuts(local_aff, full_aff, patch_rows, patch_cols, static_cast<float>(config.dino_group_spatial_weight));
   log_grouped_patch_memory(verbose, "after_local_aff", debug_label, patch_rows, patch_cols, reduced_dim);
   const auto seed_norm = normalize01_quantile(seed_patch, 5.0, 95.0);
+  result.seed_norm_map = seed_norm;
+  result.seed_persistence_map = seed_patch;
+  result.seed_contrast_map = seed_patch;
   result.support_map = local_affinity_score_map(local_aff, patch_rows, patch_cols);
   log_grouped_patch_memory(verbose, "after_support_map", debug_label, patch_rows, patch_cols, reduced_dim);
   const auto components = connected_affinity_components(local_aff, result.support_map, patch_rows, patch_cols);
@@ -3684,7 +3766,7 @@ GroupedDinoPatchResult grouped_dino_from_patch_features(const std::vector<float>
   for (size_t index = 0; index < result.score_patch.size(); ++index) {
     result.score_patch[index] = 0.70f * result.selected_support_map[index] +
                                 0.20f * result.cluster_quality_map[index] +
-                                0.10f * seed_norm[index];
+                                kGroupedScoreSeedWeight * seed_norm[index];
   }
   result.score_patch = normalize01_quantile(result.score_patch, 5.0, 95.0);
 
@@ -5301,10 +5383,12 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
   const int runtime_col_offset = 0;
   std::vector<float> raw_aligned_score;
   std::vector<float> raw_dino_score_map;
+  std::vector<float> raw_dino_score_source;
   std::vector<float> grouped_score_patch;
   int grouped_score_rows = runtime_result.aligned_rows;
   int grouped_score_cols = runtime_result.aligned_cols;
   bool grouped_score_is_patch_grid = false;
+  const bool need_raw_dino_source = keep_debug_artifacts || config.hybrid_use_inverted_raw_dino_energy;
   {
     const size_t estimated_bytes = static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols) * sizeof(float) * 3;
     ScopedStageProfile stage(profiler, "chunk_score_projection", "chunk", result.chunk_index, estimated_bytes, verbose);
@@ -5318,11 +5402,24 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
                                           runtime_result.aligned_cols);
     }
     if (!runtime_result.patch_features.empty() && result.patch_rows > 0 && result.patch_cols > 0 && result.feature_dim > 0) {
-      if (keep_debug_artifacts) {
+      if (need_raw_dino_source) {
         const auto raw_patch_score = raw_feature_energy_score_patch(runtime_result.patch_features,
                                                                     result.patch_rows,
                                                                     result.patch_cols,
                                                                     result.feature_dim);
+        raw_dino_score_source = project_patch_map_to_output(raw_patch_score,
+                                                            result.patch_rows,
+                                                            result.patch_cols,
+                                                            runtime_result.aligned_rows,
+                                                            runtime_result.aligned_cols,
+                                                            result.src_rows,
+                                                            result.src_cols,
+                                                            runtime_row_offset,
+                                                            runtime_col_offset,
+                                                            result.src_rows,
+                                                            result.src_cols,
+                                                            runtime_result.input_resized_to_target);
+        if (keep_debug_artifacts) {
         raw_dino_score_map = project_patch_map_to_output(raw_patch_score,
                                                          result.patch_rows,
                                                          result.patch_cols,
@@ -5335,39 +5432,54 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
                                                          result.dst_rows,
                                                          result.dst_cols,
                                                          runtime_result.input_resized_to_target);
+        }
       }
-    } else if (keep_debug_artifacts) {
-      raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
-                                                         runtime_result.aligned_rows,
-                                                         runtime_result.aligned_cols,
-                                                         result.src_rows,
-                                                         result.src_cols,
-                                                         runtime_row_offset,
-                                                         runtime_col_offset,
-                                                         result.dst_rows,
-                                                         result.dst_cols,
-                                                         runtime_result.input_resized_to_target);
+    } else if (need_raw_dino_source) {
+      raw_dino_score_source = project_aligned_map_to_output(raw_aligned_score,
+                                                            runtime_result.aligned_rows,
+                                                            runtime_result.aligned_cols,
+                                                            result.src_rows,
+                                                            result.src_cols,
+                                                            runtime_row_offset,
+                                                            runtime_col_offset,
+                                                            result.src_rows,
+                                                            result.src_cols,
+                                                            runtime_result.input_resized_to_target);
+      if (keep_debug_artifacts) {
+        raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
+                                                           runtime_result.aligned_rows,
+                                                           runtime_result.aligned_cols,
+                                                           result.src_rows,
+                                                           result.src_cols,
+                                                           runtime_row_offset,
+                                                           runtime_col_offset,
+                                                           result.dst_rows,
+                                                           result.dst_cols,
+                                                           runtime_result.input_resized_to_target);
+      }
     }
     if (runtime_result.patch_features.empty() || result.patch_rows <= 0 || result.patch_cols <= 0 || result.feature_dim <= 0) {
       throw std::runtime_error("debug chunk grouped score requires patch features");
     }
     const size_t debug_estimated_bytes = static_cast<size_t>(result.patch_rows) * static_cast<size_t>(result.patch_cols) * sizeof(float) * 8;
     ScopedStageProfile debug_stage(profiler, "chunk_grouped_patch_debug", "chunk", result.chunk_index, debug_estimated_bytes, verbose);
-    const auto seed_patch = dino_seed_patch_map(corrected_chunk,
-                                                result.src_rows,
-                                                result.src_cols,
-                                                runtime_rows,
-                                                runtime_cols,
-                                                result.patch_rows,
-                                                result.patch_cols);
-    const auto grouped_patch = grouped_dino_from_patch_features(runtime_result.patch_features,
+    const auto seed_components = dino_seed_patch_components(corrected_chunk,
+                                result.src_rows,
+                                result.src_cols,
+                                runtime_rows,
+                                runtime_cols,
+                                result.patch_rows,
+                                result.patch_cols);
+    auto grouped_patch = grouped_dino_from_patch_features(runtime_result.patch_features,
                                                                 result.patch_rows,
                                                                 result.patch_cols,
                                                                 result.feature_dim,
-                                                                seed_patch,
+                                  seed_components.seed_patch,
                                                                 config,
                                                                 verbose && keep_debug_artifacts,
                                                                 "debug_chunk_grouped_patch");
+    grouped_patch.seed_persistence_map = seed_components.persistence_patch;
+    grouped_patch.seed_contrast_map = seed_components.contrast_patch;
     if (grouped_patch.score_patch.empty()) {
       throw std::runtime_error("debug chunk grouped patch score is empty");
     }
@@ -5375,6 +5487,93 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
     grouped_score_rows = result.patch_rows;
     grouped_score_cols = result.patch_cols;
     grouped_score_is_patch_grid = true;
+    if (keep_debug_artifacts) {
+      const auto grouped_seed_score_source = project_patch_map_to_output(grouped_patch.seed_norm_map,
+                                                                         grouped_score_rows,
+                                                                         grouped_score_cols,
+                                                                         runtime_result.aligned_rows,
+                                                                         runtime_result.aligned_cols,
+                                                                         result.src_rows,
+                                                                         result.src_cols,
+                                                                         runtime_row_offset,
+                                                                         runtime_col_offset,
+                                                                         result.src_rows,
+                                                                         result.src_cols,
+                                                                         runtime_result.input_resized_to_target);
+                                                  const auto grouped_seed_persistence_source = project_patch_map_to_output(grouped_patch.seed_persistence_map,
+                                                                           grouped_score_rows,
+                                                                           grouped_score_cols,
+                                                                           runtime_result.aligned_rows,
+                                                                           runtime_result.aligned_cols,
+                                                                           result.src_rows,
+                                                                           result.src_cols,
+                                                                           runtime_row_offset,
+                                                                           runtime_col_offset,
+                                                                           result.src_rows,
+                                                                           result.src_cols,
+                                                                           runtime_result.input_resized_to_target);
+                                                  const auto grouped_seed_contrast_source = project_patch_map_to_output(grouped_patch.seed_contrast_map,
+                                                                            grouped_score_rows,
+                                                                            grouped_score_cols,
+                                                                            runtime_result.aligned_rows,
+                                                                            runtime_result.aligned_cols,
+                                                                            result.src_rows,
+                                                                            result.src_cols,
+                                                                            runtime_row_offset,
+                                                                            runtime_col_offset,
+                                                                            result.src_rows,
+                                                                            result.src_cols,
+                                                                            runtime_result.input_resized_to_target);
+      const auto grouped_selected_support_source = project_patch_map_to_output(grouped_patch.selected_support_map,
+                                                                               grouped_score_rows,
+                                                                               grouped_score_cols,
+                                                                               runtime_result.aligned_rows,
+                                                                               runtime_result.aligned_cols,
+                                                                               result.src_rows,
+                                                                               result.src_cols,
+                                                                               runtime_row_offset,
+                                                                               runtime_col_offset,
+                                                                               result.src_rows,
+                                                                               result.src_cols,
+                                                                               runtime_result.input_resized_to_target);
+      const auto grouped_cluster_quality_source = project_patch_map_to_output(grouped_patch.cluster_quality_map,
+                                                                              grouped_score_rows,
+                                                                              grouped_score_cols,
+                                                                              runtime_result.aligned_rows,
+                                                                              runtime_result.aligned_cols,
+                                                                              result.src_rows,
+                                                                              result.src_cols,
+                                                                              runtime_row_offset,
+                                                                              runtime_col_offset,
+                                                                              result.src_rows,
+                                                                              result.src_cols,
+                                                                              runtime_result.input_resized_to_target);
+      result.grouped_seed_score_map = resize_bilinear(grouped_seed_score_source,
+                                                      result.src_rows,
+                                                      result.src_cols,
+                                                      result.dst_rows,
+                                                      result.dst_cols);
+      result.grouped_seed_persistence_map = resize_bilinear(grouped_seed_persistence_source,
+                        result.src_rows,
+                        result.src_cols,
+                        result.dst_rows,
+                        result.dst_cols);
+      result.grouped_seed_contrast_map = resize_bilinear(grouped_seed_contrast_source,
+                         result.src_rows,
+                         result.src_cols,
+                         result.dst_rows,
+                         result.dst_cols);
+      result.grouped_selected_support_map = resize_bilinear(grouped_selected_support_source,
+                                                            result.src_rows,
+                                                            result.src_cols,
+                                                            result.dst_rows,
+                                                            result.dst_cols);
+      result.grouped_cluster_quality_map = resize_bilinear(grouped_cluster_quality_source,
+                                                           result.src_rows,
+                                                           result.src_cols,
+                                                           result.dst_rows,
+                                                           result.dst_cols);
+    }
   }
   if (keep_debug_artifacts) {
     result.raw_dino_score_map = raw_dino_score_map;
@@ -5439,6 +5638,7 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
   artifacts.corrected_chunk = std::move(corrected_chunk);
   artifacts.source_chunk_valid_mask = std::move(source_chunk_valid_mask);
   artifacts.grouped_dino_score_source = std::move(grouped_dino_score_source);
+  artifacts.raw_dino_score_source = std::move(raw_dino_score_source);
   artifacts.source_chunk_coherence_gate = std::move(source_chunk_coherence_gate);
   return artifacts;
 }
@@ -5566,7 +5766,7 @@ std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::o
   chunk_runtime_config.ignore_sideband_hz = 0.0;
   chunk_runtime_config.return_pre_model_gray = false;
   chunk_runtime_config.return_patch_features = true;
-  chunk_runtime_config.return_final_mask_device = false;
+  chunk_runtime_config.return_final_mask_device = true;
   holoscan::ops::DinoTorchRuntimeBatchResult runtime_result;
   {
     ScopedStageProfile stage(profiler, "chunk_torch_runtime_batch", "run", -1, total_elements * sizeof(float), verbose);
@@ -5630,68 +5830,9 @@ std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::o
     throw std::runtime_error("unexpected batched coherence map size returned from GPU helper");
   }
 
-  if (runtime_result.score_maps_device != nullptr && source_coherence_batch_tensor.defined()) {
-    torch::InferenceMode inference_mode_guard(true);
-    const c10::Device compute_device(torch::kCUDA, 0);
-    const auto torch_stream = gpu_workspace.stream
-                                  ? c10::cuda::getStreamFromExternal(gpu_workspace.stream, compute_device.index())
-                                  : c10::cuda::getDefaultCUDAStream(compute_device.index());
-    c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
-    auto runtime_score_batch = torch::from_blob(const_cast<float*>(runtime_result.score_maps_device),
-                          {static_cast<int64_t>(batch_size), static_cast<int64_t>(runtime_rows), static_cast<int64_t>(runtime_cols)},
-                          torch::TensorOptions().dtype(torch::kFloat32).device(compute_device))
-                     .contiguous();
-    auto grouped_score_batch = normalize_map01_quantile_torch_batch(runtime_score_batch, 0.05, 0.95);
-    auto grouped_score_source_batch = project_aligned_map_to_output_torch_batch(grouped_score_batch,
-                                          uniform_rows,
-                                          src_cols,
-                                          uniform_rows,
-                                          src_cols,
-                                          runtime_result.input_resized_to_target);
-    auto hybrid_results = run_residual_veto_hybrid_gpu_batch_device_inputs(grouped_score_source_batch,
-                                                                           source_coherence_batch_tensor,
-                                                                           source_valid_mask_batch,
-                                                                           static_cast<int>(batch_size),
-                                                                           uniform_rows,
-                                                                           src_cols,
-                                                                           use_fp16_precision(config.hybrid_torch_dtype));
-    if (hybrid_results.size() != batch_size) {
-      throw std::runtime_error("GPU batch hybrid postprocess returned an unexpected result count");
-    }
-    record_timed_stage(profiler, "chunk_hybrid_norm_batch_cpu", "run", -1, 0.0);
-    for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
-      auto& artifacts = artifacts_batch[batch_index];
-      auto& result = artifacts.result;
-      result.ignore_bins_per_side = 0;
-      result.dino_threshold = batch_index < runtime_result.dino_thresholds.size()
-                                  ? runtime_result.dino_thresholds[batch_index]
-                                  : chunk_runtime_config.pipeline_final_threshold;
-      result.runtime_final_threshold = batch_index < runtime_result.final_thresholds.size()
-                                           ? runtime_result.final_thresholds[batch_index]
-                                           : result.dino_threshold;
-      artifacts.source_chunk_valid_mask.assign(
-          source_valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * chunk_elements),
-          source_valid_mask_batch.begin() + static_cast<std::ptrdiff_t>((batch_index + 1) * chunk_elements));
-      artifacts.precomputed_hybrid_result_source = std::move(hybrid_results[batch_index]);
-      artifacts.has_precomputed_hybrid_result = true;
-    }
-    return artifacts_batch;
-  }
-
-  if (source_coherence_batch.empty() && source_coherence_batch_tensor.defined()) {
-    auto source_coherence_batch_cpu = source_coherence_batch_tensor.to(torch::kCPU, torch::kFloat32).contiguous();
-    source_coherence_batch.resize(static_cast<size_t>(source_coherence_batch_cpu.numel()), 0.0f);
-    if (!source_coherence_batch.empty()) {
-      std::memcpy(source_coherence_batch.data(), source_coherence_batch_cpu.data_ptr<float>(), source_coherence_batch.size() * sizeof(float));
-    }
-  }
-
-  if (source_coherence_batch.size() != total_elements) {
-    throw std::runtime_error("unexpected batched coherence map size returned from GPU helper");
-  }
-
-  if (runtime_result.score_maps.size() != batch_size * runtime_elements) {
-    throw std::runtime_error("unexpected batched DINO score map size returned from runtime");
+  std::vector<float> dino_score_source_batch;
+  if (source_coherence_batch_tensor.defined()) {
+    dino_score_source_batch.assign(batch_size * chunk_elements, 0.0f);
   }
 
   for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
@@ -5707,8 +5848,6 @@ std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::o
 
     const int runtime_row_offset = 0;
     const int runtime_col_offset = 0;
-    std::vector<float> raw_aligned_score(runtime_result.score_maps.begin() + static_cast<std::ptrdiff_t>(batch_index * runtime_elements),
-                                         runtime_result.score_maps.begin() + static_cast<std::ptrdiff_t>((batch_index + 1) * runtime_elements));
     std::vector<float> grouped_score_patch;
     {
       const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * sizeof(float);
@@ -5733,38 +5872,106 @@ std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::o
       const std::vector<float> patch_features_sample(
           runtime_result.patch_features_batch.begin() + static_cast<std::ptrdiff_t>(sample_offset),
           runtime_result.patch_features_batch.begin() + static_cast<std::ptrdiff_t>(sample_offset + patch_count * feature_dim));
+      if (config.hybrid_use_inverted_raw_dino_energy) {
+        const auto raw_patch_score = raw_feature_energy_score_patch(patch_features_sample,
+                                                                    runtime_result.patch_rows,
+                                                                    runtime_result.patch_cols,
+                                                                    runtime_result.feature_dim);
+        artifacts.raw_dino_score_source = project_patch_map_to_output(raw_patch_score,
+                                                                      runtime_result.patch_rows,
+                                                                      runtime_result.patch_cols,
+                                                                      runtime_result.aligned_rows,
+                                                                      runtime_result.aligned_cols,
+                                                                      result.src_rows,
+                                                                      result.src_cols,
+                                                                      runtime_row_offset,
+                                                                      runtime_col_offset,
+                                                                      result.src_rows,
+                                                                      result.src_cols,
+                                                                      runtime_result.input_resized_to_target);
+      }
       const auto grouped_patch = grouped_dino_from_patch_features(patch_features_sample,
                                                                   runtime_result.patch_rows,
                                                                   runtime_result.patch_cols,
                                                                   runtime_result.feature_dim,
                                                                   seed_patch,
                                                                   config,
-                                                                  verbose,
+                                                                  false,
                                                                   "batch_chunk_grouped_patch");
       if (grouped_patch.score_patch.empty()) {
         throw std::runtime_error("batched grouped patch score is empty");
       }
       grouped_score_patch = grouped_patch.score_patch;
-      artifacts.grouped_dino_score_source = project_patch_map_to_output(grouped_score_patch,
-                                                                        runtime_result.patch_rows,
-                                                                        runtime_result.patch_cols,
-                                                                        runtime_result.aligned_rows,
-                                                                        runtime_result.aligned_cols,
-                                                                        result.src_rows,
-                                                                        result.src_cols,
-                                                                        runtime_row_offset,
-                                                                        runtime_col_offset,
-                                                                        result.src_rows,
-                                                                        result.src_cols,
-                                                                        runtime_result.input_resized_to_target);
+      auto grouped_score_source = project_patch_map_to_output(grouped_score_patch,
+                                                              runtime_result.patch_rows,
+                                                              runtime_result.patch_cols,
+                                                              runtime_result.aligned_rows,
+                                                              runtime_result.aligned_cols,
+                                                              result.src_rows,
+                                                              result.src_cols,
+                                                              runtime_row_offset,
+                                                              runtime_col_offset,
+                                                              result.src_rows,
+                                                              result.src_cols,
+                                                              runtime_result.input_resized_to_target);
+      if (!dino_score_source_batch.empty()) {
+        const auto& hybrid_dino_source = (config.hybrid_use_inverted_raw_dino_energy &&
+                                          artifacts.raw_dino_score_source.size() == grouped_score_source.size())
+                                             ? artifacts.raw_dino_score_source
+                                             : grouped_score_source;
+        std::copy(hybrid_dino_source.begin(),
+                  hybrid_dino_source.end(),
+                  dino_score_source_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * chunk_elements));
+      } else {
+        artifacts.grouped_dino_score_source = std::move(grouped_score_source);
+      }
     }
 
     artifacts.source_chunk_valid_mask.assign(
         source_valid_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * chunk_elements),
         source_valid_mask_batch.begin() + static_cast<std::ptrdiff_t>((batch_index + 1) * chunk_elements));
-    artifacts.source_chunk_coherence_gate.assign(
+    if (!source_coherence_batch.empty()) {
+      artifacts.source_chunk_coherence_gate.assign(
         source_coherence_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * chunk_elements),
         source_coherence_batch.begin() + static_cast<std::ptrdiff_t>((batch_index + 1) * chunk_elements));
+    }
+  }
+
+  if (source_coherence_batch_tensor.defined()) {
+    const size_t estimated_bytes = static_cast<size_t>(batch_size) * chunk_elements * (sizeof(float) * 2 + sizeof(uint8_t));
+    ScopedStageProfile stage(profiler, "chunk_hybrid_support_batch", "run", -1, estimated_bytes, verbose);
+    const auto pack_start = std::chrono::steady_clock::now();
+    for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+      if (artifacts_batch[batch_index].source_chunk_valid_mask.size() != chunk_elements) {
+        throw std::runtime_error("batched hybrid device-input precompute requires dense grouped score and valid mask inputs");
+      }
+    }
+    record_timed_stage(profiler,
+                       "chunk_hybrid_norm_batch_cpu",
+                       "run",
+                       -1,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pack_start).count());
+
+    const auto residual_veto_start = std::chrono::steady_clock::now();
+    auto dino_score_source_tensor = torch::from_blob(dino_score_source_batch.data(),
+                                                     {static_cast<int64_t>(batch_size), static_cast<int64_t>(uniform_rows), static_cast<int64_t>(src_cols)},
+                                                     torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    auto hybrid_results = run_residual_veto_hybrid_gpu_batch_device_inputs(dino_score_source_tensor,
+                                                                           source_coherence_batch_tensor,
+                                                                           source_valid_mask_batch,
+                                                                           static_cast<int>(batch_size),
+                                                                           uniform_rows,
+                                                                           src_cols,
+                                                                           use_fp16_precision(config.hybrid_torch_dtype));
+    record_timed_stage(profiler,
+                       "chunk_hybrid_residual_veto_batch",
+                       "run",
+                       -1,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - residual_veto_start).count());
+    for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+      artifacts_batch[batch_index].precomputed_hybrid_result_source = std::move(hybrid_results[batch_index]);
+      artifacts_batch[batch_index].has_precomputed_hybrid_result = true;
+    }
   }
   return artifacts_batch;
 }
@@ -5784,7 +5991,16 @@ ChunkRetryResult finalize_retry_chunk_postprocess(const ValidatorConfig& config,
                                    (artifacts.keep_debug_artifacts ? static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols) * sizeof(float) : 0);
     ScopedStageProfile stage(profiler, "chunk_hybrid_support", "chunk", result.chunk_index, estimated_bytes, verbose);
     const auto dino_norm_start = std::chrono::steady_clock::now();
-    const auto dino_score_norm_source = normalize01_quantile(artifacts.grouped_dino_score_source, 5.0, 95.0);
+    const bool use_inverted_raw_dino_energy = config.hybrid_use_inverted_raw_dino_energy &&
+                                              artifacts.raw_dino_score_source.size() == artifacts.grouped_dino_score_source.size() &&
+                                              !artifacts.raw_dino_score_source.empty();
+    const auto& hybrid_dino_source = use_inverted_raw_dino_energy ? artifacts.raw_dino_score_source : artifacts.grouped_dino_score_source;
+    auto dino_score_norm_source = normalize01_quantile(hybrid_dino_source, 5.0, 95.0);
+    if (use_inverted_raw_dino_energy) {
+      for (float& value : dino_score_norm_source) {
+        value = 1.0f - value;
+      }
+    }
     record_timed_stage(profiler,
                        "chunk_hybrid_dino_norm",
                        "chunk",
@@ -5800,7 +6016,7 @@ ChunkRetryResult finalize_retry_chunk_postprocess(const ValidatorConfig& config,
                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - coherence_norm_start).count());
 
     const auto multiply_start = std::chrono::steady_clock::now();
-    hybrid_contrib_source.assign(artifacts.grouped_dino_score_source.size(), 0.0f);
+    hybrid_contrib_source.assign(hybrid_dino_source.size(), 0.0f);
     for (size_t index = 0; index < hybrid_contrib_source.size(); ++index) {
       hybrid_contrib_source[index] = dino_score_norm_source[index] * coherence_gate_norm_source[index];
     }
@@ -6453,10 +6669,10 @@ int main(int argc, char** argv) {
                                                                  gpu_workspace,
                                                                  &profiler,
                                                                  options.verbose);
+        precompute_retry_chunk_hybrid_batch(batched_inference, config, &profiler, options.verbose);
         auto mapped_indices = pending_runtime_indices;
         pending_postprocess.push_back(std::async(std::launch::async,
                                                  [&, mapped_indices = std::move(mapped_indices), batched_inference = std::move(batched_inference)]() mutable {
-                                                   precompute_retry_chunk_hybrid_batch(batched_inference, config, &profiler, options.verbose);
                                                    std::vector<std::pair<size_t, ChunkRetryResult>> completed_results;
                                                    completed_results.reserve(batched_inference.size());
                                                    for (size_t batch_index = 0; batch_index < batched_inference.size(); ++batch_index) {
@@ -6614,6 +6830,11 @@ int main(int argc, char** argv) {
       const auto debug_coherence_gate_path = chunk_debug_dir / "chunk_coherence_gate.npy";
       const auto debug_hybrid_contrib_path = chunk_debug_dir / "chunk_hybrid_contrib.npy";
       const auto debug_combined_score_path = chunk_debug_dir / "chunk_combined_score.npy";
+      const auto debug_grouped_seed_score_path = chunk_debug_dir / "chunk_grouped_seed_score.npy";
+      const auto debug_grouped_seed_persistence_path = chunk_debug_dir / "chunk_grouped_seed_persistence.npy";
+      const auto debug_grouped_seed_contrast_path = chunk_debug_dir / "chunk_grouped_seed_contrast.npy";
+      const auto debug_grouped_selected_support_path = chunk_debug_dir / "chunk_grouped_selected_support.npy";
+      const auto debug_grouped_cluster_quality_path = chunk_debug_dir / "chunk_grouped_cluster_quality.npy";
       const auto debug_patch_features_path = chunk_debug_dir / "chunk_patch_features.npy";
       const auto debug_valid_mask_path = chunk_debug_dir / "chunk_valid_mask.npy";
       const auto debug_bridged_mask_path = chunk_debug_dir / "chunk_bridged_mask.npy";
@@ -6669,6 +6890,36 @@ int main(int argc, char** argv) {
                    debug_chunk.dst_rows,
                    debug_chunk.dst_cols,
                    "<f4");
+      write_npy_2d(debug_grouped_seed_score_path,
+           debug_chunk.grouped_seed_score_map.data(),
+           debug_chunk.grouped_seed_score_map.size() * sizeof(float),
+           debug_chunk.dst_rows,
+           debug_chunk.dst_cols,
+           "<f4");
+       write_npy_2d(debug_grouped_seed_persistence_path,
+         debug_chunk.grouped_seed_persistence_map.data(),
+         debug_chunk.grouped_seed_persistence_map.size() * sizeof(float),
+         debug_chunk.dst_rows,
+         debug_chunk.dst_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_seed_contrast_path,
+         debug_chunk.grouped_seed_contrast_map.data(),
+         debug_chunk.grouped_seed_contrast_map.size() * sizeof(float),
+         debug_chunk.dst_rows,
+         debug_chunk.dst_cols,
+         "<f4");
+      write_npy_2d(debug_grouped_selected_support_path,
+           debug_chunk.grouped_selected_support_map.data(),
+           debug_chunk.grouped_selected_support_map.size() * sizeof(float),
+           debug_chunk.dst_rows,
+           debug_chunk.dst_cols,
+           "<f4");
+      write_npy_2d(debug_grouped_cluster_quality_path,
+           debug_chunk.grouped_cluster_quality_map.data(),
+           debug_chunk.grouped_cluster_quality_map.size() * sizeof(float),
+           debug_chunk.dst_rows,
+           debug_chunk.dst_cols,
+           "<f4");
       if (!debug_chunk.patch_features.empty() && debug_chunk.patch_rows > 0 && debug_chunk.patch_cols > 0 && debug_chunk.feature_dim > 0) {
         write_npy_2d(debug_patch_features_path,
                      debug_chunk.patch_features.data(),
@@ -6777,14 +7028,23 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"patch_rows\": " << debug_chunk.patch_rows << ",\n";
       debug_summary_out << "  \"patch_cols\": " << debug_chunk.patch_cols << ",\n";
       debug_summary_out << "  \"feature_dim\": " << debug_chunk.feature_dim << ",\n";
+      debug_summary_out << "  \"grouped_seed_prior_enabled\": false,\n";
+      debug_summary_out << "  \"grouped_component_seed_weight\": 0.0,\n";
+      debug_summary_out << "  \"grouped_score_seed_weight\": 0.0,\n";
       debug_summary_out << "  \"artifact_contract\": \"chunk_fixed_detector_grid_v1\",\n";
       debug_summary_out << "  \"corrected_resized_npy\": \"" << json_escape(debug_corrected_path.string()) << "\",\n";
       debug_summary_out << "  \"runtime_input_gray_npy\": \"" << json_escape(debug_runtime_input_gray_path.string()) << "\",\n";
       debug_summary_out << "  \"dino_score_npy\": \"" << json_escape(debug_dino_score_path.string()) << "\",\n";
       debug_summary_out << "  \"dino_score_raw_npy\": \"" << json_escape(debug_raw_dino_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"hybrid_dino_source_mode\": \"" << (config.hybrid_use_inverted_raw_dino_energy ? "inverted_raw_dino_energy" : "grouped_dino_score") << "\",\n";
       debug_summary_out << "  \"coherence_gate_npy\": \"" << json_escape(debug_coherence_gate_path.string()) << "\",\n";
       debug_summary_out << "  \"hybrid_contrib_npy\": \"" << json_escape(debug_hybrid_contrib_path.string()) << "\",\n";
       debug_summary_out << "  \"combined_score_npy\": \"" << json_escape(debug_combined_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_seed_score_npy\": \"" << json_escape(debug_grouped_seed_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_seed_persistence_npy\": \"" << json_escape(debug_grouped_seed_persistence_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_seed_contrast_npy\": \"" << json_escape(debug_grouped_seed_contrast_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_selected_support_npy\": \"" << json_escape(debug_grouped_selected_support_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_cluster_quality_npy\": \"" << json_escape(debug_grouped_cluster_quality_path.string()) << "\",\n";
       debug_summary_out << "  \"patch_features_npy\": \"" << json_escape(debug_patch_features_path.string()) << "\",\n";
       debug_summary_out << "  \"valid_mask_npy\": \"" << json_escape(debug_valid_mask_path.string()) << "\",\n";
       debug_summary_out << "  \"bridged_mask_npy\": \"" << json_escape(debug_bridged_mask_path.string()) << "\",\n";
@@ -6964,6 +7224,11 @@ int main(int argc, char** argv) {
       const auto debug_coherence_gate_path = chunk_debug_dir / "chunk_coherence_gate.npy";
       const auto debug_hybrid_contrib_path = chunk_debug_dir / "chunk_hybrid_contrib.npy";
       const auto debug_combined_score_path = chunk_debug_dir / "chunk_combined_score.npy";
+      const auto debug_grouped_seed_score_path = chunk_debug_dir / "chunk_grouped_seed_score.npy";
+      const auto debug_grouped_seed_persistence_path = chunk_debug_dir / "chunk_grouped_seed_persistence.npy";
+      const auto debug_grouped_seed_contrast_path = chunk_debug_dir / "chunk_grouped_seed_contrast.npy";
+      const auto debug_grouped_selected_support_path = chunk_debug_dir / "chunk_grouped_selected_support.npy";
+      const auto debug_grouped_cluster_quality_path = chunk_debug_dir / "chunk_grouped_cluster_quality.npy";
       const auto debug_patch_features_path = chunk_debug_dir / "chunk_patch_features.npy";
       const auto debug_valid_mask_path = chunk_debug_dir / "chunk_valid_mask.npy";
       const auto debug_bridged_mask_path = chunk_debug_dir / "chunk_bridged_mask.npy";
@@ -7022,6 +7287,36 @@ int main(int argc, char** argv) {
                    debug_chunk.dst_rows,
                    debug_chunk.dst_cols,
                    "<f4");
+      write_npy_2d(debug_grouped_seed_score_path,
+           debug_chunk.grouped_seed_score_map.data(),
+           debug_chunk.grouped_seed_score_map.size() * sizeof(float),
+           debug_chunk.dst_rows,
+           debug_chunk.dst_cols,
+           "<f4");
+       write_npy_2d(debug_grouped_seed_persistence_path,
+         debug_chunk.grouped_seed_persistence_map.data(),
+         debug_chunk.grouped_seed_persistence_map.size() * sizeof(float),
+         debug_chunk.dst_rows,
+         debug_chunk.dst_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_seed_contrast_path,
+         debug_chunk.grouped_seed_contrast_map.data(),
+         debug_chunk.grouped_seed_contrast_map.size() * sizeof(float),
+         debug_chunk.dst_rows,
+         debug_chunk.dst_cols,
+         "<f4");
+      write_npy_2d(debug_grouped_selected_support_path,
+           debug_chunk.grouped_selected_support_map.data(),
+           debug_chunk.grouped_selected_support_map.size() * sizeof(float),
+           debug_chunk.dst_rows,
+           debug_chunk.dst_cols,
+           "<f4");
+      write_npy_2d(debug_grouped_cluster_quality_path,
+           debug_chunk.grouped_cluster_quality_map.data(),
+           debug_chunk.grouped_cluster_quality_map.size() * sizeof(float),
+           debug_chunk.dst_rows,
+           debug_chunk.dst_cols,
+           "<f4");
       if (!debug_chunk.patch_features.empty() && debug_chunk.patch_rows > 0 && debug_chunk.patch_cols > 0 && debug_chunk.feature_dim > 0) {
         write_npy_2d(debug_patch_features_path,
                      debug_chunk.patch_features.data(),
@@ -7178,6 +7473,9 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"patch_rows\": " << debug_chunk.patch_rows << ",\n";
       debug_summary_out << "  \"patch_cols\": " << debug_chunk.patch_cols << ",\n";
       debug_summary_out << "  \"feature_dim\": " << debug_chunk.feature_dim << ",\n";
+      debug_summary_out << "  \"grouped_seed_prior_enabled\": false,\n";
+      debug_summary_out << "  \"grouped_component_seed_weight\": 0.0,\n";
+      debug_summary_out << "  \"grouped_score_seed_weight\": 0.0,\n";
       debug_summary_out << "  \"legacy_fast_gray_preprocess\": " << (config.legacy_fast_gray_preprocess ? "true" : "false") << ",\n";
       debug_summary_out << "  \"artifact_contract\": \"chunk_fixed_detector_grid_v1\",\n";
       debug_summary_out << "  \"mask_source\": \"stitched_chunk_result\",\n";
@@ -7189,6 +7487,11 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"coherence_gate_npy\": \"" << json_escape(debug_coherence_gate_path.string()) << "\",\n";
       debug_summary_out << "  \"hybrid_contrib_npy\": \"" << json_escape(debug_hybrid_contrib_path.string()) << "\",\n";
       debug_summary_out << "  \"combined_score_npy\": \"" << json_escape(debug_combined_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_seed_score_npy\": \"" << json_escape(debug_grouped_seed_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_seed_persistence_npy\": \"" << json_escape(debug_grouped_seed_persistence_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_seed_contrast_npy\": \"" << json_escape(debug_grouped_seed_contrast_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_selected_support_npy\": \"" << json_escape(debug_grouped_selected_support_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_cluster_quality_npy\": \"" << json_escape(debug_grouped_cluster_quality_path.string()) << "\",\n";
       debug_summary_out << "  \"patch_features_npy\": \"" << json_escape(debug_patch_features_path.string()) << "\",\n";
       debug_summary_out << "  \"valid_mask_npy\": \"" << json_escape(debug_valid_mask_path.string()) << "\",\n";
       debug_summary_out << "  \"bridged_mask_npy\": \"" << json_escape(debug_bridged_mask_path.string()) << "\",\n";

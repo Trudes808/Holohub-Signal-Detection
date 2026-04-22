@@ -1795,6 +1795,232 @@ def run_coherent_power_pipeline(
     }
 
 
+def _resolve_artifact_path(path_value: str | Path) -> Path:
+    path = Path(path_value)
+    path_text = str(path)
+    container_prefixes = {
+        "/workspace/spectrograms": Path("/tmp/usrp_spectrograms"),
+        "/workspace/dino_masks": Path("/tmp/usrp_dino_masks"),
+        "/workspace/coherent_power_masks": Path("/tmp/coherent_power_masks"),
+    }
+    for prefix, host_root in container_prefixes.items():
+        if path_text == prefix or path_text.startswith(prefix + "/"):
+            suffix = path_text[len(prefix) :].lstrip("/")
+            return host_root / suffix if suffix else host_root
+    return path
+
+
+def _display_oriented(image: np.ndarray, display_transposed: bool, *, is_mask: bool = False) -> np.ndarray:
+    display_image = np.asarray(image.T if display_transposed else image, dtype=np.float32)
+    if is_mask:
+        return display_image
+    return display_image.astype(np.float32, copy=False)
+
+
+def _build_overlay_input_record(
+    tensor_path: str | Path,
+    metadata: dict[str, Any],
+) -> tuple[dict[str, Any], np.ndarray, str]:
+    tensor_path = Path(tensor_path)
+    tensor_snapshot = np.load(tensor_path, allow_pickle=False)
+    power_db_snapshot = (10.0 * np.log10(np.maximum(np.abs(tensor_snapshot) ** 2, 1e-12))).astype(np.float32)
+
+    input_record = load_input_record(
+        tensor_path,
+        input_kind="tensor_npy",
+        tensor_target_height=None,
+        tensor_target_width=None,
+    )
+
+    tensor_axis_order = str(metadata.get("tensor_axis_order") or input_record.get("tensor_axis_order") or "").strip().lower()
+    if not tensor_axis_order:
+        tensor_axis_order = "frequency_time"
+
+    if tensor_axis_order == "frequency_time":
+        input_record["sxx_db"] = np.ascontiguousarray(power_db_snapshot)
+        input_record["display_sxx_db"] = np.ascontiguousarray(power_db_snapshot)
+        input_record["display_transposed"] = False
+    elif tensor_axis_order == "time_frequency":
+        input_record["sxx_db"] = np.ascontiguousarray(power_db_snapshot.T)
+        input_record["display_sxx_db"] = np.ascontiguousarray(power_db_snapshot)
+        input_record["display_transposed"] = True
+    else:
+        raise ValueError(f"Unsupported tensor_axis_order: {tensor_axis_order!r}")
+
+    input_record["tensor_axis_order"] = tensor_axis_order
+    input_record["frequency_axis_calibrated"] = bool(metadata.get("frequency_axis_calibrated", True))
+
+    freq_bins = int(input_record["sxx_db"].shape[0])
+    time_bins = int(input_record["sxx_db"].shape[1])
+    resolution_hz = float(metadata.get("resolution_hz", 0.0) or 0.0)
+    sample_rate_hz = float(metadata.get("sample_rate_hz", 0.0) or 0.0)
+    span_hz = float(metadata.get("span_hz", 0.0) or 0.0)
+
+    if sample_rate_hz <= 0.0 and span_hz > 0.0:
+        sample_rate_hz = span_hz
+    if span_hz <= 0.0 and sample_rate_hz > 0.0:
+        span_hz = sample_rate_hz
+    if resolution_hz <= 0.0 and span_hz > 0.0 and freq_bins > 0:
+        resolution_hz = span_hz / float(freq_bins)
+    if sample_rate_hz <= 0.0 and resolution_hz > 0.0:
+        sample_rate_hz = float(freq_bins) * resolution_hz
+    if span_hz <= 0.0 and resolution_hz > 0.0:
+        span_hz = float(freq_bins) * resolution_hz
+
+    if resolution_hz > 0.0:
+        input_record["freq_axis_hz"] = np.arange(freq_bins, dtype=np.float32) * resolution_hz
+    else:
+        input_record["freq_axis_hz"] = np.arange(freq_bins, dtype=np.float32)
+    input_record["time_axis_s"] = np.arange(time_bins, dtype=np.float32)
+    input_record["center_frequency_hz"] = float(metadata.get("center_frequency_hz", 0.0) or 0.0)
+    input_record["sample_rate_hz"] = sample_rate_hz if sample_rate_hz > 0.0 else None
+    input_record["span_hz"] = span_hz if span_hz > 0.0 else None
+    input_record["resolution_hz"] = resolution_hz if resolution_hz > 0.0 else None
+    input_record["raw_tensor_shape"] = tuple(int(v) for v in tensor_snapshot.shape)
+    input_record["resized_tensor_shape"] = tuple(int(v) for v in power_db_snapshot.shape)
+
+    return input_record, power_db_snapshot, tensor_axis_order
+
+
+def load_offline_coherent_overlay_context(
+    tensor_path: str | Path,
+    summary_path: str | Path,
+    *,
+    target_chunk_rows: int = 1024,
+    target_overlap_rows: int = 256,
+) -> dict[str, Any]:
+    tensor_path = Path(tensor_path)
+    summary_path = Path(summary_path)
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Missing coherent validator summary: {summary_path}")
+
+    summary = json.loads(summary_path.read_text())
+    summary["metadata_path"] = str(_resolve_artifact_path(summary["metadata_path"]))
+    summary["corrected_sxx_db_npy"] = str(_resolve_artifact_path(summary["corrected_sxx_db_npy"]))
+    summary["final_mask_npy"] = str(_resolve_artifact_path(summary["final_mask_npy"]))
+
+    metadata = json.loads(Path(summary["metadata_path"]).read_text())
+    coherent_cfg = CoherentPowerConfig(**metadata["config"])
+    input_record, power_db_snapshot, tensor_axis_order = _build_overlay_input_record(tensor_path, metadata)
+
+    active_cfg = adapt_chunk_config_for_input_record(
+        input_record,
+        coherent_cfg,
+        target_chunk_rows=target_chunk_rows,
+        target_overlap_rows=target_overlap_rows,
+    )
+    pipeline_result = run_coherent_power_pipeline(input_record, active_cfg)
+
+    display_transposed = bool(
+        input_record.get(
+            "display_transposed",
+            input_kind_requires_display_transpose(input_record.get("input_kind")),
+        )
+    )
+    raw_sxx_db = np.asarray(input_record["sxx_db"], dtype=np.float32)
+    corrected_db_raw = np.load(summary["corrected_sxx_db_npy"], allow_pickle=False).astype(np.float32)
+    final_mask_raw = np.load(summary["final_mask_npy"], allow_pickle=False).astype(np.float32)
+    merged_coherence = np.asarray(pipeline_result["merged_coherence"], dtype=np.float32)
+    ignore_bins_per_side = int(summary.get("ignore_bins_per_side", 0))
+    valid_row_mask = np.asarray(
+        pipeline_result.get(
+            "valid_row_mask",
+            pipeline_result.get("ignore_sideband", {}).get("valid_row_mask", np.ones(raw_sxx_db.shape[0], dtype=bool)),
+        ),
+        dtype=bool,
+    )
+
+    tensor_power_db = _display_oriented(raw_sxx_db, display_transposed)
+    corrected_db = _display_oriented(corrected_db_raw, display_transposed)
+    display_mask = _display_oriented(final_mask_raw, display_transposed, is_mask=True)
+    display_coherence = _display_oriented(merged_coherence, display_transposed)
+    main_plot_transposed = _actual_display_transposed(tensor_power_db, raw_sxx_db, display_transposed)
+
+    diagnostics = {
+        "display_transposed": display_transposed,
+        "main_plot_transposed": main_plot_transposed,
+        "tensor_axis_order": tensor_axis_order,
+        "tensor_analysis_shape": tuple(int(v) for v in raw_sxx_db.shape),
+        "tensor_display_shape": tuple(int(v) for v in tensor_power_db.shape),
+        "corrected_db_raw_shape": tuple(int(v) for v in corrected_db_raw.shape),
+        "display_coherence_shape": tuple(int(v) for v in display_coherence.shape),
+        "active_chunk_bandwidth_mhz": round(active_cfg.chunk_bandwidth_hz / 1e6, 3),
+        "active_chunk_overlap_mhz": round(active_cfg.chunk_overlap_hz / 1e6, 3),
+        "chunk_count_python": len(pipeline_result.get("chunk_plan", [])),
+        "ignore_bins_per_side": ignore_bins_per_side,
+        "merged_box_count_python": len(pipeline_result.get("merged_boxes", [])),
+        "grouped_box_count_cpp": int(summary.get("grouped_box_count", 0)),
+        "summary": summary,
+    }
+
+    return {
+        "summary": summary,
+        "metadata": metadata,
+        "coherent_cfg": coherent_cfg,
+        "active_cfg": active_cfg,
+        "pipeline_result": pipeline_result,
+        "input_record": input_record,
+        "power_db_snapshot": power_db_snapshot,
+        "raw_sxx_db": raw_sxx_db,
+        "corrected_db_raw": corrected_db_raw,
+        "final_mask_raw": final_mask_raw,
+        "merged_coherence": merged_coherence,
+        "tensor_power_db": tensor_power_db,
+        "corrected_db": corrected_db,
+        "display_mask": display_mask,
+        "display_coherence": display_coherence,
+        "display_transposed": display_transposed,
+        "main_plot_transposed": main_plot_transposed,
+        "ignore_bins_per_side": ignore_bins_per_side,
+        "valid_row_mask": valid_row_mask,
+        "diagnostics": diagnostics,
+    }
+
+
+def plot_offline_coherent_overlay(
+    overlay_context: dict[str, Any],
+    figsize: tuple[int, int] = (26, 6),
+):
+    raw_sxx_db = np.asarray(overlay_context["raw_sxx_db"], dtype=np.float32)
+    tensor_power_db = np.asarray(overlay_context["tensor_power_db"], dtype=np.float32)
+    corrected_db = np.asarray(overlay_context["corrected_db"], dtype=np.float32)
+    display_coherence = np.asarray(overlay_context["display_coherence"], dtype=np.float32)
+    display_mask = np.asarray(overlay_context["display_mask"], dtype=np.float32)
+    ignore_bins_per_side = int(overlay_context.get("ignore_bins_per_side", 0))
+    requested_display_transposed = bool(overlay_context.get("display_transposed", overlay_context.get("main_plot_transposed", False)))
+    main_plot_transposed = _actual_display_transposed(tensor_power_db, raw_sxx_db, requested_display_transposed)
+    valid_row_mask = np.asarray(
+        overlay_context.get("valid_row_mask", np.ones(raw_sxx_db.shape[0], dtype=bool)),
+        dtype=bool,
+    )
+
+    fig, axes = plt.subplots(1, 4, figsize=figsize, constrained_layout=True)
+    raw_vmin, raw_vmax = _display_db_window(raw_sxx_db)
+    axes[0].imshow(tensor_power_db, aspect="auto", origin="lower", vmin=raw_vmin, vmax=raw_vmax, interpolation="nearest")
+    axes[0].set_title("Frozen tensor power")
+    axes[1].imshow(corrected_db, aspect="auto", origin="lower", vmin=raw_vmin, vmax=raw_vmax, interpolation="nearest")
+    axes[1].set_title("Offline coherent corrected power")
+    axes[2].imshow(display_coherence, aspect="auto", origin="lower", cmap="plasma", vmin=0.0, vmax=1.0, interpolation="nearest")
+    axes[2].set_title("Python merged raw coherence map")
+    axes[3].imshow(corrected_db, aspect="auto", origin="lower", cmap="gray", vmin=raw_vmin, vmax=raw_vmax, interpolation="nearest")
+    axes[3].imshow(np.ma.masked_where(display_mask <= 0.5, display_mask), aspect="auto", origin="lower", cmap="autumn", alpha=0.45, interpolation="nearest")
+    axes[3].set_title("C++ final mask overlay")
+
+    ignored_rows = np.flatnonzero(~valid_row_mask)
+    if ignored_rows.size == 0 and ignore_bins_per_side > 0:
+        ignored_rows = np.concatenate(
+            [
+                np.arange(ignore_bins_per_side, dtype=int),
+                np.arange(max(raw_sxx_db.shape[0] - ignore_bins_per_side, 0), raw_sxx_db.shape[0], dtype=int),
+            ]
+        )
+
+    for axis in axes:
+        _shade_ignored_rows(axis, ignored_rows, main_plot_transposed)
+        _set_spectrogram_axis_labels(axis, main_plot_transposed)
+    return fig, axes
+
+
 def _display_db_window(sxx_db: np.ndarray, low_q: float = 1.0, high_q: float = 99.0):
     values = np.asarray(sxx_db, dtype=np.float32)
     return float(np.percentile(values, low_q)), float(np.percentile(values, high_q))
@@ -1850,6 +2076,43 @@ def _expected_display_shape(reference: np.ndarray, display_transposed: bool) -> 
     return reference.T.shape if display_transposed else reference.shape
 
 
+def _actual_display_transposed(
+    display_panel: np.ndarray,
+    reference: np.ndarray,
+    requested_display_transposed: bool,
+) -> bool:
+    display_panel = np.asarray(display_panel)
+    reference = np.asarray(reference)
+    if reference.ndim != 2 or display_panel.ndim != 2:
+        return requested_display_transposed
+    if display_panel.shape == reference.shape and display_panel.shape != reference.T.shape:
+        return False
+    if display_panel.shape == reference.T.shape and display_panel.shape != reference.shape:
+        return True
+    return requested_display_transposed
+
+
+def _ignored_row_spans(ignored_rows: np.ndarray) -> list[tuple[int, int]]:
+    ignored_rows = np.asarray(ignored_rows, dtype=int).reshape(-1)
+    if ignored_rows.size == 0:
+        return []
+    ignored_rows = np.unique(ignored_rows)
+    split_points = np.where(np.diff(ignored_rows) > 1)[0] + 1
+    blocks = np.split(ignored_rows, split_points)
+    return [(int(block[0]), int(block[-1])) for block in blocks if block.size > 0]
+
+
+def _shade_ignored_rows(ax, ignored_rows: np.ndarray, display_transposed: bool) -> None:
+    spans = _ignored_row_spans(ignored_rows)
+    if not spans:
+        return
+    for row_start, row_stop in spans:
+        if display_transposed:
+            ax.axvspan(row_start, row_stop, color="black", alpha=0.12)
+        else:
+            ax.axhspan(row_start, row_stop, color="black", alpha=0.12)
+
+
 def _orient_panel_for_display(panel: np.ndarray, reference: np.ndarray, display_transposed: bool) -> np.ndarray:
     panel = np.asarray(panel)
     expected_shape = _expected_display_shape(reference, display_transposed)
@@ -1872,9 +2135,10 @@ def _show_debug_panel(
 ):
     reference_panel = panel if reference is None else reference
     display_panel = _orient_panel_for_display(panel, reference_panel, display_transposed)
+    actual_display_transposed = _actual_display_transposed(display_panel, reference_panel, display_transposed)
     ax.imshow(display_panel, aspect="auto", origin="lower", cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
     ax.set_title(title)
-    _set_spectrogram_axis_labels(ax, display_transposed)
+    _set_spectrogram_axis_labels(ax, actual_display_transposed)
 
 
 def _show_debug_overlay(
@@ -1894,11 +2158,12 @@ def _show_debug_overlay(
         overlay_cmap = mask_cmap
     display_base = _orient_panel_for_display(base, base, display_transposed)
     display_overlay = _orient_panel_for_display(overlay, base, display_transposed)
+    actual_display_transposed = _actual_display_transposed(display_base, base, display_transposed)
     ax.imshow(display_base, aspect="auto", origin="lower", cmap="gray", vmin=base_vmin, vmax=base_vmax, interpolation="nearest")
     ax.imshow(np.where(display_overlay, 1.0, np.nan), aspect="auto", origin="lower", cmap=overlay_cmap, alpha=overlay_alpha, interpolation="nearest")
-    _draw_signal_boxes(ax, boxes, display_transposed)
+    _draw_signal_boxes(ax, boxes, actual_display_transposed)
     ax.set_title(title)
-    _set_spectrogram_axis_labels(ax, display_transposed)
+    _set_spectrogram_axis_labels(ax, actual_display_transposed)
 
 
 def plot_frontend_overview(pipeline_result: dict[str, Any], figsize: tuple[int, int] = (18, 10)):
@@ -1909,6 +2174,7 @@ def plot_frontend_overview(pipeline_result: dict[str, Any], figsize: tuple[int, 
     display_transposed = bool(input_record.get("display_transposed", input_kind_requires_display_transpose(input_record.get("input_kind"))))
     display_raw = raw_sxx_db.T if display_transposed else raw_sxx_db
     display_corrected = corrected_sxx_db.T if display_transposed else corrected_sxx_db
+    actual_display_transposed = _actual_display_transposed(display_raw, raw_sxx_db, display_transposed)
     raw_vmin, raw_vmax = _display_db_window(raw_sxx_db)
     corrected_vmin, corrected_vmax = _display_db_window(corrected_sxx_db)
     row_axis = np.arange(raw_sxx_db.shape[0], dtype=np.float32)
@@ -1932,7 +2198,7 @@ def plot_frontend_overview(pipeline_result: dict[str, Any], figsize: tuple[int, 
     for row_axes in axes:
         for ax in row_axes:
             if ax not in (axes[1][0], axes[1][1]):
-                _set_spectrogram_axis_labels(ax, display_transposed)
+                _set_spectrogram_axis_labels(ax, actual_display_transposed)
     return fig, axes
 
 
@@ -1945,34 +2211,23 @@ def plot_chunk_plan(pipeline_result: dict[str, Any], figsize: tuple[int, int] = 
         )
     )
     display_corrected = corrected_sxx_db.T if display_transposed else corrected_sxx_db
+    actual_display_transposed = _actual_display_transposed(display_corrected, corrected_sxx_db, display_transposed)
     valid_row_mask = np.asarray(pipeline_result.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
     vmin, vmax = _display_db_window(corrected_sxx_db)
 
     fig, ax = plt.subplots(1, 1, figsize=figsize, constrained_layout=True)
     ax.imshow(display_corrected, aspect="auto", origin="lower", cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")
     for chunk in pipeline_result["chunk_plan"]:
-        if display_transposed:
+        if actual_display_transposed:
             ax.axvline(chunk["row_start"], color="white", alpha=0.25, linewidth=0.9)
             ax.axvline(chunk["row_stop"] - 1, color="white", alpha=0.25, linewidth=0.9)
         else:
             ax.axhline(chunk["row_start"], color="white", alpha=0.25, linewidth=0.9)
             ax.axhline(chunk["row_stop"] - 1, color="white", alpha=0.25, linewidth=0.9)
     ignored_rows = np.flatnonzero(~valid_row_mask)
-    if ignored_rows.size > 0:
-        low_block = ignored_rows[ignored_rows < (corrected_sxx_db.shape[0] // 2)]
-        high_block = ignored_rows[ignored_rows >= (corrected_sxx_db.shape[0] // 2)]
-        if low_block.size > 0:
-            if display_transposed:
-                ax.axvspan(low_block[0], low_block[-1], color="black", alpha=0.12)
-            else:
-                ax.axhspan(low_block[0], low_block[-1], color="black", alpha=0.12)
-        if high_block.size > 0:
-            if display_transposed:
-                ax.axvspan(high_block[0], high_block[-1], color="black", alpha=0.12)
-            else:
-                ax.axhspan(high_block[0], high_block[-1], color="black", alpha=0.12)
+    _shade_ignored_rows(ax, ignored_rows, actual_display_transposed)
     ax.set_title("Corrected spectrogram with subsection boundaries")
-    _set_spectrogram_axis_labels(ax, display_transposed)
+    _set_spectrogram_axis_labels(ax, actual_display_transposed)
     return fig, ax
 
 
@@ -1993,6 +2248,7 @@ def plot_merged_detection(pipeline_result: dict[str, Any], figsize: tuple[int, i
     display_score = _orient_panel_for_display(merged_score, corrected_sxx_db, display_transposed)
     display_mask = _orient_panel_for_display(merged_mask, corrected_sxx_db, display_transposed)
     display_support = _orient_panel_for_display(merged_support, corrected_sxx_db, display_transposed)
+    actual_display_transposed = _actual_display_transposed(display_corrected, corrected_sxx_db, display_transposed)
     vmin, vmax = _display_db_window(corrected_sxx_db)
     fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
     axes[0].imshow(display_corrected, aspect="auto", origin="lower", cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")
@@ -2003,27 +2259,14 @@ def plot_merged_detection(pipeline_result: dict[str, Any], figsize: tuple[int, i
     axes[2].imshow(display_corrected, aspect="auto", origin="lower", cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
     axes[2].imshow(np.where(display_mask, 1.0, np.nan), aspect="auto", origin="lower", cmap="autumn", alpha=0.55, interpolation="nearest")
     axes[2].set_title(f"Grouped detection overlay ({len(merged_boxes)} boxes)")
-    _draw_signal_boxes(axes[0], merged_boxes, display_transposed)
-    _draw_signal_boxes(axes[1], merged_boxes, display_transposed)
-    _draw_signal_boxes(axes[2], merged_boxes, display_transposed)
+    _draw_signal_boxes(axes[0], merged_boxes, actual_display_transposed)
+    _draw_signal_boxes(axes[1], merged_boxes, actual_display_transposed)
+    _draw_signal_boxes(axes[2], merged_boxes, actual_display_transposed)
     ignored_rows = np.flatnonzero(~valid_row_mask)
-    if ignored_rows.size > 0:
-        low_block = ignored_rows[ignored_rows < (corrected_sxx_db.shape[0] // 2)]
-        high_block = ignored_rows[ignored_rows >= (corrected_sxx_db.shape[0] // 2)]
-        if low_block.size > 0:
-            for ax in axes:
-                if display_transposed:
-                    ax.axvspan(low_block[0], low_block[-1], color="black", alpha=0.12)
-                else:
-                    ax.axhspan(low_block[0], low_block[-1], color="black", alpha=0.12)
-        if high_block.size > 0:
-            for ax in axes:
-                if display_transposed:
-                    ax.axvspan(high_block[0], high_block[-1], color="black", alpha=0.12)
-                else:
-                    ax.axhspan(high_block[0], high_block[-1], color="black", alpha=0.12)
     for ax in axes:
-        _set_spectrogram_axis_labels(ax, display_transposed)
+        _shade_ignored_rows(ax, ignored_rows, actual_display_transposed)
+    for ax in axes:
+        _set_spectrogram_axis_labels(ax, actual_display_transposed)
     return fig, axes
 
 
@@ -2048,8 +2291,9 @@ def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] 
     _show_debug_panel(axes[2], merged_power, "Merged normalized power", display_transposed, "cividis", 0.0, 1.0, reference=corrected_sxx_db)
     _show_debug_panel(axes[3], merged_score, "Merged coherence + power score", display_transposed, "magma", 0.0, 1.0, reference=corrected_sxx_db)
     support_display = _orient_panel_for_display(merged_support, corrected_sxx_db, display_transposed)
+    actual_display_transposed = _actual_display_transposed(support_display, corrected_sxx_db, display_transposed)
     axes[3].imshow(np.where(support_display, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.18, interpolation="nearest")
-    _draw_signal_boxes(axes[3], merged_boxes, display_transposed)
+    _draw_signal_boxes(axes[3], merged_boxes, actual_display_transposed)
     _show_debug_overlay(axes[4], corrected_sxx_db, merged_mask, "Grouped final overlay", display_transposed, vmin, vmax, boxes=merged_boxes)
     return fig, axes
 

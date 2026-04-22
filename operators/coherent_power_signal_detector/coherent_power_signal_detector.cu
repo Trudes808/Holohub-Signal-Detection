@@ -9,12 +9,14 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <numeric>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -37,6 +39,25 @@ constexpr std::array<const char*, holoscan::ops::CoherentPowerSignalDetector::kT
         "device_copy_ms",
         "mask_save_ms",
         "total_ms",
+    };
+
+enum ReferenceTimingStageIndex : size_t {
+  kReferenceFrontendStage = 0,
+  kReferenceChunkWallStage,
+  kReferenceChunkSumStage,
+  kReferenceChunkMaxStage,
+  kReferenceMergeStage,
+  kReferenceGroupingStage,
+};
+
+constexpr std::array<const char*, holoscan::ops::CoherentPowerSignalDetector::kReferenceTimingStageCount>
+    kReferenceTimingStageNames = {
+        "reference_frontend_ms",
+        "reference_chunk_wall_ms",
+        "reference_chunk_sum_ms",
+        "reference_chunk_max_ms",
+        "reference_merge_ms",
+        "reference_grouping_ms",
     };
 
 struct ChunkPlanEntry {
@@ -79,6 +100,7 @@ struct DetectionChunkResult {
   std::vector<DetectionBox> grouped_boxes;
   float support_threshold = 0.0f;
   float score_threshold = 0.0f;
+  double compute_ms = 0.0;
 };
 
 struct GroupingResult {
@@ -94,6 +116,7 @@ struct PipelineSummary {
   int ignore_bins_per_side = 0;
   float merged_threshold = 0.0f;
   float seed_threshold = 0.0f;
+  std::array<double, holoscan::ops::CoherentPowerSignalDetector::kReferenceTimingStageCount> reference_stage_ms {};
 };
 
 struct FastGpuMetadataSummary {
@@ -1817,7 +1840,21 @@ std::vector<float> row_quantile(const std::vector<float>& image, int rows, int c
   return output;
 }
 
-std::vector<float> apply_frontend_correction(const std::vector<float>& power_db,
+std::vector<float> row_quantile(const float* image, int rows, int cols, float percentile) {
+  std::vector<float> output(static_cast<size_t>(rows), 0.0f);
+  std::vector<float> row_values;
+  row_values.reserve(static_cast<size_t>(cols));
+  for (int row = 0; row < rows; ++row) {
+    row_values.clear();
+    for (int col = 0; col < cols; ++col) {
+      row_values.push_back(image[flat_index(rows, cols, row, col)]);
+    }
+    output[static_cast<size_t>(row)] = percentile_from_values(row_values, percentile);
+  }
+  return output;
+}
+
+std::vector<float> apply_frontend_correction(const float* power_db,
                                              int rows,
                                              int cols,
                                              const std::vector<uint8_t>& valid_row_mask,
@@ -1840,7 +1877,8 @@ std::vector<float> apply_frontend_correction(const std::vector<float>& power_db,
   }
   const float reference_db = percentile_from_values(std::move(valid_response), reference_q);
   boost_db_out.assign(static_cast<size_t>(rows), 0.0f);
-  std::vector<float> corrected(power_db.size(), 0.0f);
+  const size_t power_db_size = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  std::vector<float> corrected(power_db_size, 0.0f);
   for (int row = 0; row < rows; ++row) {
     boost_db_out[static_cast<size_t>(row)] = clamp_float(reference_db - response[static_cast<size_t>(row)], 0.0f, max_boost_db);
     for (int col = 0; col < cols; ++col) {
@@ -1946,7 +1984,7 @@ DetectionChunkResult detect_chunk_coherent_power(const std::vector<float>& corre
   return result;
 }
 
-PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
+PipelineSummary run_reference_pipeline(const float* power_db,
                                        int src_rows,
                                        int src_cols,
                                        int ignore_bins_per_side,
@@ -1974,7 +2012,15 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                        int grouping_min_time_span_px,
                                        double grouping_min_density,
                                        double grouping_time_continuity_ratio) {
+  if (power_db == nullptr) {
+    throw std::invalid_argument("reference pipeline requires a power_db buffer");
+  }
   PipelineSummary summary;
+  auto time_reference_stage_ms = [](auto&& fn) {
+    const auto stage_start = std::chrono::steady_clock::now();
+    fn();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
+  };
   if (ignore_bins_per_side == 0) {
     ignore_bins_per_side = compute_ignore_bins_per_side(
         src_rows, resolution_hz, ignore_sideband_percent, 0.0);
@@ -1988,15 +2034,18 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
   }
 
   std::vector<float> boost_db;
-  const auto corrected_sxx_db = apply_frontend_correction(power_db,
-                                                          src_rows,
-                                                          src_cols,
-                                                          valid_row_mask,
-                                                          static_cast<float>(frontend_row_q),
-                                                          static_cast<float>(frontend_reference_q),
-                                                          static_cast<float>(frontend_smooth_sigma),
-                                                          static_cast<float>(frontend_max_boost_db),
-                                                          boost_db);
+  std::vector<float> corrected_sxx_db;
+  summary.reference_stage_ms[kReferenceFrontendStage] = time_reference_stage_ms([&] {
+    corrected_sxx_db = apply_frontend_correction(power_db,
+                                                 src_rows,
+                                                 src_cols,
+                                                 valid_row_mask,
+                                                 static_cast<float>(frontend_row_q),
+                                                 static_cast<float>(frontend_reference_q),
+                                                 static_cast<float>(frontend_smooth_sigma),
+                                                 static_cast<float>(frontend_max_boost_db),
+                                                 boost_db);
+  });
   (void)boost_db;
 
   const auto chunk_plan = build_frequency_chunks(src_rows,
@@ -2007,43 +2056,90 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                                  uncalibrated_chunk_fraction,
                                                  uncalibrated_overlap_fraction);
   summary.subsection_count = static_cast<int>(chunk_plan.size());
+  std::vector<std::future<DetectionChunkResult>> chunk_futures;
   std::vector<DetectionChunkResult> chunk_results;
   chunk_results.reserve(chunk_plan.size());
-  for (const auto& chunk : chunk_plan) {
-    const int chunk_rows = chunk.row_stop - chunk.row_start;
-    std::vector<float> corrected_chunk(static_cast<size_t>(chunk_rows) * static_cast<size_t>(src_cols), 0.0f);
-    std::vector<uint8_t> chunk_valid_row_mask(static_cast<size_t>(chunk_rows), 0);
-    for (int row = 0; row < chunk_rows; ++row) {
-      chunk_valid_row_mask[static_cast<size_t>(row)] = valid_row_mask[static_cast<size_t>(chunk.row_start + row)];
-      for (int col = 0; col < src_cols; ++col) {
-        corrected_chunk[flat_index(chunk_rows, src_cols, row, col)] =
-            corrected_sxx_db[flat_index(src_rows, src_cols, chunk.row_start + row, col)];
+  summary.reference_stage_ms[kReferenceChunkWallStage] = time_reference_stage_ms([&] {
+    chunk_futures.reserve(chunk_plan.size());
+    for (const auto& chunk : chunk_plan) {
+      chunk_futures.push_back(std::async(std::launch::async,
+                                       [&corrected_sxx_db,
+                                        &valid_row_mask,
+                                        chunk,
+                                        src_rows,
+                                        src_cols,
+                                        coherence_weight,
+                                        power_weight,
+                                        coherence_power_support_q,
+                                        coherence_power_q,
+                                        min_component_size,
+                                        filter_detection_mask,
+                                        grouping_bridge_freq_px,
+                                        grouping_bridge_time_px,
+                                        grouping_min_component_size,
+                                        grouping_min_freq_span_px,
+                                        grouping_min_time_span_px,
+                                        grouping_min_density]() {
+                              const auto chunk_start = std::chrono::steady_clock::now();
+      const int chunk_rows = chunk.row_stop - chunk.row_start;
+      std::vector<float> corrected_chunk(static_cast<size_t>(chunk_rows) * static_cast<size_t>(src_cols), 0.0f);
+      std::vector<uint8_t> chunk_valid_row_mask(static_cast<size_t>(chunk_rows), 0);
+      for (int row = 0; row < chunk_rows; ++row) {
+        chunk_valid_row_mask[static_cast<size_t>(row)] = valid_row_mask[static_cast<size_t>(chunk.row_start + row)];
+        for (int col = 0; col < src_cols; ++col) {
+          corrected_chunk[flat_index(chunk_rows, src_cols, row, col)] =
+              corrected_sxx_db[flat_index(src_rows, src_cols, chunk.row_start + row, col)];
+        }
       }
+      auto result = detect_chunk_coherent_power(corrected_chunk,
+                                                chunk_rows,
+                                                src_cols,
+                                                chunk,
+                                                chunk_valid_row_mask,
+                                                coherence_weight,
+                                                power_weight,
+                                                coherence_power_support_q,
+                                                coherence_power_q,
+                                                min_component_size,
+                                                filter_detection_mask,
+                                                grouping_bridge_freq_px,
+                                                grouping_bridge_time_px,
+                                                grouping_min_component_size,
+                                                grouping_min_freq_span_px,
+                                                grouping_min_time_span_px,
+                                                grouping_min_density);
+      result.compute_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - chunk_start).count();
+      return result;
+    }));
     }
-    chunk_results.push_back(detect_chunk_coherent_power(corrected_chunk,
-                                                        chunk_rows,
-                                                        src_cols,
-                                                        chunk,
-                                                        chunk_valid_row_mask,
-                                                        coherence_weight,
-                                                        power_weight,
-                                                        coherence_power_support_q,
-                                                        coherence_power_q,
-                                                        min_component_size,
-                                                        filter_detection_mask,
-                                                        grouping_bridge_freq_px,
-                                                        grouping_bridge_time_px,
-                                                        grouping_min_component_size,
-                                                        grouping_min_freq_span_px,
-                                                        grouping_min_time_span_px,
-                                                        grouping_min_density));
-  }
 
-  std::vector<float> merged_coherence_sum(power_db.size(), 0.0f);
-  std::vector<float> merged_power_sum(power_db.size(), 0.0f);
-  std::vector<float> merged_weight(power_db.size(), 0.0f);
-  std::vector<uint8_t> merged_support(power_db.size(), 0);
-  for (const auto& chunk : chunk_results) {
+    for (auto& chunk_future : chunk_futures) {
+      chunk_results.push_back(chunk_future.get());
+    }
+  });
+  double chunk_sum_ms = 0.0;
+  double chunk_max_ms = 0.0;
+  for (const auto& chunk_result : chunk_results) {
+    chunk_sum_ms += chunk_result.compute_ms;
+    chunk_max_ms = std::max(chunk_max_ms, chunk_result.compute_ms);
+  }
+  summary.reference_stage_ms[kReferenceChunkSumStage] = chunk_sum_ms;
+  summary.reference_stage_ms[kReferenceChunkMaxStage] = chunk_max_ms;
+
+  const size_t frame_size = static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols);
+  std::vector<float> merged_coherence_sum(frame_size, 0.0f);
+  std::vector<float> merged_power_sum(frame_size, 0.0f);
+  std::vector<float> merged_weight(frame_size, 0.0f);
+  std::vector<uint8_t> merged_support(frame_size, 0);
+  std::vector<float> merged_coherence(frame_size, 0.0f);
+  std::vector<float> merged_power(frame_size, 0.0f);
+  std::vector<float> combined_score(frame_size, 0.0f);
+  std::vector<uint8_t> overlap_mask(frame_size, 0);
+  std::vector<uint8_t> raw_merged_mask;
+  std::vector<uint8_t> valid_score_mask;
+  std::vector<float> merged_score;
+  summary.reference_stage_ms[kReferenceMergeStage] = time_reference_stage_ms([&] {
+    for (const auto& chunk : chunk_results) {
     const int chunk_rows = chunk.chunk.row_stop - chunk.chunk.row_start;
     std::vector<float> chunk_weights(static_cast<size_t>(chunk_rows), 1.0f);
     if (chunk_rows > 2) {
@@ -2064,13 +2160,9 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
         merged_support[merged_index] = merged_support[merged_index] || chunk.support_px[chunk_index];
       }
     }
-  }
+    }
 
-  std::vector<float> merged_coherence(power_db.size(), 0.0f);
-  std::vector<float> merged_power(power_db.size(), 0.0f);
-  std::vector<float> combined_score(power_db.size(), 0.0f);
-  std::vector<uint8_t> overlap_mask(power_db.size(), 0);
-  for (size_t index = 0; index < power_db.size(); ++index) {
+    for (size_t index = 0; index < frame_size; ++index) {
     if (merged_weight[index] > 0.0f) {
       merged_coherence[index] = merged_coherence_sum[index] / merged_weight[index];
       merged_power[index] = merged_power_sum[index] / merged_weight[index];
@@ -2078,43 +2170,46 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
     }
     combined_score[index] = static_cast<float>(coherence_weight) * merged_coherence[index] +
                             static_cast<float>(power_weight) * merged_power[index];
-  }
-  auto valid_score_mask = valid_row_mask_to_full_mask(valid_row_mask, src_cols);
-  for (size_t index = 0; index < valid_score_mask.size(); ++index) {
+    }
+    valid_score_mask = valid_row_mask_to_full_mask(valid_row_mask, src_cols);
+    for (size_t index = 0; index < valid_score_mask.size(); ++index) {
     valid_score_mask[index] = (valid_score_mask[index] && overlap_mask[index]) ? 1 : 0;
-  }
-  auto merged_score = normalize_map01_masked(combined_score, valid_score_mask, 5.0f, 95.0f);
-  std::vector<float> threshold_values;
-  threshold_values.reserve(merged_score.size());
-  for (size_t index = 0; index < merged_score.size(); ++index) {
+    }
+    merged_score = normalize_map01_masked(combined_score, valid_score_mask, 5.0f, 95.0f);
+    std::vector<float> threshold_values;
+    threshold_values.reserve(merged_score.size());
+    for (size_t index = 0; index < merged_score.size(); ++index) {
     if (valid_score_mask[index] && merged_support[index]) {
       threshold_values.push_back(merged_score[index]);
     }
-  }
-  summary.merged_threshold = threshold_values.empty() ? 1.0f :
+    }
+    summary.merged_threshold = threshold_values.empty() ? 1.0f :
                              robust_high_quantile_threshold(threshold_values, static_cast<float>(coherence_power_q));
 
-  std::vector<uint8_t> raw_merged_mask(merged_score.size(), 0);
-  for (size_t index = 0; index < merged_score.size(); ++index) {
+    raw_merged_mask.assign(merged_score.size(), 0);
+    for (size_t index = 0; index < merged_score.size(); ++index) {
     raw_merged_mask[index] = (valid_score_mask[index] && merged_support[index] && merged_score[index] >= summary.merged_threshold) ? 1 : 0;
-  }
-  raw_merged_mask = smooth_binary_label_map(raw_merged_mask, src_rows, src_cols, 1, min_component_size);
-
-  std::vector<float> seed_values;
-  seed_values.reserve(merged_score.size());
-  for (size_t index = 0; index < merged_score.size(); ++index) {
-    if (valid_score_mask[index] && merged_support[index]) {
-      seed_values.push_back(merged_score[index]);
     }
-  }
-  summary.seed_threshold = seed_values.empty() ? 1.0f :
-                           robust_high_quantile_threshold(seed_values, static_cast<float>(grouping_seed_score_q));
-  std::vector<uint8_t> seed_mask(merged_score.size(), 0);
-  for (size_t index = 0; index < merged_score.size(); ++index) {
-    const bool seed = raw_merged_mask[index] || (merged_support[index] && merged_score[index] >= summary.seed_threshold);
-    seed_mask[index] = seed ? 1 : 0;
-  }
-  const auto merged_grouping = merge_projected_subsection_boxes(src_rows,
+    raw_merged_mask = smooth_binary_label_map(raw_merged_mask, src_rows, src_cols, 1, min_component_size);
+
+    std::vector<float> seed_values;
+    seed_values.reserve(merged_score.size());
+    for (size_t index = 0; index < merged_score.size(); ++index) {
+      if (valid_score_mask[index] && merged_support[index]) {
+        seed_values.push_back(merged_score[index]);
+      }
+    }
+    summary.seed_threshold = seed_values.empty() ? 1.0f :
+                             robust_high_quantile_threshold(seed_values, static_cast<float>(grouping_seed_score_q));
+  });
+
+  summary.reference_stage_ms[kReferenceGroupingStage] = time_reference_stage_ms([&] {
+    std::vector<uint8_t> seed_mask(merged_score.size(), 0);
+    for (size_t index = 0; index < merged_score.size(); ++index) {
+      const bool seed = raw_merged_mask[index] || (merged_support[index] && merged_score[index] >= summary.seed_threshold);
+      seed_mask[index] = seed ? 1 : 0;
+    }
+    const auto merged_grouping = merge_projected_subsection_boxes(src_rows,
                                                                 src_cols,
                                                                 chunk_results,
                                                                 merged_score,
@@ -2127,13 +2222,14 @@ PipelineSummary run_reference_pipeline(const std::vector<float>& power_db,
                                                                 grouping_min_time_span_px,
                                                                 static_cast<float>(grouping_min_density),
                                                                 static_cast<float>(grouping_time_continuity_ratio));
-  summary.grouped_box_count = static_cast<int>(merged_grouping.boxes.size());
+    summary.grouped_box_count = static_cast<int>(merged_grouping.boxes.size());
 
-  const auto final_mask_u8 = boxes_to_mask(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
-  summary.final_mask.assign(final_mask_u8.size(), 0.0f);
-  for (size_t index = 0; index < final_mask_u8.size(); ++index) {
-    summary.final_mask[index] = final_mask_u8[index] ? 1.0f : 0.0f;
-  }
+    const auto final_mask_u8 = boxes_to_mask(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
+    summary.final_mask.assign(final_mask_u8.size(), 0.0f);
+    for (size_t index = 0; index < final_mask_u8.size(); ++index) {
+      summary.final_mask[index] = final_mask_u8[index] ? 1.0f : 0.0f;
+    }
+  });
   return summary;
 }
 
@@ -2181,7 +2277,7 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
   }
 
   std::vector<float> boost_db;
-  result.corrected_sxx_db = apply_frontend_correction(result.power_db,
+  result.corrected_sxx_db = apply_frontend_correction(result.power_db.data(),
                                                       src_rows,
                                                       src_cols,
                                                       valid_row_mask,
@@ -2191,7 +2287,7 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
                                                       static_cast<float>(config.frontend_max_boost_db),
                                                       boost_db);
 
-  const auto summary = run_reference_pipeline(result.power_db,
+  const auto summary = run_reference_pipeline(result.power_db.data(),
                                               src_rows,
                                               src_cols,
                                               ignore_bins_per_side,
@@ -2258,7 +2354,7 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(emit_stride_, "emit_stride", "Emit stride", "Emit one output every N input frames per channel.", 1);
   spec.param(channel_filter_, "channel_filter", "Channel filter", "If non-negative, only process frames for this channel number.", -1);
   spec.param(log_detections_, "log_detections", "Log detections", "If true, logs detector execution details.", false);
-  spec.param(backend_mode_, "backend_mode", "Backend mode", "Detector backend mode: auto, fast_gpu, or reference.", std::string("auto"));
+  spec.param(backend_mode_, "backend_mode", "Backend mode", "Detector backend mode: auto, fast_low_fidelity_mode, or reference.", std::string("auto"));
   spec.param(enable_mask_save_, "enable_mask_save", "Enable mask save", "Enable writing detector masks to disk for debug runs.", false);
   spec.param(enable_tensor_snapshot_save_, "enable_tensor_snapshot_save", "Enable tensor snapshot save", "Enable writing frozen detector input snapshots for offline parity runs.", false);
   spec.param(save_every_n_frames_, "save_every_n_frames", "Save stride", "Save one detector mask every N frames per channel.", 1);
@@ -2581,15 +2677,18 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
   const auto backend_mode = backend_mode_.get();
   const bool backend_is_reference = backend_mode == "reference";
-  const bool backend_is_fast = backend_mode == "fast_gpu";
+  const bool backend_is_low_fidelity = backend_mode == "fast_low_fidelity_mode";
+  const bool backend_is_legacy_fast = backend_mode == "fast_gpu";
   const bool backend_is_auto = backend_mode == "auto";
-  if (!backend_is_reference && !backend_is_fast && !backend_is_auto) {
+  if (backend_is_legacy_fast) {
+    HOLOSCAN_LOG_WARN("coherent backend_mode='fast_gpu' is deprecated; use 'fast_low_fidelity_mode' instead.");
+  } else if (!backend_is_reference && !backend_is_low_fidelity && !backend_is_auto) {
     HOLOSCAN_LOG_WARN("Unsupported coherent backend_mode='{}'. Falling back to auto.", backend_mode);
   }
   const bool save_requested = enable_mask_save_.get();
   const bool require_reference_dimensions = src_rows != configured_analysis_rows || src_cols != configured_analysis_cols;
   const bool use_reference_backend = backend_is_reference ||
-                                     (!backend_is_fast && (save_requested || require_reference_dimensions));
+                                     (!(backend_is_low_fidelity || backend_is_legacy_fast) && (save_requested || require_reference_dimensions));
   const int output_rows = use_reference_backend ? src_rows : configured_analysis_rows;
   const int output_cols = use_reference_backend ? src_cols : configured_analysis_cols;
   const bool should_save_mask = save_requested &&
@@ -2775,8 +2874,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
   PipelineSummary pipeline_summary;
   FastGpuMetadataSummary fast_summary;
-  std::string coherent_backend_name = use_reference_backend ? "coherent_power_reference_v1" : "coherent_power_fast_gpu_v1";
-  std::string coherent_variant_name = use_reference_backend ? "frontend_chunked_grouped_box_mask_v1" : "frontend_local_fast_mask_v1";
+  std::string coherent_backend_name = use_reference_backend ? "coherent_power_reference_v1" : "coherent_power_fast_low_fidelity_v1";
+  std::string coherent_variant_name = use_reference_backend ? "frontend_chunked_grouped_box_mask_v1" : "frontend_local_fast_low_fidelity_mask_v1";
   time_step_ms(kPipelineStage, [&] {
     if (use_reference_backend) {
       auto copy_result = cudaMemcpyAsync(buffers.power_db_host,
@@ -2791,9 +2890,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       if (sync_result != cudaSuccess) {
         throw std::runtime_error(std::string("power_db synchronization failed: ") + cudaGetErrorString(sync_result));
       }
-      std::vector<float> host_power_db(buffers.power_db_host,
-                                       buffers.power_db_host + static_cast<size_t>(total_bins));
-      pipeline_summary = run_reference_pipeline(host_power_db,
+      pipeline_summary = run_reference_pipeline(buffers.power_db_host,
                                                 src_rows,
                                                 src_cols,
                                                 ignore_bins_per_side,
@@ -3122,6 +3219,12 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     stats.total_ms[stage_index] += stage_ms[stage_index];
     stats.max_ms[stage_index] = std::max(stats.max_ms[stage_index], stage_ms[stage_index]);
   }
+  if (use_reference_backend) {
+    for (size_t stage_index = 0; stage_index < kReferenceTimingStageCount; ++stage_index) {
+      stats.reference_total_ms[stage_index] += pipeline_summary.reference_stage_ms[stage_index];
+      stats.reference_max_ms[stage_index] = std::max(stats.reference_max_ms[stage_index], pipeline_summary.reference_stage_ms[stage_index]);
+    }
+  }
 
   const int summary_every = std::max(1, timing_summary_every_n_.get());
   const int summary_window = std::max(1, timing_summary_window_.get());
@@ -3139,6 +3242,13 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     const double mean_ms = stats.total_ms[stage_index] * inv_frames;
     oss << ' ' << kTimingStageNames[stage_index] << "_mean=" << mean_ms
         << ' ' << kTimingStageNames[stage_index] << "_max=" << stats.max_ms[stage_index];
+  }
+  if (use_reference_backend) {
+    for (size_t stage_index = 0; stage_index < kReferenceTimingStageCount; ++stage_index) {
+      const double mean_ms = stats.reference_total_ms[stage_index] * inv_frames;
+      oss << ' ' << kReferenceTimingStageNames[stage_index] << "_mean=" << mean_ms
+          << ' ' << kReferenceTimingStageNames[stage_index] << "_max=" << stats.reference_max_ms[stage_index];
+    }
   }
   HOLOSCAN_LOG_INFO("{}", oss.str());
   stats = ChannelTimingStats {};

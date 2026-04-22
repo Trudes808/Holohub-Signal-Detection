@@ -74,6 +74,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   HOLOSCAN_OPERATOR_FORWARD_ARGS(CoherentPowerSignalDetector)
 
   static constexpr size_t kTimingStageCount = 6;
+    static constexpr size_t kReferenceTimingStageCount = 6;
 
   CoherentPowerSignalDetector() = default;
   ~CoherentPowerSignalDetector() override;
@@ -111,6 +112,8 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
     uint64_t window_frames = 0;
     std::array<double, kTimingStageCount> total_ms {};
     std::array<double, kTimingStageCount> max_ms {};
+    std::array<double, kReferenceTimingStageCount> reference_total_ms {};
+    std::array<double, kReferenceTimingStageCount> reference_max_ms {};
   };
 
   holoscan::Parameter<int> num_channels_;

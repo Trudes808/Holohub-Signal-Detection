@@ -333,6 +333,7 @@ endforeach()
   set(USRP_WIDEBAND_CONFIG_FILES
     old_configs/config.yaml
     old_configs/config_coherent_power_debug_capture.yaml
+    config_coherent_power_live_timing_reference.yaml
     config_coherent_power_performance.yaml
     old_configs/config_coherent_power_realtime_guarded.yaml
     config_coherent_power_validation.yaml

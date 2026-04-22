@@ -292,6 +292,13 @@ def try_load_bool_npy(path: str | Path) -> tuple[np.ndarray | None, str | None]:
         return None, str(exc)
 
 
+def try_load_float32_npy(path: str | Path) -> tuple[np.ndarray | None, str | None]:
+    try:
+        return load_float32_npy(path), None
+    except RuntimeError as exc:
+        return None, str(exc)
+
+
 def normalize01_masked(array: np.ndarray, mask: np.ndarray) -> np.ndarray:
     array = np.asarray(array, dtype=np.float32)
     active = np.asarray(mask, dtype=bool) & np.isfinite(array)
@@ -893,6 +900,11 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
     chunk_dino_score_raw_path = output_path / "chunk_debug" / "chunk_dino_score_raw.npy"
     chunk_dino_score_raw = load_float32_npy(chunk_dino_score_raw_path) if chunk_dino_score_raw_path.exists() else chunk_dino_score.copy()
     chunk_combined_score = load_float32_npy(output_path / "chunk_debug" / "chunk_combined_score.npy")
+    chunk_grouped_seed_score_path = output_path / "chunk_debug" / "chunk_grouped_seed_score.npy"
+    chunk_grouped_seed_persistence_path = output_path / "chunk_debug" / "chunk_grouped_seed_persistence.npy"
+    chunk_grouped_seed_contrast_path = output_path / "chunk_debug" / "chunk_grouped_seed_contrast.npy"
+    chunk_grouped_selected_support_path = output_path / "chunk_debug" / "chunk_grouped_selected_support.npy"
+    chunk_grouped_cluster_quality_path = output_path / "chunk_debug" / "chunk_grouped_cluster_quality.npy"
     runtime_input_gray_path = output_path / "chunk_debug" / "chunk_runtime_input_gray.npy"
     chunk_grouped_mask = load_bool_npy(output_path / "chunk_debug" / "chunk_grouped_mask.npy")
     chunk_grouped_combined_score = np.where(chunk_grouped_mask, chunk_combined_score, 0.0).astype(np.float32)
@@ -934,6 +946,36 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
     if not patch_features_path.exists() or not has_patch_feature_grouping:
         artifact_warnings.append(
             "chunk_debug/chunk_patch_features.npy is missing or inconsistent, so the saved C++ grouped DINO surface is not a verified patch-feature grouping result."
+        )
+    chunk_grouped_seed_score, chunk_grouped_seed_score_error = try_load_float32_npy(chunk_grouped_seed_score_path)
+    if chunk_grouped_seed_score_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_seed_score.npy is unavailable or incomplete, so the grouped seed-prior panel will be skipped. "
+            + chunk_grouped_seed_score_error
+        )
+    chunk_grouped_seed_persistence, chunk_grouped_seed_persistence_error = try_load_float32_npy(chunk_grouped_seed_persistence_path)
+    if chunk_grouped_seed_persistence_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_seed_persistence.npy is unavailable or incomplete, so the grouped seed-persistence panel will be skipped. "
+            + chunk_grouped_seed_persistence_error
+        )
+    chunk_grouped_seed_contrast, chunk_grouped_seed_contrast_error = try_load_float32_npy(chunk_grouped_seed_contrast_path)
+    if chunk_grouped_seed_contrast_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_seed_contrast.npy is unavailable or incomplete, so the grouped seed-contrast panel will be skipped. "
+            + chunk_grouped_seed_contrast_error
+        )
+    chunk_grouped_selected_support, chunk_grouped_selected_support_error = try_load_float32_npy(chunk_grouped_selected_support_path)
+    if chunk_grouped_selected_support_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_selected_support.npy is unavailable or incomplete, so the grouped selected-support panel will be skipped. "
+            + chunk_grouped_selected_support_error
+        )
+    chunk_grouped_cluster_quality, chunk_grouped_cluster_quality_error = try_load_float32_npy(chunk_grouped_cluster_quality_path)
+    if chunk_grouped_cluster_quality_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_cluster_quality.npy is unavailable or incomplete, so the grouped cluster-quality panel will be skipped. "
+            + chunk_grouped_cluster_quality_error
         )
     if artifact_contract and artifact_contract not in {"chunk_no_extra_sideband_crop_v2", "chunk_fixed_detector_grid_v1"}:
         artifact_warnings.append(
@@ -978,6 +1020,11 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
             "grouped_dino_score": chunk_grouped_dino_score,
             "grouped_combined_score": chunk_grouped_combined_score,
             "grouped_raw_dino_score": chunk_grouped_raw_dino_score,
+            "grouped_seed_score": chunk_grouped_seed_score,
+            "grouped_seed_persistence": chunk_grouped_seed_persistence,
+            "grouped_seed_contrast": chunk_grouped_seed_contrast,
+            "grouped_selected_support": chunk_grouped_selected_support,
+            "grouped_cluster_quality": chunk_grouped_cluster_quality,
             "coherence_gate": load_float32_npy(output_path / "chunk_debug" / "chunk_coherence_gate.npy"),
             "hybrid_contrib": load_float32_npy(output_path / "chunk_debug" / "chunk_hybrid_contrib.npy"),
             "combined_score": chunk_combined_score,
@@ -990,6 +1037,11 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
             "mapped_row_stop": mapped_row_stop,
             "output_shape": (output_rows, output_cols),
             "artifact_contract": artifact_contract,
+            "grouped_seed_prior_enabled": bool(debug_summary.get("grouped_seed_prior_enabled", True)),
+            "grouped_component_seed_weight": float(debug_summary.get("grouped_component_seed_weight", 0.05) or 0.0),
+            "grouped_score_seed_weight": float(debug_summary.get("grouped_score_seed_weight", 0.10) or 0.0),
+            "hybrid_dino_source_recorded": "hybrid_dino_source_mode" in debug_summary,
+            "hybrid_dino_source_mode": str(debug_summary.get("hybrid_dino_source_mode", "grouped_dino_score") or "grouped_dino_score"),
         },
         "artifact_warnings": artifact_warnings,
     }
@@ -1592,6 +1644,57 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
     }
 
     python_grouped_combined = np.where(python_mapped["grouped_mask"], python_mapped["combined_score"], 0.0).astype(np.float32)
+    grouped_seed_score = cpp_chunk.get("grouped_seed_score")
+    grouped_seed_persistence = cpp_chunk.get("grouped_seed_persistence")
+    grouped_seed_contrast = cpp_chunk.get("grouped_seed_contrast")
+    grouped_selected_support = cpp_chunk.get("grouped_selected_support")
+    grouped_cluster_quality = cpp_chunk.get("grouped_cluster_quality")
+    grouped_seed_prior_enabled = bool(cpp_chunk.get("grouped_seed_prior_enabled", True))
+    grouped_component_seed_weight = float(cpp_chunk.get("grouped_component_seed_weight", 0.05) or 0.0)
+    grouped_score_seed_weight = float(cpp_chunk.get("grouped_score_seed_weight", 0.10) or 0.0)
+    seed_disabled_suffix = " [DISABLED IN GROUPED SCORE]" if not grouped_seed_prior_enabled else ""
+    grouped_seed_weighted = None if grouped_seed_score is None else (grouped_score_seed_weight * np.asarray(grouped_seed_score, dtype=np.float32))
+    grouped_selected_support_weighted = None if grouped_selected_support is None else (0.70 * np.asarray(grouped_selected_support, dtype=np.float32))
+    grouped_cluster_quality_weighted = None if grouped_cluster_quality is None else (0.20 * np.asarray(grouped_cluster_quality, dtype=np.float32))
+    grouped_formula_reconstruction = None
+    grouped_formula_residual = None
+    if (
+        grouped_seed_weighted is not None
+        and grouped_selected_support_weighted is not None
+        and grouped_cluster_quality_weighted is not None
+    ):
+        grouped_formula_reconstruction = (
+            grouped_seed_weighted + grouped_selected_support_weighted + grouped_cluster_quality_weighted
+        ).astype(np.float32)
+        grouped_formula_residual = (
+            np.asarray(cpp_chunk["dino_score_grouped"], dtype=np.float32) - grouped_formula_reconstruction
+        ).astype(np.float32)
+    inverted_raw_dino_energy = 1.0 - np.clip(np.asarray(cpp_chunk["dino_score_raw"], dtype=np.float32), 0.0, 1.0)
+    hybrid_dino_source_mode = str(cpp_chunk.get("hybrid_dino_source_mode", "grouped_dino_score") or "grouped_dino_score")
+    cpp_support = build_retry_frequency_support_mask(
+        np.asarray(cpp_chunk["hybrid_contrib"], dtype=np.float32),
+        np.asarray(cpp_chunk["valid_mask"], dtype=bool),
+    )
+    cpp_support_gate = (0.35 + 0.65 * np.asarray(cpp_support["residual_veto_gate"], dtype=np.float32)).astype(np.float32)
+    cpp_seed_threshold_mask = np.logical_and.reduce(
+        (
+            np.asarray(cpp_support["keep_freq"], dtype=np.float32) >= float(cpp_support["seed_freq_threshold"]),
+            np.asarray(cpp_support["keep_res"], dtype=np.float32) >= float(cpp_support["seed_res_threshold"]),
+            np.asarray(cpp_chunk["valid_mask"], dtype=bool),
+        )
+    )
+    cpp_seed_freq_pass = np.logical_and(
+        np.asarray(cpp_support["keep_freq"], dtype=np.float32) >= float(cpp_support["seed_freq_threshold"]),
+        np.asarray(cpp_chunk["valid_mask"], dtype=bool),
+    )
+    cpp_seed_res_pass = np.logical_and(
+        np.asarray(cpp_support["keep_res"], dtype=np.float32) >= float(cpp_support["seed_res_threshold"]),
+        np.asarray(cpp_chunk["valid_mask"], dtype=bool),
+    )
+    cpp_combined_pass = np.logical_and(
+        np.asarray(cpp_support["combined_score"], dtype=np.float32) >= float(cpp_support["combined_threshold"]) * 0.85,
+        np.asarray(cpp_chunk["valid_mask"], dtype=bool),
+    )
     grouped_note_rows = [
         {
             "comparison": "grouped_score_surface",
@@ -1608,8 +1711,81 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
             if python_mapped.get("dino_score_runtime_raw_feature") is not None
             else "raw feature-energy proxy built from Python features",
             "note": "This row now compares the raw feature-energy proxy on the runtime-cropped DINO slice contract when that runtime crop can be reconstructed in Python. It is still not the full grouped/postprocessed Python DINO path.",
+        },
+        {
+            "comparison": "grouped_score_formula",
+            "cpp_surface": f"0.70 * selected_support + 0.20 * cluster_quality + {grouped_score_seed_weight:.2f} * seed_norm",
+            "python_surface": "No Python analogue plotted yet for these three intermediate terms",
+            "note": "The grouped DINO score is dominated by selected_support_map. cluster_quality_map is a component-ranking prior, and seed_norm is the spectrogram-derived patch prior."
+            + (" The seed prior is temporarily disabled in the C++ grouped-score path for this run." if not grouped_seed_prior_enabled else ""),
+        },
+        {
+            "comparison": "grouped_seed_formula",
+            "cpp_surface": "seed_norm = patch_mean(0.65 * persistence_n + 0.35 * contrast_n)",
+            "python_surface": "No Python analogue plotted yet for these two seed ingredients",
+            "note": "The seed prior is not the corrected spectrogram itself. It is a patch-averaged mix of time persistence and local contrast measured on the corrected spectrogram."
+            + (" The map is still exported here, but it is currently disabled as a score input." if not grouped_seed_prior_enabled else ""),
+        },
+        {
+            "comparison": "hybrid_dino_source_probe",
+            "cpp_surface": hybrid_dino_source_mode,
+            "python_surface": "Notebook-only reference panel shows 1 - raw feature-energy score",
+            "note": "If the validator was run with hybrid_use_inverted_raw_dino_energy: true, the hybrid contribution used the inverted raw feature-energy surface instead of the grouped DINO score.",
+        },
+        {
+            "comparison": "seed_support_breakdown",
+            "cpp_surface": "Notebook-reconstructed support components from chunk_hybrid_contrib.npy and chunk_valid_mask.npy",
+            "python_surface": "Same support decomposition exists in the Python helper, but these debug panels focus on the current C++ support path first",
+            "note": "Seed support is now broken into the normalized base map, smoothed envelope, curvature and residual penalties, keep gates, threshold passes, and the post-component-filter seed mask so you can see which stage is suppressing regions.",
         }
     ]
+
+    grouped_score_component_panels = []
+    grouped_component_specs = [
+        (f"Seed persistence (norm){seed_disabled_suffix}", grouped_seed_persistence, "viridis"),
+        (f"Seed contrast (norm){seed_disabled_suffix}", grouped_seed_contrast, "magma"),
+        (f"Grouped seed prior{seed_disabled_suffix}", grouped_seed_score, "viridis"),
+        (f"{grouped_score_seed_weight:.2f} x seed prior{seed_disabled_suffix}", grouped_seed_weighted, "viridis"),
+        ("Grouped selected support", grouped_selected_support, "plasma"),
+        ("0.70 x selected support", grouped_selected_support_weighted, "plasma"),
+        ("Grouped cluster quality", grouped_cluster_quality, "cividis"),
+        ("0.20 x cluster quality", grouped_cluster_quality_weighted, "cividis"),
+        (f"Formula reconstruction (component seed {grouped_component_seed_weight:.2f}, score seed {grouped_score_seed_weight:.2f})", grouped_formula_reconstruction, "plasma"),
+        (f"Grouped minus formula{seed_disabled_suffix}", grouped_formula_residual, "coolwarm"),
+        (f"{grouped_surface_label}{seed_disabled_suffix}", cpp_chunk["dino_score_grouped"], "plasma"),
+        ("Inverted raw DINO energy", inverted_raw_dino_energy, "inferno"),
+        (f"Hybrid contrib ({hybrid_dino_source_mode})", cpp_chunk["hybrid_contrib"], "cividis"),
+        ("Support base norm", cpp_support["base_norm"], "viridis"),
+        ("Support envelope", cpp_support["envelope_map"], "viridis"),
+        ("Support residual penalty", cpp_support["residual_penalty"], "magma"),
+        ("Support freq curvature penalty", cpp_support["freq_curvature_penalty"], "magma"),
+        ("Support keep_freq", cpp_support["keep_freq"], "plasma"),
+        ("Support keep_res", cpp_support["keep_res"], "plasma"),
+        ("Support residual veto gate", cpp_support["residual_veto_gate"], "cividis"),
+        ("Support combined gate (0.35 + 0.65 * veto)", cpp_support_gate, "cividis"),
+        ("Support combined score", cpp_support["combined_score"], "plasma"),
+        (f"Seed freq pass >= {float(cpp_support['seed_freq_threshold']):.3f}", cpp_seed_freq_pass, "gray"),
+        (f"Seed res pass >= {float(cpp_support['seed_res_threshold']):.3f}", cpp_seed_res_pass, "gray"),
+        ("Seed threshold mask (pre size filter)", cpp_seed_threshold_mask, "gray"),
+        ("Seed mask (post size filter)", cpp_support["seed_mask"], "gray"),
+        (f"Combined pass >= {float(cpp_support['combined_threshold']) * 0.85:.3f}", cpp_combined_pass, "gray"),
+    ]
+    for title, image, cmap in grouped_component_specs:
+        if image is None:
+            continue
+        panel = {
+            "title": title,
+            "image": np.asarray(image, dtype=np.float32),
+            "cmap": cmap,
+        }
+        if title == "Grouped minus formula":
+            limit = float(np.max(np.abs(panel["image"]))) if panel["image"].size else 1.0
+            limit = max(limit, 1.0e-6)
+            panel["vmin"] = -limit
+            panel["vmax"] = limit
+        grouped_score_component_panels.append(
+            panel
+        )
 
     stage_pairs = [
         ("Corrected", cpp_chunk["corrected_resized"], python_mapped["corrected"], "magma"),
@@ -1639,6 +1815,7 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
         "dino_input_panel": dino_input_panel,
         "raw_dino_panel": raw_dino_panel,
         "grouped_note_rows": grouped_note_rows,
+        "grouped_score_component_panels": grouped_score_component_panels,
         "stage_pairs": stage_pairs,
         "cpp_boxes": cpp_boxes,
         "python_boxes_scaled": python_boxes_scaled,

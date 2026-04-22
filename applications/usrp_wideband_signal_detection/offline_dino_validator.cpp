@@ -1881,6 +1881,7 @@ std::vector<DinoComponentSummaryRow> component_summary_table(const std::vector<f
                                                              const std::vector<float>& seed_norm,
                                                              int patch_rows,
                                                              int patch_cols) {
+  constexpr float kGroupedComponentSeedWeight = 0.0f;
   const int patch_count = patch_rows * patch_cols;
   int max_label = 0;
   for (int label : component_map) {
@@ -1958,7 +1959,7 @@ std::vector<DinoComponentSummaryRow> component_summary_table(const std::vector<f
                                  0.20f * support_peak_n[index] +
                                  0.20f * internal_n[index] +
                                  0.15f * boundary_gap_n[index] +
-                                 0.05f * seed_n[index] +
+                                 kGroupedComponentSeedWeight * seed_n[index] +
                                  0.05f * smooth_n[index] -
                                  0.10f * size_penalty;
   }
@@ -2034,6 +2035,7 @@ GroupedDinoPatchResult grouped_dino_from_patch_features(const std::vector<float>
                                                         const ValidatorConfig& config,
                                                         bool verbose,
                                                         const char* debug_label) {
+  constexpr float kGroupedScoreSeedWeight = 0.0f;
   GroupedDinoPatchResult result;
   const int patch_count = patch_rows * patch_cols;
   result.mask_patch.assign(static_cast<size_t>(patch_count), 0);
@@ -2122,7 +2124,7 @@ GroupedDinoPatchResult grouped_dino_from_patch_features(const std::vector<float>
   for (size_t index = 0; index < result.score_patch.size(); ++index) {
     result.score_patch[index] = 0.70f * result.selected_support_map[index] +
                                 0.20f * result.cluster_quality_map[index] +
-                                0.10f * seed_norm[index];
+                                kGroupedScoreSeedWeight * seed_norm[index];
   }
   result.score_patch = normalize01_quantile(result.score_patch, 5.0, 95.0);
 
@@ -3961,6 +3963,9 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"patch_rows\": " << debug_chunk.patch_rows << ",\n";
       debug_summary_out << "  \"patch_cols\": " << debug_chunk.patch_cols << ",\n";
       debug_summary_out << "  \"feature_dim\": " << debug_chunk.feature_dim << ",\n";
+      debug_summary_out << "  \"grouped_seed_prior_enabled\": false,\n";
+      debug_summary_out << "  \"grouped_component_seed_weight\": 0.0,\n";
+      debug_summary_out << "  \"grouped_score_seed_weight\": 0.0,\n";
       debug_summary_out << "  \"artifact_contract\": \"chunk_no_extra_sideband_crop_v2\",\n";
       debug_summary_out << "  \"corrected_resized_npy\": \"" << json_escape(debug_corrected_path.string()) << "\",\n";
       debug_summary_out << "  \"runtime_input_gray_npy\": \"" << json_escape(debug_runtime_input_gray_path.string()) << "\",\n";

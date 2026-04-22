@@ -20,6 +20,8 @@ The full notebook-derived coherent-power algorithm is planned to replace the pla
 
 Validation and production parity rule: configs used to validate or represent production mask generation must keep the same `backend_mode`. `emit_stride` may vary for throughput tuning, but the mask-generation backend must not.
 
+The old low-fidelity runtime shortcut previously named `fast_gpu` has been renamed to `fast_low_fidelity_mode` to make its tradeoff explicit.
+
 ## Configuration
 
 ```yaml
