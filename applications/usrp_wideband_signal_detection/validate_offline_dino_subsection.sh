@@ -92,7 +92,6 @@ if [[ "${skip_validator}" != "1" ]]; then
     "--config" "${config_path}"
     "--output-dir" "${output_dir}"
     "--debug-chunk-index" "${debug_chunk_index}"
-    "--subsection-only-validation"
   )
   if [[ "${verbose}" == "1" ]]; then
     validator_cmd+=("--verbose")

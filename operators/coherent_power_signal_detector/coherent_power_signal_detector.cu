@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -82,6 +83,21 @@ constexpr std::array<const char*, holoscan::ops::CoherentPowerSignalDetector::kC
     "chunk_grouping_ms",
   };
 
+enum PowerSupportTimingStageIndex : size_t {
+  kPowerSupportFloorEstimateStage = 0,
+  kPowerSupportLocalRelativeStage,
+  kPowerSupportAbsoluteAssistStage,
+  kPowerSupportBlendStage,
+};
+
+constexpr std::array<const char*, holoscan::ops::CoherentPowerSignalDetector::kPowerSupportTimingStageCount>
+  kPowerSupportTimingStageNames = {
+    "power_support_floor_estimate_ms",
+    "power_support_local_relative_ms",
+    "power_support_absolute_assist_ms",
+    "power_support_blend_ms",
+  };
+
 constexpr int kQuantileHistogramBins = 1024;
 
 struct ChunkPlanEntry {
@@ -125,6 +141,7 @@ struct DetectionChunkResult {
   float score_threshold = 0.0f;
   double compute_ms = 0.0;
   std::array<double, holoscan::ops::CoherentPowerSignalDetector::kChunkTimingStageCount> stage_ms {};
+  std::array<double, holoscan::ops::CoherentPowerSignalDetector::kPowerSupportTimingStageCount> power_support_stage_ms {};
 };
 
 class ChunkWorkerPool {
@@ -308,6 +325,8 @@ struct PipelineSummary {
   std::array<double, holoscan::ops::CoherentPowerSignalDetector::kReferenceTimingStageCount> reference_stage_ms {};
   std::array<double, holoscan::ops::CoherentPowerSignalDetector::kChunkTimingStageCount> chunk_stage_sum_ms {};
   std::array<double, holoscan::ops::CoherentPowerSignalDetector::kChunkTimingStageCount> chunk_stage_peak_ms {};
+  std::array<double, holoscan::ops::CoherentPowerSignalDetector::kPowerSupportTimingStageCount> power_support_stage_sum_ms {};
+  std::array<double, holoscan::ops::CoherentPowerSignalDetector::kPowerSupportTimingStageCount> power_support_stage_peak_ms {};
 };
 
 struct FastGpuMetadataSummary {
@@ -885,6 +904,72 @@ __global__ void coherent_power_weighted_sum_kernel(const float* lhs,
     return;
   }
   output[idx] = lhs_weight * lhs[idx] + rhs_weight * rhs[idx];
+}
+
+__global__ void coherent_power_gate_kernel(const float* coherence,
+                                           int total,
+                                           float gate_start,
+                                           float gate_inv_span,
+                                           float* gate) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  gate[idx] = fminf(fmaxf((coherence[idx] - gate_start) * gate_inv_span, 0.0f), 1.0f);
+}
+
+__global__ void coherent_power_bridged_joint_score_kernel(const float* power,
+                                                          const float* coherence_gate,
+                                                          int total,
+                                                          float bridge_bias,
+                                                          float joint_weight,
+                                                          float* combined) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  const float power_value = fmaxf(power[idx], 0.0f);
+  const float gate_value = fmaxf(coherence_gate[idx], 0.0f);
+  const float bridged_power = power_value * (bridge_bias + (1.0f - bridge_bias) * gate_value);
+  const float joint_power = sqrtf(power_value * gate_value);
+  combined[idx] = joint_weight * joint_power + (1.0f - joint_weight) * bridged_power;
+}
+
+__global__ void coherent_power_absolute_assist_kernel(const float* corrected_db,
+                                                      int rows,
+                                                      int cols,
+                                                      const uint8_t* valid_row_mask,
+                                                      float floor_db,
+                                                      float start_db,
+                                                      float inv_span_db,
+                                                      float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const int row = idx / cols;
+  if (!valid_row_mask[row]) {
+    output[idx] = 0.0f;
+    return;
+  }
+
+  const float excess_db = corrected_db[idx] - floor_db;
+  output[idx] = fminf(fmaxf((excess_db - start_db) * inv_span_db, 0.0f), 1.0f);
+}
+
+__global__ void coherent_power_blend_kernel(const float* absolute_power,
+                                            const float* local_power,
+                                            int total,
+                                            float local_blend,
+                                            float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+
+  output[idx] = fminf(fmaxf((1.0f - local_blend) * absolute_power[idx] + local_blend * local_power[idx], 0.0f), 1.0f);
 }
 
 __global__ void coherent_power_apply_valid_row_mask_kernel(float* values,
@@ -1845,15 +1930,253 @@ void normalize_map01_device_inplace(float* values_device,
   }
 }
 
+bool local_relative_power_support_map_cuda(const float* sxx_db_local,
+                                           int rows,
+                                           int cols,
+                                           const std::vector<uint8_t>& valid_row_mask,
+                                           float floor_q,
+                                           int freq_window,
+                                           int time_window,
+                                           std::vector<float>& support);
+
+float estimate_noise_floor_db(const float* corrected_chunk,
+                              int rows,
+                              int cols,
+                              const std::vector<uint8_t>& valid_row_mask,
+                              float time_q,
+                              float global_q) {
+  std::vector<float> row_floor_db(static_cast<size_t>(rows), 0.0f);
+  std::vector<float> row_values(static_cast<size_t>(cols), 0.0f);
+  for (int row = 0; row < rows; ++row) {
+    const float* row_ptr = corrected_chunk + static_cast<size_t>(row) * static_cast<size_t>(cols);
+    std::copy(row_ptr, row_ptr + cols, row_values.begin());
+    row_floor_db[static_cast<size_t>(row)] = percentile_from_values(row_values, time_q);
+  }
+
+  std::vector<float> valid_row_floor_db;
+  valid_row_floor_db.reserve(static_cast<size_t>(rows));
+  for (int row = 0; row < rows; ++row) {
+    if (valid_row_mask[static_cast<size_t>(row)]) {
+      valid_row_floor_db.push_back(row_floor_db[static_cast<size_t>(row)]);
+    }
+  }
+  if (valid_row_floor_db.empty()) {
+    valid_row_floor_db = row_floor_db;
+  }
+
+  return percentile_from_values(std::move(valid_row_floor_db), global_q);
+}
+
+bool build_power_assist_map_device(const float* corrected_chunk,
+                                   int rows,
+                                   int cols,
+                                   const std::vector<uint8_t>& valid_row_mask,
+                                   std::string power_assist_mode,
+                                   float power_floor_time_q,
+                                   float power_floor_global_q,
+                                   float power_excess_start_db,
+                                   float power_excess_full_db,
+                                   float power_local_blend,
+                                   std::array<double, holoscan::ops::CoherentPowerSignalDetector::kPowerSupportTimingStageCount>* detail_ms_out,
+                                   const float** power_px_device_out) {
+  const int total = rows * cols;
+  if (total <= 0 || corrected_chunk == nullptr || power_px_device_out == nullptr) {
+    return false;
+  }
+
+  if (detail_ms_out != nullptr) {
+    *detail_ms_out = {};
+  }
+
+  auto& scratch = chunk_cuda_scratch();
+  if (!scratch.ensure_capacity(static_cast<size_t>(total))) {
+    return false;
+  }
+
+  float* corrected_db_device = scratch.buffers[0];
+  float* linear_power_device = scratch.buffers[1];
+  float* relative_db_device = scratch.buffers[2];
+  float* local_baseline_device = scratch.buffers[3];
+  float* local_support_device = scratch.buffers[4];
+  float* local_power_device = scratch.buffers[5];
+  float* absolute_power_device = scratch.buffers[6];
+  float* blended_power_device = scratch.buffers[7];
+  uint8_t* valid_row_mask_device = scratch.mask_buffers[0];
+  unsigned int* histogram_device = scratch.histogram_buffers[0];
+  cudaStream_t stream = scratch.stream;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  auto time_stage_ms = [](auto&& fn) {
+    const auto stage_start = std::chrono::steady_clock::now();
+    fn();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
+  };
+
+  if (cudaMemcpyAsync(corrected_db_device,
+                      corrected_chunk,
+                      static_cast<size_t>(total) * sizeof(float),
+                      cudaMemcpyHostToDevice,
+                      stream) != cudaSuccess ||
+      cudaMemcpyAsync(valid_row_mask_device,
+                      valid_row_mask.data(),
+                      static_cast<size_t>(rows) * sizeof(uint8_t),
+                      cudaMemcpyHostToDevice,
+                      stream) != cudaSuccess) {
+    return false;
+  }
+
+  coherent_power_db_to_linear_kernel<<<blocks, threads, 0, stream>>>(corrected_db_device, total, linear_power_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  float valid_min_db = std::numeric_limits<float>::max();
+  float valid_max_db = std::numeric_limits<float>::lowest();
+  for (int row = 0; row < rows; ++row) {
+    if (!valid_row_mask[static_cast<size_t>(row)]) {
+      continue;
+    }
+    const float* row_ptr = corrected_chunk + static_cast<size_t>(row) * static_cast<size_t>(cols);
+    for (int col = 0; col < cols; ++col) {
+      valid_min_db = std::min(valid_min_db, row_ptr[col]);
+      valid_max_db = std::max(valid_max_db, row_ptr[col]);
+    }
+  }
+  if (!(valid_min_db < valid_max_db)) {
+    valid_min_db = -120.0f;
+    valid_max_db = 120.0f;
+  }
+
+  float local_floor_linear = 1e-20f;
+  const double floor_estimate_ms = time_stage_ms([&] {
+    const float local_floor_db = device_quantile_from_histogram_valid_rows(corrected_db_device,
+                                                                           rows,
+                                                                           cols,
+                                                                           valid_row_mask_device,
+                                                                           0.30f,
+                                                                           valid_min_db,
+                                                                           valid_max_db,
+                                                                           histogram_device,
+                                                                           stream);
+    local_floor_linear = std::max(std::pow(10.0f, local_floor_db / 10.0f), 1e-20f);
+  });
+  if (detail_ms_out != nullptr) {
+    (*detail_ms_out)[kPowerSupportFloorEstimateStage] = floor_estimate_ms;
+  }
+
+  const double local_relative_ms = time_stage_ms([&] {
+    coherent_power_relative_db_kernel<<<blocks, threads, 0, stream>>>(linear_power_device,
+                                                                       local_floor_linear,
+                                                                       total,
+                                                                       relative_db_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk local-relative db kernel failed");
+    }
+    coherent_power_box_mean_cols_kernel<<<blocks, threads, 0, stream>>>(relative_db_device,
+                                                                         rows,
+                                                                         cols,
+                                                                         std::max(5, 33 | 1) / 2,
+                                                                         local_baseline_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk local-relative col-mean kernel failed");
+    }
+    coherent_power_box_mean_rows_kernel<<<blocks, threads, 0, stream>>>(local_baseline_device,
+                                                                         rows,
+                                                                         cols,
+                                                                         std::max(3, 9 | 1) / 2,
+                                                                         local_support_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk local-relative row-mean kernel failed");
+    }
+    coherent_power_subtract_clamp_kernel<<<blocks, threads, 0, stream>>>(relative_db_device,
+                                                                          local_support_device,
+                                                                          total,
+                                                                          local_power_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk local-relative subtract kernel failed");
+    }
+    coherent_power_apply_valid_row_mask_kernel<<<blocks, threads, 0, stream>>>(local_power_device,
+                                                                                 rows,
+                                                                                 cols,
+                                                                                 valid_row_mask_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk local-relative valid-mask kernel failed");
+    }
+    normalize_map01_device_inplace(local_power_device, total, 5.0f, 95.0f, 0.0f, 25.0f, histogram_device, stream);
+  });
+  if (detail_ms_out != nullptr) {
+    (*detail_ms_out)[kPowerSupportLocalRelativeStage] = local_relative_ms;
+  }
+
+  std::transform(power_assist_mode.begin(),
+                 power_assist_mode.end(),
+                 power_assist_mode.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  if (power_assist_mode == "local_relative") {
+    *power_px_device_out = local_power_device;
+    return true;
+  }
+
+  const float floor_db = estimate_noise_floor_db(corrected_chunk,
+                                                 rows,
+                                                 cols,
+                                                 valid_row_mask,
+                                                 power_floor_time_q,
+                                                 power_floor_global_q);
+  const float start_db = power_excess_start_db;
+  const float full_db = std::max(power_excess_full_db, start_db + 1e-3f);
+  const double absolute_assist_ms = time_stage_ms([&] {
+    coherent_power_absolute_assist_kernel<<<blocks, threads, 0, stream>>>(corrected_db_device,
+                                                                           rows,
+                                                                           cols,
+                                                                           valid_row_mask_device,
+                                                                           floor_db,
+                                                                           start_db,
+                                                                           1.0f / (full_db - start_db),
+                                                                           absolute_power_device);
+    if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess) {
+      throw std::runtime_error("chunk absolute-assist kernel failed");
+    }
+  });
+  if (detail_ms_out != nullptr) {
+    (*detail_ms_out)[kPowerSupportAbsoluteAssistStage] = absolute_assist_ms;
+  }
+
+  if (power_assist_mode == "absolute_floor") {
+    *power_px_device_out = absolute_power_device;
+    return true;
+  }
+
+  const float local_blend = clamp_float(power_local_blend, 0.0f, 1.0f);
+  const double blend_ms = time_stage_ms([&] {
+    coherent_power_blend_kernel<<<blocks, threads, 0, stream>>>(absolute_power_device,
+                                                                 local_power_device,
+                                                                 total,
+                                                                 local_blend,
+                                                                 blended_power_device);
+    if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess) {
+      throw std::runtime_error("chunk power-assist blend kernel failed");
+    }
+  });
+  if (detail_ms_out != nullptr) {
+    (*detail_ms_out)[kPowerSupportBlendStage] = blend_ms;
+  }
+
+  *power_px_device_out = blended_power_device;
+  return true;
+}
+
 void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
-                               const std::vector<float>& power_support,
+                               const float* power_px_device,
                                int rows,
                                int cols,
                                const std::vector<uint8_t>& valid_row_mask,
-                               double coherence_weight,
-                               double power_weight,
                                double support_q,
                                double final_q,
+                               double coherence_gate_start,
+                               double coherence_gate_full,
+                               double coherence_bridge_bias,
+                               double coherence_power_joint_weight,
                                int min_component_size,
                                std::vector<float>& combined_raw_px,
                                std::vector<float>& score_px,
@@ -1862,7 +2185,7 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
                                float& support_threshold,
                                float& score_threshold) {
   const int total = rows * cols;
-  if (total <= 0 || static_cast<int>(coherence_px.size()) != total || static_cast<int>(power_support.size()) != total) {
+  if (total <= 0 || static_cast<int>(coherence_px.size()) != total || power_px_device == nullptr) {
     throw std::invalid_argument("run_chunk_score_masks_gpu received mismatched chunk buffers");
   }
 
@@ -1872,7 +2195,6 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
   }
 
   float* d0 = scratch.buffers[0];
-  float* d1 = scratch.buffers[1];
   float* d2 = scratch.buffers[2];
   float* d3 = scratch.buffers[3];
   float* d4 = scratch.buffers[4];
@@ -1888,11 +2210,6 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
                       static_cast<size_t>(total) * sizeof(float),
                       cudaMemcpyHostToDevice,
                       stream) != cudaSuccess ||
-      cudaMemcpyAsync(d1,
-                      power_support.data(),
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyHostToDevice,
-                      stream) != cudaSuccess ||
       cudaMemcpyAsync(valid_row_mask_device,
                       valid_row_mask.data(),
                       static_cast<size_t>(rows) * sizeof(uint8_t),
@@ -1902,16 +2219,25 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
   }
 
   normalize_map01_device_inplace(d0, total, 5.0f, 99.0f, 0.0f, 1.0f, histogram_device, stream);
-  normalize_map01_device_inplace(d1, total, 5.0f, 95.0f, 0.0f, 25.0f, histogram_device, stream);
-
-  coherent_power_weighted_sum_kernel<<<blocks, threads, 0, stream>>>(d0,
-                                                                      d1,
-                                                                      total,
-                                                                      static_cast<float>(coherence_weight),
-                                                                      static_cast<float>(power_weight),
-                                                                      d2);
+  const float gate_start = static_cast<float>(coherence_gate_start);
+  const float gate_full = std::max(static_cast<float>(coherence_gate_full), gate_start + 1e-3f);
+  coherent_power_gate_kernel<<<blocks, threads, 0, stream>>>(d0,
+                                                              total,
+                                                              gate_start,
+                                                              1.0f / (gate_full - gate_start),
+                                                              d4);
   if (cudaGetLastError() != cudaSuccess) {
-    throw std::runtime_error("chunk combined score kernel failed");
+    throw std::runtime_error("chunk coherence-gate kernel failed");
+  }
+
+  coherent_power_bridged_joint_score_kernel<<<blocks, threads, 0, stream>>>(power_px_device,
+                                                                             d4,
+                                                                             total,
+                                                                             clamp_float(static_cast<float>(coherence_bridge_bias), 0.0f, 1.0f),
+                                                                             clamp_float(static_cast<float>(coherence_power_joint_weight), 0.0f, 1.0f),
+                                                                             d2);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("chunk bridged/joint score kernel failed");
   }
   if (cudaMemcpyAsync(d3,
                       d2,
@@ -3200,6 +3526,16 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
                                                  const std::vector<uint8_t>& chunk_valid_row_mask,
                                                  double coherence_weight,
                                                  double power_weight,
+                                                 const std::string& power_assist_mode,
+                                                 double power_floor_time_q,
+                                                 double power_floor_global_q,
+                                                 double power_excess_start_db,
+                                                 double power_excess_full_db,
+                                                 double power_local_blend,
+                                                 double coherence_gate_start,
+                                                 double coherence_gate_full,
+                                                 double coherence_bridge_bias,
+                                                 double coherence_power_joint_weight,
                                                  double support_q,
                                                  double final_q,
                                                  int min_component_size,
@@ -3232,29 +3568,37 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
   });
   (void)energy_px;
   (void)gate_px;
-  std::vector<float> power_support;
+  (void)coherence_weight;
+  (void)power_weight;
+  const float* power_px_device = nullptr;
   result.stage_ms[kChunkPowerSupportStage] = time_chunk_stage_ms([&] {
-    if (!local_relative_power_support_map_cuda(corrected_chunk,
-                                               rows,
-                                               cols,
-                                               chunk_valid_row_mask,
-                                               30.0f,
-                                               9,
-                                               33,
-                                               power_support)) {
-      throw std::runtime_error("CUDA power-support path failed in detect_chunk_coherent_power");
+    if (!build_power_assist_map_device(corrected_chunk,
+                                       rows,
+                                       cols,
+                                       chunk_valid_row_mask,
+                                       power_assist_mode,
+                                       static_cast<float>(power_floor_time_q),
+                                       static_cast<float>(power_floor_global_q),
+                                       static_cast<float>(power_excess_start_db),
+                                       static_cast<float>(power_excess_full_db),
+                                       static_cast<float>(power_local_blend),
+                                       &result.power_support_stage_ms,
+                                       &power_px_device)) {
+      throw std::runtime_error("GPU power-assist path failed in detect_chunk_coherent_power");
     }
   });
   result.stage_ms[kChunkScoreThresholdStage] = time_chunk_stage_ms([&] {
     run_chunk_score_masks_gpu(coherence_px,
-                              power_support,
+                              power_px_device,
                               rows,
                               cols,
                               chunk_valid_row_mask,
-                              coherence_weight,
-                              power_weight,
                               support_q,
                               final_q,
+                              coherence_gate_start,
+                              coherence_gate_full,
+                              coherence_bridge_bias,
+                              coherence_power_joint_weight,
                               min_component_size,
                               result.combined_raw_px,
                               result.score_px,
@@ -3311,6 +3655,16 @@ PipelineSummary run_reference_pipeline(const float* power_db,
                                        double frontend_max_boost_db,
                                        double coherence_weight,
                                        double power_weight,
+                                       const std::string& power_assist_mode,
+                                       double power_floor_time_q,
+                                       double power_floor_global_q,
+                                       double power_excess_start_db,
+                                       double power_excess_full_db,
+                                       double power_local_blend,
+                                       double coherence_gate_start,
+                                       double coherence_gate_full,
+                                       double coherence_bridge_bias,
+                                       double coherence_power_joint_weight,
                                        double coherence_power_support_q,
                                        double coherence_power_q,
                                        int min_component_size,
@@ -3391,6 +3745,16 @@ PipelineSummary run_reference_pipeline(const float* power_db,
                                                     chunk_valid_row_mask,
                                                     coherence_weight,
                                                     power_weight,
+                                                    power_assist_mode,
+                                                    power_floor_time_q,
+                                                    power_floor_global_q,
+                                                    power_excess_start_db,
+                                                    power_excess_full_db,
+                                                    power_local_blend,
+                                                    coherence_gate_start,
+                                                    coherence_gate_full,
+                                                    coherence_bridge_bias,
+                                                    coherence_power_joint_weight,
                                                     coherence_power_support_q,
                                                     coherence_power_q,
                                                     min_component_size,
@@ -3415,6 +3779,12 @@ PipelineSummary run_reference_pipeline(const float* power_db,
          ++stage_index) {
       summary.chunk_stage_sum_ms[stage_index] += chunk_result.stage_ms[stage_index];
       summary.chunk_stage_peak_ms[stage_index] = std::max(summary.chunk_stage_peak_ms[stage_index], chunk_result.stage_ms[stage_index]);
+    }
+    for (size_t stage_index = 0;
+         stage_index < holoscan::ops::CoherentPowerSignalDetector::kPowerSupportTimingStageCount;
+         ++stage_index) {
+      summary.power_support_stage_sum_ms[stage_index] += chunk_result.power_support_stage_ms[stage_index];
+      summary.power_support_stage_peak_ms[stage_index] = std::max(summary.power_support_stage_peak_ms[stage_index], chunk_result.power_support_stage_ms[stage_index]);
     }
   }
   summary.reference_stage_ms[kReferenceChunkSumStage] = chunk_sum_ms;
@@ -3462,6 +3832,16 @@ PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
                                                  double ignore_sideband_percent,
                                                  double coherence_weight,
                                                  double power_weight,
+                                                 const std::string& power_assist_mode,
+                                                 double power_floor_time_q,
+                                                 double power_floor_global_q,
+                                                 double power_excess_start_db,
+                                                 double power_excess_full_db,
+                                                 double power_local_blend,
+                                                 double coherence_gate_start,
+                                                 double coherence_gate_full,
+                                                 double coherence_bridge_bias,
+                                                 double coherence_power_joint_weight,
                                                  double coherence_power_support_q,
                                                  double coherence_power_q,
                                                  int min_component_size,
@@ -3528,6 +3908,16 @@ PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
                                                     chunk_valid_row_mask,
                                                     coherence_weight,
                                                     power_weight,
+                                                    power_assist_mode,
+                                                    power_floor_time_q,
+                                                    power_floor_global_q,
+                                                    power_excess_start_db,
+                                                    power_excess_full_db,
+                                                    power_local_blend,
+                                                    coherence_gate_start,
+                                                    coherence_gate_full,
+                                                    coherence_bridge_bias,
+                                                    coherence_power_joint_weight,
                                                     coherence_power_support_q,
                                                     coherence_power_q,
                                                     min_component_size,
@@ -3552,6 +3942,12 @@ PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
          ++stage_index) {
       summary.chunk_stage_sum_ms[stage_index] += chunk_result.stage_ms[stage_index];
       summary.chunk_stage_peak_ms[stage_index] = std::max(summary.chunk_stage_peak_ms[stage_index], chunk_result.stage_ms[stage_index]);
+    }
+    for (size_t stage_index = 0;
+         stage_index < holoscan::ops::CoherentPowerSignalDetector::kPowerSupportTimingStageCount;
+         ++stage_index) {
+      summary.power_support_stage_sum_ms[stage_index] += chunk_result.power_support_stage_ms[stage_index];
+      summary.power_support_stage_peak_ms[stage_index] = std::max(summary.power_support_stage_peak_ms[stage_index], chunk_result.power_support_stage_ms[stage_index]);
     }
   }
   summary.reference_stage_ms[kReferenceChunkSumStage] = chunk_sum_ms;
@@ -3657,6 +4053,16 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
                                               config.frontend_max_boost_db,
                                               config.coherence_weight,
                                               config.power_weight,
+                                              config.power_assist_mode,
+                                              config.power_floor_time_q,
+                                              config.power_floor_global_q,
+                                              config.power_excess_start_db,
+                                              config.power_excess_full_db,
+                                              config.power_local_blend,
+                                              config.coherence_gate_start,
+                                              config.coherence_gate_full,
+                                              config.coherence_bridge_bias,
+                                              config.coherence_power_joint_weight,
                                               config.coherence_power_support_q,
                                               config.coherence_power_q,
                                               config.min_component_size,
@@ -3729,6 +4135,16 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(frontend_max_boost_db_, "frontend_max_boost_db", "Frontend max boost", "Notebook-derived frontend max boost in dB.", 12.0);
   spec.param(coherence_weight_, "coherence_weight", "Coherence weight", "Notebook-derived coherence score weight.", 0.55);
   spec.param(power_weight_, "power_weight", "Power weight", "Notebook-derived power score weight.", 0.45);
+  spec.param(power_assist_mode_, "power_assist_mode", "Power assist mode", "Notebook-derived power assist mode: hybrid, local_relative, or absolute_floor.", std::string("hybrid"));
+  spec.param(power_floor_time_q_, "power_floor_time_q", "Power floor time quantile", "Notebook-derived per-row noise floor quantile.", 25.0);
+  spec.param(power_floor_global_q_, "power_floor_global_q", "Power floor global quantile", "Notebook-derived global noise floor quantile.", 30.0);
+  spec.param(power_excess_start_db_, "power_excess_start_db", "Power excess start dB", "Notebook-derived absolute power assist ramp start above floor.", 3.0);
+  spec.param(power_excess_full_db_, "power_excess_full_db", "Power excess full dB", "Notebook-derived absolute power assist full-scale point above floor.", 15.0);
+  spec.param(power_local_blend_, "power_local_blend", "Power local blend", "Notebook-derived hybrid blend between absolute and local-relative power assist.", 0.25);
+  spec.param(coherence_gate_start_, "coherence_gate_start", "Coherence gate start", "Notebook-derived coherence gate ramp start.", 0.15);
+  spec.param(coherence_gate_full_, "coherence_gate_full", "Coherence gate full", "Notebook-derived coherence gate full-scale point.", 0.45);
+  spec.param(coherence_bridge_bias_, "coherence_bridge_bias", "Coherence bridge bias", "Notebook-derived power bridging bias under partial coherence.", 0.05);
+  spec.param(coherence_power_joint_weight_, "coherence_power_joint_weight", "Coherence-power joint weight", "Notebook-derived weight between joint and bridged power scores.", 0.70);
   spec.param(coherence_power_support_q_, "coherence_power_support_q", "Support quantile", "Notebook-derived support quantile.", 0.82);
   spec.param(coherence_power_q_, "coherence_power_q", "Final quantile", "Notebook-derived final score quantile.", 0.92);
   spec.param(min_component_size_, "min_component_size", "Minimum component size", "Notebook-derived minimum component size.", 6);
@@ -4303,6 +4719,16 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                                           ignore_sideband_percent_.get(),
                                                           coherence_weight_.get(),
                                                           power_weight_.get(),
+                                                          power_assist_mode_.get(),
+                                                          power_floor_time_q_.get(),
+                                                          power_floor_global_q_.get(),
+                                                          power_excess_start_db_.get(),
+                                                          power_excess_full_db_.get(),
+                                                          power_local_blend_.get(),
+                                                          coherence_gate_start_.get(),
+                                                          coherence_gate_full_.get(),
+                                                          coherence_bridge_bias_.get(),
+                                                          coherence_power_joint_weight_.get(),
                                                           coherence_power_support_q_.get(),
                                                           coherence_power_q_.get(),
                                                           min_component_size_.get(),
@@ -4564,6 +4990,16 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     meta_out << "    \"frontend_max_boost_db\": " << frontend_max_boost_db_.get() << ",\n";
     meta_out << "    \"coherence_weight\": " << coherence_weight_.get() << ",\n";
     meta_out << "    \"power_weight\": " << power_weight_.get() << ",\n";
+    meta_out << "    \"power_assist_mode\": \"" << power_assist_mode_.get() << "\",\n";
+    meta_out << "    \"power_floor_time_q\": " << power_floor_time_q_.get() << ",\n";
+    meta_out << "    \"power_floor_global_q\": " << power_floor_global_q_.get() << ",\n";
+    meta_out << "    \"power_excess_start_db\": " << power_excess_start_db_.get() << ",\n";
+    meta_out << "    \"power_excess_full_db\": " << power_excess_full_db_.get() << ",\n";
+    meta_out << "    \"power_local_blend\": " << power_local_blend_.get() << ",\n";
+    meta_out << "    \"coherence_gate_start\": " << coherence_gate_start_.get() << ",\n";
+    meta_out << "    \"coherence_gate_full\": " << coherence_gate_full_.get() << ",\n";
+    meta_out << "    \"coherence_bridge_bias\": " << coherence_bridge_bias_.get() << ",\n";
+    meta_out << "    \"coherence_power_joint_weight\": " << coherence_power_joint_weight_.get() << ",\n";
     meta_out << "    \"coherence_power_support_q\": " << coherence_power_support_q_.get() << ",\n";
     meta_out << "    \"coherence_power_q\": " << coherence_power_q_.get() << ",\n";
     meta_out << "    \"min_component_size\": " << min_component_size_.get() << ",\n";
@@ -4628,6 +5064,10 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       stats.chunk_stage_peak_total_ms[stage_index] += pipeline_summary.chunk_stage_peak_ms[stage_index];
       stats.chunk_stage_peak_max_ms[stage_index] = std::max(stats.chunk_stage_peak_max_ms[stage_index], pipeline_summary.chunk_stage_peak_ms[stage_index]);
     }
+    for (size_t stage_index = 0; stage_index < kPowerSupportTimingStageCount; ++stage_index) {
+      stats.power_support_stage_total_ms[stage_index] += pipeline_summary.power_support_stage_sum_ms[stage_index];
+      stats.power_support_stage_max_ms[stage_index] = std::max(stats.power_support_stage_max_ms[stage_index], pipeline_summary.power_support_stage_peak_ms[stage_index]);
+    }
   }
 
   const int summary_every = std::max(1, timing_summary_every_n_.get());
@@ -4660,6 +5100,11 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
           << ' ' << kChunkTimingStageNames[stage_index] << "_sum_max=" << stats.chunk_stage_sum_max_ms[stage_index]
           << ' ' << kChunkTimingStageNames[stage_index] << "_peak_mean=" << peak_mean_ms
           << ' ' << kChunkTimingStageNames[stage_index] << "_peak_max=" << stats.chunk_stage_peak_max_ms[stage_index];
+    }
+    for (size_t stage_index = 0; stage_index < kPowerSupportTimingStageCount; ++stage_index) {
+      const double mean_ms = stats.power_support_stage_total_ms[stage_index] * inv_frames;
+      oss << ' ' << kPowerSupportTimingStageNames[stage_index] << "_sum_mean=" << mean_ms
+          << ' ' << kPowerSupportTimingStageNames[stage_index] << "_peak_max=" << stats.power_support_stage_max_ms[stage_index];
     }
   }
   HOLOSCAN_LOG_INFO("{}", oss.str());

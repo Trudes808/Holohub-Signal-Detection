@@ -52,7 +52,6 @@ live_mask_path=${LIVE_MASK_PATH:-}
 output_dir=${OUTPUT_DIR:-}
 debug_chunk_index=${DEBUG_CHUNK_INDEX:-13}
 verbose=0
-subsection_only_validation=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -80,12 +79,8 @@ while [[ $# -gt 0 ]]; do
       verbose=1
       shift
       ;;
-    --subsection-only-validation)
-      subsection_only_validation=1
-      shift
-      ;;
     *)
-      echo "Usage: $0 --tensor-npy PATH [--config PATH] [--live-mask PATH] [--output-dir DIR] [--debug-chunk-index N] [--verbose] [--subsection-only-validation]" >&2
+      echo "Usage: $0 --tensor-npy PATH [--config PATH] [--live-mask PATH] [--output-dir DIR] [--debug-chunk-index N] [--verbose]" >&2
       exit 1
       ;;
   esac
@@ -136,7 +131,6 @@ exec sudo docker exec -it \
   -e LIVE_MASK_PATH="${container_live_mask_path}" \
   -e DEBUG_CHUNK_INDEX="${debug_chunk_index}" \
   -e VERBOSE_FLAG="${verbose}" \
-  -e SUBSECTION_ONLY_VALIDATION_FLAG="${subsection_only_validation}" \
   "${CONTAINER_NAME}" \
   bash -lc '
 set -euo pipefail
@@ -246,9 +240,6 @@ if [[ -n "${LIVE_MASK_PATH}" ]]; then
 fi
 if [[ "${VERBOSE_FLAG}" == "1" ]]; then
   cmd+=("--verbose")
-fi
-if [[ "${SUBSECTION_ONLY_VALIDATION_FLAG}" == "1" ]]; then
-  cmd+=("--subsection-only-validation")
 fi
 
 echo "Resetting validator output directory: ${OUTPUT_DIR}" >&2

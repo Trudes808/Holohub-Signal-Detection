@@ -158,7 +158,6 @@ dinov3_signal_detector:
   hybrid_torch_dtype: "fp16"
   legacy_fast_gray_preprocess: false
   runtime_batch_size: 8
-  fast_boxes_only_non_debug_grouping: true
   strict_model_forward: true
   imagenet_mean: [0.485, 0.456, 0.406]
   imagenet_std: [0.229, 0.224, 0.225]

@@ -31,6 +31,16 @@ struct CoherentPowerReferenceConfig {
   double frontend_max_boost_db = 12.0;
   double coherence_weight = 0.55;
   double power_weight = 0.45;
+  std::string power_assist_mode = "hybrid";
+  double power_floor_time_q = 25.0;
+  double power_floor_global_q = 30.0;
+  double power_excess_start_db = 3.0;
+  double power_excess_full_db = 15.0;
+  double power_local_blend = 0.25;
+  double coherence_gate_start = 0.15;
+  double coherence_gate_full = 0.45;
+  double coherence_bridge_bias = 0.05;
+  double coherence_power_joint_weight = 0.70;
   double coherence_power_support_q = 0.82;
   double coherence_power_q = 0.92;
   int min_component_size = 6;
@@ -76,6 +86,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   static constexpr size_t kTimingStageCount = 6;
   static constexpr size_t kReferenceTimingStageCount = 6;
   static constexpr size_t kChunkTimingStageCount = 5;
+  static constexpr size_t kPowerSupportTimingStageCount = 4;
 
   CoherentPowerSignalDetector() = default;
   ~CoherentPowerSignalDetector() override;
@@ -119,6 +130,8 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
     std::array<double, kChunkTimingStageCount> chunk_stage_sum_max_ms {};
     std::array<double, kChunkTimingStageCount> chunk_stage_peak_total_ms {};
     std::array<double, kChunkTimingStageCount> chunk_stage_peak_max_ms {};
+    std::array<double, kPowerSupportTimingStageCount> power_support_stage_total_ms {};
+    std::array<double, kPowerSupportTimingStageCount> power_support_stage_max_ms {};
   };
 
   holoscan::Parameter<int> num_channels_;
@@ -148,6 +161,16 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<double> frontend_max_boost_db_;
   holoscan::Parameter<double> coherence_weight_;
   holoscan::Parameter<double> power_weight_;
+  holoscan::Parameter<std::string> power_assist_mode_;
+  holoscan::Parameter<double> power_floor_time_q_;
+  holoscan::Parameter<double> power_floor_global_q_;
+  holoscan::Parameter<double> power_excess_start_db_;
+  holoscan::Parameter<double> power_excess_full_db_;
+  holoscan::Parameter<double> power_local_blend_;
+  holoscan::Parameter<double> coherence_gate_start_;
+  holoscan::Parameter<double> coherence_gate_full_;
+  holoscan::Parameter<double> coherence_bridge_bias_;
+  holoscan::Parameter<double> coherence_power_joint_weight_;
   holoscan::Parameter<double> coherence_power_support_q_;
   holoscan::Parameter<double> coherence_power_q_;
   holoscan::Parameter<int> min_component_size_;

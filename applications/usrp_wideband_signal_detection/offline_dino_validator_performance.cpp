@@ -47,7 +47,6 @@ struct ValidatorOptions {
   std::filesystem::path output_dir;
   int debug_chunk_index = 13;
   bool verbose = false;
-  bool subsection_only_validation = false;
 };
 
 struct ValidatorConfig {
@@ -78,7 +77,6 @@ struct ValidatorConfig {
   double dino_group_score_q = 0.60;
   int min_component_size = 6;
   bool filter_detection_mask = true;
-  bool fast_boxes_only_non_debug_grouping = false;
   int grouping_bridge_freq_px = 33;
   int grouping_bridge_time_px = 5;
   int grouping_min_component_size = 24;
@@ -90,7 +88,6 @@ struct ValidatorConfig {
   double pipeline_gap_floor = 0.10;
   double pipeline_power_rescue_floor = 0.10;
   double pipeline_power_rescue_gain = 2.0;
-  bool hybrid_use_inverted_raw_dino_energy = false;
   std::string inference_backend = "torchscript";
   std::string model_script_path = "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts";
   std::string torchscript_init_mode = "load_cuda_eval";
@@ -379,10 +376,8 @@ struct ChunkGpuWorkspace {
 
 struct ChunkInferenceArtifacts {
   ChunkRetryResult result;
-  std::vector<float> corrected_chunk;
   std::vector<uint8_t> source_chunk_valid_mask;
   std::vector<float> grouped_dino_score_source;
-  std::vector<float> raw_dino_score_source;
   std::vector<float> source_chunk_coherence_gate;
   HybridPostprocessResult precomputed_hybrid_result_source;
   bool has_precomputed_hybrid_result = false;
@@ -737,7 +732,6 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.dino_group_score_q = extract_number<double>(text, "dino_group_score_q").value_or(config.dino_group_score_q);
   config.min_component_size = extract_number<int>(text, "min_component_size").value_or(config.min_component_size);
   config.filter_detection_mask = extract_bool(text, "filter_detection_mask").value_or(config.filter_detection_mask);
-  config.fast_boxes_only_non_debug_grouping = extract_bool(text, "fast_boxes_only_non_debug_grouping").value_or(config.fast_boxes_only_non_debug_grouping);
   config.grouping_bridge_freq_px = extract_number<int>(text, "grouping_bridge_freq_px").value_or(config.grouping_bridge_freq_px);
   config.grouping_bridge_time_px = extract_number<int>(text, "grouping_bridge_time_px").value_or(config.grouping_bridge_time_px);
   config.grouping_min_component_size = extract_number<int>(text, "grouping_min_component_size").value_or(config.grouping_min_component_size);
@@ -749,7 +743,6 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.pipeline_gap_floor = extract_number<double>(text, "pipeline_gap_floor").value_or(config.pipeline_gap_floor);
   config.pipeline_power_rescue_floor = extract_number<double>(text, "pipeline_power_rescue_floor").value_or(config.pipeline_power_rescue_floor);
   config.pipeline_power_rescue_gain = extract_number<double>(text, "pipeline_power_rescue_gain").value_or(config.pipeline_power_rescue_gain);
-  config.hybrid_use_inverted_raw_dino_energy = extract_bool(text, "hybrid_use_inverted_raw_dino_energy").value_or(config.hybrid_use_inverted_raw_dino_energy);
   config.inference_backend = extract_yaml_string(text, "inference_backend").value_or(config.inference_backend);
   config.model_script_path = extract_yaml_string(text, "model_script_path").value_or(config.model_script_path);
   config.torchscript_init_mode = extract_yaml_string(text, "torchscript_init_mode").value_or(config.torchscript_init_mode);
@@ -5423,10 +5416,8 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
   const int runtime_col_offset = 0;
   std::vector<float> raw_aligned_score;
   std::vector<float> raw_dino_score_map;
-  std::vector<float> raw_dino_score_source;
   std::vector<float> deweighted_raw_dino_score_map;
   std::vector<float> deweighted_raw_dino_score_source;
-  const bool need_raw_dino_source = keep_debug_artifacts;
   {
     const size_t estimated_bytes = static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols) * sizeof(float) * 3;
     ScopedStageProfile stage(profiler, "chunk_score_projection", "chunk", result.chunk_index, estimated_bytes, verbose);
@@ -5440,24 +5431,11 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
                                           runtime_result.aligned_cols);
     }
     if (!runtime_result.patch_features.empty() && result.patch_rows > 0 && result.patch_cols > 0 && result.feature_dim > 0) {
-      if (need_raw_dino_source) {
+      if (keep_debug_artifacts) {
         const auto raw_patch_score = raw_feature_energy_score_patch(runtime_result.patch_features,
                                                                     result.patch_rows,
                                                                     result.patch_cols,
                                                                     result.feature_dim);
-        raw_dino_score_source = project_patch_map_to_output(raw_patch_score,
-                                                            result.patch_rows,
-                                                            result.patch_cols,
-                                                            runtime_result.aligned_rows,
-                                                            runtime_result.aligned_cols,
-                                                            result.src_rows,
-                                                            result.src_cols,
-                                                            runtime_row_offset,
-                                                            runtime_col_offset,
-                                                            result.src_rows,
-                                                            result.src_cols,
-                                                            runtime_result.input_resized_to_target);
-        if (keep_debug_artifacts) {
         raw_dino_score_map = project_patch_map_to_output(raw_patch_score,
                                                          result.patch_rows,
                                                          result.patch_cols,
@@ -5470,7 +5448,6 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
                                                          result.dst_rows,
                                                          result.dst_cols,
                                                          runtime_result.input_resized_to_target);
-        }
       }
       const auto deweighted_raw_patch_score = raw_feature_energy_score_patch(runtime_result.patch_features,
                                                                              result.patch_rows,
@@ -5504,29 +5481,17 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
                                                                     runtime_result.input_resized_to_target);
       }
     } else {
-      if (need_raw_dino_source) {
-        raw_dino_score_source = project_aligned_map_to_output(raw_aligned_score,
-                                                              runtime_result.aligned_rows,
-                                                              runtime_result.aligned_cols,
-                                                              result.src_rows,
-                                                              result.src_cols,
-                                                              runtime_row_offset,
-                                                              runtime_col_offset,
-                                                              result.src_rows,
-                                                              result.src_cols,
-                                                              runtime_result.input_resized_to_target);
-        if (keep_debug_artifacts) {
-          raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
-                                                             runtime_result.aligned_rows,
-                                                             runtime_result.aligned_cols,
-                                                             result.src_rows,
-                                                             result.src_cols,
-                                                             runtime_row_offset,
-                                                             runtime_col_offset,
-                                                             result.dst_rows,
-                                                             result.dst_cols,
-                                                             runtime_result.input_resized_to_target);
-        }
+      if (keep_debug_artifacts) {
+        raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
+                                                           runtime_result.aligned_rows,
+                                                           runtime_result.aligned_cols,
+                                                           result.src_rows,
+                                                           result.src_cols,
+                                                           runtime_row_offset,
+                                                           runtime_col_offset,
+                                                           result.dst_rows,
+                                                           result.dst_cols,
+                                                           runtime_result.input_resized_to_target);
       }
       deweighted_raw_dino_score_source = project_aligned_map_to_output(raw_aligned_score,
                                                                        runtime_result.aligned_rows,
@@ -5596,10 +5561,8 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
     result.coherence_gate = coherence_gate;
   }
 
-  artifacts.corrected_chunk = std::move(corrected_chunk);
   artifacts.source_chunk_valid_mask = std::move(source_chunk_valid_mask);
   artifacts.grouped_dino_score_source = std::move(deweighted_raw_dino_score_source);
-  artifacts.raw_dino_score_source = std::move(raw_dino_score_source);
   artifacts.source_chunk_coherence_gate = std::move(source_chunk_coherence_gate);
   return artifacts;
 }
@@ -5736,7 +5699,6 @@ std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::o
   record_timed_stage(profiler, "chunk_model_prep_batch", "run", -1, runtime_result.timing.model_prep_ms);
   record_timed_stage(profiler, "chunk_torch_forward_batch", "run", -1, runtime_result.timing.torch_forward_ms);
   record_timed_stage(profiler, "chunk_dino_score_batch", "run", -1, runtime_result.timing.dino_score_ms);
-  record_timed_stage(profiler, "chunk_score_to_cpu_batch", "run", -1, runtime_result.timing.score_to_cpu_ms);
   if (!runtime_result.success) {
     throw std::runtime_error("batched chunk DINO runtime failed at " + runtime_result.error_stage + ": " + runtime_result.error_message + " (" + runtime_result.error_detail + ")");
   }
@@ -5809,7 +5771,6 @@ std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::o
 
     const int runtime_row_offset = 0;
     const int runtime_col_offset = 0;
-    std::vector<float> grouped_score_patch;
     {
       const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * sizeof(float);
       ScopedStageProfile stage(profiler, "chunk_score_projection", "chunk", result.chunk_index, estimated_bytes, verbose);
@@ -5822,26 +5783,9 @@ std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::o
       if (sample_offset + patch_count * feature_dim > runtime_result.patch_features_batch.size()) {
         throw std::runtime_error("batched grouped score patch feature slice is out of range");
       }
-      const auto corrected_chunk = slice_rows(corrected_db, full_rows, full_cols, chunks[batch_index].row_start, chunks[batch_index].row_stop);
       const std::vector<float> patch_features_sample(
           runtime_result.patch_features_batch.begin() + static_cast<std::ptrdiff_t>(sample_offset),
           runtime_result.patch_features_batch.begin() + static_cast<std::ptrdiff_t>(sample_offset + patch_count * feature_dim));
-      const auto raw_patch_score = raw_feature_energy_score_patch(patch_features_sample,
-                                                                  runtime_result.patch_rows,
-                                                                  runtime_result.patch_cols,
-                                                                  runtime_result.feature_dim);
-      artifacts.raw_dino_score_source = project_patch_map_to_output(raw_patch_score,
-                                                                    runtime_result.patch_rows,
-                                                                    runtime_result.patch_cols,
-                                                                    runtime_result.aligned_rows,
-                                                                    runtime_result.aligned_cols,
-                                                                    result.src_rows,
-                                                                    result.src_cols,
-                                                                    runtime_row_offset,
-                                                                    runtime_col_offset,
-                                                                    result.src_rows,
-                                                                    result.src_cols,
-                                                                    runtime_result.input_resized_to_target);
       const auto deweighted_raw_patch_score = raw_feature_energy_score_patch(patch_features_sample,
                                                                              runtime_result.patch_rows,
                                                                              runtime_result.patch_cols,
@@ -6000,7 +5944,7 @@ ChunkRetryResult finalize_retry_chunk_postprocess(const ValidatorConfig& config,
                                           result.src_cols,
                                           result.dst_rows,
                                           result.dst_cols);
-  if (!artifacts.keep_debug_artifacts && config.fast_boxes_only_non_debug_grouping) {
+  if (!artifacts.keep_debug_artifacts) {
     {
       const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * (sizeof(uint8_t) + sizeof(int)) +
                                      sizeof(DetectionBox) * 8;
@@ -6379,10 +6323,8 @@ ValidatorOptions parse_arguments(int argc, char** argv) {
       options.debug_chunk_index = parse_int_or_throw(argv[++index], "--debug-chunk-index");
     } else if (arg == "--verbose") {
       options.verbose = true;
-    } else if (arg == "--subsection-only-validation") {
-      options.subsection_only_validation = true;
     } else if (arg == "--help") {
-      std::cout << "Usage: " << argv[0] << " --tensor-npy PATH --config FILE [--live-mask PATH] [--output-dir DIR] [--debug-chunk-index N] [--verbose] [--subsection-only-validation]\n";
+      std::cout << "Usage: " << argv[0] << " --tensor-npy PATH --config FILE [--live-mask PATH] [--output-dir DIR] [--debug-chunk-index N] [--verbose]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unrecognized argument: " + arg);
@@ -7643,7 +7585,6 @@ int main(int argc, char** argv) {
       std::cout << "  runtime backend: " << runtime_config.inference_backend << "\n";
       std::cout << "  ignore bins/side: " << ignore_bins_per_side << "\n";
       std::cout << "  chunk count: " << chunk_plan.size() << "\n";
-      std::cout << "  subsection-only validation: " << (options.subsection_only_validation ? "true" : "false") << "\n";
       std::cout << "  legacy fast gray preprocess: " << (config.legacy_fast_gray_preprocess ? "true" : "false") << "\n";
       std::cout << "  projected grouped boxes: " << global_merged.projected_boxes.size() << "\n";
       std::cout << "  merged grouped boxes: " << global_merged.merged_boxes.size() << "\n";
