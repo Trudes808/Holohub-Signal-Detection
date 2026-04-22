@@ -212,9 +212,12 @@ struct GroupedDinoPatchResult {
   std::vector<float> seed_norm_map;
   std::vector<float> seed_persistence_map;
   std::vector<float> seed_contrast_map;
+  std::vector<uint8_t> active_mask_patch;
   std::vector<uint8_t> label_map_patch;
+  std::vector<uint8_t> label_map_pre_smooth_patch;
   std::vector<int> cluster_map;
   std::vector<float> support_map;
+  std::vector<float> support_selected_raw_map;
   std::vector<float> cluster_quality_map;
   std::vector<float> selected_support_map;
   float threshold = 0.0f;
@@ -239,6 +242,11 @@ HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& hybri
                                                  int rows,
                                                  int cols);
 DetectionBox merge_box_cluster(const std::vector<DetectionBox>& cluster);
+std::vector<float> suppress_raw_dino_positional_features(const std::vector<float>& patch_features,
+                                                         int patch_rows,
+                                                         int patch_cols,
+                                                         int feature_dim,
+                                                         float suppression);
 
 struct ChunkRetryResult {
   int chunk_index = 0;
@@ -270,10 +278,17 @@ struct ChunkRetryResult {
   std::vector<float> patch_features;
   std::vector<float> corrected_resized;
   std::vector<float> raw_dino_score_map;
+  std::vector<float> raw_dino_score_deweighted_map;
   std::vector<float> dino_score_map;
   std::vector<float> grouped_seed_score_map;
   std::vector<float> grouped_seed_persistence_map;
   std::vector<float> grouped_seed_contrast_map;
+  std::vector<float> grouped_support_map_exact;
+  std::vector<float> grouped_active_mask_exact;
+  std::vector<float> grouped_cluster_labels_exact;
+  std::vector<float> grouped_selected_mask_pre_smooth_exact;
+  std::vector<float> grouped_selected_mask_exact;
+  std::vector<float> grouped_support_selected_raw_exact;
   std::vector<float> grouped_selected_support_map;
   std::vector<float> grouped_cluster_quality_map;
   std::vector<float> coherence_gate;
@@ -336,7 +351,6 @@ struct ChunkGpuWorkspace {
     if (cudaMalloc(reinterpret_cast<void**>(&power_chunk_device), required_bytes) != cudaSuccess ||
         cudaMalloc(reinterpret_cast<void**>(&corrected_chunk_device), required_bytes) != cudaSuccess) {
       if (power_chunk_device != nullptr) {
-        cudaFree(power_chunk_device);
         power_chunk_device = nullptr;
       }
       if (corrected_chunk_device != nullptr) {
@@ -345,7 +359,6 @@ struct ChunkGpuWorkspace {
       }
       throw std::runtime_error("failed to allocate reusable chunk GPU buffers for offline DINO validator");
     }
-    capacity_elements = required_elements;
   }
 
   void ensure_full_frame_capacity(size_t required_elements) {
@@ -2671,19 +2684,12 @@ void precompute_retry_chunk_hybrid_batch(std::vector<ChunkInferenceArtifacts>& a
       }
       const size_t offset = static_cast<size_t>(sample_index) * sample_elements;
       auto* hybrid_contrib_output = hybrid_contrib_batch.data() + static_cast<std::ptrdiff_t>(offset);
-      const bool use_inverted_raw_dino_energy = config.hybrid_use_inverted_raw_dino_energy &&
-                                                artifacts.raw_dino_score_source.size() == sample_elements;
-      const auto& hybrid_dino_source = use_inverted_raw_dino_energy ? artifacts.raw_dino_score_source : artifacts.grouped_dino_score_source;
+      const auto& hybrid_dino_source = artifacts.grouped_dino_score_source;
       const auto [dino_low, dino_high] = quantile_bounds_from_input(hybrid_dino_source, 5.0, 95.0);
       normalize01_quantile_into(hybrid_dino_source,
                                 dino_low,
                                 dino_high,
                                 hybrid_contrib_output);
-      if (use_inverted_raw_dino_energy) {
-        for (size_t element_index = 0; element_index < sample_elements; ++element_index) {
-          hybrid_contrib_output[element_index] = 1.0f - hybrid_contrib_output[element_index];
-        }
-      }
       const auto [coherence_low, coherence_high] = quantile_bounds_from_input(artifacts.source_chunk_coherence_gate, 5.0, 99.0);
       multiply_normalized_quantile_into(artifacts.source_chunk_coherence_gate,
                                         coherence_low,
@@ -2818,17 +2824,24 @@ std::vector<float> dino_seed_patch_map(const std::vector<float>& spectrogram_db,
 std::vector<float> raw_feature_energy_score_patch(const std::vector<float>& patch_features,
                                                   int patch_rows,
                                                   int patch_cols,
-                                                  int feature_dim) {
+                                                  int feature_dim,
+                                                  float positional_suppression = 0.0f) {
   const int patch_count = patch_rows * patch_cols;
   std::vector<float> raw_patch_score(static_cast<size_t>(patch_count), 0.0f);
   if (patch_count <= 0 || feature_dim <= 0 ||
       patch_features.size() != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
     return raw_patch_score;
   }
+  const auto energy_features = suppress_raw_dino_positional_features(
+      patch_features,
+      patch_rows,
+      patch_cols,
+      feature_dim,
+      positional_suppression);
   for (int patch_index = 0; patch_index < patch_count; ++patch_index) {
     float mean_sq = 0.0f;
     for (int feature_index = 0; feature_index < feature_dim; ++feature_index) {
-      const float value = patch_features[flat_index(feature_dim, patch_index, feature_index)];
+      const float value = energy_features[flat_index(feature_dim, patch_index, feature_index)];
       mean_sq += value * value;
     }
     mean_sq /= static_cast<float>(feature_dim);
@@ -3158,6 +3171,30 @@ std::vector<float> remove_position_correlated_components(const std::vector<float
     }
   }
   return tensor_to_vector_float(scores.matmul(vh));
+}
+constexpr float kHybridRawDinoPositionalDeweight = 0.75f;
+
+std::vector<float> suppress_raw_dino_positional_features(const std::vector<float>& patch_features,
+                                                         int patch_rows,
+                                                         int patch_cols,
+                                                         int feature_dim,
+                                                         float suppression) {
+  const int patch_count = patch_rows * patch_cols;
+  if (suppression <= 0.0f || patch_count <= 0 || feature_dim <= 0 ||
+      patch_features.size() != static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim)) {
+    return patch_features;
+  }
+  const float clamped = clamp_value(suppression, 0.0f, 1.0f);
+  auto suppressed = remove_positional_trend(patch_features, patch_count, feature_dim, patch_rows, patch_cols);
+  suppressed = remove_position_correlated_components(suppressed, patch_count, feature_dim, patch_rows, patch_cols);
+  if (clamped >= 1.0f) {
+    return suppressed;
+  }
+  std::vector<float> blended(patch_features.size(), 0.0f);
+  for (size_t index = 0; index < patch_features.size(); ++index) {
+    blended[index] = (1.0f - clamped) * patch_features[index] + clamped * suppressed[index];
+  }
+  return blended;
 }
 
 std::vector<float> row_normalize_square_matrix(const std::vector<float>& input, int size) {
@@ -3730,6 +3767,7 @@ GroupedDinoPatchResult grouped_dino_from_patch_features(const std::vector<float>
   log_grouped_patch_memory(verbose, "after_support_map", debug_label, patch_rows, patch_cols, reduced_dim);
   const auto components = connected_affinity_components(local_aff, result.support_map, patch_rows, patch_cols);
   result.cluster_map = components.first;
+  result.active_mask_patch = components.second;
   const auto component_rows = component_summary_table(local_aff, result.cluster_map, result.support_map, seed_norm, patch_rows, patch_cols);
   const auto selected_components = select_signal_components(component_rows);
   if (!selected_components.empty()) {
@@ -3743,11 +3781,13 @@ GroupedDinoPatchResult grouped_dino_from_patch_features(const std::vector<float>
       result.cluster_map[index] = result.label_map_patch[index] != 0 ? 1 : 0;
     }
   }
+  result.label_map_pre_smooth_patch = result.label_map_patch;
   result.label_map_patch = smooth_binary_label_map(result.label_map_patch, patch_rows, patch_cols, 2, config.min_component_size);
   std::vector<float> support_selected(result.support_map.size(), 0.0f);
   for (size_t index = 0; index < support_selected.size(); ++index) {
     support_selected[index] = result.support_map[index] * static_cast<float>(result.label_map_patch[index]);
   }
+  result.support_selected_raw_map = support_selected;
   result.selected_support_map = normalize01_quantile(box_mean_2d(support_selected, patch_rows, patch_cols, 1, 1), 5.0, 95.0);
   if (!component_rows.empty()) {
     std::vector<float> component_scores;
@@ -5384,11 +5424,9 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
   std::vector<float> raw_aligned_score;
   std::vector<float> raw_dino_score_map;
   std::vector<float> raw_dino_score_source;
-  std::vector<float> grouped_score_patch;
-  int grouped_score_rows = runtime_result.aligned_rows;
-  int grouped_score_cols = runtime_result.aligned_cols;
-  bool grouped_score_is_patch_grid = false;
-  const bool need_raw_dino_source = keep_debug_artifacts || config.hybrid_use_inverted_raw_dino_energy;
+  std::vector<float> deweighted_raw_dino_score_map;
+  std::vector<float> deweighted_raw_dino_score_source;
+  const bool need_raw_dino_source = keep_debug_artifacts;
   {
     const size_t estimated_bytes = static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols) * sizeof(float) * 3;
     ScopedStageProfile stage(profiler, "chunk_score_projection", "chunk", result.chunk_index, estimated_bytes, verbose);
@@ -5434,180 +5472,103 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
                                                          runtime_result.input_resized_to_target);
         }
       }
-    } else if (need_raw_dino_source) {
-      raw_dino_score_source = project_aligned_map_to_output(raw_aligned_score,
-                                                            runtime_result.aligned_rows,
-                                                            runtime_result.aligned_cols,
-                                                            result.src_rows,
-                                                            result.src_cols,
-                                                            runtime_row_offset,
-                                                            runtime_col_offset,
-                                                            result.src_rows,
-                                                            result.src_cols,
-                                                            runtime_result.input_resized_to_target);
+      const auto deweighted_raw_patch_score = raw_feature_energy_score_patch(runtime_result.patch_features,
+                                                                             result.patch_rows,
+                                                                             result.patch_cols,
+                                                                             result.feature_dim,
+                                                                             kHybridRawDinoPositionalDeweight);
+      deweighted_raw_dino_score_source = project_patch_map_to_output(deweighted_raw_patch_score,
+                                                                     result.patch_rows,
+                                                                     result.patch_cols,
+                                                                     runtime_result.aligned_rows,
+                                                                     runtime_result.aligned_cols,
+                                                                     result.src_rows,
+                                                                     result.src_cols,
+                                                                     runtime_row_offset,
+                                                                     runtime_col_offset,
+                                                                     result.src_rows,
+                                                                     result.src_cols,
+                                                                     runtime_result.input_resized_to_target);
       if (keep_debug_artifacts) {
-        raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
-                                                           runtime_result.aligned_rows,
-                                                           runtime_result.aligned_cols,
-                                                           result.src_rows,
-                                                           result.src_cols,
-                                                           runtime_row_offset,
-                                                           runtime_col_offset,
-                                                           result.dst_rows,
-                                                           result.dst_cols,
-                                                           runtime_result.input_resized_to_target);
+        deweighted_raw_dino_score_map = project_patch_map_to_output(deweighted_raw_patch_score,
+                                                                    result.patch_rows,
+                                                                    result.patch_cols,
+                                                                    runtime_result.aligned_rows,
+                                                                    runtime_result.aligned_cols,
+                                                                    result.src_rows,
+                                                                    result.src_cols,
+                                                                    runtime_row_offset,
+                                                                    runtime_col_offset,
+                                                                    result.dst_rows,
+                                                                    result.dst_cols,
+                                                                    runtime_result.input_resized_to_target);
+      }
+    } else {
+      if (need_raw_dino_source) {
+        raw_dino_score_source = project_aligned_map_to_output(raw_aligned_score,
+                                                              runtime_result.aligned_rows,
+                                                              runtime_result.aligned_cols,
+                                                              result.src_rows,
+                                                              result.src_cols,
+                                                              runtime_row_offset,
+                                                              runtime_col_offset,
+                                                              result.src_rows,
+                                                              result.src_cols,
+                                                              runtime_result.input_resized_to_target);
+        if (keep_debug_artifacts) {
+          raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
+                                                             runtime_result.aligned_rows,
+                                                             runtime_result.aligned_cols,
+                                                             result.src_rows,
+                                                             result.src_cols,
+                                                             runtime_row_offset,
+                                                             runtime_col_offset,
+                                                             result.dst_rows,
+                                                             result.dst_cols,
+                                                             runtime_result.input_resized_to_target);
+        }
+      }
+      deweighted_raw_dino_score_source = project_aligned_map_to_output(raw_aligned_score,
+                                                                       runtime_result.aligned_rows,
+                                                                       runtime_result.aligned_cols,
+                                                                       result.src_rows,
+                                                                       result.src_cols,
+                                                                       runtime_row_offset,
+                                                                       runtime_col_offset,
+                                                                       result.src_rows,
+                                                                       result.src_cols,
+                                                                       runtime_result.input_resized_to_target);
+      if (keep_debug_artifacts) {
+        deweighted_raw_dino_score_map = project_aligned_map_to_output(raw_aligned_score,
+                                                                      runtime_result.aligned_rows,
+                                                                      runtime_result.aligned_cols,
+                                                                      result.src_rows,
+                                                                      result.src_cols,
+                                                                      runtime_row_offset,
+                                                                      runtime_col_offset,
+                                                                      result.dst_rows,
+                                                                      result.dst_cols,
+                                                                      runtime_result.input_resized_to_target);
       }
     }
-    if (runtime_result.patch_features.empty() || result.patch_rows <= 0 || result.patch_cols <= 0 || result.feature_dim <= 0) {
-      throw std::runtime_error("debug chunk grouped score requires patch features");
-    }
-    const size_t debug_estimated_bytes = static_cast<size_t>(result.patch_rows) * static_cast<size_t>(result.patch_cols) * sizeof(float) * 8;
-    ScopedStageProfile debug_stage(profiler, "chunk_grouped_patch_debug", "chunk", result.chunk_index, debug_estimated_bytes, verbose);
-    const auto seed_components = dino_seed_patch_components(corrected_chunk,
-                                result.src_rows,
-                                result.src_cols,
-                                runtime_rows,
-                                runtime_cols,
-                                result.patch_rows,
-                                result.patch_cols);
-    auto grouped_patch = grouped_dino_from_patch_features(runtime_result.patch_features,
-                                                                result.patch_rows,
-                                                                result.patch_cols,
-                                                                result.feature_dim,
-                                  seed_components.seed_patch,
-                                                                config,
-                                                                verbose && keep_debug_artifacts,
-                                                                "debug_chunk_grouped_patch");
-    grouped_patch.seed_persistence_map = seed_components.persistence_patch;
-    grouped_patch.seed_contrast_map = seed_components.contrast_patch;
-    if (grouped_patch.score_patch.empty()) {
-      throw std::runtime_error("debug chunk grouped patch score is empty");
-    }
-    grouped_score_patch = grouped_patch.score_patch;
-    grouped_score_rows = result.patch_rows;
-    grouped_score_cols = result.patch_cols;
-    grouped_score_is_patch_grid = true;
-    if (keep_debug_artifacts) {
-      const auto grouped_seed_score_source = project_patch_map_to_output(grouped_patch.seed_norm_map,
-                                                                         grouped_score_rows,
-                                                                         grouped_score_cols,
-                                                                         runtime_result.aligned_rows,
-                                                                         runtime_result.aligned_cols,
-                                                                         result.src_rows,
-                                                                         result.src_cols,
-                                                                         runtime_row_offset,
-                                                                         runtime_col_offset,
-                                                                         result.src_rows,
-                                                                         result.src_cols,
-                                                                         runtime_result.input_resized_to_target);
-                                                  const auto grouped_seed_persistence_source = project_patch_map_to_output(grouped_patch.seed_persistence_map,
-                                                                           grouped_score_rows,
-                                                                           grouped_score_cols,
-                                                                           runtime_result.aligned_rows,
-                                                                           runtime_result.aligned_cols,
-                                                                           result.src_rows,
-                                                                           result.src_cols,
-                                                                           runtime_row_offset,
-                                                                           runtime_col_offset,
-                                                                           result.src_rows,
-                                                                           result.src_cols,
-                                                                           runtime_result.input_resized_to_target);
-                                                  const auto grouped_seed_contrast_source = project_patch_map_to_output(grouped_patch.seed_contrast_map,
-                                                                            grouped_score_rows,
-                                                                            grouped_score_cols,
-                                                                            runtime_result.aligned_rows,
-                                                                            runtime_result.aligned_cols,
-                                                                            result.src_rows,
-                                                                            result.src_cols,
-                                                                            runtime_row_offset,
-                                                                            runtime_col_offset,
-                                                                            result.src_rows,
-                                                                            result.src_cols,
-                                                                            runtime_result.input_resized_to_target);
-      const auto grouped_selected_support_source = project_patch_map_to_output(grouped_patch.selected_support_map,
-                                                                               grouped_score_rows,
-                                                                               grouped_score_cols,
-                                                                               runtime_result.aligned_rows,
-                                                                               runtime_result.aligned_cols,
-                                                                               result.src_rows,
-                                                                               result.src_cols,
-                                                                               runtime_row_offset,
-                                                                               runtime_col_offset,
-                                                                               result.src_rows,
-                                                                               result.src_cols,
-                                                                               runtime_result.input_resized_to_target);
-      const auto grouped_cluster_quality_source = project_patch_map_to_output(grouped_patch.cluster_quality_map,
-                                                                              grouped_score_rows,
-                                                                              grouped_score_cols,
-                                                                              runtime_result.aligned_rows,
-                                                                              runtime_result.aligned_cols,
-                                                                              result.src_rows,
-                                                                              result.src_cols,
-                                                                              runtime_row_offset,
-                                                                              runtime_col_offset,
-                                                                              result.src_rows,
-                                                                              result.src_cols,
-                                                                              runtime_result.input_resized_to_target);
-      result.grouped_seed_score_map = resize_bilinear(grouped_seed_score_source,
-                                                      result.src_rows,
-                                                      result.src_cols,
-                                                      result.dst_rows,
-                                                      result.dst_cols);
-      result.grouped_seed_persistence_map = resize_bilinear(grouped_seed_persistence_source,
-                        result.src_rows,
-                        result.src_cols,
-                        result.dst_rows,
-                        result.dst_cols);
-      result.grouped_seed_contrast_map = resize_bilinear(grouped_seed_contrast_source,
-                         result.src_rows,
-                         result.src_cols,
-                         result.dst_rows,
-                         result.dst_cols);
-      result.grouped_selected_support_map = resize_bilinear(grouped_selected_support_source,
-                                                            result.src_rows,
-                                                            result.src_cols,
-                                                            result.dst_rows,
-                                                            result.dst_cols);
-      result.grouped_cluster_quality_map = resize_bilinear(grouped_cluster_quality_source,
-                                                           result.src_rows,
-                                                           result.src_cols,
-                                                           result.dst_rows,
-                                                           result.dst_cols);
-    }
   }
   if (keep_debug_artifacts) {
+    const size_t dst_elements = static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols);
+    const size_t patch_elements = static_cast<size_t>(std::max(result.patch_rows, 0)) * static_cast<size_t>(std::max(result.patch_cols, 0));
     result.raw_dino_score_map = raw_dino_score_map;
-  }
-  std::vector<float> grouped_dino_score_source;
-  std::vector<float> grouped_dino_score_map;
-  {
-    const size_t estimated_bytes = static_cast<size_t>(result.src_rows) * static_cast<size_t>(result.src_cols) * sizeof(float) * 2;
-    ScopedStageProfile stage(profiler, "chunk_grouped_score_remap", "chunk", result.chunk_index, estimated_bytes, verbose);
-    if (!grouped_score_is_patch_grid) {
-      throw std::runtime_error("debug chunk grouped score must come from patch-feature grouping");
-    }
-    grouped_dino_score_source = project_patch_map_to_output(grouped_score_patch,
-                                                            grouped_score_rows,
-                                                            grouped_score_cols,
-                                                            runtime_result.aligned_rows,
-                                                            runtime_result.aligned_cols,
-                                                            result.src_rows,
-                                                            result.src_cols,
-                                                            runtime_row_offset,
-                                                            runtime_col_offset,
-                                                            result.src_rows,
-                                                            result.src_cols,
-                                                            runtime_result.input_resized_to_target);
-    if (keep_debug_artifacts) {
-      grouped_dino_score_map = resize_bilinear(grouped_dino_score_source,
-                                               result.src_rows,
-                                               result.src_cols,
-                                               result.dst_rows,
-                                               result.dst_cols);
-    }
-  }
-  if (keep_debug_artifacts) {
-    result.dino_score_map = grouped_dino_score_map;
+    result.raw_dino_score_deweighted_map = deweighted_raw_dino_score_map;
+    result.dino_score_map = deweighted_raw_dino_score_map;
+    result.grouped_seed_score_map.assign(dst_elements, 0.0f);
+    result.grouped_seed_persistence_map.assign(dst_elements, 0.0f);
+    result.grouped_seed_contrast_map.assign(dst_elements, 0.0f);
+    result.grouped_support_map_exact.assign(patch_elements, 0.0f);
+    result.grouped_active_mask_exact.assign(patch_elements, 0.0f);
+    result.grouped_cluster_labels_exact.assign(patch_elements, 0.0f);
+    result.grouped_selected_mask_pre_smooth_exact.assign(patch_elements, 0.0f);
+    result.grouped_selected_mask_exact.assign(patch_elements, 0.0f);
+    result.grouped_support_selected_raw_exact.assign(patch_elements, 0.0f);
+    result.grouped_selected_support_map.assign(dst_elements, 0.0f);
+    result.grouped_cluster_quality_map.assign(dst_elements, 0.0f);
     result.corrected_resized = resize_bilinear(corrected_chunk, result.src_rows, result.src_cols, result.dst_rows, result.dst_cols);
   }
   std::vector<uint8_t> source_chunk_valid_mask;
@@ -5637,7 +5598,7 @@ ChunkInferenceArtifacts run_retry_chunk_inference(holoscan::ops::DinoTorchRuntim
 
   artifacts.corrected_chunk = std::move(corrected_chunk);
   artifacts.source_chunk_valid_mask = std::move(source_chunk_valid_mask);
-  artifacts.grouped_dino_score_source = std::move(grouped_dino_score_source);
+  artifacts.grouped_dino_score_source = std::move(deweighted_raw_dino_score_source);
   artifacts.raw_dino_score_source = std::move(raw_dino_score_source);
   artifacts.source_chunk_coherence_gate = std::move(source_chunk_coherence_gate);
   return artifacts;
@@ -5862,68 +5823,48 @@ std::vector<ChunkInferenceArtifacts> run_retry_chunk_inference_batch(holoscan::o
         throw std::runtime_error("batched grouped score patch feature slice is out of range");
       }
       const auto corrected_chunk = slice_rows(corrected_db, full_rows, full_cols, chunks[batch_index].row_start, chunks[batch_index].row_stop);
-      const auto seed_patch = dino_seed_patch_map(corrected_chunk,
-                                                  result.src_rows,
-                                                  result.src_cols,
-                                                  runtime_rows,
-                                                  runtime_cols,
-                                                  runtime_result.patch_rows,
-                                                  runtime_result.patch_cols);
       const std::vector<float> patch_features_sample(
           runtime_result.patch_features_batch.begin() + static_cast<std::ptrdiff_t>(sample_offset),
           runtime_result.patch_features_batch.begin() + static_cast<std::ptrdiff_t>(sample_offset + patch_count * feature_dim));
-      if (config.hybrid_use_inverted_raw_dino_energy) {
-        const auto raw_patch_score = raw_feature_energy_score_patch(patch_features_sample,
-                                                                    runtime_result.patch_rows,
-                                                                    runtime_result.patch_cols,
-                                                                    runtime_result.feature_dim);
-        artifacts.raw_dino_score_source = project_patch_map_to_output(raw_patch_score,
-                                                                      runtime_result.patch_rows,
-                                                                      runtime_result.patch_cols,
-                                                                      runtime_result.aligned_rows,
-                                                                      runtime_result.aligned_cols,
-                                                                      result.src_rows,
-                                                                      result.src_cols,
-                                                                      runtime_row_offset,
-                                                                      runtime_col_offset,
-                                                                      result.src_rows,
-                                                                      result.src_cols,
-                                                                      runtime_result.input_resized_to_target);
-      }
-      const auto grouped_patch = grouped_dino_from_patch_features(patch_features_sample,
+      const auto raw_patch_score = raw_feature_energy_score_patch(patch_features_sample,
                                                                   runtime_result.patch_rows,
                                                                   runtime_result.patch_cols,
-                                                                  runtime_result.feature_dim,
-                                                                  seed_patch,
-                                                                  config,
-                                                                  false,
-                                                                  "batch_chunk_grouped_patch");
-      if (grouped_patch.score_patch.empty()) {
-        throw std::runtime_error("batched grouped patch score is empty");
-      }
-      grouped_score_patch = grouped_patch.score_patch;
-      auto grouped_score_source = project_patch_map_to_output(grouped_score_patch,
-                                                              runtime_result.patch_rows,
-                                                              runtime_result.patch_cols,
-                                                              runtime_result.aligned_rows,
-                                                              runtime_result.aligned_cols,
-                                                              result.src_rows,
-                                                              result.src_cols,
-                                                              runtime_row_offset,
-                                                              runtime_col_offset,
-                                                              result.src_rows,
-                                                              result.src_cols,
-                                                              runtime_result.input_resized_to_target);
+                                                                  runtime_result.feature_dim);
+      artifacts.raw_dino_score_source = project_patch_map_to_output(raw_patch_score,
+                                                                    runtime_result.patch_rows,
+                                                                    runtime_result.patch_cols,
+                                                                    runtime_result.aligned_rows,
+                                                                    runtime_result.aligned_cols,
+                                                                    result.src_rows,
+                                                                    result.src_cols,
+                                                                    runtime_row_offset,
+                                                                    runtime_col_offset,
+                                                                    result.src_rows,
+                                                                    result.src_cols,
+                                                                    runtime_result.input_resized_to_target);
+      const auto deweighted_raw_patch_score = raw_feature_energy_score_patch(patch_features_sample,
+                                                                             runtime_result.patch_rows,
+                                                                             runtime_result.patch_cols,
+                                                                             runtime_result.feature_dim,
+                                                                             kHybridRawDinoPositionalDeweight);
+      auto deweighted_raw_score_source = project_patch_map_to_output(deweighted_raw_patch_score,
+                                                                     runtime_result.patch_rows,
+                                                                     runtime_result.patch_cols,
+                                                                     runtime_result.aligned_rows,
+                                                                     runtime_result.aligned_cols,
+                                                                     result.src_rows,
+                                                                     result.src_cols,
+                                                                     runtime_row_offset,
+                                                                     runtime_col_offset,
+                                                                     result.src_rows,
+                                                                     result.src_cols,
+                                                                     runtime_result.input_resized_to_target);
       if (!dino_score_source_batch.empty()) {
-        const auto& hybrid_dino_source = (config.hybrid_use_inverted_raw_dino_energy &&
-                                          artifacts.raw_dino_score_source.size() == grouped_score_source.size())
-                                             ? artifacts.raw_dino_score_source
-                                             : grouped_score_source;
-        std::copy(hybrid_dino_source.begin(),
-                  hybrid_dino_source.end(),
+        std::copy(deweighted_raw_score_source.begin(),
+                  deweighted_raw_score_source.end(),
                   dino_score_source_batch.begin() + static_cast<std::ptrdiff_t>(batch_index * chunk_elements));
       } else {
-        artifacts.grouped_dino_score_source = std::move(grouped_score_source);
+        artifacts.grouped_dino_score_source = std::move(deweighted_raw_score_source);
       }
     }
 
@@ -5991,16 +5932,8 @@ ChunkRetryResult finalize_retry_chunk_postprocess(const ValidatorConfig& config,
                                    (artifacts.keep_debug_artifacts ? static_cast<size_t>(result.dst_rows) * static_cast<size_t>(result.dst_cols) * sizeof(float) : 0);
     ScopedStageProfile stage(profiler, "chunk_hybrid_support", "chunk", result.chunk_index, estimated_bytes, verbose);
     const auto dino_norm_start = std::chrono::steady_clock::now();
-    const bool use_inverted_raw_dino_energy = config.hybrid_use_inverted_raw_dino_energy &&
-                                              artifacts.raw_dino_score_source.size() == artifacts.grouped_dino_score_source.size() &&
-                                              !artifacts.raw_dino_score_source.empty();
-    const auto& hybrid_dino_source = use_inverted_raw_dino_energy ? artifacts.raw_dino_score_source : artifacts.grouped_dino_score_source;
+    const auto& hybrid_dino_source = artifacts.grouped_dino_score_source;
     auto dino_score_norm_source = normalize01_quantile(hybrid_dino_source, 5.0, 95.0);
-    if (use_inverted_raw_dino_energy) {
-      for (float& value : dino_score_norm_source) {
-        value = 1.0f - value;
-      }
-    }
     record_timed_stage(profiler,
                        "chunk_hybrid_dino_norm",
                        "chunk",
@@ -6827,12 +6760,19 @@ int main(int argc, char** argv) {
       const auto debug_runtime_input_gray_path = chunk_debug_dir / "chunk_runtime_input_gray.npy";
       const auto debug_dino_score_path = chunk_debug_dir / "chunk_dino_score.npy";
       const auto debug_raw_dino_score_path = chunk_debug_dir / "chunk_dino_score_raw.npy";
+      const auto debug_raw_dino_score_deweighted_path = chunk_debug_dir / "chunk_dino_score_raw_deweighted.npy";
       const auto debug_coherence_gate_path = chunk_debug_dir / "chunk_coherence_gate.npy";
       const auto debug_hybrid_contrib_path = chunk_debug_dir / "chunk_hybrid_contrib.npy";
       const auto debug_combined_score_path = chunk_debug_dir / "chunk_combined_score.npy";
       const auto debug_grouped_seed_score_path = chunk_debug_dir / "chunk_grouped_seed_score.npy";
       const auto debug_grouped_seed_persistence_path = chunk_debug_dir / "chunk_grouped_seed_persistence.npy";
       const auto debug_grouped_seed_contrast_path = chunk_debug_dir / "chunk_grouped_seed_contrast.npy";
+      const auto debug_grouped_support_exact_path = chunk_debug_dir / "chunk_grouped_support_exact_patch.npy";
+      const auto debug_grouped_active_mask_exact_path = chunk_debug_dir / "chunk_grouped_active_mask_exact_patch.npy";
+      const auto debug_grouped_cluster_labels_exact_path = chunk_debug_dir / "chunk_grouped_cluster_labels_exact_patch.npy";
+      const auto debug_grouped_selected_mask_pre_smooth_exact_path = chunk_debug_dir / "chunk_grouped_selected_mask_pre_smooth_exact_patch.npy";
+      const auto debug_grouped_selected_mask_exact_path = chunk_debug_dir / "chunk_grouped_selected_mask_exact_patch.npy";
+      const auto debug_grouped_support_selected_raw_exact_path = chunk_debug_dir / "chunk_grouped_support_selected_raw_exact_patch.npy";
       const auto debug_grouped_selected_support_path = chunk_debug_dir / "chunk_grouped_selected_support.npy";
       const auto debug_grouped_cluster_quality_path = chunk_debug_dir / "chunk_grouped_cluster_quality.npy";
       const auto debug_patch_features_path = chunk_debug_dir / "chunk_patch_features.npy";
@@ -6872,6 +6812,12 @@ int main(int argc, char** argv) {
            debug_chunk.dst_rows,
            debug_chunk.dst_cols,
            "<f4");
+       write_npy_2d(debug_raw_dino_score_deweighted_path,
+         debug_chunk.raw_dino_score_deweighted_map.data(),
+         debug_chunk.raw_dino_score_deweighted_map.size() * sizeof(float),
+         debug_chunk.dst_rows,
+         debug_chunk.dst_cols,
+         "<f4");
       write_npy_2d(debug_coherence_gate_path,
                    debug_chunk.coherence_gate.data(),
                    debug_chunk.coherence_gate.size() * sizeof(float),
@@ -6907,6 +6853,42 @@ int main(int argc, char** argv) {
          debug_chunk.grouped_seed_contrast_map.size() * sizeof(float),
          debug_chunk.dst_rows,
          debug_chunk.dst_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_support_exact_path,
+         debug_chunk.grouped_support_map_exact.data(),
+         debug_chunk.grouped_support_map_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_active_mask_exact_path,
+         debug_chunk.grouped_active_mask_exact.data(),
+         debug_chunk.grouped_active_mask_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_cluster_labels_exact_path,
+         debug_chunk.grouped_cluster_labels_exact.data(),
+         debug_chunk.grouped_cluster_labels_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_selected_mask_pre_smooth_exact_path,
+         debug_chunk.grouped_selected_mask_pre_smooth_exact.data(),
+         debug_chunk.grouped_selected_mask_pre_smooth_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_selected_mask_exact_path,
+         debug_chunk.grouped_selected_mask_exact.data(),
+         debug_chunk.grouped_selected_mask_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_support_selected_raw_exact_path,
+         debug_chunk.grouped_support_selected_raw_exact.data(),
+         debug_chunk.grouped_support_selected_raw_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
          "<f4");
       write_npy_2d(debug_grouped_selected_support_path,
            debug_chunk.grouped_selected_support_map.data(),
@@ -7031,18 +7013,26 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"grouped_seed_prior_enabled\": false,\n";
       debug_summary_out << "  \"grouped_component_seed_weight\": 0.0,\n";
       debug_summary_out << "  \"grouped_score_seed_weight\": 0.0,\n";
+      debug_summary_out << "  \"grouped_path_enabled\": false,\n";
       debug_summary_out << "  \"artifact_contract\": \"chunk_fixed_detector_grid_v1\",\n";
       debug_summary_out << "  \"corrected_resized_npy\": \"" << json_escape(debug_corrected_path.string()) << "\",\n";
       debug_summary_out << "  \"runtime_input_gray_npy\": \"" << json_escape(debug_runtime_input_gray_path.string()) << "\",\n";
       debug_summary_out << "  \"dino_score_npy\": \"" << json_escape(debug_dino_score_path.string()) << "\",\n";
       debug_summary_out << "  \"dino_score_raw_npy\": \"" << json_escape(debug_raw_dino_score_path.string()) << "\",\n";
-      debug_summary_out << "  \"hybrid_dino_source_mode\": \"" << (config.hybrid_use_inverted_raw_dino_energy ? "inverted_raw_dino_energy" : "grouped_dino_score") << "\",\n";
+      debug_summary_out << "  \"dino_score_raw_deweighted_npy\": \"" << json_escape(debug_raw_dino_score_deweighted_path.string()) << "\",\n";
+      debug_summary_out << "  \"hybrid_dino_source_mode\": \"deweighted_raw_dino_energy\",\n";
       debug_summary_out << "  \"coherence_gate_npy\": \"" << json_escape(debug_coherence_gate_path.string()) << "\",\n";
       debug_summary_out << "  \"hybrid_contrib_npy\": \"" << json_escape(debug_hybrid_contrib_path.string()) << "\",\n";
       debug_summary_out << "  \"combined_score_npy\": \"" << json_escape(debug_combined_score_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_score_npy\": \"" << json_escape(debug_grouped_seed_score_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_persistence_npy\": \"" << json_escape(debug_grouped_seed_persistence_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_contrast_npy\": \"" << json_escape(debug_grouped_seed_contrast_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_support_exact_patch_npy\": \"" << json_escape(debug_grouped_support_exact_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_active_mask_exact_patch_npy\": \"" << json_escape(debug_grouped_active_mask_exact_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_cluster_labels_exact_patch_npy\": \"" << json_escape(debug_grouped_cluster_labels_exact_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_selected_mask_pre_smooth_exact_patch_npy\": \"" << json_escape(debug_grouped_selected_mask_pre_smooth_exact_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_selected_mask_exact_patch_npy\": \"" << json_escape(debug_grouped_selected_mask_exact_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_support_selected_raw_exact_patch_npy\": \"" << json_escape(debug_grouped_support_selected_raw_exact_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_selected_support_npy\": \"" << json_escape(debug_grouped_selected_support_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_cluster_quality_npy\": \"" << json_escape(debug_grouped_cluster_quality_path.string()) << "\",\n";
       debug_summary_out << "  \"patch_features_npy\": \"" << json_escape(debug_patch_features_path.string()) << "\",\n";
@@ -7221,12 +7211,19 @@ int main(int argc, char** argv) {
       const auto debug_runtime_input_gray_path = chunk_debug_dir / "chunk_runtime_input_gray.npy";
       const auto debug_dino_score_path = chunk_debug_dir / "chunk_dino_score.npy";
       const auto debug_raw_dino_score_path = chunk_debug_dir / "chunk_dino_score_raw.npy";
+      const auto debug_raw_dino_score_deweighted_path = chunk_debug_dir / "chunk_dino_score_raw_deweighted.npy";
       const auto debug_coherence_gate_path = chunk_debug_dir / "chunk_coherence_gate.npy";
       const auto debug_hybrid_contrib_path = chunk_debug_dir / "chunk_hybrid_contrib.npy";
       const auto debug_combined_score_path = chunk_debug_dir / "chunk_combined_score.npy";
       const auto debug_grouped_seed_score_path = chunk_debug_dir / "chunk_grouped_seed_score.npy";
       const auto debug_grouped_seed_persistence_path = chunk_debug_dir / "chunk_grouped_seed_persistence.npy";
       const auto debug_grouped_seed_contrast_path = chunk_debug_dir / "chunk_grouped_seed_contrast.npy";
+      const auto debug_grouped_support_exact_path = chunk_debug_dir / "chunk_grouped_support_exact_patch.npy";
+      const auto debug_grouped_active_mask_exact_path = chunk_debug_dir / "chunk_grouped_active_mask_exact_patch.npy";
+      const auto debug_grouped_cluster_labels_exact_path = chunk_debug_dir / "chunk_grouped_cluster_labels_exact_patch.npy";
+      const auto debug_grouped_selected_mask_pre_smooth_exact_path = chunk_debug_dir / "chunk_grouped_selected_mask_pre_smooth_exact_patch.npy";
+      const auto debug_grouped_selected_mask_exact_path = chunk_debug_dir / "chunk_grouped_selected_mask_exact_patch.npy";
+      const auto debug_grouped_support_selected_raw_exact_path = chunk_debug_dir / "chunk_grouped_support_selected_raw_exact_patch.npy";
       const auto debug_grouped_selected_support_path = chunk_debug_dir / "chunk_grouped_selected_support.npy";
       const auto debug_grouped_cluster_quality_path = chunk_debug_dir / "chunk_grouped_cluster_quality.npy";
       const auto debug_patch_features_path = chunk_debug_dir / "chunk_patch_features.npy";
@@ -7269,6 +7266,12 @@ int main(int argc, char** argv) {
                    debug_chunk.dst_rows,
                    debug_chunk.dst_cols,
                    "<f4");
+      write_npy_2d(debug_raw_dino_score_deweighted_path,
+           debug_chunk.raw_dino_score_deweighted_map.data(),
+           debug_chunk.raw_dino_score_deweighted_map.size() * sizeof(float),
+           debug_chunk.dst_rows,
+           debug_chunk.dst_cols,
+           "<f4");
       write_npy_2d(debug_coherence_gate_path,
                    debug_chunk.coherence_gate.data(),
                    debug_chunk.coherence_gate.size() * sizeof(float),
@@ -7304,6 +7307,42 @@ int main(int argc, char** argv) {
          debug_chunk.grouped_seed_contrast_map.size() * sizeof(float),
          debug_chunk.dst_rows,
          debug_chunk.dst_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_support_exact_path,
+         debug_chunk.grouped_support_map_exact.data(),
+         debug_chunk.grouped_support_map_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_active_mask_exact_path,
+         debug_chunk.grouped_active_mask_exact.data(),
+         debug_chunk.grouped_active_mask_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_cluster_labels_exact_path,
+         debug_chunk.grouped_cluster_labels_exact.data(),
+         debug_chunk.grouped_cluster_labels_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_selected_mask_pre_smooth_exact_path,
+         debug_chunk.grouped_selected_mask_pre_smooth_exact.data(),
+         debug_chunk.grouped_selected_mask_pre_smooth_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_selected_mask_exact_path,
+         debug_chunk.grouped_selected_mask_exact.data(),
+         debug_chunk.grouped_selected_mask_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
+         "<f4");
+       write_npy_2d(debug_grouped_support_selected_raw_exact_path,
+         debug_chunk.grouped_support_selected_raw_exact.data(),
+         debug_chunk.grouped_support_selected_raw_exact.size() * sizeof(float),
+         debug_chunk.patch_rows,
+         debug_chunk.patch_cols,
          "<f4");
       write_npy_2d(debug_grouped_selected_support_path,
            debug_chunk.grouped_selected_support_map.data(),
@@ -7476,6 +7515,7 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"grouped_seed_prior_enabled\": false,\n";
       debug_summary_out << "  \"grouped_component_seed_weight\": 0.0,\n";
       debug_summary_out << "  \"grouped_score_seed_weight\": 0.0,\n";
+      debug_summary_out << "  \"grouped_path_enabled\": false,\n";
       debug_summary_out << "  \"legacy_fast_gray_preprocess\": " << (config.legacy_fast_gray_preprocess ? "true" : "false") << ",\n";
       debug_summary_out << "  \"artifact_contract\": \"chunk_fixed_detector_grid_v1\",\n";
       debug_summary_out << "  \"mask_source\": \"stitched_chunk_result\",\n";
@@ -7484,12 +7524,20 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"runtime_input_gray_npy\": \"" << json_escape(debug_runtime_input_gray_path.string()) << "\",\n";
       debug_summary_out << "  \"dino_score_npy\": \"" << json_escape(debug_dino_score_path.string()) << "\",\n";
       debug_summary_out << "  \"dino_score_raw_npy\": \"" << json_escape(debug_raw_dino_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"dino_score_raw_deweighted_npy\": \"" << json_escape(debug_raw_dino_score_deweighted_path.string()) << "\",\n";
+      debug_summary_out << "  \"hybrid_dino_source_mode\": \"deweighted_raw_dino_energy\",\n";
       debug_summary_out << "  \"coherence_gate_npy\": \"" << json_escape(debug_coherence_gate_path.string()) << "\",\n";
       debug_summary_out << "  \"hybrid_contrib_npy\": \"" << json_escape(debug_hybrid_contrib_path.string()) << "\",\n";
       debug_summary_out << "  \"combined_score_npy\": \"" << json_escape(debug_combined_score_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_score_npy\": \"" << json_escape(debug_grouped_seed_score_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_persistence_npy\": \"" << json_escape(debug_grouped_seed_persistence_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_contrast_npy\": \"" << json_escape(debug_grouped_seed_contrast_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_support_exact_patch_npy\": \"" << json_escape(debug_grouped_support_exact_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_active_mask_exact_patch_npy\": \"" << json_escape(debug_grouped_active_mask_exact_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_cluster_labels_exact_patch_npy\": \"" << json_escape(debug_grouped_cluster_labels_exact_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_selected_mask_pre_smooth_exact_patch_npy\": \"" << json_escape(debug_grouped_selected_mask_pre_smooth_exact_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_selected_mask_exact_patch_npy\": \"" << json_escape(debug_grouped_selected_mask_exact_path.string()) << "\",\n";
+      debug_summary_out << "  \"grouped_support_selected_raw_exact_patch_npy\": \"" << json_escape(debug_grouped_support_selected_raw_exact_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_selected_support_npy\": \"" << json_escape(debug_grouped_selected_support_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_cluster_quality_npy\": \"" << json_escape(debug_grouped_cluster_quality_path.string()) << "\",\n";
       debug_summary_out << "  \"patch_features_npy\": \"" << json_escape(debug_patch_features_path.string()) << "\",\n";

@@ -629,17 +629,15 @@ def build_python_full_frame_final_mask(
         **cache_info,
     }
 
-
 def mask_metrics(lhs: np.ndarray, rhs: np.ndarray) -> dict[str, float]:
     lhs = np.asarray(lhs, dtype=bool)
     rhs = np.asarray(rhs, dtype=bool)
     if lhs.shape != rhs.shape:
         raise ValueError(f"Mask shape mismatch: {lhs.shape} vs {rhs.shape}")
-    agreement = float(np.mean(lhs == rhs))
     intersection = float(np.count_nonzero(lhs & rhs))
     union = float(np.count_nonzero(lhs | rhs))
     return {
-        "agreement": agreement,
+        "agreement": intersection,
         "iou": 1.0 if union == 0.0 else intersection / union,
         "lhs_fraction": float(np.mean(lhs)),
         "rhs_fraction": float(np.mean(rhs)),
@@ -898,11 +896,19 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
     mapped_row_stop = max(mapped_row_start + 1, min(output_rows, int(np.ceil(row_stop * output_rows / max(canonical_rows, 1)))))
     chunk_dino_score = load_float32_npy(output_path / "chunk_debug" / "chunk_dino_score.npy")
     chunk_dino_score_raw_path = output_path / "chunk_debug" / "chunk_dino_score_raw.npy"
+    chunk_dino_score_raw_deweighted_path = output_path / "chunk_debug" / "chunk_dino_score_raw_deweighted.npy"
     chunk_dino_score_raw = load_float32_npy(chunk_dino_score_raw_path) if chunk_dino_score_raw_path.exists() else chunk_dino_score.copy()
+    chunk_dino_score_raw_deweighted = load_float32_npy(chunk_dino_score_raw_deweighted_path) if chunk_dino_score_raw_deweighted_path.exists() else chunk_dino_score.copy()
     chunk_combined_score = load_float32_npy(output_path / "chunk_debug" / "chunk_combined_score.npy")
     chunk_grouped_seed_score_path = output_path / "chunk_debug" / "chunk_grouped_seed_score.npy"
     chunk_grouped_seed_persistence_path = output_path / "chunk_debug" / "chunk_grouped_seed_persistence.npy"
     chunk_grouped_seed_contrast_path = output_path / "chunk_debug" / "chunk_grouped_seed_contrast.npy"
+    chunk_grouped_support_exact_path = output_path / "chunk_debug" / "chunk_grouped_support_exact_patch.npy"
+    chunk_grouped_active_mask_exact_path = output_path / "chunk_debug" / "chunk_grouped_active_mask_exact_patch.npy"
+    chunk_grouped_cluster_labels_exact_path = output_path / "chunk_debug" / "chunk_grouped_cluster_labels_exact_patch.npy"
+    chunk_grouped_selected_mask_pre_smooth_exact_path = output_path / "chunk_debug" / "chunk_grouped_selected_mask_pre_smooth_exact_patch.npy"
+    chunk_grouped_selected_mask_exact_path = output_path / "chunk_debug" / "chunk_grouped_selected_mask_exact_patch.npy"
+    chunk_grouped_support_selected_raw_exact_path = output_path / "chunk_debug" / "chunk_grouped_support_selected_raw_exact_patch.npy"
     chunk_grouped_selected_support_path = output_path / "chunk_debug" / "chunk_grouped_selected_support.npy"
     chunk_grouped_cluster_quality_path = output_path / "chunk_debug" / "chunk_grouped_cluster_quality.npy"
     runtime_input_gray_path = output_path / "chunk_debug" / "chunk_runtime_input_gray.npy"
@@ -931,6 +937,10 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
     if not chunk_dino_score_raw_path.exists():
         artifact_warnings.append(
             "chunk_debug/chunk_dino_score_raw.npy is missing, so the notebook would compare the C++ grouped/fallback DINO surface against the Python raw feature score."
+        )
+    if not chunk_dino_score_raw_deweighted_path.exists():
+        artifact_warnings.append(
+            "chunk_debug/chunk_dino_score_raw_deweighted.npy is missing, so the position-deweighted raw DINO panel will fall back to chunk_dino_score.npy."
         )
     if runtime_input_gray is None:
         artifact_warnings.append(
@@ -964,6 +974,42 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
         artifact_warnings.append(
             "chunk_debug/chunk_grouped_seed_contrast.npy is unavailable or incomplete, so the grouped seed-contrast panel will be skipped. "
             + chunk_grouped_seed_contrast_error
+        )
+    chunk_grouped_support_exact, chunk_grouped_support_exact_error = try_load_float32_npy(chunk_grouped_support_exact_path)
+    if chunk_grouped_support_exact_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_support_exact_patch.npy is unavailable or incomplete, so the exact grouped support-map panel will be skipped. "
+            + chunk_grouped_support_exact_error
+        )
+    chunk_grouped_active_mask_exact, chunk_grouped_active_mask_exact_error = try_load_float32_npy(chunk_grouped_active_mask_exact_path)
+    if chunk_grouped_active_mask_exact_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_active_mask_exact_patch.npy is unavailable or incomplete, so the exact grouped active-mask panel will be skipped. "
+            + chunk_grouped_active_mask_exact_error
+        )
+    chunk_grouped_cluster_labels_exact, chunk_grouped_cluster_labels_exact_error = try_load_float32_npy(chunk_grouped_cluster_labels_exact_path)
+    if chunk_grouped_cluster_labels_exact_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_cluster_labels_exact_patch.npy is unavailable or incomplete, so the exact grouped cluster-label panel will be skipped. "
+            + chunk_grouped_cluster_labels_exact_error
+        )
+    chunk_grouped_selected_mask_pre_smooth_exact, chunk_grouped_selected_mask_pre_smooth_exact_error = try_load_float32_npy(chunk_grouped_selected_mask_pre_smooth_exact_path)
+    if chunk_grouped_selected_mask_pre_smooth_exact_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_selected_mask_pre_smooth_exact_patch.npy is unavailable or incomplete, so the exact grouped selected-mask pre-smooth panel will be skipped. "
+            + chunk_grouped_selected_mask_pre_smooth_exact_error
+        )
+    chunk_grouped_selected_mask_exact, chunk_grouped_selected_mask_exact_error = try_load_float32_npy(chunk_grouped_selected_mask_exact_path)
+    if chunk_grouped_selected_mask_exact_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_selected_mask_exact_patch.npy is unavailable or incomplete, so the exact grouped selected-mask panel will be skipped. "
+            + chunk_grouped_selected_mask_exact_error
+        )
+    chunk_grouped_support_selected_raw_exact, chunk_grouped_support_selected_raw_exact_error = try_load_float32_npy(chunk_grouped_support_selected_raw_exact_path)
+    if chunk_grouped_support_selected_raw_exact_error is not None:
+        artifact_warnings.append(
+            "chunk_debug/chunk_grouped_support_selected_raw_exact_patch.npy is unavailable or incomplete, so the exact grouped selected-support raw panel will be skipped. "
+            + chunk_grouped_support_selected_raw_exact_error
         )
     chunk_grouped_selected_support, chunk_grouped_selected_support_error = try_load_float32_npy(chunk_grouped_selected_support_path)
     if chunk_grouped_selected_support_error is not None:
@@ -1016,6 +1062,7 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
             "grouped_dino_source": "patch_feature_grouping" if has_patch_feature_grouping else "raw_score_fallback",
             "dino_score": chunk_dino_score,
             "dino_score_raw": chunk_dino_score_raw,
+            "dino_score_raw_deweighted": chunk_dino_score_raw_deweighted,
             "dino_score_grouped": chunk_dino_score,
             "grouped_dino_score": chunk_grouped_dino_score,
             "grouped_combined_score": chunk_grouped_combined_score,
@@ -1023,6 +1070,12 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
             "grouped_seed_score": chunk_grouped_seed_score,
             "grouped_seed_persistence": chunk_grouped_seed_persistence,
             "grouped_seed_contrast": chunk_grouped_seed_contrast,
+            "grouped_support_exact_patch": chunk_grouped_support_exact,
+            "grouped_active_mask_exact_patch": chunk_grouped_active_mask_exact,
+            "grouped_cluster_labels_exact_patch": chunk_grouped_cluster_labels_exact,
+            "grouped_selected_mask_pre_smooth_exact_patch": chunk_grouped_selected_mask_pre_smooth_exact,
+            "grouped_selected_mask_exact_patch": chunk_grouped_selected_mask_exact,
+            "grouped_support_selected_raw_exact_patch": chunk_grouped_support_selected_raw_exact,
             "grouped_selected_support": chunk_grouped_selected_support,
             "grouped_cluster_quality": chunk_grouped_cluster_quality,
             "coherence_gate": load_float32_npy(output_path / "chunk_debug" / "chunk_coherence_gate.npy"),
@@ -1037,11 +1090,12 @@ def load_cpp_artifact_bundle(output_dir: str | Path, debug_chunk_index: int | No
             "mapped_row_stop": mapped_row_stop,
             "output_shape": (output_rows, output_cols),
             "artifact_contract": artifact_contract,
+            "grouped_path_enabled": bool(debug_summary.get("grouped_path_enabled", True)),
             "grouped_seed_prior_enabled": bool(debug_summary.get("grouped_seed_prior_enabled", True)),
             "grouped_component_seed_weight": float(debug_summary.get("grouped_component_seed_weight", 0.05) or 0.0),
             "grouped_score_seed_weight": float(debug_summary.get("grouped_score_seed_weight", 0.10) or 0.0),
             "hybrid_dino_source_recorded": "hybrid_dino_source_mode" in debug_summary,
-            "hybrid_dino_source_mode": str(debug_summary.get("hybrid_dino_source_mode", "grouped_dino_score") or "grouped_dino_score"),
+            "hybrid_dino_source_mode": str(debug_summary.get("hybrid_dino_source_mode", "deweighted_raw_dino_energy") or "deweighted_raw_dino_energy"),
         },
         "artifact_warnings": artifact_warnings,
     }
@@ -1491,11 +1545,20 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
     cpp_full = cpp_bundle["full_frame"]
     script_report = cpp_bundle["comparison_report"]
     has_patch_feature_grouping = bool(cpp_chunk.get("has_patch_feature_grouping", False))
-    grouped_surface_label = "Grouped DINO score" if has_patch_feature_grouping else "Fallback DINO score"
+    grouped_path_enabled = bool(cpp_chunk.get("grouped_path_enabled", True))
+    grouped_surface_label = (
+        "Position-deweighted raw DINO energy"
+        if not grouped_path_enabled
+        else ("Grouped DINO score" if has_patch_feature_grouping else "Fallback DINO score")
+    )
     grouped_surface_note = (
-        "Current C++ artifact includes patch-feature exports, so this compares the grouped patch-feature score surface directly."
-        if has_patch_feature_grouping
-        else "Current C++ artifact is missing patch-feature exports, so the saved C++ DINO surface is a fallback derived from the raw runtime score_map rather than the grouped patch-feature path."
+        "The grouped DINO pathway was bypassed for this run. This surface is the position-deweighted raw feature-energy map that also feeds the hybrid contribution."
+        if not grouped_path_enabled
+        else (
+            "Current C++ artifact includes patch-feature exports, so this compares the grouped patch-feature score surface directly."
+            if has_patch_feature_grouping
+            else "Current C++ artifact is missing patch-feature exports, so the saved C++ DINO surface is a fallback derived from the raw runtime score_map rather than the grouped patch-feature path."
+        )
     )
 
     summary_rows = [
@@ -1647,8 +1710,27 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
     grouped_seed_score = cpp_chunk.get("grouped_seed_score")
     grouped_seed_persistence = cpp_chunk.get("grouped_seed_persistence")
     grouped_seed_contrast = cpp_chunk.get("grouped_seed_contrast")
+    grouped_support_exact_patch = cpp_chunk.get("grouped_support_exact_patch")
+    grouped_active_mask_exact_patch = cpp_chunk.get("grouped_active_mask_exact_patch")
+    grouped_cluster_labels_exact_patch = cpp_chunk.get("grouped_cluster_labels_exact_patch")
+    grouped_selected_mask_pre_smooth_exact_patch = cpp_chunk.get("grouped_selected_mask_pre_smooth_exact_patch")
+    grouped_selected_mask_exact_patch = cpp_chunk.get("grouped_selected_mask_exact_patch")
+    grouped_support_selected_raw_exact_patch = cpp_chunk.get("grouped_support_selected_raw_exact_patch")
     grouped_selected_support = cpp_chunk.get("grouped_selected_support")
     grouped_cluster_quality = cpp_chunk.get("grouped_cluster_quality")
+    deweighted_raw_dino = np.asarray(cpp_chunk.get("dino_score_raw_deweighted", cpp_chunk["dino_score_grouped"]), dtype=np.float32)
+    if not grouped_path_enabled:
+        grouped_seed_score = None
+        grouped_seed_persistence = None
+        grouped_seed_contrast = None
+        grouped_support_exact_patch = None
+        grouped_active_mask_exact_patch = None
+        grouped_cluster_labels_exact_patch = None
+        grouped_selected_mask_pre_smooth_exact_patch = None
+        grouped_selected_mask_exact_patch = None
+        grouped_support_selected_raw_exact_patch = None
+        grouped_selected_support = None
+        grouped_cluster_quality = None
     grouped_seed_prior_enabled = bool(cpp_chunk.get("grouped_seed_prior_enabled", True))
     grouped_component_seed_weight = float(cpp_chunk.get("grouped_component_seed_weight", 0.05) or 0.0)
     grouped_score_seed_weight = float(cpp_chunk.get("grouped_score_seed_weight", 0.10) or 0.0)
@@ -1670,7 +1752,8 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
             np.asarray(cpp_chunk["dino_score_grouped"], dtype=np.float32) - grouped_formula_reconstruction
         ).astype(np.float32)
     inverted_raw_dino_energy = 1.0 - np.clip(np.asarray(cpp_chunk["dino_score_raw"], dtype=np.float32), 0.0, 1.0)
-    hybrid_dino_source_mode = str(cpp_chunk.get("hybrid_dino_source_mode", "grouped_dino_score") or "grouped_dino_score")
+    inverted_deweighted_raw_dino_energy = 1.0 - np.clip(deweighted_raw_dino, 0.0, 1.0)
+    hybrid_dino_source_mode = str(cpp_chunk.get("hybrid_dino_source_mode", "deweighted_raw_dino_energy") or "deweighted_raw_dino_energy")
     cpp_support = build_retry_frequency_support_mask(
         np.asarray(cpp_chunk["hybrid_contrib"], dtype=np.float32),
         np.asarray(cpp_chunk["valid_mask"], dtype=bool),
@@ -1698,10 +1781,10 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
     grouped_note_rows = [
         {
             "comparison": "grouped_score_surface",
-            "cpp_surface": "grouped DINO score from C++ patch-feature grouping"
-            if has_patch_feature_grouping
-            else "fallback C++ DINO score derived without exported patch features",
-            "python_surface": "Python grouped DINO support score",
+            "cpp_surface": "position-deweighted raw feature-energy surface used in hybrid contribution"
+            if not grouped_path_enabled
+            else ("grouped DINO score from C++ patch-feature grouping" if has_patch_feature_grouping else "fallback C++ DINO score derived without exported patch features"),
+            "python_surface": "Python grouped DINO support score" if grouped_path_enabled else "No Python deweighted-raw analogue is plotted yet",
             "note": grouped_surface_note,
         },
         {
@@ -1716,8 +1799,12 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
             "comparison": "grouped_score_formula",
             "cpp_surface": f"0.70 * selected_support + 0.20 * cluster_quality + {grouped_score_seed_weight:.2f} * seed_norm",
             "python_surface": "No Python analogue plotted yet for these three intermediate terms",
-            "note": "The grouped DINO score is dominated by selected_support_map. cluster_quality_map is a component-ranking prior, and seed_norm is the spectrogram-derived patch prior."
-            + (" The seed prior is temporarily disabled in the C++ grouped-score path for this run." if not grouped_seed_prior_enabled else ""),
+            "note": (
+                "The grouped DINO formula panels are bypassed for this run because grouped patch-feature scoring was disabled."
+                if not grouped_path_enabled
+                else "The grouped DINO score is dominated by selected_support_map. cluster_quality_map is a component-ranking prior, and seed_norm is the spectrogram-derived patch prior."
+                + (" The seed prior is temporarily disabled in the C++ grouped-score path for this run." if not grouped_seed_prior_enabled else "")
+            ),
         },
         {
             "comparison": "grouped_seed_formula",
@@ -1729,14 +1816,20 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
         {
             "comparison": "hybrid_dino_source_probe",
             "cpp_surface": hybrid_dino_source_mode,
-            "python_surface": "Notebook-only reference panel shows 1 - raw feature-energy score",
-            "note": "If the validator was run with hybrid_use_inverted_raw_dino_energy: true, the hybrid contribution used the inverted raw feature-energy surface instead of the grouped DINO score.",
+            "python_surface": "Notebook-only reference panels show both raw and position-deweighted raw feature-energy maps",
+            "note": "The hybrid contribution now uses the position-deweighted raw feature-energy surface directly, not the grouped DINO score.",
         },
         {
             "comparison": "seed_support_breakdown",
             "cpp_surface": "Notebook-reconstructed support components from chunk_hybrid_contrib.npy and chunk_valid_mask.npy",
             "python_surface": "Same support decomposition exists in the Python helper, but these debug panels focus on the current C++ support path first",
             "note": "Seed support is now broken into the normalized base map, smoothed envelope, curvature and residual penalties, keep gates, threshold passes, and the post-component-filter seed mask so you can see which stage is suppressing regions.",
+        },
+        {
+            "comparison": "grouped_selected_support_exact_stages",
+            "cpp_surface": "Exact validator-generated patch-grid stages for grouped selected support",
+            "python_surface": "No notebook reconstruction is used for these selected-support stage panels",
+            "note": "These panels come directly from the validation debug artifact bundle: feature-graph support map, grown active mask, cluster labels, selected mask before smoothing, selected mask after smoothing, masked raw support, and the final projected selected-support map. They are expected to be absent or zeroed when grouped scoring is disabled.",
         }
     ]
 
@@ -1746,14 +1839,22 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
         (f"Seed contrast (norm){seed_disabled_suffix}", grouped_seed_contrast, "magma"),
         (f"Grouped seed prior{seed_disabled_suffix}", grouped_seed_score, "viridis"),
         (f"{grouped_score_seed_weight:.2f} x seed prior{seed_disabled_suffix}", grouped_seed_weighted, "viridis"),
+        ("Exact grouped support map (patch grid)", grouped_support_exact_patch, "plasma"),
+        ("Exact grouped active mask (patch grid)", grouped_active_mask_exact_patch, "gray"),
+        ("Exact grouped cluster labels (patch grid)", grouped_cluster_labels_exact_patch, "tab20"),
+        ("Exact selected mask pre-smooth (patch grid)", grouped_selected_mask_pre_smooth_exact_patch, "gray"),
+        ("Exact selected mask post-smooth (patch grid)", grouped_selected_mask_exact_patch, "gray"),
+        ("Exact support x selected mask (patch grid)", grouped_support_selected_raw_exact_patch, "plasma"),
         ("Grouped selected support", grouped_selected_support, "plasma"),
         ("0.70 x selected support", grouped_selected_support_weighted, "plasma"),
         ("Grouped cluster quality", grouped_cluster_quality, "cividis"),
         ("0.20 x cluster quality", grouped_cluster_quality_weighted, "cividis"),
         (f"Formula reconstruction (component seed {grouped_component_seed_weight:.2f}, score seed {grouped_score_seed_weight:.2f})", grouped_formula_reconstruction, "plasma"),
         (f"Grouped minus formula{seed_disabled_suffix}", grouped_formula_residual, "coolwarm"),
+        ("Position-deweighted raw DINO energy", deweighted_raw_dino, "inferno"),
         (f"{grouped_surface_label}{seed_disabled_suffix}", cpp_chunk["dino_score_grouped"], "plasma"),
         ("Inverted raw DINO energy", inverted_raw_dino_energy, "inferno"),
+        ("Inverted position-deweighted raw DINO energy", inverted_deweighted_raw_dino_energy, "inferno"),
         (f"Hybrid contrib ({hybrid_dino_source_mode})", cpp_chunk["hybrid_contrib"], "cividis"),
         ("Support base norm", cpp_support["base_norm"], "viridis"),
         ("Support envelope", cpp_support["envelope_map"], "viridis"),
@@ -1792,9 +1893,17 @@ def build_notebook_display_bundle(comparison: dict[str, Any]) -> dict[str, Any]:
         (
             grouped_surface_label,
             cpp_chunk["dino_score_grouped"],
-            python_mapped["dino_score_runtime_grouped"]
-            if (not has_patch_feature_grouping and python_mapped.get("dino_score_runtime_grouped") is not None)
-            else python_mapped["dino_score_grouped"],
+            (
+                python_mapped["dino_score_runtime_raw_feature"]
+                if python_mapped.get("dino_score_runtime_raw_feature") is not None
+                else python_mapped["dino_score_raw_feature"]
+            )
+            if not grouped_path_enabled
+            else (
+                python_mapped["dino_score_runtime_grouped"]
+                if (not has_patch_feature_grouping and python_mapped.get("dino_score_runtime_grouped") is not None)
+                else python_mapped["dino_score_grouped"]
+            ),
             "plasma",
         ),
         ("Hybrid contrib", cpp_chunk["hybrid_contrib"], python_mapped["hybrid_contrib"], "cividis"),

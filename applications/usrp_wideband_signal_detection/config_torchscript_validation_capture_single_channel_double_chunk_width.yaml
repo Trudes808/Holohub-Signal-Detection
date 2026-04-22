@@ -183,7 +183,7 @@ dinov3_signal_detector:
   dino_group_k: 8
   dino_group_spatial_weight: 0.35
   dino_group_score_q: 0.60
-  hybrid_use_inverted_raw_dino_energy: false
+  hybrid_use_inverted_raw_dino_energy: true
   pipeline_final_threshold: 0.20
   pipeline_final_threshold_no_speckle: 0.10
   pipeline_gap_floor: 0.10

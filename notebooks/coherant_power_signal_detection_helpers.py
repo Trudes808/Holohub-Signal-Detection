@@ -29,6 +29,16 @@ class CoherentPowerConfig:
     frontend_max_boost_db: float = 12.0
     coherence_weight: float = 0.55
     power_weight: float = 0.45
+    power_assist_mode: str = "hybrid"
+    power_floor_time_q: float = 25.0
+    power_floor_global_q: float = 30.0
+    power_excess_start_db: float = 3.0
+    power_excess_full_db: float = 15.0
+    power_local_blend: float = 0.25
+    coherence_gate_start: float = 0.15
+    coherence_gate_full: float = 0.45
+    coherence_bridge_bias: float = 0.05
+    coherence_power_joint_weight: float = 0.70
     coherence_power_support_q: float = 0.82
     coherence_power_q: float = 0.92
     min_component_size: int = 6
@@ -697,6 +707,91 @@ def _local_relative_power_support_map(
     return local_support
 
 
+def _estimate_noise_floor_db(
+    sxx_db_local: np.ndarray,
+    valid_row_mask: np.ndarray | None = None,
+    time_q: float = 25.0,
+    global_q: float = 30.0,
+) -> tuple[float, np.ndarray]:
+    x_db = np.asarray(sxx_db_local, dtype=np.float32)
+    row_floor_db = np.percentile(x_db, float(np.clip(time_q, 0.0, 100.0)), axis=1).astype(np.float32)
+    if valid_row_mask is None:
+        valid_row_floor_db = row_floor_db
+    else:
+        valid_row_mask = np.asarray(valid_row_mask, dtype=bool).reshape(-1)
+        if valid_row_mask.shape[0] != row_floor_db.shape[0]:
+            raise ValueError("valid_row_mask length must match the number of spectrogram rows")
+        valid_row_floor_db = row_floor_db[valid_row_mask]
+        if valid_row_floor_db.size == 0:
+            valid_row_floor_db = row_floor_db
+    floor_db = float(np.percentile(valid_row_floor_db, float(np.clip(global_q, 0.0, 100.0))))
+    return floor_db, row_floor_db
+
+
+def _absolute_power_assist_map(
+    sxx_db_local: np.ndarray,
+    valid_row_mask: np.ndarray | None = None,
+    *,
+    floor_db: float,
+    start_db: float = 3.0,
+    full_db: float = 15.0,
+) -> np.ndarray:
+    x_db = np.asarray(sxx_db_local, dtype=np.float32)
+    start_db = float(start_db)
+    full_db = max(float(full_db), start_db + 1e-3)
+    excess_db = x_db - float(floor_db)
+    power_assist = np.clip((excess_db - start_db) / (full_db - start_db), 0.0, 1.0).astype(np.float32)
+    if valid_row_mask is not None:
+        valid_row_mask = np.asarray(valid_row_mask, dtype=bool).reshape(-1)
+        if valid_row_mask.shape[0] != power_assist.shape[0]:
+            raise ValueError("valid_row_mask length must match the number of spectrogram rows")
+        power_assist = power_assist.copy()
+        power_assist[~valid_row_mask, :] = 0.0
+    return power_assist
+
+
+def _build_power_assist_maps(
+    corrected_chunk: np.ndarray,
+    cfg: CoherentPowerConfig,
+    valid_row_mask: np.ndarray | None = None,
+) -> dict[str, Any]:
+    noise_floor_db, noise_floor_by_row_db = _estimate_noise_floor_db(
+        corrected_chunk,
+        valid_row_mask=valid_row_mask,
+        time_q=cfg.power_floor_time_q,
+        global_q=cfg.power_floor_global_q,
+    )
+    absolute_power_px = _absolute_power_assist_map(
+        corrected_chunk,
+        valid_row_mask=valid_row_mask,
+        floor_db=noise_floor_db,
+        start_db=cfg.power_excess_start_db,
+        full_db=cfg.power_excess_full_db,
+    )
+    local_power_px = _normalize_map01_local(
+        _local_relative_power_support_map(corrected_chunk, valid_row_mask=valid_row_mask, floor_q=30.0),
+        5.0,
+        95.0,
+    )
+    mode = str(cfg.power_assist_mode or "hybrid").strip().lower()
+    if mode == "local_relative":
+        power_px = local_power_px
+    elif mode == "absolute_floor":
+        power_px = absolute_power_px
+    else:
+        local_blend = float(np.clip(cfg.power_local_blend, 0.0, 1.0))
+        power_px = np.clip((1.0 - local_blend) * absolute_power_px + local_blend * local_power_px, 0.0, 1.0).astype(np.float32)
+        mode = "hybrid"
+    return {
+        "power_px": np.asarray(power_px, dtype=np.float32),
+        "absolute_power_px": np.asarray(absolute_power_px, dtype=np.float32),
+        "local_power_px": np.asarray(local_power_px, dtype=np.float32),
+        "noise_floor_db": float(noise_floor_db),
+        "noise_floor_by_row_db": np.asarray(noise_floor_by_row_db, dtype=np.float32),
+        "power_assist_mode": mode,
+    }
+
+
 def residual_background_spectrogram(sxx_db_local: np.ndarray):
     x_db = np.asarray(sxx_db_local, dtype=np.float32)
     bg_freq = max(9, int(2 * max(1, x_db.shape[0] // 24) + 1))
@@ -795,13 +890,17 @@ def detect_chunk_coherent_power(
 
     coherence_maps = multi_scale_structure_tensor_gate(corrected_chunk)
     coherence_px = _normalize_map01_local(np.asarray(coherence_maps["coherence_px"], dtype=np.float32), 5.0, 99.0)
-    power_px = _normalize_map01_local(
-        _local_relative_power_support_map(corrected_chunk, valid_row_mask=valid_row_mask, floor_q=30.0),
-        5.0,
-        95.0,
-    )
+    power_assist = _build_power_assist_maps(corrected_chunk, cfg, valid_row_mask=valid_row_mask)
+    power_px = np.asarray(power_assist["power_px"], dtype=np.float32)
+    gate_start = float(cfg.coherence_gate_start)
+    gate_full = max(float(cfg.coherence_gate_full), gate_start + 1e-3)
+    coherence_gate_px = np.clip((coherence_px - gate_start) / (gate_full - gate_start), 0.0, 1.0).astype(np.float32)
+    bridge_bias = float(np.clip(cfg.coherence_bridge_bias, 0.0, 1.0))
+    bridged_power_px = (power_px * (bridge_bias + (1.0 - bridge_bias) * coherence_gate_px)).astype(np.float32)
+    joint_power_px = np.sqrt(np.maximum(power_px, 0.0) * np.maximum(coherence_gate_px, 0.0)).astype(np.float32)
+    joint_weight = float(np.clip(cfg.coherence_power_joint_weight, 0.0, 1.0))
     combined_score = _normalize_map01_local(
-        float(cfg.coherence_weight) * coherence_px + float(cfg.power_weight) * power_px,
+        joint_weight * joint_power_px + (1.0 - joint_weight) * bridged_power_px,
         5.0,
         95.0,
     )
@@ -825,7 +924,10 @@ def detect_chunk_coherent_power(
     ).astype(bool)
 
     coherence_px[~valid_score_mask] = 0.0
+    coherence_gate_px[~valid_score_mask] = 0.0
     power_px[~valid_score_mask] = 0.0
+    bridged_power_px[~valid_score_mask] = 0.0
+    joint_power_px[~valid_score_mask] = 0.0
     combined_score[~valid_score_mask] = 0.0
     support_px[~valid_score_mask] = False
     mask_px[~valid_score_mask] = False
@@ -833,7 +935,15 @@ def detect_chunk_coherent_power(
 
     return {
         "coherence_px": coherence_px.astype(np.float32),
+        "coherence_gate_px": coherence_gate_px.astype(np.float32),
         "power_px": power_px.astype(np.float32),
+        "bridged_power_px": bridged_power_px.astype(np.float32),
+        "joint_power_px": joint_power_px.astype(np.float32),
+        "absolute_power_px": np.asarray(power_assist["absolute_power_px"], dtype=np.float32),
+        "local_power_px": np.asarray(power_assist["local_power_px"], dtype=np.float32),
+        "noise_floor_db": float(power_assist["noise_floor_db"]),
+        "noise_floor_by_row_db": np.asarray(power_assist["noise_floor_by_row_db"], dtype=np.float32),
+        "power_assist_mode": str(power_assist["power_assist_mode"]),
         "score_px": combined_score.astype(np.float32),
         "support_px": support_px.astype(bool),
         "mask_px": mask_px.astype(bool),
@@ -1531,6 +1641,7 @@ def merge_chunk_results(
     global_valid_row_mask: np.ndarray | None = None,
     coherence_weight: float = 0.55,
     power_weight: float = 0.45,
+    coherence_power_joint_weight: float = 0.70,
     grouping_seed_score_q: float = 0.72,
     grouping_bridge_freq_px: int = 33,
     grouping_bridge_time_px: int = 5,
@@ -1543,8 +1654,15 @@ def merge_chunk_results(
     merged_score_sum = np.zeros(global_shape, dtype=np.float32)
     merged_support = np.zeros(global_shape, dtype=bool)
     merged_coherence_sum = np.zeros(global_shape, dtype=np.float32)
+    merged_coherence_gate_sum = np.zeros(global_shape, dtype=np.float32)
     merged_power_sum = np.zeros(global_shape, dtype=np.float32)
+    merged_bridged_power_sum = np.zeros(global_shape, dtype=np.float32)
+    merged_joint_power_sum = np.zeros(global_shape, dtype=np.float32)
+    merged_absolute_power_sum = np.zeros(global_shape, dtype=np.float32)
+    merged_local_power_sum = np.zeros(global_shape, dtype=np.float32)
     merged_weight = np.zeros(global_shape, dtype=np.float32)
+    chunk_noise_floors_db: list[float] = []
+    power_assist_mode = "hybrid"
 
     for chunk in chunk_results:
         row_start = int(chunk["row_start"])
@@ -1554,12 +1672,24 @@ def merge_chunk_results(
         blend_weights = chunk_weights * valid_score_mask.astype(np.float32)
         score_px = np.asarray(chunk["score_px"], dtype=np.float32)
         coherence_px = np.asarray(chunk["coherence_px"], dtype=np.float32)
+        coherence_gate_px = np.asarray(chunk.get("coherence_gate_px", coherence_px), dtype=np.float32)
         power_px = np.asarray(chunk["power_px"], dtype=np.float32)
+        bridged_power_px = np.asarray(chunk.get("bridged_power_px", power_px), dtype=np.float32)
+        joint_power_px = np.asarray(chunk.get("joint_power_px", power_px), dtype=np.float32)
+        absolute_power_px = np.asarray(chunk.get("absolute_power_px", power_px), dtype=np.float32)
+        local_power_px = np.asarray(chunk.get("local_power_px", power_px), dtype=np.float32)
         merged_score_sum[row_start:row_stop, :] += score_px * blend_weights
         merged_coherence_sum[row_start:row_stop, :] += coherence_px * blend_weights
+        merged_coherence_gate_sum[row_start:row_stop, :] += coherence_gate_px * blend_weights
         merged_power_sum[row_start:row_stop, :] += power_px * blend_weights
+        merged_bridged_power_sum[row_start:row_stop, :] += bridged_power_px * blend_weights
+        merged_joint_power_sum[row_start:row_stop, :] += joint_power_px * blend_weights
+        merged_absolute_power_sum[row_start:row_stop, :] += absolute_power_px * blend_weights
+        merged_local_power_sum[row_start:row_stop, :] += local_power_px * blend_weights
         merged_weight[row_start:row_stop, :] += blend_weights
         merged_support[row_start:row_stop, :] |= np.asarray(chunk["support_px"], dtype=bool)
+        chunk_noise_floors_db.append(float(chunk.get("noise_floor_db", 0.0)))
+        power_assist_mode = str(chunk.get("power_assist_mode", power_assist_mode))
 
     valid_row_mask = np.ones(global_shape[0], dtype=bool)
     if global_valid_row_mask is not None:
@@ -1568,13 +1698,24 @@ def merge_chunk_results(
             raise ValueError("global_valid_row_mask length must match global_shape rows")
 
     merged_coherence = np.zeros(global_shape, dtype=np.float32)
+    merged_coherence_gate = np.zeros(global_shape, dtype=np.float32)
     merged_power = np.zeros(global_shape, dtype=np.float32)
+    merged_bridged_power = np.zeros(global_shape, dtype=np.float32)
+    merged_joint_power = np.zeros(global_shape, dtype=np.float32)
+    merged_absolute_power = np.zeros(global_shape, dtype=np.float32)
+    merged_local_power = np.zeros(global_shape, dtype=np.float32)
     overlap_mask = merged_weight > 0.0
     merged_coherence[overlap_mask] = merged_coherence_sum[overlap_mask] / merged_weight[overlap_mask]
+    merged_coherence_gate[overlap_mask] = merged_coherence_gate_sum[overlap_mask] / merged_weight[overlap_mask]
     merged_power[overlap_mask] = merged_power_sum[overlap_mask] / merged_weight[overlap_mask]
+    merged_bridged_power[overlap_mask] = merged_bridged_power_sum[overlap_mask] / merged_weight[overlap_mask]
+    merged_joint_power[overlap_mask] = merged_joint_power_sum[overlap_mask] / merged_weight[overlap_mask]
+    merged_absolute_power[overlap_mask] = merged_absolute_power_sum[overlap_mask] / merged_weight[overlap_mask]
+    merged_local_power[overlap_mask] = merged_local_power_sum[overlap_mask] / merged_weight[overlap_mask]
+    joint_weight = float(np.clip(coherence_power_joint_weight, 0.0, 1.0))
     combined_score = (
-        float(coherence_weight) * merged_coherence
-        + float(power_weight) * merged_power
+        joint_weight * merged_joint_power
+        + (1.0 - joint_weight) * merged_bridged_power
     ).astype(np.float32)
     merged_score = _normalize_map01_masked(
         combined_score,
@@ -1594,7 +1735,12 @@ def merge_chunk_results(
     merged_score[~valid_row_mask, :] = 0.0
     merged_support[~valid_row_mask, :] = False
     merged_coherence[~valid_row_mask, :] = 0.0
+    merged_coherence_gate[~valid_row_mask, :] = 0.0
     merged_power[~valid_row_mask, :] = 0.0
+    merged_bridged_power[~valid_row_mask, :] = 0.0
+    merged_joint_power[~valid_row_mask, :] = 0.0
+    merged_absolute_power[~valid_row_mask, :] = 0.0
+    merged_local_power[~valid_row_mask, :] = 0.0
 
     merged_box_groups = _merge_projected_subsection_boxes(
         global_shape=global_shape,
@@ -1641,7 +1787,15 @@ def merge_chunk_results(
         "merged_box_groups": merged_box_groups,
         "merged_region_groups": merged_region_groups,
         "merged_coherence": merged_coherence.astype(np.float32),
+        "merged_coherence_gate": merged_coherence_gate.astype(np.float32),
         "merged_power": merged_power.astype(np.float32),
+        "merged_bridged_power": merged_bridged_power.astype(np.float32),
+        "merged_joint_power": merged_joint_power.astype(np.float32),
+        "merged_absolute_power": merged_absolute_power.astype(np.float32),
+        "merged_local_power": merged_local_power.astype(np.float32),
+        "chunk_noise_floors_db": [float(value) for value in chunk_noise_floors_db],
+        "merged_noise_floor_db": float(np.median(chunk_noise_floors_db)) if chunk_noise_floors_db else 0.0,
+        "power_assist_mode": power_assist_mode,
     }
 
 
@@ -1766,6 +1920,7 @@ def run_coherent_power_pipeline(
         global_valid_row_mask=valid_row_mask,
         coherence_weight=cfg.coherence_weight,
         power_weight=cfg.power_weight,
+        coherence_power_joint_weight=cfg.coherence_power_joint_weight,
         grouping_seed_score_q=cfg.grouping_seed_score_q,
         grouping_bridge_freq_px=cfg.grouping_bridge_freq_px,
         grouping_bridge_time_px=cfg.grouping_bridge_time_px,
@@ -1817,9 +1972,22 @@ def _display_oriented(image: np.ndarray, display_transposed: bool, *, is_mask: b
     return display_image.astype(np.float32, copy=False)
 
 
+def _match_display_reference(panel: np.ndarray, display_reference: np.ndarray, *, is_mask: bool = False) -> np.ndarray:
+    panel = np.asarray(panel, dtype=np.float32)
+    display_reference = np.asarray(display_reference)
+    if panel.shape == display_reference.shape:
+        return panel
+    if panel.ndim == 2 and panel.T.shape == display_reference.shape:
+        matched = np.asarray(panel.T, dtype=np.float32)
+        return matched if is_mask else matched.astype(np.float32, copy=False)
+    return panel if is_mask else panel.astype(np.float32, copy=False)
+
+
 def _build_overlay_input_record(
     tensor_path: str | Path,
     metadata: dict[str, Any],
+    *,
+    tensor_axis_order_override: str | None = None,
 ) -> tuple[dict[str, Any], np.ndarray, str]:
     tensor_path = Path(tensor_path)
     tensor_snapshot = np.load(tensor_path, allow_pickle=False)
@@ -1832,7 +2000,12 @@ def _build_overlay_input_record(
         tensor_target_width=None,
     )
 
-    tensor_axis_order = str(metadata.get("tensor_axis_order") or input_record.get("tensor_axis_order") or "").strip().lower()
+    tensor_axis_order = str(
+        tensor_axis_order_override
+        or metadata.get("tensor_axis_order")
+        or input_record.get("tensor_axis_order")
+        or ""
+    ).strip().lower()
     if not tensor_axis_order:
         tensor_axis_order = "frequency_time"
 
@@ -1888,6 +2061,7 @@ def load_offline_coherent_overlay_context(
     *,
     target_chunk_rows: int = 1024,
     target_overlap_rows: int = 256,
+    tensor_axis_order_override: str | None = None,
 ) -> dict[str, Any]:
     tensor_path = Path(tensor_path)
     summary_path = Path(summary_path)
@@ -1901,7 +2075,11 @@ def load_offline_coherent_overlay_context(
 
     metadata = json.loads(Path(summary["metadata_path"]).read_text())
     coherent_cfg = CoherentPowerConfig(**metadata["config"])
-    input_record, power_db_snapshot, tensor_axis_order = _build_overlay_input_record(tensor_path, metadata)
+    input_record, power_db_snapshot, tensor_axis_order = _build_overlay_input_record(
+        tensor_path,
+        metadata,
+        tensor_axis_order_override=tensor_axis_order_override,
+    )
 
     active_cfg = adapt_chunk_config_for_input_record(
         input_record,
@@ -1931,8 +2109,8 @@ def load_offline_coherent_overlay_context(
     )
 
     tensor_power_db = _display_oriented(raw_sxx_db, display_transposed)
-    corrected_db = _display_oriented(corrected_db_raw, display_transposed)
-    display_mask = _display_oriented(final_mask_raw, display_transposed, is_mask=True)
+    corrected_db = _match_display_reference(corrected_db_raw, tensor_power_db)
+    display_mask = _match_display_reference(final_mask_raw, tensor_power_db, is_mask=True)
     display_coherence = _display_oriented(merged_coherence, display_transposed)
     main_plot_transposed = _actual_display_transposed(tensor_power_db, raw_sxx_db, display_transposed)
 
@@ -1940,6 +2118,8 @@ def load_offline_coherent_overlay_context(
         "display_transposed": display_transposed,
         "main_plot_transposed": main_plot_transposed,
         "tensor_axis_order": tensor_axis_order,
+        "power_assist_mode": str(pipeline_result.get("power_assist_mode", "hybrid")),
+        "merged_noise_floor_db": float(pipeline_result.get("merged_noise_floor_db", 0.0)),
         "tensor_analysis_shape": tuple(int(v) for v in raw_sxx_db.shape),
         "tensor_display_shape": tuple(int(v) for v in tensor_power_db.shape),
         "corrected_db_raw_shape": tuple(int(v) for v in corrected_db_raw.shape),
@@ -2285,10 +2465,11 @@ def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] 
         )
     )
     vmin, vmax = _display_db_window(corrected_sxx_db)
+    power_mode = str(pipeline_result.get("power_assist_mode", "hybrid")).replace("_", " ")
     fig, axes = plt.subplots(1, 5, figsize=figsize, constrained_layout=True)
     _show_debug_panel(axes[0], corrected_sxx_db, "Input spectrogram", display_transposed, "viridis", vmin, vmax)
     _show_debug_panel(axes[1], merged_coherence, "Merged coherence", display_transposed, "plasma", 0.0, 1.0, reference=corrected_sxx_db)
-    _show_debug_panel(axes[2], merged_power, "Merged normalized power", display_transposed, "cividis", 0.0, 1.0, reference=corrected_sxx_db)
+    _show_debug_panel(axes[2], merged_power, f"Merged power assist ({power_mode})", display_transposed, "cividis", 0.0, 1.0, reference=corrected_sxx_db)
     _show_debug_panel(axes[3], merged_score, "Merged coherence + power score", display_transposed, "magma", 0.0, 1.0, reference=corrected_sxx_db)
     support_display = _orient_panel_for_display(merged_support, corrected_sxx_db, display_transposed)
     actual_display_transposed = _actual_display_transposed(support_display, corrected_sxx_db, display_transposed)
@@ -2325,7 +2506,8 @@ def plot_subsection_debug(
     fig, axes = plt.subplots(1, 6, figsize=figsize, constrained_layout=True)
     _show_debug_panel(axes[0], raw_chunk, f"Subsection {subsection_index} original spectrogram", display_transposed, "viridis", raw_vmin, raw_vmax)
     _show_debug_panel(axes[1], np.asarray(chunk["coherence_px"], dtype=np.float32), f"Subsection {subsection_index} coherence component", display_transposed, "plasma", 0.0, 1.0)
-    _show_debug_panel(axes[2], np.asarray(chunk["power_px"], dtype=np.float32), f"Subsection {subsection_index} normalized power", display_transposed, "cividis", 0.0, 1.0)
+    power_mode = str(chunk.get("power_assist_mode", "hybrid")).replace("_", " ")
+    _show_debug_panel(axes[2], np.asarray(chunk["power_px"], dtype=np.float32), f"Subsection {subsection_index} power assist ({power_mode})", display_transposed, "cividis", 0.0, 1.0)
     _show_debug_panel(axes[3], np.asarray(chunk["score_px"], dtype=np.float32), f"Subsection {subsection_index} coherence + power score", display_transposed, "magma", 0.0, 1.0)
     _show_debug_overlay(
         axes[4],
