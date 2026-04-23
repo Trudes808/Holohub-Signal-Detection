@@ -227,6 +227,8 @@ Start the radio stream from a second host terminal using the same external USRP 
 
 When you change code or config files in the repository:
 
+Use the helper scripts below rather than a host-local CMake configure/build. The rebuild happens inside the demo container and is the supported path for the live app.
+
 ```bash
 cd applications/usrp_wideband_signal_detection
 ./rebuild_demo_container_app.sh
@@ -315,6 +317,18 @@ cd applications/usrp_wideband_signal_detection
 ```
 
 That profile keeps `backend_mode: "reference"`, enables `timing_summary_enable`, and raises coherent `emit_stride` to `32` so the timing synchronizations are sparse enough to inspect the live path without completely collapsing throughput.
+
+To sample stage timings from the live single-channel DINO reference path with the same container launch flow:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+./run_torchscript_live_timing_single_channel.sh
+```
+
+That profile keeps the current single-channel live DINO settings, enables `timing_summary_enable`, and raises DINO `emit_stride` to `32` so the forced timing synchronizations are sparse enough to inspect the GPU path without completely swamping ingest. Look for these log lines:
+
+- `DINO hybrid timing summary` for `input_ms`, `power_db_ms`, `frontend_ms`, `coherence_ms`, `torch_runtime_ms`, `hybrid_post_ms`, `mask_save_ms`, and `total_ms`
+- `DINO service timing` for `frontend`, `crop_align`, `resize`, `model_prep`, `torch_forward`, `dino_score`, `fusion`, plus the reference chunk stages `host_copy`, `host_frontend`, `chunk_plan`, `chunk_upload`, `score_project`, `coherence_hybrid`, `chunk_group`, and `global_merge`
 
 To run the coherent detector with an explicit config through the same sudo/docker flow:
 

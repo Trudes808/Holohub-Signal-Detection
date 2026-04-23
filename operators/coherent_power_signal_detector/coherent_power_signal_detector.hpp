@@ -82,6 +82,13 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
     double resolution_hz,
     const CoherentPowerReferenceConfig& config);
 
+CoherentPowerReferenceResult run_coherent_power_live_validation(
+  const std::vector<coherent_power_complex>& input_tensor,
+  int src_rows,
+  int src_cols,
+  double resolution_hz,
+  const CoherentPowerReferenceConfig& config);
+
 class CoherentPowerSignalDetector : public holoscan::Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(CoherentPowerSignalDetector)

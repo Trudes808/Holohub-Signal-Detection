@@ -24,6 +24,7 @@ class DinoV3SignalDetector : public holoscan::Operator {
 
   static constexpr size_t kTimingStageCount = 8;
   static constexpr size_t kReferenceStageCount = 8;
+  static constexpr size_t kHybridSubstageCount = 8;
 
   DinoV3SignalDetector() = default;
   ~DinoV3SignalDetector() override;
@@ -43,18 +44,11 @@ class DinoV3SignalDetector : public holoscan::Operator {
       float* row_stat_device = nullptr;
       float* row_smooth_device = nullptr;
       float* frontend_reference_device = nullptr;
-      float* time_mean_device = nullptr;
-      float* freq_mean_device = nullptr;
       float* background_device = nullptr;
-      float* box_filter_scratch_device = nullptr;
-      float* coherence_gate_device = nullptr;
-      float* coherence_gate_resized_device = nullptr;
-      float* coherence_gate_host = nullptr;
       uint8_t* mask_host = nullptr;
       cudaStream_t processing_stream = nullptr;
       cudaStream_t staging_stream = nullptr;
       cudaEvent_t analysis_ready_event = nullptr;
-      cudaEvent_t coherence_gate_ready_event = nullptr;
       size_t frame_elements = 0;
       size_t row_elements = 0;
       size_t mask_elements = 0;
@@ -86,6 +80,8 @@ class DinoV3SignalDetector : public holoscan::Operator {
     std::array<double, 7> max_runtime_stage_ms {};
     std::array<double, kReferenceStageCount> total_reference_stage_ms {};
     std::array<double, kReferenceStageCount> max_reference_stage_ms {};
+    std::array<double, kHybridSubstageCount> total_hybrid_substage_ms {};
+    std::array<double, kHybridSubstageCount> max_hybrid_substage_ms {};
     uint64_t total_chunk_count = 0;
     uint64_t max_chunk_count = 0;
   };
@@ -136,9 +132,6 @@ class DinoV3SignalDetector : public holoscan::Operator {
   holoscan::Parameter<double> texture_q_;
   holoscan::Parameter<int> texture_k_;
   holoscan::Parameter<double> power_q_;
-  holoscan::Parameter<int> dino_group_k_;
-  holoscan::Parameter<double> dino_group_spatial_weight_;
-  holoscan::Parameter<double> dino_group_score_q_;
   holoscan::Parameter<bool> filter_detection_mask_;
   holoscan::Parameter<int> grouping_bridge_freq_px_;
   holoscan::Parameter<int> grouping_bridge_time_px_;

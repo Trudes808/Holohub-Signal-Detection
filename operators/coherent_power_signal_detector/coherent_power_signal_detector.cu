@@ -128,13 +128,22 @@ struct DetectionBox {
   std::vector<int> source_chunk_indices;
 };
 
+struct DeviceDetectionBox {
+  int freq_start = 0;
+  int freq_stop = 0;
+  int time_start = 0;
+  int time_stop = 0;
+};
+
 struct DetectionChunkResult {
   ChunkPlanEntry chunk;
+  uint8_t* mask_device = nullptr;
+  int mask_rows = 0;
+  int mask_cols = 0;
   std::vector<float> coherence_px;
   std::vector<float> power_px;
   std::vector<float> score_px;
   std::vector<uint8_t> mask_px;
-  std::vector<uint8_t> grouped_mask;
   std::vector<uint8_t> valid_row_mask;
   std::vector<uint8_t> valid_score_mask;
   std::vector<DetectionBox> grouped_boxes;
@@ -143,6 +152,52 @@ struct DetectionChunkResult {
   double compute_ms = 0.0;
   std::array<double, holoscan::ops::CoherentPowerSignalDetector::kChunkTimingStageCount> stage_ms {};
   std::array<double, holoscan::ops::CoherentPowerSignalDetector::kPowerSupportTimingStageCount> power_support_stage_ms {};
+
+  DetectionChunkResult() = default;
+
+  ~DetectionChunkResult() {
+    if (mask_device != nullptr) {
+      cudaFree(mask_device);
+      mask_device = nullptr;
+    }
+  }
+
+  DetectionChunkResult(const DetectionChunkResult&) = delete;
+  DetectionChunkResult& operator=(const DetectionChunkResult&) = delete;
+
+  DetectionChunkResult(DetectionChunkResult&& other) noexcept {
+    *this = std::move(other);
+  }
+
+  DetectionChunkResult& operator=(DetectionChunkResult&& other) noexcept {
+    if (this == &other) {
+      return *this;
+    }
+    if (mask_device != nullptr) {
+      cudaFree(mask_device);
+    }
+    chunk = other.chunk;
+    mask_device = other.mask_device;
+    mask_rows = other.mask_rows;
+    mask_cols = other.mask_cols;
+    coherence_px = std::move(other.coherence_px);
+    power_px = std::move(other.power_px);
+    score_px = std::move(other.score_px);
+    mask_px = std::move(other.mask_px);
+    valid_row_mask = std::move(other.valid_row_mask);
+    valid_score_mask = std::move(other.valid_score_mask);
+    grouped_boxes = std::move(other.grouped_boxes);
+    support_threshold = other.support_threshold;
+    score_threshold = other.score_threshold;
+    compute_ms = other.compute_ms;
+    stage_ms = other.stage_ms;
+    power_support_stage_ms = other.power_support_stage_ms;
+
+    other.mask_device = nullptr;
+    other.mask_rows = 0;
+    other.mask_cols = 0;
+    return *this;
+  }
 };
 
 class ChunkWorkerPool {
@@ -1139,6 +1194,18 @@ __global__ void coherent_power_threshold_mask_kernel(const float* input,
   output[idx] = (gate_mask[idx] && input[idx] >= threshold) ? 1 : 0;
 }
 
+__global__ void coherent_power_threshold_mask_device_kernel(const float* input,
+                                                            const uint8_t* gate_mask,
+                                                            int total,
+                                                            const float* threshold,
+                                                            uint8_t* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  output[idx] = (gate_mask[idx] && input[idx] >= threshold[0]) ? 1 : 0;
+}
+
 __global__ void coherent_power_threshold_valid_rows_kernel(const float* input,
                                                            int rows,
                                                            int cols,
@@ -1152,6 +1219,21 @@ __global__ void coherent_power_threshold_valid_rows_kernel(const float* input,
   }
   const int row = idx / cols;
   output[idx] = (valid_row_mask[row] && input[idx] >= threshold) ? 1 : 0;
+}
+
+__global__ void coherent_power_threshold_valid_rows_device_kernel(const float* input,
+                                                                  int rows,
+                                                                  int cols,
+                                                                  const uint8_t* valid_row_mask,
+                                                                  const float* threshold,
+                                                                  uint8_t* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+  const int row = idx / cols;
+  output[idx] = (valid_row_mask[row] && input[idx] >= threshold[0]) ? 1 : 0;
 }
 
 float clamp_float(float value, float low, float high) {
@@ -1212,6 +1294,235 @@ __global__ void coherent_power_histogram_all_kernel(const float* input,
   const float clamped = fminf(fmaxf((input[idx] - range_min) / denom, 0.0f), 1.0f);
   const int bin = min(histogram_bins - 1, max(0, static_cast<int>(clamped * static_cast<float>(histogram_bins - 1))));
   atomicAdd(histogram + bin, 1U);
+}
+
+__global__ void coherent_power_histogram_quantile_kernel(const unsigned int* histogram,
+                                                         int histogram_bins,
+                                                         float q,
+                                                         float range_min,
+                                                         float range_max,
+                                                         float* output) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  uint64_t total_count = 0;
+  for (int index = 0; index < histogram_bins; ++index) {
+    total_count += histogram[index];
+  }
+  if (total_count == 0) {
+    output[0] = range_min;
+    return;
+  }
+  q = fminf(fmaxf(q, 0.0f), 1.0f);
+  const uint64_t target = static_cast<uint64_t>(llrintf(q * static_cast<float>(total_count - 1)));
+  uint64_t prefix = 0;
+  int bin_index = histogram_bins - 1;
+  for (int index = 0; index < histogram_bins; ++index) {
+    prefix += histogram[index];
+    if (prefix > target) {
+      bin_index = index;
+      break;
+    }
+  }
+  const float bin_width = (range_max - range_min) / static_cast<float>(max(1, histogram_bins - 1));
+  output[0] = range_min + static_cast<float>(bin_index) * bin_width;
+}
+
+__global__ void coherent_power_normalize_clamp_from_device_scalars_kernel(float* values,
+                                                                           int total,
+                                                                           const float* low,
+                                                                           const float* high) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  const float low_value = low[0];
+  const float high_value = high[0] <= low_value ? (low_value + 1e-6f) : high[0];
+  values[idx] = fminf(fmaxf((values[idx] - low_value) / (high_value - low_value), 0.0f), 1.0f);
+}
+
+__global__ void coherent_power_db_to_linear_scalar_kernel(const float* input_db,
+                                                          float* output_linear) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  output_linear[0] = fmaxf(powf(10.0f, input_db[0] / 10.0f), 1e-20f);
+}
+
+__global__ void coherent_power_relative_db_scalar_floor_kernel(const float* input_linear,
+                                                               const float* floor_linear,
+                                                               int total,
+                                                               float* output_rel_db) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  output_rel_db[idx] = fminf(fmaxf(10.0f * log10f(fmaxf(input_linear[idx], 1e-20f) / floor_linear[0]), -5.0f), 25.0f);
+}
+
+__global__ void coherent_power_absolute_assist_device_floor_kernel(const float* corrected_db,
+                                                                   int rows,
+                                                                   int cols,
+                                                                   const uint8_t* valid_row_mask,
+                                                                   const float* floor_db,
+                                                                   float start_db,
+                                                                   float inv_span_db,
+                                                                   float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+  const int row = idx / cols;
+  if (!valid_row_mask[row]) {
+    output[idx] = 0.0f;
+    return;
+  }
+  const float excess_db = corrected_db[idx] - floor_db[0];
+  output[idx] = fminf(fmaxf((excess_db - start_db) * inv_span_db, 0.0f), 1.0f);
+}
+
+__global__ void coherent_power_boxes_to_mask_kernel(const DeviceDetectionBox* boxes,
+                                                    int box_count,
+                                                    int rows,
+                                                    int cols,
+                                                    float* output) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= box_count) {
+    return;
+  }
+  const DeviceDetectionBox box = boxes[index];
+  const int freq_start = max(0, min(rows, box.freq_start));
+  const int freq_stop = max(freq_start, min(rows, box.freq_stop));
+  const int time_start = max(0, min(cols, box.time_start));
+  const int time_stop = max(time_start, min(cols, box.time_stop));
+  for (int row = freq_start; row < freq_stop; ++row) {
+    for (int col = time_start; col < time_stop; ++col) {
+      output[flat_index(rows, cols, row, col)] = 1.0f;
+    }
+  }
+}
+
+__global__ void coherent_power_project_chunk_mask_kernel(const uint8_t* chunk_mask,
+                                                         int chunk_rows,
+                                                         int chunk_cols,
+                                                         int row_start,
+                                                         int frame_rows,
+                                                         int frame_cols,
+                                                         uint8_t* frame_mask) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = chunk_rows * chunk_cols;
+  if (idx >= total) {
+    return;
+  }
+  if (!chunk_mask[idx]) {
+    return;
+  }
+  const int row = idx / chunk_cols;
+  const int col = idx % chunk_cols;
+  const int global_row = row_start + row;
+  if (global_row < 0 || global_row >= frame_rows || col < 0 || col >= frame_cols) {
+    return;
+  }
+  frame_mask[flat_index(frame_rows, frame_cols, global_row, col)] = 1;
+}
+
+__global__ void coherent_power_binary_dilate_freq_kernel(const uint8_t* input,
+                                                         int rows,
+                                                         int cols,
+                                                         int radius,
+                                                         uint8_t* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+  const int row = idx / cols;
+  const int col = idx % cols;
+  uint8_t value = 0;
+  for (int src_row = max(0, row - radius); src_row <= min(rows - 1, row + radius); ++src_row) {
+    if (input[flat_index(rows, cols, src_row, col)]) {
+      value = 1;
+      break;
+    }
+  }
+  output[idx] = value;
+}
+
+__global__ void coherent_power_binary_erode_freq_kernel(const uint8_t* input,
+                                                        int rows,
+                                                        int cols,
+                                                        int radius,
+                                                        uint8_t* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+  const int row = idx / cols;
+  const int col = idx % cols;
+  uint8_t value = 1;
+  for (int src_row = max(0, row - radius); src_row <= min(rows - 1, row + radius); ++src_row) {
+    if (!input[flat_index(rows, cols, src_row, col)]) {
+      value = 0;
+      break;
+    }
+  }
+  output[idx] = value;
+}
+
+__global__ void coherent_power_fill_time_gaps_kernel(uint8_t* mask,
+                                                     int rows,
+                                                     int cols,
+                                                     int max_gap_px,
+                                                     float min_continuity_ratio) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows || max_gap_px <= 0) {
+    return;
+  }
+
+  int run_start = -1;
+  int previous_stop = -1;
+  int previous_width = 0;
+  for (int col = 0; col <= cols; ++col) {
+    const bool active = col < cols && mask[flat_index(rows, cols, row, col)] != 0;
+    if (active) {
+      if (run_start < 0) {
+        run_start = col;
+      }
+      continue;
+    }
+    if (run_start < 0) {
+      continue;
+    }
+    const int run_stop = col;
+    const int run_width = run_stop - run_start;
+    if (previous_stop >= 0) {
+      const int gap_width = run_start - previous_stop;
+      if (gap_width > 0 && gap_width <= max_gap_px) {
+        const float continuity_ratio = static_cast<float>(previous_width + run_width) /
+                                       static_cast<float>(previous_width + gap_width + run_width);
+        if (continuity_ratio >= min_continuity_ratio) {
+          for (int fill_col = previous_stop; fill_col < run_start; ++fill_col) {
+            mask[flat_index(rows, cols, row, fill_col)] = 1;
+          }
+        }
+      }
+    }
+    previous_stop = run_stop;
+    previous_width = run_width;
+    run_start = -1;
+  }
+}
+
+__global__ void coherent_power_u8_to_float_mask_kernel(const uint8_t* input,
+                                                       int total,
+                                                       float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  output[idx] = input[idx] ? 1.0f : 0.0f;
 }
 
 int clamp_int(int value, int low, int high) {
@@ -1331,9 +1642,18 @@ bool gaussian_blur_2d_cuda(const float* input_device,
                            int cols,
                            float sigma,
                            float* kernel_device,
+                           size_t kernel_epoch,
                            float* scratch_device,
                            float* output_device,
                            cudaStream_t stream) {
+  struct GaussianKernelCacheState {
+    float* kernel_device = nullptr;
+    size_t kernel_epoch = 0;
+    float sigma = std::numeric_limits<float>::quiet_NaN();
+    int radius = -1;
+  };
+  thread_local GaussianKernelCacheState cache;
+
   sigma = std::max(0.5f, sigma);
   const auto kernel = gaussian_kernel_1d(sigma);
   if (kernel.empty() || kernel.size() > static_cast<size_t>(kMaxGaussianKernelSize)) {
@@ -1343,12 +1663,22 @@ bool gaussian_blur_2d_cuda(const float* input_device,
   const int total = rows * cols;
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
-  if (cudaMemcpyAsync(kernel_device,
-                      kernel.data(),
-                      kernel.size() * sizeof(float),
-                      cudaMemcpyHostToDevice,
-                      stream) != cudaSuccess) {
-    return false;
+  const bool kernel_matches_cache = cache.kernel_device == kernel_device &&
+                                    cache.kernel_epoch == kernel_epoch &&
+                                    cache.radius == radius &&
+                                    std::abs(cache.sigma - sigma) < 1e-6f;
+  if (!kernel_matches_cache) {
+    if (cudaMemcpyAsync(kernel_device,
+                        kernel.data(),
+                        kernel.size() * sizeof(float),
+                        cudaMemcpyHostToDevice,
+                        stream) != cudaSuccess) {
+      return false;
+    }
+    cache.kernel_device = kernel_device;
+    cache.kernel_epoch = kernel_epoch;
+    cache.sigma = sigma;
+    cache.radius = radius;
   }
   coherent_power_gaussian_rows_kernel<<<blocks, threads, 0, stream>>>(input_device,
                                                                        rows,
@@ -1833,10 +2163,12 @@ multi_scale_structure_tensor_gate(const std::vector<float>& sxx_db_local, int ro
 
 struct ChunkCudaScratch {
   cudaStream_t stream = nullptr;
-  std::array<float*, 8> buffers {};
+  std::array<float*, 9> buffers {};
   std::array<uint8_t*, 2> mask_buffers {};
   std::array<unsigned int*, 2> histogram_buffers {};
+  std::array<float*, 4> scalar_buffers {};
   float* gaussian_kernel_device = nullptr;
+  size_t gaussian_kernel_epoch = 1;
   size_t capacity = 0;
 
   void release_buffers() {
@@ -1858,10 +2190,17 @@ struct ChunkCudaScratch {
         pointer = nullptr;
       }
     }
+    for (float*& pointer : scalar_buffers) {
+      if (pointer != nullptr) {
+        cudaFree(pointer);
+        pointer = nullptr;
+      }
+    }
     if (gaussian_kernel_device != nullptr) {
       cudaFree(gaussian_kernel_device);
       gaussian_kernel_device = nullptr;
     }
+    ++gaussian_kernel_epoch;
     capacity = 0;
   }
 
@@ -1888,6 +2227,12 @@ struct ChunkCudaScratch {
     }
     for (unsigned int*& pointer : histogram_buffers) {
       if (cudaMalloc(reinterpret_cast<void**>(&pointer), kQuantileHistogramBins * sizeof(unsigned int)) != cudaSuccess) {
+        release_buffers();
+        return false;
+      }
+    }
+    for (float*& pointer : scalar_buffers) {
+      if (cudaMalloc(reinterpret_cast<void**>(&pointer), sizeof(float)) != cudaSuccess) {
         release_buffers();
         return false;
       }
@@ -1965,6 +2310,61 @@ float device_quantile_from_histogram_all(float* values_device,
   return quantile_from_histogram_host(histogram, q, range_min, range_max);
 }
 
+void device_quantile_from_histogram_all_async(float* values_device,
+                                              int total,
+                                              float q,
+                                              float range_min,
+                                              float range_max,
+                                              unsigned int* histogram_device,
+                                              float* output_device,
+                                              cudaStream_t stream) {
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  if (cudaMemsetAsync(histogram_device, 0, kQuantileHistogramBins * sizeof(unsigned int), stream) != cudaSuccess) {
+    throw std::runtime_error("histogram memset failed");
+  }
+  coherent_power_histogram_all_kernel<<<blocks, threads, 0, stream>>>(values_device,
+                                                                       total,
+                                                                       range_min,
+                                                                       range_max,
+                                                                       histogram_device,
+                                                                       kQuantileHistogramBins);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("histogram all kernel failed");
+  }
+  coherent_power_histogram_quantile_kernel<<<1, 1, 0, stream>>>(histogram_device,
+                                                                 kQuantileHistogramBins,
+                                                                 q,
+                                                                 range_min,
+                                                                 range_max,
+                                                                 output_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("histogram all quantile kernel failed");
+  }
+}
+
+void device_histogram_all_async(float* values_device,
+                                int total,
+                                float range_min,
+                                float range_max,
+                                unsigned int* histogram_device,
+                                cudaStream_t stream) {
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  if (cudaMemsetAsync(histogram_device, 0, kQuantileHistogramBins * sizeof(unsigned int), stream) != cudaSuccess) {
+    throw std::runtime_error("histogram memset failed");
+  }
+  coherent_power_histogram_all_kernel<<<blocks, threads, 0, stream>>>(values_device,
+                                                                       total,
+                                                                       range_min,
+                                                                       range_max,
+                                                                       histogram_device,
+                                                                       kQuantileHistogramBins);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("histogram all kernel failed");
+  }
+}
+
 float device_quantile_from_histogram_valid_rows(float* values_device,
                                                 int rows,
                                                 int cols,
@@ -2003,6 +2403,44 @@ float device_quantile_from_histogram_valid_rows(float* values_device,
   return quantile_from_histogram_host(histogram, q, range_min, range_max);
 }
 
+void device_quantile_from_histogram_valid_rows_async(float* values_device,
+                                                     int rows,
+                                                     int cols,
+                                                     const uint8_t* valid_row_mask_device,
+                                                     float q,
+                                                     float range_min,
+                                                     float range_max,
+                                                     unsigned int* histogram_device,
+                                                     float* output_device,
+                                                     cudaStream_t stream) {
+  const int total = rows * cols;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  if (cudaMemsetAsync(histogram_device, 0, kQuantileHistogramBins * sizeof(unsigned int), stream) != cudaSuccess) {
+    throw std::runtime_error("valid-row histogram memset failed");
+  }
+  coherent_power_histogram_valid_rows_kernel<<<blocks, threads, 0, stream>>>(values_device,
+                                                                              rows,
+                                                                              cols,
+                                                                              valid_row_mask_device,
+                                                                              range_min,
+                                                                              range_max,
+                                                                              histogram_device,
+                                                                              kQuantileHistogramBins);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("valid-row histogram kernel failed");
+  }
+  coherent_power_histogram_quantile_kernel<<<1, 1, 0, stream>>>(histogram_device,
+                                                                 kQuantileHistogramBins,
+                                                                 q,
+                                                                 range_min,
+                                                                 range_max,
+                                                                 output_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("valid-row histogram quantile kernel failed");
+  }
+}
+
 float device_quantile_from_histogram_masked(float* values_device,
                                             const uint8_t* mask_device,
                                             int total,
@@ -2036,6 +2474,317 @@ float device_quantile_from_histogram_masked(float* values_device,
     throw std::runtime_error("masked histogram readback failed");
   }
   return quantile_from_histogram_host(histogram, q, range_min, range_max);
+}
+
+void device_quantile_from_histogram_masked_async(float* values_device,
+                                                 const uint8_t* mask_device,
+                                                 int total,
+                                                 float q,
+                                                 float range_min,
+                                                 float range_max,
+                                                 unsigned int* histogram_device,
+                                                 float* output_device,
+                                                 cudaStream_t stream) {
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  if (cudaMemsetAsync(histogram_device, 0, kQuantileHistogramBins * sizeof(unsigned int), stream) != cudaSuccess) {
+    throw std::runtime_error("masked histogram memset failed");
+  }
+  coherent_power_histogram_masked_kernel<<<blocks, threads, 0, stream>>>(values_device,
+                                                                          mask_device,
+                                                                          total,
+                                                                          range_min,
+                                                                          range_max,
+                                                                          histogram_device,
+                                                                          kQuantileHistogramBins);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("masked histogram kernel failed");
+  }
+  coherent_power_histogram_quantile_kernel<<<1, 1, 0, stream>>>(histogram_device,
+                                                                 kQuantileHistogramBins,
+                                                                 q,
+                                                                 range_min,
+                                                                 range_max,
+                                                                 output_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("masked histogram quantile kernel failed");
+  }
+}
+
+float estimate_noise_floor_db_device(float* corrected_db_device,
+                                     int rows,
+                                     int cols,
+                                     const uint8_t* valid_row_mask_device,
+                                     float global_q,
+                                     unsigned int* histogram_device,
+                                     cudaStream_t stream) {
+  return device_quantile_from_histogram_valid_rows(corrected_db_device,
+                                                   rows,
+                                                   cols,
+                                                   valid_row_mask_device,
+                                                   clamp_float(global_q / 100.0f, 0.01f, 0.99f),
+                                                   -120.0f,
+                                                   120.0f,
+                                                   histogram_device,
+                                                   stream);
+}
+
+void estimate_noise_floor_db_device_async(float* corrected_db_device,
+                                          int rows,
+                                          int cols,
+                                          const uint8_t* valid_row_mask_device,
+                                          float global_q,
+                                          unsigned int* histogram_device,
+                                          float* output_device,
+                                          cudaStream_t stream) {
+  device_quantile_from_histogram_valid_rows_async(corrected_db_device,
+                                                  rows,
+                                                  cols,
+                                                  valid_row_mask_device,
+                                                  clamp_float(global_q / 100.0f, 0.01f, 0.99f),
+                                                  -120.0f,
+                                                  120.0f,
+                                                  histogram_device,
+                                                  output_device,
+                                                  stream);
+}
+
+void normalize_map01_device_inplace_async(float* values_device,
+                                          int total,
+                                          float low_q,
+                                          float high_q,
+                                          float range_min,
+                                          float range_max,
+                                          unsigned int* histogram_device,
+                                          float* low_device,
+                                          float* high_device,
+                                          cudaStream_t stream) {
+  device_histogram_all_async(values_device,
+                             total,
+                             range_min,
+                             range_max,
+                             histogram_device,
+                             stream);
+  coherent_power_histogram_quantile_kernel<<<1, 1, 0, stream>>>(histogram_device,
+                                                                 kQuantileHistogramBins,
+                                                                 low_q / 100.0f,
+                                                                 range_min,
+                                                                 range_max,
+                                                                 low_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("histogram low quantile kernel failed");
+  }
+  coherent_power_histogram_quantile_kernel<<<1, 1, 0, stream>>>(histogram_device,
+                                                                 kQuantileHistogramBins,
+                                                                 high_q / 100.0f,
+                                                                 range_min,
+                                                                 range_max,
+                                                                 high_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("histogram high quantile kernel failed");
+  }
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  coherent_power_normalize_clamp_from_device_scalars_kernel<<<blocks, threads, 0, stream>>>(values_device,
+                                                                                              total,
+                                                                                              low_device,
+                                                                                              high_device);
+  const auto cuda_result = cudaGetLastError();
+  if (cuda_result != cudaSuccess) {
+    throw std::runtime_error(std::string("device normalize kernel failed: ") + cudaGetErrorString(cuda_result));
+  }
+}
+
+std::vector<float> boxes_to_float_mask_cuda(int rows,
+                                            int cols,
+                                            const std::vector<DetectionBox>& boxes,
+                                            const std::vector<uint8_t>& valid_row_mask) {
+  const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  auto& scratch = chunk_cuda_scratch();
+  if (!scratch.ensure_capacity(total)) {
+    throw std::runtime_error("final mask CUDA scratch allocation failed");
+  }
+
+  float* mask_device = scratch.buffers[0];
+  uint8_t* valid_row_mask_device = scratch.mask_buffers[0];
+  DeviceDetectionBox* boxes_device = reinterpret_cast<DeviceDetectionBox*>(scratch.buffers[1]);
+  cudaStream_t stream = scratch.stream;
+
+  if (cudaMemsetAsync(mask_device, 0, total * sizeof(float), stream) != cudaSuccess ||
+      cudaMemcpyAsync(valid_row_mask_device,
+                      valid_row_mask.data(),
+                      static_cast<size_t>(rows) * sizeof(uint8_t),
+                      cudaMemcpyHostToDevice,
+                      stream) != cudaSuccess) {
+    throw std::runtime_error("final mask setup failed");
+  }
+
+  if (!boxes.empty()) {
+    std::vector<DeviceDetectionBox> device_boxes;
+    device_boxes.reserve(boxes.size());
+    for (const auto& box : boxes) {
+      device_boxes.push_back({box.freq_start, box.freq_stop, box.time_start, box.time_stop});
+    }
+    if (cudaMemcpyAsync(boxes_device,
+                        device_boxes.data(),
+                        device_boxes.size() * sizeof(DeviceDetectionBox),
+                        cudaMemcpyHostToDevice,
+                        stream) != cudaSuccess) {
+      throw std::runtime_error("final mask box upload failed");
+    }
+    constexpr int box_threads = 64;
+    const int box_blocks = static_cast<int>((device_boxes.size() + box_threads - 1) / box_threads);
+    coherent_power_boxes_to_mask_kernel<<<box_blocks, box_threads, 0, stream>>>(boxes_device,
+                                                                                 static_cast<int>(device_boxes.size()),
+                                                                                 rows,
+                                                                                 cols,
+                                                                                 mask_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("final mask raster kernel failed");
+    }
+  }
+
+  constexpr int threads = 256;
+  const int blocks = static_cast<int>((total + threads - 1) / threads);
+  coherent_power_apply_valid_row_mask_kernel<<<blocks, threads, 0, stream>>>(mask_device,
+                                                                              rows,
+                                                                              cols,
+                                                                              valid_row_mask_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("final mask valid-row kernel failed");
+  }
+
+  std::vector<float> final_mask(total, 0.0f);
+  if (cudaMemcpyAsync(final_mask.data(),
+                      mask_device,
+                      total * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess ||
+      cudaStreamSynchronize(stream) != cudaSuccess) {
+    throw std::runtime_error("final mask readback failed");
+  }
+  return final_mask;
+}
+
+std::vector<float> merge_chunk_masks_to_float_mask_cuda(const std::vector<DetectionChunkResult>& chunk_results,
+                                                        int rows,
+                                                        int cols,
+                                                        const std::vector<uint8_t>& valid_row_mask,
+                                                        bool filter_detection_mask,
+                                                        int bridge_freq_px,
+                                                        int bridge_time_px,
+                                                        float time_continuity_ratio) {
+  const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  auto& scratch = chunk_cuda_scratch();
+  if (!scratch.ensure_capacity(total)) {
+    throw std::runtime_error("global mask CUDA scratch allocation failed");
+  }
+
+  uint8_t* frame_mask_device = scratch.mask_buffers[0];
+  uint8_t* frame_scratch_device = scratch.mask_buffers[1];
+  float* final_mask_device = scratch.buffers[0];
+  cudaStream_t stream = scratch.stream;
+
+  if (cudaMemsetAsync(frame_mask_device, 0, total * sizeof(uint8_t), stream) != cudaSuccess) {
+    throw std::runtime_error("global mask memset failed");
+  }
+
+  constexpr int threads = 256;
+  for (const auto& chunk_result : chunk_results) {
+    if (chunk_result.mask_device == nullptr || chunk_result.mask_rows <= 0 || chunk_result.mask_cols <= 0) {
+      continue;
+    }
+    const int chunk_total = chunk_result.mask_rows * chunk_result.mask_cols;
+    const int blocks = (chunk_total + threads - 1) / threads;
+    coherent_power_project_chunk_mask_kernel<<<blocks, threads, 0, stream>>>(chunk_result.mask_device,
+                                                                              chunk_result.mask_rows,
+                                                                              chunk_result.mask_cols,
+                                                                              chunk_result.chunk.row_start,
+                                                                              rows,
+                                                                              cols,
+                                                                              frame_mask_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk mask projection kernel failed");
+    }
+  }
+
+  if (filter_detection_mask) {
+    const int total_blocks = static_cast<int>((total + threads - 1) / threads);
+    if (bridge_freq_px > 1) {
+      const int radius = std::max(1, bridge_freq_px / 2);
+      coherent_power_binary_dilate_freq_kernel<<<total_blocks, threads, 0, stream>>>(frame_mask_device,
+                                                                                      rows,
+                                                                                      cols,
+                                                                                      radius,
+                                                                                      frame_scratch_device);
+      if (cudaGetLastError() != cudaSuccess) {
+        throw std::runtime_error("global mask dilate kernel failed");
+      }
+      coherent_power_binary_erode_freq_kernel<<<total_blocks, threads, 0, stream>>>(frame_scratch_device,
+                                                                                     rows,
+                                                                                     cols,
+                                                                                     radius,
+                                                                                     frame_mask_device);
+      if (cudaGetLastError() != cudaSuccess) {
+        throw std::runtime_error("global mask erode kernel failed");
+      }
+    }
+    if (bridge_time_px > 0) {
+      const int row_threads = 64;
+      const int row_blocks = (rows + row_threads - 1) / row_threads;
+      coherent_power_fill_time_gaps_kernel<<<row_blocks, row_threads, 0, stream>>>(frame_mask_device,
+                                                                                    rows,
+                                                                                    cols,
+                                                                                    bridge_time_px,
+                                                                                    time_continuity_ratio);
+      if (cudaGetLastError() != cudaSuccess) {
+        throw std::runtime_error("global mask time-gap kernel failed");
+      }
+    }
+    coherent_power_majority_smooth_kernel<<<total_blocks, threads, 0, stream>>>(frame_mask_device,
+                                                                                 rows,
+                                                                                 cols,
+                                                                                 0,
+                                                                                 frame_scratch_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("global mask smooth kernel failed");
+    }
+    if (cudaMemcpyAsync(frame_mask_device,
+                        frame_scratch_device,
+                        total * sizeof(uint8_t),
+                        cudaMemcpyDeviceToDevice,
+                        stream) != cudaSuccess) {
+      throw std::runtime_error("global mask smooth copy failed");
+    }
+  }
+
+  const int total_blocks = static_cast<int>((total + threads - 1) / threads);
+  coherent_power_u8_to_float_mask_kernel<<<total_blocks, threads, 0, stream>>>(frame_mask_device,
+                                                                                static_cast<int>(total),
+                                                                                final_mask_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("global mask float conversion kernel failed");
+  }
+
+  std::vector<float> final_mask(total, 0.0f);
+  if (cudaMemcpyAsync(final_mask.data(),
+                      final_mask_device,
+                      total * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess ||
+      cudaStreamSynchronize(stream) != cudaSuccess) {
+    throw std::runtime_error("global mask readback failed");
+  }
+
+  for (int row = 0; row < rows; ++row) {
+    if (valid_row_mask[static_cast<size_t>(row)]) {
+      continue;
+    }
+    for (int col = 0; col < cols; ++col) {
+      final_mask[flat_index(rows, cols, row, col)] = 0.0f;
+    }
+  }
+  return final_mask;
 }
 
 void normalize_map01_device_inplace(float* values_device,
@@ -2102,9 +2851,11 @@ float estimate_noise_floor_db(const float* corrected_chunk,
 }
 
 bool build_power_assist_map_device(const float* corrected_chunk,
+                                   bool corrected_chunk_on_device,
                                    int rows,
                                    int cols,
                                    const std::vector<uint8_t>& valid_row_mask,
+                                   bool synchronize_timing,
                                    std::string power_assist_mode,
                                    float power_floor_time_q,
                                    float power_floor_global_q,
@@ -2127,7 +2878,7 @@ bool build_power_assist_map_device(const float* corrected_chunk,
     return false;
   }
 
-  float* corrected_db_device = scratch.buffers[0];
+  float* corrected_db_scratch = scratch.buffers[0];
   float* linear_power_device = scratch.buffers[1];
   float* relative_db_device = scratch.buffers[2];
   float* local_baseline_device = scratch.buffers[3];
@@ -2137,21 +2888,35 @@ bool build_power_assist_map_device(const float* corrected_chunk,
   float* blended_power_device = scratch.buffers[7];
   uint8_t* valid_row_mask_device = scratch.mask_buffers[0];
   unsigned int* histogram_device = scratch.histogram_buffers[0];
+  float* scalar0_device = scratch.scalar_buffers[0];
+  float* scalar1_device = scratch.scalar_buffers[1];
   cudaStream_t stream = scratch.stream;
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
-  auto time_stage_ms = [](auto&& fn) {
+  auto time_stage_ms = [&](auto&& fn) {
     const auto stage_start = std::chrono::steady_clock::now();
     fn();
+    if (synchronize_timing) {
+      auto sync_result = cudaStreamSynchronize(stream);
+      if (sync_result != cudaSuccess) {
+        throw std::runtime_error(std::string("power-support timing synchronization failed: ") +
+                                 cudaGetErrorString(sync_result));
+      }
+    }
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
   };
 
-  if (cudaMemcpyAsync(corrected_db_device,
-                      corrected_chunk,
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyHostToDevice,
-                      stream) != cudaSuccess ||
-      cudaMemcpyAsync(valid_row_mask_device,
+  float* corrected_db_device = corrected_db_scratch;
+  if (corrected_chunk_on_device) {
+    corrected_db_device = const_cast<float*>(corrected_chunk);
+  } else if (cudaMemcpyAsync(corrected_db_device,
+                             corrected_chunk,
+                             static_cast<size_t>(total) * sizeof(float),
+                             cudaMemcpyHostToDevice,
+                             stream) != cudaSuccess) {
+    return false;
+  }
+  if (cudaMemcpyAsync(valid_row_mask_device,
                       valid_row_mask.data(),
                       static_cast<size_t>(rows) * sizeof(uint8_t),
                       cudaMemcpyHostToDevice,
@@ -2166,14 +2931,19 @@ bool build_power_assist_map_device(const float* corrected_chunk,
 
   float valid_min_db = std::numeric_limits<float>::max();
   float valid_max_db = std::numeric_limits<float>::lowest();
-  for (int row = 0; row < rows; ++row) {
-    if (!valid_row_mask[static_cast<size_t>(row)]) {
-      continue;
-    }
-    const float* row_ptr = corrected_chunk + static_cast<size_t>(row) * static_cast<size_t>(cols);
-    for (int col = 0; col < cols; ++col) {
-      valid_min_db = std::min(valid_min_db, row_ptr[col]);
-      valid_max_db = std::max(valid_max_db, row_ptr[col]);
+  if (corrected_chunk_on_device) {
+    valid_min_db = -120.0f;
+    valid_max_db = 120.0f;
+  } else {
+    for (int row = 0; row < rows; ++row) {
+      if (!valid_row_mask[static_cast<size_t>(row)]) {
+        continue;
+      }
+      const float* row_ptr = corrected_chunk + static_cast<size_t>(row) * static_cast<size_t>(cols);
+      for (int col = 0; col < cols; ++col) {
+        valid_min_db = std::min(valid_min_db, row_ptr[col]);
+        valid_max_db = std::max(valid_max_db, row_ptr[col]);
+      }
     }
   }
   if (!(valid_min_db < valid_max_db)) {
@@ -2181,28 +2951,31 @@ bool build_power_assist_map_device(const float* corrected_chunk,
     valid_max_db = 120.0f;
   }
 
-  float local_floor_linear = 1e-20f;
   const double floor_estimate_ms = time_stage_ms([&] {
-    const float local_floor_db = device_quantile_from_histogram_valid_rows(corrected_db_device,
-                                                                           rows,
-                                                                           cols,
-                                                                           valid_row_mask_device,
-                                                                           0.30f,
-                                                                           valid_min_db,
-                                                                           valid_max_db,
-                                                                           histogram_device,
-                                                                           stream);
-    local_floor_linear = std::max(std::pow(10.0f, local_floor_db / 10.0f), 1e-20f);
+    device_quantile_from_histogram_valid_rows_async(corrected_db_device,
+                                                    rows,
+                                                    cols,
+                                                    valid_row_mask_device,
+                                                    0.30f,
+                                                    valid_min_db,
+                                                    valid_max_db,
+                                                    histogram_device,
+                                                    scalar0_device,
+                                                    stream);
+    coherent_power_db_to_linear_scalar_kernel<<<1, 1, 0, stream>>>(scalar0_device, scalar1_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk local floor scalar kernel failed");
+    }
   });
   if (detail_ms_out != nullptr) {
     (*detail_ms_out)[kPowerSupportFloorEstimateStage] = floor_estimate_ms;
   }
 
   const double local_relative_ms = time_stage_ms([&] {
-    coherent_power_relative_db_kernel<<<blocks, threads, 0, stream>>>(linear_power_device,
-                                                                       local_floor_linear,
-                                                                       total,
-                                                                       relative_db_device);
+    coherent_power_relative_db_scalar_floor_kernel<<<blocks, threads, 0, stream>>>(linear_power_device,
+                                                                                    scalar1_device,
+                                                                                    total,
+                                                                                    relative_db_device);
     if (cudaGetLastError() != cudaSuccess) {
       throw std::runtime_error("chunk local-relative db kernel failed");
     }
@@ -2236,7 +3009,16 @@ bool build_power_assist_map_device(const float* corrected_chunk,
     if (cudaGetLastError() != cudaSuccess) {
       throw std::runtime_error("chunk local-relative valid-mask kernel failed");
     }
-    normalize_map01_device_inplace(local_power_device, total, 5.0f, 95.0f, 0.0f, 25.0f, histogram_device, stream);
+    normalize_map01_device_inplace_async(local_power_device,
+                                         total,
+                                         5.0f,
+                                         95.0f,
+                                         0.0f,
+                                         25.0f,
+                                         histogram_device,
+                                         scalar0_device,
+                                         scalar1_device,
+                                         stream);
   });
   if (detail_ms_out != nullptr) {
     (*detail_ms_out)[kPowerSupportLocalRelativeStage] = local_relative_ms;
@@ -2251,24 +3033,43 @@ bool build_power_assist_map_device(const float* corrected_chunk,
     return true;
   }
 
-  const float floor_db = estimate_noise_floor_db(corrected_chunk,
-                                                 rows,
-                                                 cols,
-                                                 valid_row_mask,
-                                                 power_floor_time_q,
-                                                 power_floor_global_q);
   const float start_db = power_excess_start_db;
   const float full_db = std::max(power_excess_full_db, start_db + 1e-3f);
   const double absolute_assist_ms = time_stage_ms([&] {
-    coherent_power_absolute_assist_kernel<<<blocks, threads, 0, stream>>>(corrected_db_device,
-                                                                           rows,
-                                                                           cols,
-                                                                           valid_row_mask_device,
-                                                                           floor_db,
-                                                                           start_db,
-                                                                           1.0f / (full_db - start_db),
-                                                                           absolute_power_device);
-    if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess) {
+    if (corrected_chunk_on_device) {
+      estimate_noise_floor_db_device_async(corrected_db_device,
+                                           rows,
+                                           cols,
+                                           valid_row_mask_device,
+                                           power_floor_global_q,
+                                           histogram_device,
+                                           scalar0_device,
+                                           stream);
+      coherent_power_absolute_assist_device_floor_kernel<<<blocks, threads, 0, stream>>>(corrected_db_device,
+                                                                                           rows,
+                                                                                           cols,
+                                                                                           valid_row_mask_device,
+                                                                                           scalar0_device,
+                                                                                           start_db,
+                                                                                           1.0f / (full_db - start_db),
+                                                                                           absolute_power_device);
+    } else {
+      const float floor_db = estimate_noise_floor_db(corrected_chunk,
+                                                     rows,
+                                                     cols,
+                                                     valid_row_mask,
+                                                     power_floor_time_q,
+                                                     power_floor_global_q);
+      coherent_power_absolute_assist_kernel<<<blocks, threads, 0, stream>>>(corrected_db_device,
+                                                                             rows,
+                                                                             cols,
+                                                                             valid_row_mask_device,
+                                                                             floor_db,
+                                                                             start_db,
+                                                                             1.0f / (full_db - start_db),
+                                                                             absolute_power_device);
+    }
+    if (cudaGetLastError() != cudaSuccess) {
       throw std::runtime_error("chunk absolute-assist kernel failed");
     }
   });
@@ -2288,7 +3089,7 @@ bool build_power_assist_map_device(const float* corrected_chunk,
                                                                  total,
                                                                  local_blend,
                                                                  blended_power_device);
-    if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess) {
+    if (cudaGetLastError() != cudaSuccess) {
       throw std::runtime_error("chunk power-assist blend kernel failed");
     }
   });
@@ -2300,7 +3101,7 @@ bool build_power_assist_map_device(const float* corrected_chunk,
   return true;
 }
 
-void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
+void run_chunk_score_masks_gpu(const float* coherence_px_device,
                                const float* power_px_device,
                                int rows,
                                int cols,
@@ -2313,12 +3114,15 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
                                double coherence_power_joint_weight,
                                int min_component_size,
                                bool filter_detection_mask,
+                               bool readback_host_outputs,
+                               const float** score_px_device_out,
+                               const uint8_t** mask_px_device_out,
                                std::vector<float>& score_px,
                                std::vector<uint8_t>& mask_px,
                                float& support_threshold,
                                float& score_threshold) {
   const int total = rows * cols;
-  if (total <= 0 || static_cast<int>(coherence_px.size()) != total || power_px_device == nullptr) {
+  if (total <= 0 || coherence_px_device == nullptr || power_px_device == nullptr) {
     throw std::invalid_argument("run_chunk_score_masks_gpu received mismatched chunk buffers");
   }
 
@@ -2328,20 +3132,24 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
   }
 
   float* d0 = scratch.buffers[0];
-  float* d2 = scratch.buffers[2];
   float* d3 = scratch.buffers[3];
   float* d4 = scratch.buffers[4];
   uint8_t* valid_row_mask_device = scratch.mask_buffers[0];
   uint8_t* mask_device = scratch.mask_buffers[1];
+  uint8_t* scratch_mask_device = scratch.mask_buffers[0];
   unsigned int* histogram_device = scratch.histogram_buffers[0];
+  float* support_threshold_device = scratch.scalar_buffers[0];
+  float* score_threshold_device = scratch.scalar_buffers[1];
+  float* normalize_low_device = scratch.scalar_buffers[2];
+  float* normalize_high_device = scratch.scalar_buffers[3];
   cudaStream_t stream = scratch.stream;
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
 
   if (cudaMemcpyAsync(d0,
-                      coherence_px.data(),
+                      coherence_px_device,
                       static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyHostToDevice,
+                      cudaMemcpyDeviceToDevice,
                       stream) != cudaSuccess ||
       cudaMemcpyAsync(valid_row_mask_device,
                       valid_row_mask.data(),
@@ -2351,7 +3159,16 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
     throw std::runtime_error("chunk score GPU input copy failed");
   }
 
-  normalize_map01_device_inplace(d0, total, 5.0f, 99.0f, 0.0f, 1.0f, histogram_device, stream);
+  normalize_map01_device_inplace_async(d0,
+                                       total,
+                                       5.0f,
+                                       99.0f,
+                                       0.0f,
+                                       1.0f,
+                                       histogram_device,
+                                       normalize_low_device,
+                                       normalize_high_device,
+                                       stream);
   const float gate_start = static_cast<float>(coherence_gate_start);
   const float gate_full = std::max(static_cast<float>(coherence_gate_full), gate_start + 1e-3f);
   coherent_power_gate_kernel<<<blocks, threads, 0, stream>>>(d0,
@@ -2368,53 +3185,43 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
                                                                              total,
                                                                              clamp_float(static_cast<float>(coherence_bridge_bias), 0.0f, 1.0f),
                                                                              clamp_float(static_cast<float>(coherence_power_joint_weight), 0.0f, 1.0f),
-                                                                             d2);
+                                                                             d3);
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk bridged/joint score kernel failed");
   }
-  if (cudaMemcpyAsync(d3,
-                      d2,
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyDeviceToDevice,
-                      stream) != cudaSuccess) {
-    throw std::runtime_error("chunk score device copy failed");
-  }
-  normalize_map01_device_inplace(d3, total, 5.0f, 95.0f, 0.0f, 1.0f, histogram_device, stream);
+  normalize_map01_device_inplace_async(d3,
+                                       total,
+                                       5.0f,
+                                       95.0f,
+                                       0.0f,
+                                       1.0f,
+                                       histogram_device,
+                                       normalize_low_device,
+                                       normalize_high_device,
+                                       stream);
 
-  coherent_power_apply_valid_row_mask_kernel<<<blocks, threads, 0, stream>>>(d2, rows, cols, valid_row_mask_device);
-  if (cudaGetLastError() != cudaSuccess) {
-    throw std::runtime_error("chunk combined valid-mask kernel failed");
-  }
   coherent_power_apply_valid_row_mask_kernel<<<blocks, threads, 0, stream>>>(d3, rows, cols, valid_row_mask_device);
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk score valid-mask kernel failed");
   }
 
-  coherent_power_copy_valid_rows_with_sentinel_kernel<<<blocks, threads, 0, stream>>>(d3,
-                                                                                       rows,
-                                                                                       cols,
-                                                                                       valid_row_mask_device,
-                                                                                       -1.0f,
-                                                                                       d4);
-  if (cudaGetLastError() != cudaSuccess) {
-    throw std::runtime_error("chunk support-mask copy kernel failed");
-  }
-  support_threshold = device_quantile_from_histogram_valid_rows(d3,
-                                                                rows,
-                                                                cols,
-                                                                valid_row_mask_device,
-                                                                clamp_float(static_cast<float>(support_q), 0.50f, 0.99f),
-                                                                0.0f,
-                                                                1.0f,
-                                                                histogram_device,
-                                                                stream);
+  device_quantile_from_histogram_valid_rows_async(d3,
+                                                  rows,
+                                                  cols,
+                                                  valid_row_mask_device,
+                                                  clamp_float(static_cast<float>(support_q), 0.50f, 0.99f),
+                                                  0.0f,
+                                                  1.0f,
+                                                  histogram_device,
+                                                  support_threshold_device,
+                                                  stream);
 
-  coherent_power_threshold_valid_rows_kernel<<<blocks, threads, 0, stream>>>(d3,
-                                                                              rows,
-                                                                              cols,
-                                                                              valid_row_mask_device,
-                                                                              support_threshold,
-                                                                              mask_device);
+  coherent_power_threshold_valid_rows_device_kernel<<<blocks, threads, 0, stream>>>(d3,
+                                                                                     rows,
+                                                                                     cols,
+                                                                                     valid_row_mask_device,
+                                                                                     support_threshold_device,
+                                                                                     mask_device);
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk support threshold kernel failed");
   }
@@ -2422,50 +3229,52 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
                                                                          rows,
                                                                          cols,
                                                                          0,
-                                                                         scratch.mask_buffers[0]);
+                                                                         scratch_mask_device);
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk support majority smooth kernel failed");
   }
-  if (cudaMemcpyAsync(mask_device,
-                      scratch.mask_buffers[0],
-                      static_cast<size_t>(total) * sizeof(uint8_t),
-                      cudaMemcpyDeviceToDevice,
-                      stream) != cudaSuccess) {
-    throw std::runtime_error("chunk support mask device copy failed");
-  }
+  std::swap(mask_device, scratch_mask_device);
 
-  coherent_power_copy_masked_with_sentinel_kernel<<<blocks, threads, 0, stream>>>(d3,
-                                                                                   mask_device,
-                                                                                   total,
-                                                                                   -1.0f,
-                                                                                   d4);
-  if (cudaGetLastError() != cudaSuccess) {
-    throw std::runtime_error("chunk final-mask copy kernel failed");
-  }
-  score_threshold = device_quantile_from_histogram_masked(d3,
-                                                          mask_device,
-                                                          total,
-                                                          clamp_float(static_cast<float>(final_q), 0.50f, 0.99f),
-                                                          0.0f,
-                                                          1.0f,
-                                                          histogram_device,
-                                                          stream);
+  device_quantile_from_histogram_masked_async(d3,
+                                              mask_device,
+                                              total,
+                                              clamp_float(static_cast<float>(final_q), 0.50f, 0.99f),
+                                              0.0f,
+                                              1.0f,
+                                              histogram_device,
+                                              score_threshold_device,
+                                              stream);
 
-  coherent_power_threshold_mask_kernel<<<blocks, threads, 0, stream>>>(d3,
-                                                                        mask_device,
-                                                                        total,
-                                                                        score_threshold,
-                                                                        scratch.mask_buffers[1]);
+  coherent_power_threshold_mask_device_kernel<<<blocks, threads, 0, stream>>>(d3,
+                                                                               mask_device,
+                                                                               total,
+                                                                               score_threshold_device,
+                                                                               scratch_mask_device);
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk final threshold kernel failed");
   }
-  coherent_power_majority_smooth_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_buffers[1],
+  coherent_power_majority_smooth_kernel<<<blocks, threads, 0, stream>>>(scratch_mask_device,
                                                                          rows,
                                                                          cols,
                                                                          0,
                                                                          mask_device);
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk final majority smooth kernel failed");
+  }
+
+  if (score_px_device_out != nullptr) {
+    *score_px_device_out = d3;
+  }
+  if (mask_px_device_out != nullptr) {
+    *mask_px_device_out = mask_device;
+  }
+
+  if (!readback_host_outputs) {
+    support_threshold = 0.0f;
+    score_threshold = 0.0f;
+    score_px.clear();
+    mask_px.clear();
+    return;
   }
 
   score_px.assign(static_cast<size_t>(total), 0.0f);
@@ -2478,6 +3287,16 @@ void run_chunk_score_masks_gpu(const std::vector<float>& coherence_px,
       cudaMemcpyAsync(mask_px.data(),
                       mask_device,
                       static_cast<size_t>(total) * sizeof(uint8_t),
+                      cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess ||
+      cudaMemcpyAsync(&support_threshold,
+                      support_threshold_device,
+                      sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess ||
+      cudaMemcpyAsync(&score_threshold,
+                      score_threshold_device,
+                      sizeof(float),
                       cudaMemcpyDeviceToHost,
                       stream) != cudaSuccess ||
       cudaStreamSynchronize(stream) != cudaSuccess) {
@@ -2600,11 +3419,12 @@ bool local_relative_power_support_map_cuda(const float* sxx_db_local,
 }
 
 bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
+                                                 bool sxx_db_local_on_device,
                                                  int rows,
                                                  int cols,
-                                                 std::vector<float>& coherence_max) {
+                                                 const float** coherence_device_out) {
   const int total = rows * cols;
-  if (total <= 0 || sxx_db_local == nullptr) {
+  if (total <= 0 || sxx_db_local == nullptr || coherence_device_out == nullptr) {
     return false;
   }
 
@@ -2620,13 +3440,19 @@ bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
   auto* d5 = scratch.buffers[5];
   auto* d6 = scratch.buffers[6];
   auto* d7 = scratch.buffers[7];
+  auto* coherence_device = scratch.buffers[8];
+  auto* scalar0_device = scratch.scalar_buffers[0];
+  auto* scalar1_device = scratch.scalar_buffers[1];
   auto stream = scratch.stream;
 
-  if (cudaMemcpyAsync(d0,
-                      sxx_db_local,
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyHostToDevice,
-                      stream) != cudaSuccess) {
+  const float* source_db_device = d0;
+  if (sxx_db_local_on_device) {
+    source_db_device = sxx_db_local;
+  } else if (cudaMemcpyAsync(d0,
+                             sxx_db_local,
+                             static_cast<size_t>(total) * sizeof(float),
+                             cudaMemcpyHostToDevice,
+                             stream) != cudaSuccess) {
     return false;
   }
 
@@ -2634,7 +3460,7 @@ bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
   const int bg_time = std::max(9, 2 * std::max(1, cols / 24) + 1);
   const int total_threads = 256;
   const int total_blocks = (total + total_threads - 1) / total_threads;
-  coherent_power_box_mean_cols_kernel<<<total_blocks, total_threads, 0, stream>>>(d0,
+  coherent_power_box_mean_cols_kernel<<<total_blocks, total_threads, 0, stream>>>(source_db_device,
                                                                                     rows,
                                                                                     cols,
                                                                                     bg_time / 2,
@@ -2650,24 +3476,29 @@ bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
   if (cudaGetLastError() != cudaSuccess) {
     return false;
   }
-  coherent_power_subtract_clamp_kernel<<<total_blocks, total_threads, 0, stream>>>(d0, d2, total, d1);
+  coherent_power_subtract_clamp_kernel<<<total_blocks, total_threads, 0, stream>>>(source_db_device, d2, total, d6);
   if (cudaGetLastError() != cudaSuccess) {
     return false;
   }
-  normalize_map01_device_inplace(d1, total, 5.0f, 99.0f, 0.0f, 40.0f, scratch.histogram_buffers[0], stream);
-  if (cudaMemcpyAsync(d0,
-                      d1,
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyDeviceToDevice,
-                      stream) != cudaSuccess ||
-      cudaMemsetAsync(d6, 0, static_cast<size_t>(total) * sizeof(float), stream) != cudaSuccess) {
+  normalize_map01_device_inplace_async(d6,
+                                       total,
+                                       5.0f,
+                                       99.0f,
+                                       0.0f,
+                                       40.0f,
+                                       scratch.histogram_buffers[0],
+                                       scalar0_device,
+                                       scalar1_device,
+                                       stream);
+  if (cudaMemsetAsync(coherence_device, 0, static_cast<size_t>(total) * sizeof(float), stream) != cudaSuccess) {
     return false;
   }
 
   const std::array<float, 3> scales{{0.8f, 1.6f, 3.2f}};
 
   for (const float grad_sigma : scales) {
-    if (!gaussian_blur_2d_cuda(d0, rows, cols, grad_sigma, scratch.gaussian_kernel_device, d1, d2, stream)) {
+    if (!gaussian_blur_2d_cuda(
+            d6, rows, cols, grad_sigma, scratch.gaussian_kernel_device, scratch.gaussian_kernel_epoch, d0, d2, stream)) {
       return false;
     }
     coherent_power_gradient_kernel<<<total_blocks, total_threads, 0, stream>>>(d2, rows, cols, d3, d4);
@@ -2680,9 +3511,12 @@ bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
     }
 
     const float integ_sigma = std::max(1.0f, 1.8f * grad_sigma);
-    if (!gaussian_blur_2d_cuda(d1, rows, cols, integ_sigma, scratch.gaussian_kernel_device, d0, d1, stream) ||
-        !gaussian_blur_2d_cuda(d2, rows, cols, integ_sigma, scratch.gaussian_kernel_device, d0, d2, stream) ||
-        !gaussian_blur_2d_cuda(d5, rows, cols, integ_sigma, scratch.gaussian_kernel_device, d0, d5, stream)) {
+    if (!gaussian_blur_2d_cuda(
+        d1, rows, cols, integ_sigma, scratch.gaussian_kernel_device, scratch.gaussian_kernel_epoch, d0, d1, stream) ||
+      !gaussian_blur_2d_cuda(
+        d2, rows, cols, integ_sigma, scratch.gaussian_kernel_device, scratch.gaussian_kernel_epoch, d0, d2, stream) ||
+      !gaussian_blur_2d_cuda(
+        d5, rows, cols, integ_sigma, scratch.gaussian_kernel_device, scratch.gaussian_kernel_epoch, d0, d5, stream)) {
       return false;
     }
 
@@ -2695,22 +3529,23 @@ bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
     if (cudaGetLastError() != cudaSuccess) {
       return false;
     }
-    normalize_map01_device_inplace(d3, total, 5.0f, 99.0f, 0.0f, 1.0f, scratch.histogram_buffers[0], stream);
-    coherent_power_elementwise_max_inplace_kernel<<<total_blocks, total_threads, 0, stream>>>(d3, total, d6);
+    normalize_map01_device_inplace_async(d3,
+                                         total,
+                                         5.0f,
+                                         99.0f,
+                                         0.0f,
+                                         1.0f,
+                                         scratch.histogram_buffers[0],
+                                         scalar0_device,
+                                         scalar1_device,
+                                         stream);
+    coherent_power_elementwise_max_inplace_kernel<<<total_blocks, total_threads, 0, stream>>>(d3, total, coherence_device);
     if (cudaGetLastError() != cudaSuccess) {
       return false;
     }
   }
 
-  coherence_max.assign(static_cast<size_t>(total), 0.0f);
-  if (cudaMemcpyAsync(coherence_max.data(),
-                      d6,
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyDeviceToHost,
-                      stream) != cudaSuccess ||
-      cudaStreamSynchronize(stream) != cudaSuccess) {
-    return false;
-  }
+  *coherence_device_out = coherence_device;
   return true;
 }
 
@@ -2833,6 +3668,11 @@ struct CandidateMask {
   std::vector<uint8_t> mask;
   std::string split_role = "unsplit";
   bool split_applied = false;
+  int min_row = 0;
+  int max_row = -1;
+  int min_col = 0;
+  int max_col = -1;
+  int filled_area = 0;
 };
 
 int component_envelope_area(const std::vector<uint8_t>& component_mask, int rows, int cols) {
@@ -2862,9 +3702,12 @@ std::vector<CandidateMask> split_component_candidate_masks(const std::vector<uin
                                                            int cols,
                                                            int min_freq_span_px,
                                                            int min_time_span_px) {
-  std::vector<CandidateMask> unsplit {{component_mask, "unsplit", false}};
+  auto make_unsplit = [&]() {
+    return std::vector<CandidateMask>{{component_mask, "unsplit", false, 0, rows - 1, 0, cols - 1,
+                                       static_cast<int>(std::count(component_mask.begin(), component_mask.end(), static_cast<uint8_t>(1)))}};
+  };
   if (rows <= 0 || cols <= 0) {
-    return unsplit;
+    return make_unsplit();
   }
 
   std::vector<int> active_cols;
@@ -2882,7 +3725,7 @@ std::vector<CandidateMask> split_component_candidate_masks(const std::vector<uin
     }
   }
   if (static_cast<int>(active_cols.size()) < std::max(6, 2 * min_time_span_px)) {
-    return unsplit;
+    return make_unsplit();
   }
 
   std::vector<int> col_span(static_cast<size_t>(cols), 0);
@@ -2904,7 +3747,7 @@ std::vector<CandidateMask> split_component_candidate_masks(const std::vector<uin
     }
   }
   if (static_cast<int>(active_spans.size()) < std::max(6, 2 * min_time_span_px)) {
-    return unsplit;
+    return make_unsplit();
   }
 
   std::sort(active_spans.begin(), active_spans.end());
@@ -2927,7 +3770,7 @@ std::vector<CandidateMask> split_component_candidate_masks(const std::vector<uin
     }
   }
   if (global_max_row < global_min_row) {
-    return unsplit;
+    return make_unsplit();
   }
 
   const int global_span = global_max_row - global_min_row + 1;
@@ -2937,7 +3780,7 @@ std::vector<CandidateMask> split_component_candidate_masks(const std::vector<uin
       min_freq_span_px,
   });
   if (burst_span_threshold >= global_span) {
-    return unsplit;
+    return make_unsplit();
   }
 
   std::vector<uint8_t> burst_cols_mask(static_cast<size_t>(cols), 0);
@@ -2957,7 +3800,7 @@ std::vector<CandidateMask> split_component_candidate_masks(const std::vector<uin
     burst_runs.push_back(run);
   }
   if (burst_runs.empty()) {
-    return unsplit;
+    return make_unsplit();
   }
 
   std::vector<int> non_burst_cols;
@@ -2968,7 +3811,7 @@ std::vector<CandidateMask> split_component_candidate_masks(const std::vector<uin
     }
   }
   if (static_cast<int>(non_burst_cols.size()) < std::max(4, 2 * min_time_span_px)) {
-    return unsplit;
+    return make_unsplit();
   }
 
   const int min_row_hits = std::max(2, static_cast<int>(std::ceil(static_cast<double>(non_burst_cols.size()) * 0.45)));
@@ -2982,7 +3825,7 @@ std::vector<CandidateMask> split_component_candidate_masks(const std::vector<uin
   }
   const auto carrier_row_runs = true_runs(carrier_rows_mask);
   if (carrier_row_runs.empty()) {
-    return unsplit;
+    return make_unsplit();
   }
 
   auto carrier_run = *std::max_element(
@@ -2993,37 +3836,69 @@ std::vector<CandidateMask> split_component_candidate_masks(const std::vector<uin
   const int carrier_freq_stop = carrier_run.second;
   const int carrier_freq_span = carrier_freq_stop - carrier_freq_start;
   if (carrier_freq_span < std::max(2, static_cast<int>(std::floor(baseline_span))) || carrier_freq_span >= burst_span_threshold) {
-    return unsplit;
+    return make_unsplit();
   }
 
   std::vector<uint8_t> carrier_mask(component_mask.size(), 0);
+  int carrier_min_col = cols;
+  int carrier_max_col = -1;
   for (int row = carrier_freq_start; row < carrier_freq_stop; ++row) {
     for (int col = 0; col < cols; ++col) {
-      carrier_mask[flat_index(rows, cols, row, col)] = component_mask[flat_index(rows, cols, row, col)];
+      const uint8_t active = component_mask[flat_index(rows, cols, row, col)];
+      carrier_mask[flat_index(rows, cols, row, col)] = active;
+      if (!active) {
+        continue;
+      }
+      carrier_min_col = std::min(carrier_min_col, col);
+      carrier_max_col = std::max(carrier_max_col, col);
     }
   }
   const int carrier_count = static_cast<int>(std::count(carrier_mask.begin(), carrier_mask.end(), static_cast<uint8_t>(1)));
   if (carrier_count < std::max(2, min_time_span_px * 2)) {
-    return unsplit;
+    return make_unsplit();
   }
 
   std::vector<CandidateMask> candidates;
-  candidates.push_back({carrier_mask, "persistent_carrier", true});
+  candidates.push_back({carrier_mask,
+                        "persistent_carrier",
+                        true,
+                        carrier_freq_start,
+                        carrier_freq_stop - 1,
+                        carrier_min_col,
+                        carrier_max_col,
+                        carrier_count});
   for (const auto& run : burst_runs) {
     std::vector<uint8_t> burst_mask(component_mask.size(), 0);
+    int burst_min_row = rows;
+    int burst_max_row = -1;
+    int burst_count = 0;
     for (int row = 0; row < rows; ++row) {
       for (int col = run.first; col < run.second; ++col) {
-        burst_mask[flat_index(rows, cols, row, col)] = component_mask[flat_index(rows, cols, row, col)];
+        const uint8_t active = component_mask[flat_index(rows, cols, row, col)];
+        burst_mask[flat_index(rows, cols, row, col)] = active;
+        if (!active) {
+          continue;
+        }
+        burst_min_row = std::min(burst_min_row, row);
+        burst_max_row = std::max(burst_max_row, row);
+        ++burst_count;
       }
     }
-    if (std::count(burst_mask.begin(), burst_mask.end(), static_cast<uint8_t>(1)) == 0) {
+    if (burst_count == 0) {
       continue;
     }
-    candidates.push_back({burst_mask, "transient_wideband_burst", true});
+    candidates.push_back({burst_mask,
+                          "transient_wideband_burst",
+                          true,
+                          burst_min_row,
+                          burst_max_row,
+                          run.first,
+                          run.second - 1,
+                          burst_count});
   }
 
   if (candidates.size() < 2) {
-    return unsplit;
+    return make_unsplit();
   }
   return candidates;
 }
@@ -3151,11 +4026,16 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
       int max_row = row;
       int min_col = col;
       int max_col = col;
+      float component_score_sum = 0.0f;
+      float component_score_peak = 0.0f;
       while (!queue.empty()) {
         const auto [current_row, current_col] = queue.front();
         queue.pop();
         const size_t current_index = flat_index(rows, cols, current_row, current_col);
         component.push_back(current_index);
+        const float score = score_map[current_index];
+        component_score_sum += score;
+        component_score_peak = std::max(component_score_peak, score);
         min_row = std::min(min_row, current_row);
         max_row = std::max(max_row, current_row);
         min_col = std::min(min_col, current_col);
@@ -3195,23 +4075,61 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
           min_freq_span_px,
           min_time_span_px);
 
+      if (candidate_masks.size() == 1 && !candidate_masks.front().split_applied) {
+        const int freq_start = parent_freq_start;
+        const int freq_stop = parent_freq_stop;
+        const int time_start = parent_time_start;
+        const int time_stop = parent_time_stop;
+        const int freq_span = freq_stop - freq_start;
+        const int time_span = time_stop - time_start;
+        const int filled_area = static_cast<int>(component.size());
+        const int bbox_area = std::max(freq_span * time_span, 1);
+        const int envelope_area = std::max(component_envelope_area(component_mask_local, local_rows, local_cols), 1);
+        const float bbox_density = static_cast<float>(filled_area) / static_cast<float>(bbox_area);
+        const float envelope_density = static_cast<float>(filled_area) / static_cast<float>(envelope_area);
+        const float density = envelope_density;
+        const float score_mean = filled_area > 0 ? component_score_sum / static_cast<float>(filled_area) : 0.0f;
+
+        const bool keep_component = filled_area >= min_component_size &&
+                                    freq_span >= min_freq_span_px &&
+                                    time_span >= min_time_span_px &&
+                                    density >= min_density &&
+                                    component_score_peak >= peak_score_floor;
+        ++output_component_id;
+        if (!keep_component) {
+          continue;
+        }
+
+        for (const size_t index : component) {
+          grouped_mask[index] = 1;
+        }
+
+        DetectionBox box;
+        box.freq_start = freq_start;
+        box.freq_stop = freq_stop;
+        box.time_start = time_start;
+        box.time_stop = time_stop;
+        box.freq_span = freq_span;
+        box.time_span = time_span;
+        box.filled_area = filled_area;
+        box.density = density;
+        box.bbox_density = bbox_density;
+        box.envelope_density = envelope_density;
+        box.score_mean = score_mean;
+        box.score_peak = component_score_peak;
+        box.split_role = candidate_masks.front().split_role;
+        box.split_applied = false;
+        box.parent_component_id = output_component_id;
+        boxes.push_back(std::move(box));
+        continue;
+      }
+
       for (const auto& candidate : candidate_masks) {
         const auto& candidate_mask_local = candidate.mask;
-        int local_min_row = local_rows;
-        int local_max_row = -1;
-        int local_min_col = local_cols;
-        int local_max_col = -1;
-        for (int local_row = 0; local_row < local_rows; ++local_row) {
-          for (int local_col = 0; local_col < local_cols; ++local_col) {
-            if (!candidate_mask_local[flat_index(local_rows, local_cols, local_row, local_col)]) {
-              continue;
-            }
-            local_min_row = std::min(local_min_row, local_row);
-            local_max_row = std::max(local_max_row, local_row);
-            local_min_col = std::min(local_min_col, local_col);
-            local_max_col = std::max(local_max_col, local_col);
-          }
-        }
+        const int local_min_row = candidate.min_row;
+        const int local_max_row = candidate.max_row;
+        const int local_min_col = candidate.min_col;
+        const int local_max_col = candidate.max_col;
         if (local_max_row < local_min_row || local_max_col < local_min_col) {
           continue;
         }
@@ -3222,27 +4140,23 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
         const int time_stop = parent_time_start + local_max_col + 1;
         const int freq_span = freq_stop - freq_start;
         const int time_span = time_stop - time_start;
-        const int cropped_rows = local_max_row - local_min_row + 1;
-        const int cropped_cols = local_max_col - local_min_col + 1;
-        std::vector<uint8_t> cropped_candidate_mask(static_cast<size_t>(cropped_rows) * static_cast<size_t>(cropped_cols), 0);
-        int filled_area = 0;
+        const int filled_area = candidate.filled_area;
         float score_peak = 0.0f;
         float score_sum = 0.0f;
-        for (int local_row = 0; local_row < cropped_rows; ++local_row) {
-          for (int local_col = 0; local_col < cropped_cols; ++local_col) {
-            const bool active = candidate_mask_local[flat_index(local_rows, local_cols, local_min_row + local_row, local_min_col + local_col)] != 0;
-            cropped_candidate_mask[flat_index(cropped_rows, cropped_cols, local_row, local_col)] = active ? 1 : 0;
+        for (int local_row = local_min_row; local_row <= local_max_row; ++local_row) {
+          for (int local_col = local_min_col; local_col <= local_max_col; ++local_col) {
+            const bool active = candidate_mask_local[flat_index(local_rows, local_cols, local_row, local_col)] != 0;
             if (!active) {
               continue;
             }
-            ++filled_area;
-            const float score = score_map[flat_index(rows, cols, freq_start + local_row, time_start + local_col)];
+            const float score = score_map[flat_index(rows, cols, parent_freq_start + local_row, parent_time_start + local_col)];
             score_sum += score;
             score_peak = std::max(score_peak, score);
+            grouped_mask[flat_index(rows, cols, parent_freq_start + local_row, parent_time_start + local_col)] = 1;
           }
         }
         const int bbox_area = std::max(freq_span * time_span, 1);
-        const int envelope_area = std::max(component_envelope_area(cropped_candidate_mask, cropped_rows, cropped_cols), 1);
+        const int envelope_area = std::max(component_envelope_area(candidate_mask_local, local_rows, local_cols), 1);
         const float bbox_density = static_cast<float>(filled_area) / static_cast<float>(bbox_area);
         const float envelope_density = static_cast<float>(filled_area) / static_cast<float>(envelope_area);
         const float density = envelope_density;
@@ -3255,16 +4169,15 @@ GroupingResult group_signal_mask_regions(const std::vector<uint8_t>& mask,
                                     score_peak >= peak_score_floor;
         ++output_component_id;
         if (!keep_component) {
-          continue;
-        }
-
-        for (int local_row = 0; local_row < cropped_rows; ++local_row) {
-          for (int local_col = 0; local_col < cropped_cols; ++local_col) {
-            if (!cropped_candidate_mask[flat_index(cropped_rows, cropped_cols, local_row, local_col)]) {
-              continue;
+          for (int local_row = local_min_row; local_row <= local_max_row; ++local_row) {
+            for (int local_col = local_min_col; local_col <= local_max_col; ++local_col) {
+              if (!candidate_mask_local[flat_index(local_rows, local_cols, local_row, local_col)]) {
+                continue;
+              }
+              grouped_mask[flat_index(rows, cols, parent_freq_start + local_row, parent_time_start + local_col)] = 0;
             }
-            grouped_mask[flat_index(rows, cols, freq_start + local_row, time_start + local_col)] = 1;
           }
+          continue;
         }
 
         DetectionBox box;
@@ -3611,11 +4524,13 @@ std::vector<float> apply_frontend_correction(const float* power_db,
 }
 
 DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
+                                                 bool corrected_chunk_on_device,
                                                  int rows,
                                                  int cols,
                                                  const ChunkPlanEntry& chunk,
                                                  const std::vector<uint8_t>& chunk_valid_row_mask,
                                                  bool capture_host_power_map,
+                                                 bool synchronize_timing,
                                                  double coherence_weight,
                                                  double power_weight,
                                                  const std::string& power_assist_mode,
@@ -3638,33 +4553,50 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
                                                  int grouping_min_freq_span_px,
                                                  int grouping_min_time_span_px,
                                                  double grouping_min_density) {
-  auto time_chunk_stage_ms = [](auto&& fn) {
+  auto time_chunk_stage_ms = [&](auto&& fn) {
     const auto stage_start = std::chrono::steady_clock::now();
     fn();
+    if (synchronize_timing) {
+      auto sync_result = cudaStreamSynchronize(chunk_cuda_scratch().stream);
+      if (sync_result != cudaSuccess) {
+        throw std::runtime_error(std::string("chunk timing synchronization failed: ") +
+                                 cudaGetErrorString(sync_result));
+      }
+    }
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
   };
 
   DetectionChunkResult result;
   result.chunk = chunk;
+  result.mask_rows = rows;
+  result.mask_cols = cols;
   result.valid_row_mask = chunk_valid_row_mask;
   result.valid_score_mask = valid_row_mask_to_full_mask(chunk_valid_row_mask, cols);
   const size_t chunk_size = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  const bool use_gpu_post_grouping = corrected_chunk_on_device && !capture_host_power_map;
 
-  std::vector<float> coherence_px;
+  const float* coherence_px_device = nullptr;
   result.stage_ms[kChunkStructureTensorStage] = time_chunk_stage_ms([&] {
-    if (!multi_scale_structure_tensor_coherence_cuda(corrected_chunk, rows, cols, coherence_px)) {
+    if (!multi_scale_structure_tensor_coherence_cuda(corrected_chunk,
+                                                     corrected_chunk_on_device,
+                                                     rows,
+                                                     cols,
+                                                     &coherence_px_device)) {
       throw std::runtime_error("CUDA structure-tensor path failed in detect_chunk_coherent_power");
     }
   });
-  result.coherence_px = coherence_px;
   (void)coherence_weight;
   (void)power_weight;
   const float* power_px_device = nullptr;
+  const float* score_px_device = nullptr;
+  const uint8_t* mask_px_device = nullptr;
   result.stage_ms[kChunkPowerSupportStage] = time_chunk_stage_ms([&] {
     if (!build_power_assist_map_device(corrected_chunk,
+                                       corrected_chunk_on_device,
                                        rows,
                                        cols,
                                        chunk_valid_row_mask,
+                                       synchronize_timing,
                                        power_assist_mode,
                                        static_cast<float>(power_floor_time_q),
                                        static_cast<float>(power_floor_global_q),
@@ -3677,7 +4609,7 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
     }
   });
   result.stage_ms[kChunkScoreThresholdStage] = time_chunk_stage_ms([&] {
-    run_chunk_score_masks_gpu(coherence_px,
+    run_chunk_score_masks_gpu(coherence_px_device,
                               power_px_device,
                               rows,
                               cols,
@@ -3690,11 +4622,26 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
                               coherence_power_joint_weight,
                               min_component_size,
                               filter_detection_mask,
+                              !use_gpu_post_grouping,
+                              &score_px_device,
+                              &mask_px_device,
                               result.score_px,
                               result.mask_px,
                               result.support_threshold,
                               result.score_threshold);
   });
+  (void)score_px_device;
+  (void)mask_px_device;
+
+  if (capture_host_power_map) {
+    result.coherence_px.assign(chunk_size, 0.0f);
+    if (cudaMemcpy(result.coherence_px.data(),
+                   coherence_px_device,
+                   chunk_size * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+      throw std::runtime_error("chunk coherence readback failed");
+    }
+  }
 
   if (capture_host_power_map) {
     result.power_px.assign(chunk_size, 0.0f);
@@ -3706,7 +4653,22 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
     }
   }
 
+  if (use_gpu_post_grouping) {
+    if (cudaMalloc(reinterpret_cast<void**>(&result.mask_device), chunk_size * sizeof(uint8_t)) != cudaSuccess) {
+      throw std::runtime_error("chunk mask device allocation failed");
+    }
+    if (cudaMemcpy(result.mask_device,
+                   mask_px_device,
+                   chunk_size * sizeof(uint8_t),
+                   cudaMemcpyDeviceToDevice) != cudaSuccess) {
+      throw std::runtime_error("chunk mask device copy failed");
+    }
+  }
+
   result.stage_ms[kChunkMaskSmoothStage] = time_chunk_stage_ms([&] {
+    if (use_gpu_post_grouping) {
+      return;
+    }
     for (size_t index = 0; index < result.score_px.size(); ++index) {
       if (result.valid_score_mask[index]) {
         continue;
@@ -3717,6 +4679,9 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
   });
 
   result.stage_ms[kChunkGroupingStage] = time_chunk_stage_ms([&] {
+    if (use_gpu_post_grouping) {
+      return;
+    }
     const auto grouping = group_signal_mask_regions(result.mask_px,
                                                     result.score_px,
                                                     rows,
@@ -3729,7 +4694,6 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
                                                     grouping_min_freq_span_px,
                                                     grouping_min_time_span_px,
                                                     static_cast<float>(grouping_min_density));
-    result.grouped_mask = grouping.grouped_mask;
     result.grouped_boxes = grouping.boxes;
   });
   return result;
@@ -3836,11 +4800,13 @@ PipelineSummary run_reference_pipeline(const float* power_db,
           const float* corrected_chunk = corrected_sxx_db.data() +
                                          static_cast<size_t>(chunk.row_start) * static_cast<size_t>(src_cols);
           auto result = detect_chunk_coherent_power(corrected_chunk,
+                                                    false,
                                                     chunk_rows,
                                                     src_cols,
                                                     chunk,
                                                     chunk_valid_row_mask,
                                                     populate_merged_maps,
+                                                    false,
                                                     coherence_weight,
                                                     power_weight,
                                                     power_assist_mode,
@@ -3912,12 +4878,191 @@ PipelineSummary run_reference_pipeline(const float* power_db,
   });
 
   summary.reference_stage_ms[kReferenceGroupingStage] = time_reference_stage_ms([&] {
-    const auto final_mask_u8 = boxes_to_mask(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
-    summary.final_mask.assign(final_mask_u8.size(), 0.0f);
-    for (size_t index = 0; index < final_mask_u8.size(); ++index) {
-      summary.final_mask[index] = final_mask_u8[index] ? 1.0f : 0.0f;
-    }
+    summary.final_mask = boxes_to_float_mask_cuda(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
   });
+  return summary;
+}
+
+PipelineSummary run_reference_pipeline_corrected_impl(const float* corrected_sxx_db,
+                                                      bool corrected_sxx_db_on_device,
+                        int src_rows,
+                        int src_cols,
+                        bool populate_merged_maps,
+                        bool materialize_host_final_mask,
+                                                      bool synchronize_chunk_stage_timing,
+                        int ignore_bins_per_side,
+                        double resolution_hz,
+                        double chunk_bandwidth_hz,
+                        double chunk_overlap_hz,
+                        double uncalibrated_chunk_fraction,
+                        double uncalibrated_overlap_fraction,
+                        double ignore_sideband_percent,
+                        double coherence_weight,
+                        double power_weight,
+                        const std::string& power_assist_mode,
+                        double power_floor_time_q,
+                        double power_floor_global_q,
+                        double power_excess_start_db,
+                        double power_excess_full_db,
+                        double power_local_blend,
+                        double coherence_gate_start,
+                        double coherence_gate_full,
+                        double coherence_bridge_bias,
+                        double coherence_power_joint_weight,
+                        double coherence_power_support_q,
+                        double coherence_power_q,
+                        int min_component_size,
+                        bool filter_detection_mask,
+                        double grouping_seed_score_q,
+                        int grouping_bridge_freq_px,
+                        int grouping_bridge_time_px,
+                        int grouping_min_component_size,
+                        int grouping_min_freq_span_px,
+                        int grouping_min_time_span_px,
+                        double grouping_min_density,
+                        double grouping_time_continuity_ratio,
+                        double frontend_stage_ms) {
+  if (corrected_sxx_db == nullptr) {
+    throw std::invalid_argument("reference pipeline requires a corrected_sxx_db buffer");
+  }
+  PipelineSummary summary;
+  auto time_reference_stage_ms = [](auto&& fn) {
+    const auto stage_start = std::chrono::steady_clock::now();
+    fn();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
+  };
+  if (ignore_bins_per_side == 0) {
+    ignore_bins_per_side = compute_ignore_bins_per_side(
+        src_rows, resolution_hz, ignore_sideband_percent, 0.0);
+  }
+  summary.ignore_bins_per_side = ignore_bins_per_side;
+
+  std::vector<uint8_t> valid_row_mask(static_cast<size_t>(src_rows), 1);
+  for (int row = 0; row < ignore_bins_per_side; ++row) {
+    valid_row_mask[static_cast<size_t>(row)] = 0;
+    valid_row_mask[static_cast<size_t>(src_rows - 1 - row)] = 0;
+  }
+
+  summary.reference_stage_ms[kReferenceFrontendStage] = frontend_stage_ms;
+
+  std::vector<ChunkPlanEntry> chunk_plan;
+  if (corrected_sxx_db_on_device && !populate_merged_maps) {
+    ChunkPlanEntry full_frame_chunk;
+    full_frame_chunk.chunk_index = 0;
+    full_frame_chunk.row_start = 0;
+    full_frame_chunk.row_stop = src_rows;
+    full_frame_chunk.freq_start_hz = 0.0;
+    full_frame_chunk.freq_stop_hz = resolution_hz > 0.0 ? static_cast<double>(std::max(0, src_rows - 1)) * resolution_hz
+                                                        : static_cast<double>(std::max(0, src_rows - 1));
+    chunk_plan.push_back(full_frame_chunk);
+  } else {
+    chunk_plan = build_frequency_chunks(src_rows,
+                                        resolution_hz,
+                                        chunk_bandwidth_hz,
+                                        chunk_overlap_hz,
+                                        valid_row_mask,
+                                        uncalibrated_chunk_fraction,
+                                        uncalibrated_overlap_fraction);
+  }
+  summary.subsection_count = static_cast<int>(chunk_plan.size());
+  std::vector<DetectionChunkResult> chunk_results;
+  chunk_results.reserve(chunk_plan.size());
+  summary.reference_stage_ms[kReferenceChunkWallStage] = time_reference_stage_ms([&] {
+    chunk_results = chunk_worker_pool().run(
+        chunk_plan.size(),
+        [&](size_t chunk_plan_index) {
+          const auto chunk_start = std::chrono::steady_clock::now();
+          const auto& chunk = chunk_plan[chunk_plan_index];
+          const int chunk_rows = chunk.row_stop - chunk.row_start;
+          std::vector<uint8_t> chunk_valid_row_mask(static_cast<size_t>(chunk_rows), 0);
+          for (int row = 0; row < chunk_rows; ++row) {
+            chunk_valid_row_mask[static_cast<size_t>(row)] = valid_row_mask[static_cast<size_t>(chunk.row_start + row)];
+          }
+          const float* corrected_chunk = corrected_sxx_db +
+                                         static_cast<size_t>(chunk.row_start) * static_cast<size_t>(src_cols);
+          auto result = detect_chunk_coherent_power(corrected_chunk,
+                                                    corrected_sxx_db_on_device,
+                                                    chunk_rows,
+                                                    src_cols,
+                                                    chunk,
+                                                    chunk_valid_row_mask,
+                                                    populate_merged_maps,
+                                                    synchronize_chunk_stage_timing,
+                                                    coherence_weight,
+                                                    power_weight,
+                                                    power_assist_mode,
+                                                    power_floor_time_q,
+                                                    power_floor_global_q,
+                                                    power_excess_start_db,
+                                                    power_excess_full_db,
+                                                    power_local_blend,
+                                                    coherence_gate_start,
+                                                    coherence_gate_full,
+                                                    coherence_bridge_bias,
+                                                    coherence_power_joint_weight,
+                                                    coherence_power_support_q,
+                                                    coherence_power_q,
+                                                    min_component_size,
+                                                    filter_detection_mask,
+                                                    grouping_bridge_freq_px,
+                                                    grouping_bridge_time_px,
+                                                    grouping_min_component_size,
+                                                    grouping_min_freq_span_px,
+                                                    grouping_min_time_span_px,
+                                                    grouping_min_density);
+          result.compute_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - chunk_start).count();
+          return result;
+        });
+  });
+  double chunk_sum_ms = 0.0;
+  double chunk_max_ms = 0.0;
+  for (const auto& chunk_result : chunk_results) {
+    chunk_sum_ms += chunk_result.compute_ms;
+    chunk_max_ms = std::max(chunk_max_ms, chunk_result.compute_ms);
+    for (size_t stage_index = 0;
+         stage_index < holoscan::ops::CoherentPowerSignalDetector::kChunkTimingStageCount;
+         ++stage_index) {
+      summary.chunk_stage_sum_ms[stage_index] += chunk_result.stage_ms[stage_index];
+      summary.chunk_stage_peak_ms[stage_index] = std::max(summary.chunk_stage_peak_ms[stage_index], chunk_result.stage_ms[stage_index]);
+    }
+    for (size_t stage_index = 0;
+         stage_index < holoscan::ops::CoherentPowerSignalDetector::kPowerSupportTimingStageCount;
+         ++stage_index) {
+      summary.power_support_stage_sum_ms[stage_index] += chunk_result.power_support_stage_ms[stage_index];
+      summary.power_support_stage_peak_ms[stage_index] = std::max(summary.power_support_stage_peak_ms[stage_index], chunk_result.power_support_stage_ms[stage_index]);
+    }
+  }
+  summary.reference_stage_ms[kReferenceChunkSumStage] = chunk_sum_ms;
+  summary.reference_stage_ms[kReferenceChunkMaxStage] = chunk_max_ms;
+  if (populate_merged_maps) {
+    populate_reference_merged_maps(chunk_results, src_rows, src_cols, valid_row_mask, summary);
+  }
+
+  GroupingResult merged_grouping;
+  summary.reference_stage_ms[kReferenceMergeStage] = time_reference_stage_ms([&] {
+    merged_grouping = merge_projected_subsection_boxes(src_rows,
+                                                       src_cols,
+                                                       chunk_results,
+                                                       std::vector<float>{},
+                                                       valid_row_mask,
+                                                       filter_detection_mask,
+                                                       grouping_bridge_freq_px,
+                                                       grouping_bridge_time_px,
+                                                       std::max(grouping_min_component_size, min_component_size),
+                                                       grouping_min_freq_span_px,
+                                                       grouping_min_time_span_px,
+                                                       static_cast<float>(grouping_min_density),
+                                                       static_cast<float>(grouping_time_continuity_ratio));
+    summary.grouped_box_count = static_cast<int>(merged_grouping.boxes.size());
+    summary.merged_threshold = 0.0f;
+    summary.seed_threshold = 0.0f;
+  });
+
+  if (materialize_host_final_mask) {
+    summary.reference_stage_ms[kReferenceGroupingStage] = time_reference_stage_ms([&] {
+      summary.final_mask = boxes_to_float_mask_cuda(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
+    });
+  }
   return summary;
 }
 
@@ -3925,6 +5070,8 @@ PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
                                                  int src_rows,
                                                  int src_cols,
                                                  bool populate_merged_maps,
+                                                 bool materialize_host_final_mask,
+                                                 bool synchronize_chunk_stage_timing,
                                                  int ignore_bins_per_side,
                                                  double resolution_hz,
                                                  double chunk_bandwidth_hz,
@@ -3957,136 +5104,124 @@ PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
                                                  double grouping_min_density,
                                                  double grouping_time_continuity_ratio,
                                                  double frontend_stage_ms) {
-  if (corrected_sxx_db == nullptr) {
-    throw std::invalid_argument("reference pipeline requires a corrected_sxx_db buffer");
-  }
-  PipelineSummary summary;
-  auto time_reference_stage_ms = [](auto&& fn) {
-    const auto stage_start = std::chrono::steady_clock::now();
-    fn();
-    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
-  };
-  if (ignore_bins_per_side == 0) {
-    ignore_bins_per_side = compute_ignore_bins_per_side(
-        src_rows, resolution_hz, ignore_sideband_percent, 0.0);
-  }
-  summary.ignore_bins_per_side = ignore_bins_per_side;
+  return run_reference_pipeline_corrected_impl(corrected_sxx_db,
+                                               false,
+                                               src_rows,
+                                               src_cols,
+                                               populate_merged_maps,
+                                               materialize_host_final_mask,
+                                               synchronize_chunk_stage_timing,
+                                               ignore_bins_per_side,
+                                               resolution_hz,
+                                               chunk_bandwidth_hz,
+                                               chunk_overlap_hz,
+                                               uncalibrated_chunk_fraction,
+                                               uncalibrated_overlap_fraction,
+                                               ignore_sideband_percent,
+                                               coherence_weight,
+                                               power_weight,
+                                               power_assist_mode,
+                                               power_floor_time_q,
+                                               power_floor_global_q,
+                                               power_excess_start_db,
+                                               power_excess_full_db,
+                                               power_local_blend,
+                                               coherence_gate_start,
+                                               coherence_gate_full,
+                                               coherence_bridge_bias,
+                                               coherence_power_joint_weight,
+                                               coherence_power_support_q,
+                                               coherence_power_q,
+                                               min_component_size,
+                                               filter_detection_mask,
+                                               grouping_seed_score_q,
+                                               grouping_bridge_freq_px,
+                                               grouping_bridge_time_px,
+                                               grouping_min_component_size,
+                                               grouping_min_freq_span_px,
+                                               grouping_min_time_span_px,
+                                               grouping_min_density,
+                                               grouping_time_continuity_ratio,
+                                               frontend_stage_ms);
+}
 
-  std::vector<uint8_t> valid_row_mask(static_cast<size_t>(src_rows), 1);
-  for (int row = 0; row < ignore_bins_per_side; ++row) {
-    valid_row_mask[static_cast<size_t>(row)] = 0;
-    valid_row_mask[static_cast<size_t>(src_rows - 1 - row)] = 0;
-  }
-
-  summary.reference_stage_ms[kReferenceFrontendStage] = frontend_stage_ms;
-
-  const auto chunk_plan = build_frequency_chunks(src_rows,
-                                                 resolution_hz,
-                                                 chunk_bandwidth_hz,
-                                                 chunk_overlap_hz,
-                                                 valid_row_mask,
-                                                 uncalibrated_chunk_fraction,
-                                                 uncalibrated_overlap_fraction);
-  summary.subsection_count = static_cast<int>(chunk_plan.size());
-  std::vector<DetectionChunkResult> chunk_results;
-  chunk_results.reserve(chunk_plan.size());
-  summary.reference_stage_ms[kReferenceChunkWallStage] = time_reference_stage_ms([&] {
-    chunk_results = chunk_worker_pool().run(
-        chunk_plan.size(),
-        [&](size_t chunk_plan_index) {
-          const auto chunk_start = std::chrono::steady_clock::now();
-          const auto& chunk = chunk_plan[chunk_plan_index];
-          const int chunk_rows = chunk.row_stop - chunk.row_start;
-          std::vector<uint8_t> chunk_valid_row_mask(static_cast<size_t>(chunk_rows), 0);
-          for (int row = 0; row < chunk_rows; ++row) {
-            chunk_valid_row_mask[static_cast<size_t>(row)] = valid_row_mask[static_cast<size_t>(chunk.row_start + row)];
-          }
-          const float* corrected_chunk = corrected_sxx_db +
-                                         static_cast<size_t>(chunk.row_start) * static_cast<size_t>(src_cols);
-          auto result = detect_chunk_coherent_power(corrected_chunk,
-                                                    chunk_rows,
-                                                    src_cols,
-                                                    chunk,
-                                                    chunk_valid_row_mask,
-                                                    populate_merged_maps,
-                                                    coherence_weight,
-                                                    power_weight,
-                                                    power_assist_mode,
-                                                    power_floor_time_q,
-                                                    power_floor_global_q,
-                                                    power_excess_start_db,
-                                                    power_excess_full_db,
-                                                    power_local_blend,
-                                                    coherence_gate_start,
-                                                    coherence_gate_full,
-                                                    coherence_bridge_bias,
-                                                    coherence_power_joint_weight,
-                                                    coherence_power_support_q,
-                                                    coherence_power_q,
-                                                    min_component_size,
-                                                    filter_detection_mask,
-                                                    grouping_bridge_freq_px,
-                                                    grouping_bridge_time_px,
-                                                    grouping_min_component_size,
-                                                    grouping_min_freq_span_px,
-                                                    grouping_min_time_span_px,
-                                                    grouping_min_density);
-          result.compute_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - chunk_start).count();
-          return result;
-        });
-  });
-  double chunk_sum_ms = 0.0;
-  double chunk_max_ms = 0.0;
-  for (const auto& chunk_result : chunk_results) {
-    chunk_sum_ms += chunk_result.compute_ms;
-    chunk_max_ms = std::max(chunk_max_ms, chunk_result.compute_ms);
-    for (size_t stage_index = 0;
-         stage_index < holoscan::ops::CoherentPowerSignalDetector::kChunkTimingStageCount;
-         ++stage_index) {
-      summary.chunk_stage_sum_ms[stage_index] += chunk_result.stage_ms[stage_index];
-      summary.chunk_stage_peak_ms[stage_index] = std::max(summary.chunk_stage_peak_ms[stage_index], chunk_result.stage_ms[stage_index]);
-    }
-    for (size_t stage_index = 0;
-         stage_index < holoscan::ops::CoherentPowerSignalDetector::kPowerSupportTimingStageCount;
-         ++stage_index) {
-      summary.power_support_stage_sum_ms[stage_index] += chunk_result.power_support_stage_ms[stage_index];
-      summary.power_support_stage_peak_ms[stage_index] = std::max(summary.power_support_stage_peak_ms[stage_index], chunk_result.power_support_stage_ms[stage_index]);
-    }
-  }
-  summary.reference_stage_ms[kReferenceChunkSumStage] = chunk_sum_ms;
-  summary.reference_stage_ms[kReferenceChunkMaxStage] = chunk_max_ms;
-  if (populate_merged_maps) {
-    populate_reference_merged_maps(chunk_results, src_rows, src_cols, valid_row_mask, summary);
-  }
-
-  GroupingResult merged_grouping;
-  summary.reference_stage_ms[kReferenceMergeStage] = time_reference_stage_ms([&] {
-    merged_grouping = merge_projected_subsection_boxes(src_rows,
-                                                       src_cols,
-                                                       chunk_results,
-                                                       std::vector<float>{},
-                                                       valid_row_mask,
-                                                       filter_detection_mask,
-                                                       grouping_bridge_freq_px,
-                                                       grouping_bridge_time_px,
-                                                       std::max(grouping_min_component_size, min_component_size),
-                                                       grouping_min_freq_span_px,
-                                                       grouping_min_time_span_px,
-                                                       static_cast<float>(grouping_min_density),
-                                                       static_cast<float>(grouping_time_continuity_ratio));
-    summary.grouped_box_count = static_cast<int>(merged_grouping.boxes.size());
-    summary.merged_threshold = 0.0f;
-    summary.seed_threshold = 0.0f;
-  });
-
-  summary.reference_stage_ms[kReferenceGroupingStage] = time_reference_stage_ms([&] {
-    const auto final_mask_u8 = boxes_to_mask(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
-    summary.final_mask.assign(final_mask_u8.size(), 0.0f);
-    for (size_t index = 0; index < final_mask_u8.size(); ++index) {
-      summary.final_mask[index] = final_mask_u8[index] ? 1.0f : 0.0f;
-    }
-  });
-  return summary;
+PipelineSummary run_reference_pipeline_corrected_device(const float* corrected_sxx_db_device,
+                                                        int src_rows,
+                                                        int src_cols,
+                                                        bool populate_merged_maps,
+                                                        bool materialize_host_final_mask,
+                                                        bool synchronize_chunk_stage_timing,
+                                                        int ignore_bins_per_side,
+                                                        double resolution_hz,
+                                                        double chunk_bandwidth_hz,
+                                                        double chunk_overlap_hz,
+                                                        double uncalibrated_chunk_fraction,
+                                                        double uncalibrated_overlap_fraction,
+                                                        double ignore_sideband_percent,
+                                                        double coherence_weight,
+                                                        double power_weight,
+                                                        const std::string& power_assist_mode,
+                                                        double power_floor_time_q,
+                                                        double power_floor_global_q,
+                                                        double power_excess_start_db,
+                                                        double power_excess_full_db,
+                                                        double power_local_blend,
+                                                        double coherence_gate_start,
+                                                        double coherence_gate_full,
+                                                        double coherence_bridge_bias,
+                                                        double coherence_power_joint_weight,
+                                                        double coherence_power_support_q,
+                                                        double coherence_power_q,
+                                                        int min_component_size,
+                                                        bool filter_detection_mask,
+                                                        double grouping_seed_score_q,
+                                                        int grouping_bridge_freq_px,
+                                                        int grouping_bridge_time_px,
+                                                        int grouping_min_component_size,
+                                                        int grouping_min_freq_span_px,
+                                                        int grouping_min_time_span_px,
+                                                        double grouping_min_density,
+                                                        double grouping_time_continuity_ratio,
+                                                        double frontend_stage_ms) {
+  return run_reference_pipeline_corrected_impl(corrected_sxx_db_device,
+                                               true,
+                                               src_rows,
+                                               src_cols,
+                                               populate_merged_maps,
+                                               materialize_host_final_mask,
+                                               synchronize_chunk_stage_timing,
+                                               ignore_bins_per_side,
+                                               resolution_hz,
+                                               chunk_bandwidth_hz,
+                                               chunk_overlap_hz,
+                                               uncalibrated_chunk_fraction,
+                                               uncalibrated_overlap_fraction,
+                                               ignore_sideband_percent,
+                                               coherence_weight,
+                                               power_weight,
+                                               power_assist_mode,
+                                               power_floor_time_q,
+                                               power_floor_global_q,
+                                               power_excess_start_db,
+                                               power_excess_full_db,
+                                               power_local_blend,
+                                               coherence_gate_start,
+                                               coherence_gate_full,
+                                               coherence_bridge_bias,
+                                               coherence_power_joint_weight,
+                                               coherence_power_support_q,
+                                               coherence_power_q,
+                                               min_component_size,
+                                               filter_detection_mask,
+                                               grouping_seed_score_q,
+                                               grouping_bridge_freq_px,
+                                               grouping_bridge_time_px,
+                                               grouping_min_component_size,
+                                               grouping_min_freq_span_px,
+                                               grouping_min_time_span_px,
+                                               grouping_min_density,
+                                               grouping_time_continuity_ratio,
+                                               frontend_stage_ms);
 }
 
 }  // namespace
@@ -4189,6 +5324,226 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
   result.grouped_box_count = summary.grouped_box_count;
   result.merged_threshold = summary.merged_threshold;
   result.seed_threshold = summary.seed_threshold;
+  return result;
+}
+
+CoherentPowerReferenceResult run_coherent_power_live_validation(
+    const std::vector<coherent_power_complex>& input_tensor,
+    int src_rows,
+    int src_cols,
+    double resolution_hz,
+    const CoherentPowerReferenceConfig& config) {
+  if (src_rows <= 0 || src_cols <= 0) {
+    throw std::invalid_argument("coherent power live validation requires positive tensor dimensions");
+  }
+  if (input_tensor.size() != static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols)) {
+    throw std::invalid_argument("coherent power live validation received mismatched tensor size");
+  }
+
+  CoherentPowerReferenceResult result;
+  result.src_rows = src_rows;
+  result.src_cols = src_cols;
+  result.dst_rows = src_rows;
+  result.dst_cols = src_cols;
+  result.span_hz = resolution_hz > 0.0 ? resolution_hz * static_cast<double>(src_rows) : 0.0;
+  result.sample_rate_hz = result.span_hz;
+  result.frequency_axis_calibrated = resolution_hz > 0.0;
+
+  const int ignore_bins_per_side = compute_ignore_bins_per_side(
+      src_rows, resolution_hz, config.ignore_sideband_percent, config.ignore_sideband_hz);
+  result.ignore_bins_per_side = ignore_bins_per_side;
+
+  cudaStream_t stream = nullptr;
+  coherent_power_complex* input_device = nullptr;
+  float* power_db_device = nullptr;
+  float* corrected_db_device = nullptr;
+  float* row_stat_device = nullptr;
+  float* row_smooth_device = nullptr;
+  float* frontend_reference_device = nullptr;
+
+  auto cleanup = [&] {
+    if (frontend_reference_device != nullptr) {
+      cudaFree(frontend_reference_device);
+    }
+    if (row_smooth_device != nullptr) {
+      cudaFree(row_smooth_device);
+    }
+    if (row_stat_device != nullptr) {
+      cudaFree(row_stat_device);
+    }
+    if (corrected_db_device != nullptr) {
+      cudaFree(corrected_db_device);
+    }
+    if (power_db_device != nullptr) {
+      cudaFree(power_db_device);
+    }
+    if (input_device != nullptr) {
+      cudaFree(input_device);
+    }
+    if (stream != nullptr) {
+      cudaStreamDestroy(stream);
+    }
+  };
+
+  try {
+    const int total_bins = src_rows * src_cols;
+    const size_t tensor_bytes = static_cast<size_t>(total_bins) * sizeof(coherent_power_complex);
+    const size_t power_db_bytes = static_cast<size_t>(total_bins) * sizeof(float);
+    const size_t row_bytes = static_cast<size_t>(src_rows) * sizeof(float);
+
+    auto stream_result = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+    if (stream_result != cudaSuccess) {
+      throw std::runtime_error(std::string("live validation stream creation failed: ") + cudaGetErrorString(stream_result));
+    }
+
+    auto alloc_tensor_result = cudaMalloc(reinterpret_cast<void**>(&input_device), tensor_bytes);
+    auto alloc_power_result = cudaMalloc(reinterpret_cast<void**>(&power_db_device), power_db_bytes);
+    auto alloc_corrected_result = cudaMalloc(reinterpret_cast<void**>(&corrected_db_device), power_db_bytes);
+    auto alloc_row_stat_result = cudaMalloc(reinterpret_cast<void**>(&row_stat_device), row_bytes);
+    auto alloc_row_smooth_result = cudaMalloc(reinterpret_cast<void**>(&row_smooth_device), row_bytes);
+    auto alloc_frontend_result = cudaMalloc(reinterpret_cast<void**>(&frontend_reference_device), sizeof(float));
+    if (alloc_tensor_result != cudaSuccess || alloc_power_result != cudaSuccess ||
+        alloc_corrected_result != cudaSuccess || alloc_row_stat_result != cudaSuccess ||
+        alloc_row_smooth_result != cudaSuccess || alloc_frontend_result != cudaSuccess) {
+      throw std::runtime_error("live validation device buffer allocation failed");
+    }
+
+    auto upload_result = cudaMemcpyAsync(input_device,
+                                         input_tensor.data(),
+                                         tensor_bytes,
+                                         cudaMemcpyHostToDevice,
+                                         stream);
+    if (upload_result != cudaSuccess) {
+      throw std::runtime_error(std::string("live validation tensor upload failed: ") + cudaGetErrorString(upload_result));
+    }
+
+    constexpr int threads = 256;
+    const int blocks = (total_bins + threads - 1) / threads;
+    const auto frontend_start = std::chrono::steady_clock::now();
+
+    coherent_power_power_db_kernel<<<blocks, threads, 0, stream>>>(input_device,
+                                                                    src_rows,
+                                                                    src_cols,
+                                                                    power_db_device);
+    auto kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("live validation power_db kernel failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    coherent_power_row_mean_kernel<<<src_rows, threads, 0, stream>>>(power_db_device,
+                                                                      src_rows,
+                                                                      src_cols,
+                                                                      row_stat_device);
+    kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("live validation row_mean kernel failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    const int smooth_radius = std::max(1, static_cast<int>(std::ceil(std::max(config.frontend_smooth_sigma, 1.0) * 1.5)));
+    const int row_blocks = (src_rows + threads - 1) / threads;
+    coherent_power_gaussian_smooth_rows_kernel<<<row_blocks, threads, 0, stream>>>(row_stat_device,
+                                                                                     src_rows,
+                                                                                     smooth_radius,
+                                                                                     static_cast<float>(std::max(config.frontend_smooth_sigma, 1.0)),
+                                                                                     row_smooth_device);
+    kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("live validation row_smooth kernel failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    coherent_power_frontend_reference_kernel<<<1, threads, 0, stream>>>(row_smooth_device,
+                                                                         src_rows,
+                                                                         static_cast<float>(config.frontend_reference_q / 100.0),
+                                                                         frontend_reference_device);
+    kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("live validation frontend_reference kernel failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    coherent_power_frontend_correction_kernel<<<blocks, threads, 0, stream>>>(power_db_device,
+                                                                               src_rows,
+                                                                               src_cols,
+                                                                               row_smooth_device,
+                                                                               frontend_reference_device,
+                                                                               static_cast<float>(config.frontend_max_boost_db),
+                                                                               corrected_db_device);
+    kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("live validation frontend_correction kernel failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    auto sync_result = cudaStreamSynchronize(stream);
+    if (sync_result != cudaSuccess) {
+      throw std::runtime_error(std::string("live validation frontend synchronization failed: ") + cudaGetErrorString(sync_result));
+    }
+    const double frontend_stage_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frontend_start).count();
+
+    result.power_db.resize(static_cast<size_t>(total_bins), 0.0f);
+    result.corrected_sxx_db.resize(static_cast<size_t>(total_bins), 0.0f);
+    auto power_download_result = cudaMemcpy(result.power_db.data(),
+                                            power_db_device,
+                                            power_db_bytes,
+                                            cudaMemcpyDeviceToHost);
+    auto corrected_download_result = cudaMemcpy(result.corrected_sxx_db.data(),
+                                                corrected_db_device,
+                                                power_db_bytes,
+                                                cudaMemcpyDeviceToHost);
+    if (power_download_result != cudaSuccess || corrected_download_result != cudaSuccess) {
+      throw std::runtime_error("live validation host readback failed");
+    }
+
+    const auto summary = run_reference_pipeline_corrected_device(corrected_db_device,
+                                                                 src_rows,
+                                                                 src_cols,
+                                                                 true,
+                                                                 true,
+                                                                 false,
+                                                                 ignore_bins_per_side,
+                                                                 resolution_hz,
+                                                                 config.chunk_bandwidth_hz,
+                                                                 config.chunk_overlap_hz,
+                                                                 config.uncalibrated_chunk_fraction,
+                                                                 config.uncalibrated_overlap_fraction,
+                                                                 config.ignore_sideband_percent,
+                                                                 config.coherence_weight,
+                                                                 config.power_weight,
+                                                                 config.power_assist_mode,
+                                                                 config.power_floor_time_q,
+                                                                 config.power_floor_global_q,
+                                                                 config.power_excess_start_db,
+                                                                 config.power_excess_full_db,
+                                                                 config.power_local_blend,
+                                                                 config.coherence_gate_start,
+                                                                 config.coherence_gate_full,
+                                                                 config.coherence_bridge_bias,
+                                                                 config.coherence_power_joint_weight,
+                                                                 config.coherence_power_support_q,
+                                                                 config.coherence_power_q,
+                                                                 config.min_component_size,
+                                                                 config.filter_detection_mask,
+                                                                 config.grouping_seed_score_q,
+                                                                 config.grouping_bridge_freq_px,
+                                                                 config.grouping_bridge_time_px,
+                                                                 config.grouping_min_component_size,
+                                                                 config.grouping_min_freq_span_px,
+                                                                 config.grouping_min_time_span_px,
+                                                                 config.grouping_min_density,
+                                                                 config.grouping_time_continuity_ratio,
+                                                                 frontend_stage_ms);
+    result.merged_coherence = summary.merged_coherence;
+    result.merged_power = summary.merged_power;
+    result.merged_score = summary.merged_score;
+    result.final_mask = summary.final_mask;
+    result.grouped_box_count = summary.grouped_box_count;
+    result.merged_threshold = summary.merged_threshold;
+    result.seed_threshold = summary.seed_threshold;
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+
+  cleanup();
   return result;
 }
 
@@ -4751,13 +6106,6 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   std::string coherent_variant_name = use_reference_backend ? "frontend_chunked_grouped_box_mask_v1" : "frontend_local_fast_low_fidelity_mask_v1";
   time_step_ms(kPipelineStage, [&] {
     if (use_reference_backend) {
-      if (buffers.power_db_host == nullptr) {
-        const auto alloc_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.power_db_host), power_db_bytes);
-        if (alloc_result != cudaSuccess) {
-          throw std::runtime_error(std::string("reference corrected_db host buffer allocation failed: ") + cudaGetErrorString(alloc_result));
-        }
-      }
-
       const auto frontend_start = std::chrono::steady_clock::now();
       constexpr int threads = 256;
       const int blocks = (total_bins + threads - 1) / threads;
@@ -4803,24 +6151,18 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         throw std::runtime_error(std::string("reference frontend_correction kernel launch failed: ") + cudaGetErrorString(kernel_result));
       }
 
-      auto copy_result = cudaMemcpyAsync(buffers.power_db_host,
-                                         buffers.corrected_db_device,
-                                         power_db_bytes,
-                                         cudaMemcpyDeviceToHost,
-                                         stream);
-      if (copy_result != cudaSuccess) {
-        throw std::runtime_error(std::string("corrected_db device-to-host copy failed: ") + cudaGetErrorString(copy_result));
-      }
       auto sync_result = cudaStreamSynchronize(stream);
       if (sync_result != cudaSuccess) {
         throw std::runtime_error(std::string("reference frontend synchronization failed: ") + cudaGetErrorString(sync_result));
       }
       const double frontend_stage_ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frontend_start).count();
-      pipeline_summary = run_reference_pipeline_corrected(buffers.power_db_host,
-                          src_rows,
-                          src_cols,
-                          false,
+      pipeline_summary = run_reference_pipeline_corrected_device(buffers.corrected_db_device,
+                                                          src_rows,
+                                                          src_cols,
+                                                          false,
+                                                          should_save_mask,
+                                                          timing_enabled,
                                                           ignore_bins_per_side,
                                                           resolution_hz,
                                                           chunk_bandwidth_hz_.get(),

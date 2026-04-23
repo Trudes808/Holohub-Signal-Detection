@@ -1,5 +1,25 @@
 # DINO Retry Chunk-Merge Port Plan
 
+## Progress Update 2026-04-22
+
+- The live single-channel timing path is now in place, including operator stage timing, runtime service timing, and hybrid substage timing, so the current hotspot picture is based on measured runs rather than inference.
+- Those live timing runs show the dominant cost is still the validator-faithful CPU coherence and hybrid-support path, especially structure-tensor gate generation and the surrounding residual-veto support work. The Torch forward path is no longer the primary bottleneck under the current single-channel profile.
+- The temporary `gpu_fast` coherence shortcut has now been removed from the operator and its config surface. It was useful as a timing probe, but it is not functionally equivalent to the offline validator and should not remain as an alternate live detector path.
+- The operator is back to one validator-faithful coherence and hybrid path, which is the correct baseline for any further optimization and for all future parity checks.
+- The next GPU optimization step is now clearer: port the validator's existing GPU-equivalent helpers from `offline_dino_validator_performance.cpp`, specifically the structure-tensor gate batch helper and the residual-veto hybrid batch helper, instead of evolving a separate heuristic fast path inside the operator.
+- Full container rebuild and end-to-end rerun after the fast-path deletion are still pending, but focused diagnostics on the touched operator and config files are clean.
+
+## Progress Update 2026-04-22T13:05:00-05:00
+
+- The operator convergence pass is now underway in the real `dinov3_signal_detector` implementation, not just in planning notes.
+- The live operator chunk planner now follows the validator's calibrated uniform-row planning path with minimal sideband trim instead of the older generic chunk builder.
+- The operator config surface has been trimmed so the stale grouped-DINO knobs are no longer exposed from the live detector path.
+- The operator hybrid DINO source now follows the validator's current contract more closely: it requests patch features from the runtime and derives the per-chunk hybrid score source from deweighted raw DINO energy, with fallback to the aligned runtime score map only when patch features are unavailable.
+- The non-debug operator runtime path now batches uniform chunks through `DinoTorchRuntime::run_batch(...)` instead of allocating device buffers and invoking the runtime once per chunk.
+- The operator main-route per-chunk grouping has been reduced toward the validator's lean path: projected chunk masks now come directly from the chunk hybrid mask, and the final operator mask now comes from merged projected chunk boxes rather than a final global `group_mask_regions(...)` pass.
+- Focused diagnostics on the touched operator files are clean after each edit pass, but full CMake build validation remains blocked by the workspace toolchain because the installed CMake version is older than the Holoscan dependency minimum required during configure.
+- The main remaining port gaps are the selected debug-chunk rerun and parity-artifact hook, plus any final cleanup needed so the live operator and offline validator expose the same stable debug and metadata contract.
+
 ## Progress Update 2026-04-22T12:00:00-05:00
 
 - The current source of truth for porting is now the cleaned `offline_dino_validator_performance.cpp` path, not the older whole-frame validator path and not the earlier partially-wired live operator reference branch.
@@ -11,6 +31,33 @@
 ## Holoscan Operator Port Plan
 
 This section supersedes the older live-port notes below whenever they conflict with the current offline performance-validator truth.
+
+### Phase O0 Audit Findings 2026-04-22T12:20:00-05:00
+
+The current operator is closer to the target than the older notes implied, but it still diverges from the cleaned offline performance-validator path in several important places.
+
+Confirmed mismatches to resolve first:
+
+1. Chunk planning: the operator still uses the older `build_frequency_chunks(...)` path, while the validator now uses the calibrated uniform-chunk selection flow with minimal sideband trim before batching. The operator therefore does not yet inherit the validator's current uniform-row planning contract.
+2. Frame setup and data flow: the operator copies full-frame `power_db` back to host and recomputes corrected power on host for the live reference path, while the validator truth now treats the corrected full-frame tensor and its chunk views as the primary execution surface.
+3. Per-chunk runtime execution: the operator currently loops chunk by chunk, allocates and frees chunk device buffers per iteration, and calls `torch_runtime_->run(...)` serially. The validator truth batches naturally equal-sized non-debug chunks through `run_retry_chunk_inference_batch(...)` and reserves the single-chunk path for the selected debug rerun.
+4. DINO score source: the operator currently normalizes a resized runtime `score_map` back into chunk space, while the validator truth now builds the hybrid source from deweighted raw DINO energy derived from patch features when available.
+5. Positional deweighting contract: the validator now treats trend-only positional deweighting as the only supported raw-DINO path. The operator does not yet implement that deweighted raw-patch-energy route in its live chunk flow.
+6. Grouping path: the operator currently runs `group_mask_regions(...)` for every chunk and again globally, while the validator main route now uses `group_boxes_fast_only(...)` for non-debug chunks and reserves the heavier grouping path for the selected debug chunk artifact flow.
+7. Config surface: the operator still exposes stale grouped-DINO tuning knobs such as `dino_group_k`, `dino_group_spatial_weight`, and `dino_group_score_q`, even though those knobs were removed from the cleaned validator live path.
+8. Debug parity path: the validator has an explicit selected debug-chunk rerun that retains heavyweight artifacts and notebook compatibility outputs. The operator does not yet expose the same focused parity hook.
+
+Implication for the port:
+
+The first operator implementation pass should be treated as a convergence pass, not a greenfield port. The fastest path is to replace these mismatched control points in the existing chunked operator path until its structure matches the validator main path plus the validator debug rerun path.
+
+Immediate coding order from this audit:
+
+1. Replace the operator chunk-plan builder with the validator's current uniform calibrated planning contract.
+2. Remove the operator's per-chunk score-map-only hybrid source and switch it to the validator's deweighted raw DINO energy source.
+3. Introduce batched non-debug chunk runtime execution and keep a separate selected debug-chunk rerun path.
+4. Swap the operator main grouping route to the validator's fast grouping path and keep the heavier grouping logic only for debug parity when needed.
+5. Trim the stale grouped-DINO config knobs from the operator surface once the control flow no longer references them.
 
 ### Operator Source Of Truth
 
@@ -219,11 +266,11 @@ These are explicitly after the faithful port is complete:
 
 ### Immediate Next Tasks For The Operator Port
 
-1. Audit `dinov3_signal_detector.cu` and `dinov3_signal_detector.hpp` against the current offline performance-validator control flow and mark every disagreement.
-2. Identify the minimal set of helpers that should be shared first from `offline_dino_validator_performance.cpp`.
-3. Trim the operator config surface so it matches the cleaned validator surface before porting more logic.
-4. Port the frame-level chunk planner and per-chunk metadata flow into the operator before touching grouping or merge.
-5. Add a selected debug-chunk parity mode in the operator early so every later stage can be checked against the notebook without rebuilding ad hoc tooling.
+1. Rebuild the demo container app and rerun the single-channel live timing profile so the post-removal operator is validated end to end on the single remaining reference path.
+2. Compare that rerun against the current offline performance validator to confirm the live timing and mask outputs still reflect the same detector contract after the fast-path deletion.
+3. Port `structure_tensor_gate_gpu_batch_tensor(...)` from `offline_dino_validator_performance.cpp` into a shared or operator-safe helper boundary without changing detector semantics.
+4. Port `run_residual_veto_hybrid_gpu_batch_device_inputs(...)` on top of the same validator-faithful contract so the heavy hybrid-support work can move to GPU without introducing a second algorithm.
+5. Keep the CPU reference path available while landing the GPU helpers so every optimization pass can still be checked against the same offline-validator parity baseline.
 
 ## Progress Update 2026-04-21T10:46:38-05:00
 

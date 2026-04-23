@@ -182,9 +182,6 @@ dinov3_signal_detector:
   texture_q: 0.90
   texture_k: 6
   power_q: 0.90
-  dino_group_k: 8
-  dino_group_spatial_weight: 0.35
-  dino_group_score_q: 0.60
   filter_detection_mask: true
   grouping_bridge_freq_px: 33
   grouping_bridge_time_px: 5

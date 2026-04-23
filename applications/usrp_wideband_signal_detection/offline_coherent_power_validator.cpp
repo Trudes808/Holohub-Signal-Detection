@@ -25,6 +25,7 @@ namespace {
 struct ValidatorOptions {
   std::filesystem::path metadata_path;
   std::filesystem::path output_dir;
+  std::string pipeline_mode = "reference";
   bool verbose = false;
 };
 
@@ -440,10 +441,12 @@ ValidatorOptions parse_arguments(int argc, char** argv) {
       options.metadata_path = argv[++index];
     } else if (arg == "--output-dir" && index + 1 < argc) {
       options.output_dir = argv[++index];
+    } else if (arg == "--pipeline-mode" && index + 1 < argc) {
+      options.pipeline_mode = argv[++index];
     } else if (arg == "--verbose") {
       options.verbose = true;
     } else if (arg == "--help" || arg == "-h") {
-      std::cout << "Usage: " << argv[0] << " --snapshot-json PATH [--output-dir DIR] [--verbose]\n";
+      std::cout << "Usage: " << argv[0] << " --snapshot-json PATH [--output-dir DIR] [--pipeline-mode reference|live_device] [--verbose]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unknown argument: " + arg);
@@ -454,6 +457,15 @@ ValidatorOptions parse_arguments(int argc, char** argv) {
   }
   if (options.output_dir.empty()) {
     options.output_dir = options.metadata_path.parent_path() / "validator_artifacts";
+  }
+  std::transform(options.pipeline_mode.begin(), options.pipeline_mode.end(), options.pipeline_mode.begin(), [](unsigned char value) {
+    return static_cast<char>(std::tolower(value));
+  });
+  if (options.pipeline_mode == "current_live_path") {
+    options.pipeline_mode = "live_device";
+  }
+  if (options.pipeline_mode != "reference" && options.pipeline_mode != "live_device") {
+    throw std::runtime_error("--pipeline-mode must be one of: reference, live_device");
   }
   return options;
 }
@@ -526,12 +538,20 @@ int main(int argc, char** argv) {
       log_stage("[offline_coherent_power_validator] running coherent reference validation...");
     }
 
-    const auto result = holoscan::ops::run_coherent_power_reference_validation(
-        tensor,
-      validator_rows,
-      validator_cols,
-        metadata.resolution_hz,
-        metadata.config);
+        const bool use_live_device_pipeline = options.pipeline_mode == "live_device";
+        const auto result = use_live_device_pipeline
+                ? holoscan::ops::run_coherent_power_live_validation(
+                  tensor,
+                  validator_rows,
+                  validator_cols,
+                  metadata.resolution_hz,
+                  metadata.config)
+                : holoscan::ops::run_coherent_power_reference_validation(
+                  tensor,
+                  validator_rows,
+                  validator_cols,
+                  metadata.resolution_hz,
+                  metadata.config);
     if (options.verbose) {
       log_stage_done("coherent reference validation");
       log_stage("[offline_coherent_power_validator] writing validator artifacts...");
@@ -591,6 +611,7 @@ int main(int argc, char** argv) {
     std::ofstream summary(summary_json, std::ios::binary);
     summary << "{\n";
     summary << "  \"metadata_path\": \"" << options.metadata_path.string() << "\",\n";
+    summary << "  \"pipeline_mode\": \"" << options.pipeline_mode << "\",\n";
     summary << "  \"tensor_snapshot_path\": \"" << metadata.tensor_snapshot_path.string() << "\",\n";
     summary << "  \"rows\": " << result.src_rows << ",\n";
     summary << "  \"cols\": " << result.src_cols << ",\n";
@@ -630,6 +651,7 @@ int main(int argc, char** argv) {
 
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "Coherent power offline validation\n";
+    std::cout << "  pipeline mode: " << options.pipeline_mode << "\n";
     std::cout << "  metadata: " << options.metadata_path << "\n";
     std::cout << "  tensor snapshot: " << metadata.tensor_snapshot_path << "\n";
     std::cout << "  output dir: " << options.output_dir << "\n";

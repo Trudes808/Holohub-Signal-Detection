@@ -10,6 +10,7 @@ DEFAULT_CONFIG=${DEFAULT_CONFIG:-${SCRIPT_DIR}/config_coherent_power_validation.
 RUN_DEMO_CONTAINER=${RUN_DEMO_CONTAINER:-${SCRIPT_REF_DIR}/run_demo_container.sh}
 VALIDATOR_BIN=${VALIDATOR_BIN:-}
 VALIDATOR_NAME=${VALIDATOR_NAME:-offline_coherent_power_validator}
+PIPELINE_MODE=${PIPELINE_MODE:-reference}
 
 host_repo_root=${HOST_REPO_ROOT:-$(dirname "$(dirname "${SCRIPT_DIR}")")}
 
@@ -53,6 +54,7 @@ tensor_path=${TENSOR_PATH:-}
 config_path=${CONFIG_PATH:-${DEFAULT_CONFIG}}
 output_root=${OUTPUT_ROOT:-}
 validator_output_dir=${OUTPUT_DIR:-}
+validation_bundle_dir=${VALIDATION_BUNDLE_DIR:-}
 verbose=0
 
 while [[ $# -gt 0 ]]; do
@@ -73,12 +75,20 @@ while [[ $# -gt 0 ]]; do
       validator_output_dir=$2
       shift 2
       ;;
+    --pipeline-mode)
+      PIPELINE_MODE=$2
+      shift 2
+      ;;
+    --validation-bundle-dir)
+      validation_bundle_dir=$2
+      shift 2
+      ;;
     --verbose)
       verbose=1
       shift
       ;;
     *)
-      echo "Usage: $0 --tensor-npy PATH [--config PATH] [--output-root DIR] [--output-dir DIR] [--verbose]" >&2
+      echo "Usage: $0 --tensor-npy PATH [--config PATH] [--output-root DIR] [--output-dir DIR] [--pipeline-mode reference|live_device] [--validation-bundle-dir DIR] [--verbose]" >&2
       exit 1
       ;;
   esac
@@ -91,9 +101,18 @@ fi
 
 tensor_path=$(absolutize_host_path "${tensor_path}")
 config_path=$(absolutize_host_path "${config_path}")
+PIPELINE_MODE=$(printf '%s' "${PIPELINE_MODE}" | tr '[:upper:]' '[:lower:]')
+if [[ "${PIPELINE_MODE}" == "current_live_path" ]]; then
+  PIPELINE_MODE="live_device"
+fi
+if [[ "${PIPELINE_MODE}" != "reference" && "${PIPELINE_MODE}" != "live_device" ]]; then
+  echo "--pipeline-mode must be one of: reference, live_device" >&2
+  exit 1
+fi
 
 echo "Using tensor: ${tensor_path}" >&2
 echo "Using coherent config: ${config_path}" >&2
+echo "Using pipeline mode: ${PIPELINE_MODE}" >&2
 
 if [[ -z "${output_root}" ]]; then
   tensor_basename=$(basename "${tensor_path}")
@@ -103,11 +122,17 @@ fi
 output_root=$(absolutize_host_path "${output_root}")
 
 if [[ -z "${validator_output_dir}" ]]; then
-  validator_output_dir="${output_root}/offline_validator"
+  validator_output_dir="${output_root}/${PIPELINE_MODE}_validator"
 fi
 validator_output_dir=$(absolutize_host_path "${validator_output_dir}")
 
+if [[ -z "${validation_bundle_dir}" ]]; then
+  validation_bundle_dir="${output_root}/validation_bundle/${PIPELINE_MODE}"
+fi
+validation_bundle_dir=$(absolutize_host_path "${validation_bundle_dir}")
+
 mkdir -p "${output_root}"
+mkdir -p "${validation_bundle_dir}"
 
 container_tensor_path=$(map_path_to_container "${tensor_path}")
 container_output_root=$(map_path_to_container "${output_root}")
@@ -289,6 +314,7 @@ exec sudo docker exec "${docker_exec_flags[@]}" \
   -e BUILD_APP_DIR="${BUILD_APP_DIR}" \
   -e SNAPSHOT_JSON="${container_metadata_path}" \
   -e OUTPUT_DIR="${container_validator_output_dir}" \
+  -e PIPELINE_MODE="${PIPELINE_MODE}" \
   -e VERBOSE_FLAG="${verbose}" \
   "${CONTAINER_NAME}" \
   bash -lc '
@@ -374,6 +400,7 @@ cmd=(
   "${validator_bin}"
   "--snapshot-json" "${SNAPSHOT_JSON}"
   "--output-dir" "${OUTPUT_DIR}"
+  "--pipeline-mode" "${PIPELINE_MODE}"
 )
 if [[ "${VERBOSE_FLAG}" == "1" ]]; then
   cmd+=("--verbose")
@@ -408,3 +435,47 @@ fi
 
 echo "coherent validator completed in ${elapsed_total}s" >&2
   '
+
+OUTPUT_ROOT_FOR_BUNDLE="${output_root}" \
+VALIDATOR_OUTPUT_DIR_FOR_BUNDLE="${validator_output_dir}" \
+VALIDATION_BUNDLE_DIR_FOR_BUNDLE="${validation_bundle_dir}" \
+PIPELINE_MODE_FOR_BUNDLE="${PIPELINE_MODE}" \
+python3 - <<'PY'
+import os
+import shutil
+from pathlib import Path
+
+output_root = Path(os.environ["OUTPUT_ROOT_FOR_BUNDLE"])
+validator_output_dir = Path(os.environ["VALIDATOR_OUTPUT_DIR_FOR_BUNDLE"])
+bundle_dir = Path(os.environ["VALIDATION_BUNDLE_DIR_FOR_BUNDLE"])
+pipeline_mode = os.environ["PIPELINE_MODE_FOR_BUNDLE"]
+
+bundle_dir.mkdir(parents=True, exist_ok=True)
+required = [
+  output_root / "coherent_power_input_snapshot.json",
+  validator_output_dir / "offline_validation_summary.json",
+  validator_output_dir / "offline_power_db.npy",
+  validator_output_dir / "offline_corrected_sxx_db.npy",
+  validator_output_dir / "offline_merged_coherence.npy",
+  validator_output_dir / "offline_merged_power.npy",
+  validator_output_dir / "offline_merged_score.npy",
+  validator_output_dir / "offline_final_mask.npy",
+]
+optional = [
+  validator_output_dir / "offline_power_db_preview.pgm",
+  validator_output_dir / "offline_corrected_preview.pgm",
+  validator_output_dir / "offline_final_mask.pgm",
+  validator_output_dir / "offline_mask_overlay.pgm",
+]
+
+missing = [str(path) for path in required if not path.exists()]
+if missing:
+  raise SystemExit("Fresh coherent validator run completed, but required artifacts are missing:\n- " + "\n- ".join(missing))
+
+for path in required + optional:
+  if not path.exists():
+    continue
+  shutil.copy2(path, bundle_dir / path.name)
+
+print(f"Saved {pipeline_mode} validation bundle to {bundle_dir}")
+PY

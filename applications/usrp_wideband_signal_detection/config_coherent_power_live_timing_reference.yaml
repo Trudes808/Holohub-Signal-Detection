@@ -206,7 +206,7 @@ coherent_power_signal_detector:
   input_width: 20480
   # Timing summaries synchronize after each measured stage, so sample the
   # reference detector much less often than the throughput profile.
-  emit_stride: 32
+  emit_stride: 8
   log_detections: false
   backend_mode: "reference"
   enable_mask_save: false
