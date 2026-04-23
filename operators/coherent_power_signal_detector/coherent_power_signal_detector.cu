@@ -987,8 +987,7 @@ __global__ void coherent_power_eigen_metrics_kernel(const float* j_ff,
                                                     const float* j_ft,
                                                     const float* j_tt,
                                                     int total,
-                                                    float* coherence,
-                                                    float* energy) {
+                                                    float* coherence) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total) {
     return;
@@ -998,11 +997,7 @@ __global__ void coherent_power_eigen_metrics_kernel(const float* j_ff,
   const float jft = j_ft[idx];
   const float jtt = j_tt[idx];
   const float delta = sqrtf(fmaxf((jff - jtt) * (jff - jtt) + 4.0f * (jft * jft), 0.0f));
-  const float lam1 = 0.5f * (jff + jtt + delta);
-  const float lam2 = 0.5f * (jff + jtt - delta);
-  const float denom = fmaxf(lam1 + lam2, 1e-6f);
-  coherence[idx] = (lam1 - lam2) / denom;
-  energy[idx] = lam1 + lam2;
+  coherence[idx] = delta / fmaxf(jff + jtt, 1e-6f);
 }
 
 __global__ void coherent_power_elementwise_max_inplace_kernel(const float* input,
@@ -3009,16 +3004,14 @@ bool build_power_assist_map_device(const float* corrected_chunk,
     if (cudaGetLastError() != cudaSuccess) {
       throw std::runtime_error("chunk local-relative valid-mask kernel failed");
     }
-    normalize_map01_device_inplace_async(local_power_device,
-                                         total,
-                                         5.0f,
-                                         95.0f,
-                                         0.0f,
-                                         25.0f,
-                                         histogram_device,
-                                         scalar0_device,
-                                         scalar1_device,
-                                         stream);
+    coherent_power_normalize_clamp_kernel<<<blocks, threads, 0, stream>>>(local_power_device,
+                                                                           total,
+                                                                           0.0f,
+                                                                           1.0f / 25.0f,
+                                                                           local_power_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk local-relative normalize kernel failed");
+    }
   });
   if (detail_ms_out != nullptr) {
     (*detail_ms_out)[kPowerSupportLocalRelativeStage] = local_relative_ms;
@@ -3131,7 +3124,6 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
     throw std::runtime_error("chunk CUDA scratch allocation failed for score masks");
   }
 
-  float* d0 = scratch.buffers[0];
   float* d3 = scratch.buffers[3];
   float* d4 = scratch.buffers[4];
   uint8_t* valid_row_mask_device = scratch.mask_buffers[0];
@@ -3146,12 +3138,7 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
 
-  if (cudaMemcpyAsync(d0,
-                      coherence_px_device,
-                      static_cast<size_t>(total) * sizeof(float),
-                      cudaMemcpyDeviceToDevice,
-                      stream) != cudaSuccess ||
-      cudaMemcpyAsync(valid_row_mask_device,
+  if (cudaMemcpyAsync(valid_row_mask_device,
                       valid_row_mask.data(),
                       static_cast<size_t>(rows) * sizeof(uint8_t),
                       cudaMemcpyHostToDevice,
@@ -3159,19 +3146,9 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
     throw std::runtime_error("chunk score GPU input copy failed");
   }
 
-  normalize_map01_device_inplace_async(d0,
-                                       total,
-                                       5.0f,
-                                       99.0f,
-                                       0.0f,
-                                       1.0f,
-                                       histogram_device,
-                                       normalize_low_device,
-                                       normalize_high_device,
-                                       stream);
   const float gate_start = static_cast<float>(coherence_gate_start);
   const float gate_full = std::max(static_cast<float>(coherence_gate_full), gate_start + 1e-3f);
-  coherent_power_gate_kernel<<<blocks, threads, 0, stream>>>(d0,
+  coherent_power_gate_kernel<<<blocks, threads, 0, stream>>>(coherence_px_device,
                                                               total,
                                                               gate_start,
                                                               1.0f / (gate_full - gate_start),
@@ -3189,16 +3166,6 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk bridged/joint score kernel failed");
   }
-  normalize_map01_device_inplace_async(d3,
-                                       total,
-                                       5.0f,
-                                       95.0f,
-                                       0.0f,
-                                       1.0f,
-                                       histogram_device,
-                                       normalize_low_device,
-                                       normalize_high_device,
-                                       stream);
 
   coherent_power_apply_valid_row_mask_kernel<<<blocks, threads, 0, stream>>>(d3, rows, cols, valid_row_mask_device);
   if (cudaGetLastError() != cudaSuccess) {
@@ -3441,8 +3408,6 @@ bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
   auto* d6 = scratch.buffers[6];
   auto* d7 = scratch.buffers[7];
   auto* coherence_device = scratch.buffers[8];
-  auto* scalar0_device = scratch.scalar_buffers[0];
-  auto* scalar1_device = scratch.scalar_buffers[1];
   auto stream = scratch.stream;
 
   const float* source_db_device = d0;
@@ -3480,23 +3445,18 @@ bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
   if (cudaGetLastError() != cudaSuccess) {
     return false;
   }
-  normalize_map01_device_inplace_async(d6,
-                                       total,
-                                       5.0f,
-                                       99.0f,
-                                       0.0f,
-                                       40.0f,
-                                       scratch.histogram_buffers[0],
-                                       scalar0_device,
-                                       scalar1_device,
-                                       stream);
-  if (cudaMemsetAsync(coherence_device, 0, static_cast<size_t>(total) * sizeof(float), stream) != cudaSuccess) {
+  coherent_power_normalize_clamp_kernel<<<total_blocks, total_threads, 0, stream>>>(d6,
+                                                                                      total,
+                                                                                      0.0f,
+                                                                                      1.0f / 40.0f,
+                                                                                      d6);
+  if (cudaGetLastError() != cudaSuccess) {
     return false;
   }
-
   const std::array<float, 3> scales{{0.8f, 1.6f, 3.2f}};
 
-  for (const float grad_sigma : scales) {
+  for (size_t scale_index = 0; scale_index < scales.size(); ++scale_index) {
+    const float grad_sigma = scales[scale_index];
     if (!gaussian_blur_2d_cuda(
             d6, rows, cols, grad_sigma, scratch.gaussian_kernel_device, scratch.gaussian_kernel_epoch, d0, d2, stream)) {
       return false;
@@ -3521,27 +3481,26 @@ bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
     }
 
     coherent_power_eigen_metrics_kernel<<<total_blocks, total_threads, 0, stream>>>(d1,
-                                                                                      d2,
-                                                                                      d5,
-                                                                                      total,
-                                                                                      d3,
-                                                                                      d4);
+                                              d2,
+                                              d5,
+                                              total,
+                                              d3);
     if (cudaGetLastError() != cudaSuccess) {
       return false;
     }
-    normalize_map01_device_inplace_async(d3,
-                                         total,
-                                         5.0f,
-                                         99.0f,
-                                         0.0f,
-                                         1.0f,
-                                         scratch.histogram_buffers[0],
-                                         scalar0_device,
-                                         scalar1_device,
-                                         stream);
-    coherent_power_elementwise_max_inplace_kernel<<<total_blocks, total_threads, 0, stream>>>(d3, total, coherence_device);
-    if (cudaGetLastError() != cudaSuccess) {
-      return false;
+    if (scale_index == 0) {
+      if (cudaMemcpyAsync(coherence_device,
+                          d3,
+                          static_cast<size_t>(total) * sizeof(float),
+                          cudaMemcpyDeviceToDevice,
+                          stream) != cudaSuccess) {
+        return false;
+      }
+    } else {
+      coherent_power_elementwise_max_inplace_kernel<<<total_blocks, total_threads, 0, stream>>>(d3, total, coherence_device);
+      if (cudaGetLastError() != cudaSuccess) {
+        return false;
+      }
     }
   }
 
@@ -4530,6 +4489,7 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
                                                  const ChunkPlanEntry& chunk,
                                                  const std::vector<uint8_t>& chunk_valid_row_mask,
                                                  bool capture_host_power_map,
+                                                 bool retain_device_mask,
                                                  bool synchronize_timing,
                                                  double coherence_weight,
                                                  double power_weight,
@@ -4653,7 +4613,7 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
     }
   }
 
-  if (use_gpu_post_grouping) {
+  if (use_gpu_post_grouping && retain_device_mask) {
     if (cudaMalloc(reinterpret_cast<void**>(&result.mask_device), chunk_size * sizeof(uint8_t)) != cudaSuccess) {
       throw std::runtime_error("chunk mask device allocation failed");
     }
@@ -4806,6 +4766,7 @@ PipelineSummary run_reference_pipeline(const float* power_db,
                                                     chunk,
                                                     chunk_valid_row_mask,
                                                     populate_merged_maps,
+                                                    false,
                                                     false,
                                                     coherence_weight,
                                                     power_weight,
@@ -4987,6 +4948,7 @@ PipelineSummary run_reference_pipeline_corrected_impl(const float* corrected_sxx
                                                     chunk,
                                                     chunk_valid_row_mask,
                                                     populate_merged_maps,
+                                                    materialize_host_final_mask,
                                                     synchronize_chunk_stage_timing,
                                                     coherence_weight,
                                                     power_weight,
@@ -5060,7 +5022,18 @@ PipelineSummary run_reference_pipeline_corrected_impl(const float* corrected_sxx
 
   if (materialize_host_final_mask) {
     summary.reference_stage_ms[kReferenceGroupingStage] = time_reference_stage_ms([&] {
-      summary.final_mask = boxes_to_float_mask_cuda(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
+      if (corrected_sxx_db_on_device && !populate_merged_maps) {
+        summary.final_mask = merge_chunk_masks_to_float_mask_cuda(chunk_results,
+                                                                  src_rows,
+                                                                  src_cols,
+                                                                  valid_row_mask,
+                                                                  filter_detection_mask,
+                                                                  grouping_bridge_freq_px,
+                                                                  grouping_bridge_time_px,
+                                                                  static_cast<float>(grouping_time_continuity_ratio));
+      } else {
+        summary.final_mask = boxes_to_float_mask_cuda(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
+      }
     });
   }
   return summary;
