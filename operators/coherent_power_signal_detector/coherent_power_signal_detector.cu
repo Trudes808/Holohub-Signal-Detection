@@ -316,7 +316,9 @@ class ChunkWorkerPool {
 };
 
 ChunkWorkerPool& chunk_worker_pool() {
-  static ChunkWorkerPool pool(std::max<size_t>(1, std::min<size_t>(8, std::thread::hardware_concurrency())));
+  // Each calling scheduler thread gets its own worker pool so concurrent detector
+  // channels do not race on shared task state or block each other at a global lock.
+  thread_local ChunkWorkerPool pool(std::max<size_t>(1, std::min<size_t>(8, std::thread::hardware_concurrency())));
   return pool;
 }
 

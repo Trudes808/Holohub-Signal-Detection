@@ -231,18 +231,18 @@ coherent_power_signal_detector:
   power_assist_mode: "absolute_direct"
   coherence_source_mode: "power_assist"
   score_threshold_mode: "fixed"
-  fixed_score_threshold: 0.3
+  fixed_score_threshold: 0.2
   coherence_power_support_q: 0.82
   coherence_power_q: 0.92
-  min_component_size: 3
+  min_component_size: 1
   filter_detection_mask: false
   grouping_seed_score_q: 0.72
   grouping_bridge_freq_px: 33
   grouping_bridge_time_px: 5
-  grouping_min_component_size: 10
-  grouping_min_freq_span_px: 8
-  grouping_min_time_span_px: 2
-  grouping_min_density: 0.025
+  grouping_min_component_size: 1
+  grouping_min_freq_span_px: 1
+  grouping_min_time_span_px: 1
+  grouping_min_density: 0.0
   grouping_time_continuity_ratio: 0.85
   timing_summary_enable: false
   timing_summary_every_n: 64
