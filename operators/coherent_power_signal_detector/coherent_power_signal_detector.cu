@@ -100,6 +100,7 @@ constexpr std::array<const char*, holoscan::ops::CoherentPowerSignalDetector::kP
 
 constexpr int kQuantileHistogramBins = 1024;
 constexpr int kMaxGaussianKernelSize = 129;
+constexpr int kScoreHistogramSampleStride = 2;
 
 struct ChunkPlanEntry {
   int chunk_index = 0;
@@ -898,6 +899,67 @@ __global__ void coherent_power_subtract_clamp_kernel(const float* input,
   output[idx] = fmaxf(input[idx] - baseline[idx], 0.0f);
 }
 
+__global__ void coherent_power_downsample2x_avg_kernel(const float* input,
+                                                       int input_rows,
+                                                       int input_cols,
+                                                       int output_rows,
+                                                       int output_cols,
+                                                       float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = output_rows * output_cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const int out_row = idx / output_cols;
+  const int out_col = idx % output_cols;
+  const int src_row0 = min(input_rows - 1, out_row * 2);
+  const int src_col0 = min(input_cols - 1, out_col * 2);
+  const int src_row1 = min(input_rows - 1, src_row0 + 1);
+  const int src_col1 = min(input_cols - 1, src_col0 + 1);
+
+  const float sum = input[flat_index(input_rows, input_cols, src_row0, src_col0)] +
+                    input[flat_index(input_rows, input_cols, src_row0, src_col1)] +
+                    input[flat_index(input_rows, input_cols, src_row1, src_col0)] +
+                    input[flat_index(input_rows, input_cols, src_row1, src_col1)];
+  output[idx] = 0.25f * sum;
+}
+
+__global__ void coherent_power_upsample_bilinear_kernel(const float* input,
+                                                        int input_rows,
+                                                        int input_cols,
+                                                        int output_rows,
+                                                        int output_cols,
+                                                        float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = output_rows * output_cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const int out_row = idx / output_cols;
+  const int out_col = idx % output_cols;
+  const float src_row = ((static_cast<float>(out_row) + 0.5f) * static_cast<float>(input_rows) /
+                         static_cast<float>(output_rows)) - 0.5f;
+  const float src_col = ((static_cast<float>(out_col) + 0.5f) * static_cast<float>(input_cols) /
+                         static_cast<float>(output_cols)) - 0.5f;
+
+  const int row0 = max(0, min(input_rows - 1, static_cast<int>(floorf(src_row))));
+  const int col0 = max(0, min(input_cols - 1, static_cast<int>(floorf(src_col))));
+  const int row1 = min(input_rows - 1, row0 + 1);
+  const int col1 = min(input_cols - 1, col0 + 1);
+  const float row_lerp = fminf(fmaxf(src_row - static_cast<float>(row0), 0.0f), 1.0f);
+  const float col_lerp = fminf(fmaxf(src_col - static_cast<float>(col0), 0.0f), 1.0f);
+
+  const float v00 = input[flat_index(input_rows, input_cols, row0, col0)];
+  const float v01 = input[flat_index(input_rows, input_cols, row0, col1)];
+  const float v10 = input[flat_index(input_rows, input_cols, row1, col0)];
+  const float v11 = input[flat_index(input_rows, input_cols, row1, col1)];
+  const float top = v00 + (v01 - v00) * col_lerp;
+  const float bottom = v10 + (v11 - v10) * col_lerp;
+  output[idx] = top + (bottom - top) * row_lerp;
+}
+
 __global__ void coherent_power_gaussian_rows_kernel(const float* input,
                                                     int rows,
                                                     int cols,
@@ -1258,6 +1320,32 @@ __global__ void coherent_power_histogram_valid_rows_kernel(const float* input,
   atomicAdd(histogram + bin, 1U);
 }
 
+__global__ void coherent_power_histogram_valid_rows_sampled_kernel(const float* input,
+                                                                   int rows,
+                                                                   int cols,
+                                                                   const uint8_t* valid_row_mask,
+                                                                   int row_stride,
+                                                                   int col_stride,
+                                                                   float range_min,
+                                                                   float range_max,
+                                                                   unsigned int* histogram,
+                                                                   int histogram_bins) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+  const int row = idx / cols;
+  const int col = idx % cols;
+  if (!valid_row_mask[row] || (row % row_stride) != 0 || (col % col_stride) != 0) {
+    return;
+  }
+  const float denom = fmaxf(range_max - range_min, 1e-6f);
+  const float clamped = fminf(fmaxf((input[idx] - range_min) / denom, 0.0f), 1.0f);
+  const int bin = min(histogram_bins - 1, max(0, static_cast<int>(clamped * static_cast<float>(histogram_bins - 1))));
+  atomicAdd(histogram + bin, 1U);
+}
+
 __global__ void coherent_power_histogram_masked_kernel(const float* input,
                                                        const uint8_t* mask,
                                                        int total,
@@ -1275,6 +1363,32 @@ __global__ void coherent_power_histogram_masked_kernel(const float* input,
   atomicAdd(histogram + bin, 1U);
 }
 
+__global__ void coherent_power_histogram_masked_sampled_kernel(const float* input,
+                                                               const uint8_t* mask,
+                                                               int rows,
+                                                               int cols,
+                                                               int row_stride,
+                                                               int col_stride,
+                                                               float range_min,
+                                                               float range_max,
+                                                               unsigned int* histogram,
+                                                               int histogram_bins) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total || !mask[idx]) {
+    return;
+  }
+  const int row = idx / cols;
+  const int col = idx % cols;
+  if ((row % row_stride) != 0 || (col % col_stride) != 0) {
+    return;
+  }
+  const float denom = fmaxf(range_max - range_min, 1e-6f);
+  const float clamped = fminf(fmaxf((input[idx] - range_min) / denom, 0.0f), 1.0f);
+  const int bin = min(histogram_bins - 1, max(0, static_cast<int>(clamped * static_cast<float>(histogram_bins - 1))));
+  atomicAdd(histogram + bin, 1U);
+}
+
 __global__ void coherent_power_histogram_all_kernel(const float* input,
                                                     int total,
                                                     float range_min,
@@ -1283,6 +1397,31 @@ __global__ void coherent_power_histogram_all_kernel(const float* input,
                                                     int histogram_bins) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total) {
+    return;
+  }
+  const float denom = fmaxf(range_max - range_min, 1e-6f);
+  const float clamped = fminf(fmaxf((input[idx] - range_min) / denom, 0.0f), 1.0f);
+  const int bin = min(histogram_bins - 1, max(0, static_cast<int>(clamped * static_cast<float>(histogram_bins - 1))));
+  atomicAdd(histogram + bin, 1U);
+}
+
+__global__ void coherent_power_histogram_all_sampled_kernel(const float* input,
+                                                            int rows,
+                                                            int cols,
+                                                            int row_stride,
+                                                            int col_stride,
+                                                            float range_min,
+                                                            float range_max,
+                                                            unsigned int* histogram,
+                                                            int histogram_bins) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+  const int row = idx / cols;
+  const int col = idx % cols;
+  if ((row % row_stride) != 0 || (col % col_stride) != 0) {
     return;
   }
   const float denom = fmaxf(range_max - range_min, 1e-6f);
@@ -2360,6 +2499,35 @@ void device_histogram_all_async(float* values_device,
   }
 }
 
+void device_histogram_all_sampled_async(float* values_device,
+                                        int rows,
+                                        int cols,
+                                        int row_stride,
+                                        int col_stride,
+                                        float range_min,
+                                        float range_max,
+                                        unsigned int* histogram_device,
+                                        cudaStream_t stream) {
+  const int total = rows * cols;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  if (cudaMemsetAsync(histogram_device, 0, kQuantileHistogramBins * sizeof(unsigned int), stream) != cudaSuccess) {
+    throw std::runtime_error("histogram memset failed");
+  }
+  coherent_power_histogram_all_sampled_kernel<<<blocks, threads, 0, stream>>>(values_device,
+                                                                               rows,
+                                                                               cols,
+                                                                               std::max(1, row_stride),
+                                                                               std::max(1, col_stride),
+                                                                               range_min,
+                                                                               range_max,
+                                                                               histogram_device,
+                                                                               kQuantileHistogramBins);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("sampled histogram all kernel failed");
+  }
+}
+
 float device_quantile_from_histogram_valid_rows(float* values_device,
                                                 int rows,
                                                 int cols,
@@ -2436,6 +2604,48 @@ void device_quantile_from_histogram_valid_rows_async(float* values_device,
   }
 }
 
+void device_quantile_from_histogram_valid_rows_sampled_async(float* values_device,
+                                                             int rows,
+                                                             int cols,
+                                                             const uint8_t* valid_row_mask_device,
+                                                             int row_stride,
+                                                             int col_stride,
+                                                             float q,
+                                                             float range_min,
+                                                             float range_max,
+                                                             unsigned int* histogram_device,
+                                                             float* output_device,
+                                                             cudaStream_t stream) {
+  const int total = rows * cols;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  if (cudaMemsetAsync(histogram_device, 0, kQuantileHistogramBins * sizeof(unsigned int), stream) != cudaSuccess) {
+    throw std::runtime_error("valid-row histogram memset failed");
+  }
+  coherent_power_histogram_valid_rows_sampled_kernel<<<blocks, threads, 0, stream>>>(values_device,
+                                                                                      rows,
+                                                                                      cols,
+                                                                                      valid_row_mask_device,
+                                                                                      std::max(1, row_stride),
+                                                                                      std::max(1, col_stride),
+                                                                                      range_min,
+                                                                                      range_max,
+                                                                                      histogram_device,
+                                                                                      kQuantileHistogramBins);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("sampled valid-row histogram kernel failed");
+  }
+  coherent_power_histogram_quantile_kernel<<<1, 1, 0, stream>>>(histogram_device,
+                                                                 kQuantileHistogramBins,
+                                                                 q,
+                                                                 range_min,
+                                                                 range_max,
+                                                                 output_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("sampled valid-row histogram quantile kernel failed");
+  }
+}
+
 float device_quantile_from_histogram_masked(float* values_device,
                                             const uint8_t* mask_device,
                                             int total,
@@ -2503,6 +2713,48 @@ void device_quantile_from_histogram_masked_async(float* values_device,
                                                                  output_device);
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("masked histogram quantile kernel failed");
+  }
+}
+
+void device_quantile_from_histogram_masked_sampled_async(float* values_device,
+                                                         const uint8_t* mask_device,
+                                                         int rows,
+                                                         int cols,
+                                                         int row_stride,
+                                                         int col_stride,
+                                                         float q,
+                                                         float range_min,
+                                                         float range_max,
+                                                         unsigned int* histogram_device,
+                                                         float* output_device,
+                                                         cudaStream_t stream) {
+  const int total = rows * cols;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  if (cudaMemsetAsync(histogram_device, 0, kQuantileHistogramBins * sizeof(unsigned int), stream) != cudaSuccess) {
+    throw std::runtime_error("masked histogram memset failed");
+  }
+  coherent_power_histogram_masked_sampled_kernel<<<blocks, threads, 0, stream>>>(values_device,
+                                                                                  mask_device,
+                                                                                  rows,
+                                                                                  cols,
+                                                                                  std::max(1, row_stride),
+                                                                                  std::max(1, col_stride),
+                                                                                  range_min,
+                                                                                  range_max,
+                                                                                  histogram_device,
+                                                                                  kQuantileHistogramBins);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("sampled masked histogram kernel failed");
+  }
+  coherent_power_histogram_quantile_kernel<<<1, 1, 0, stream>>>(histogram_device,
+                                                                 kQuantileHistogramBins,
+                                                                 q,
+                                                                 range_min,
+                                                                 range_max,
+                                                                 output_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    throw std::runtime_error("sampled masked histogram quantile kernel failed");
   }
 }
 
@@ -3129,6 +3381,8 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
   cudaStream_t stream = scratch.stream;
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
+  const bool use_sampled_score_histograms = rows >= 128 && cols >= 256;
+  const int score_histogram_stride = use_sampled_score_histograms ? kScoreHistogramSampleStride : 1;
 
   if (cudaMemcpyAsync(valid_row_mask_device,
                       valid_row_mask.data(),
@@ -3158,32 +3412,86 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk bridged/joint score kernel failed");
   }
-  normalize_map01_device_inplace_async(d3,
-                                       total,
-                                       5.0f,
-                                       95.0f,
+  if (use_sampled_score_histograms) {
+    device_histogram_all_sampled_async(d3,
+                                       rows,
+                                       cols,
+                                       score_histogram_stride,
+                                       score_histogram_stride,
                                        0.0f,
                                        1.0f,
                                        histogram_device,
-                                       normalize_low_device,
-                                       normalize_high_device,
                                        stream);
+    coherent_power_histogram_quantile_kernel<<<1, 1, 0, stream>>>(histogram_device,
+                                                                   kQuantileHistogramBins,
+                                                                   0.05f,
+                                                                   0.0f,
+                                                                   1.0f,
+                                                                   normalize_low_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("sampled score low quantile kernel failed");
+    }
+    coherent_power_histogram_quantile_kernel<<<1, 1, 0, stream>>>(histogram_device,
+                                                                   kQuantileHistogramBins,
+                                                                   0.95f,
+                                                                   0.0f,
+                                                                   1.0f,
+                                                                   normalize_high_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("sampled score high quantile kernel failed");
+    }
+    coherent_power_normalize_clamp_from_device_scalars_kernel<<<blocks, threads, 0, stream>>>(d3,
+                                                                                                total,
+                                                                                                normalize_low_device,
+                                                                                                normalize_high_device);
+    const auto normalize_result = cudaGetLastError();
+    if (normalize_result != cudaSuccess) {
+      throw std::runtime_error(std::string("device normalize kernel failed: ") +
+                               cudaGetErrorString(normalize_result));
+    }
+  } else {
+    normalize_map01_device_inplace_async(d3,
+                                         total,
+                                         5.0f,
+                                         95.0f,
+                                         0.0f,
+                                         1.0f,
+                                         histogram_device,
+                                         normalize_low_device,
+                                         normalize_high_device,
+                                         stream);
+  }
 
   coherent_power_apply_valid_row_mask_kernel<<<blocks, threads, 0, stream>>>(d3, rows, cols, valid_row_mask_device);
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk score valid-mask kernel failed");
   }
 
-  device_quantile_from_histogram_valid_rows_async(d3,
-                                                  rows,
-                                                  cols,
-                                                  valid_row_mask_device,
-                                                  clamp_float(static_cast<float>(support_q), 0.50f, 0.99f),
-                                                  0.0f,
-                                                  1.0f,
-                                                  histogram_device,
-                                                  support_threshold_device,
-                                                  stream);
+  if (use_sampled_score_histograms) {
+    device_quantile_from_histogram_valid_rows_sampled_async(d3,
+                                                            rows,
+                                                            cols,
+                                                            valid_row_mask_device,
+                                                            score_histogram_stride,
+                                                            score_histogram_stride,
+                                                            clamp_float(static_cast<float>(support_q), 0.50f, 0.99f),
+                                                            0.0f,
+                                                            1.0f,
+                                                            histogram_device,
+                                                            support_threshold_device,
+                                                            stream);
+  } else {
+    device_quantile_from_histogram_valid_rows_async(d3,
+                                                    rows,
+                                                    cols,
+                                                    valid_row_mask_device,
+                                                    clamp_float(static_cast<float>(support_q), 0.50f, 0.99f),
+                                                    0.0f,
+                                                    1.0f,
+                                                    histogram_device,
+                                                    support_threshold_device,
+                                                    stream);
+  }
 
   coherent_power_threshold_valid_rows_device_kernel<<<blocks, threads, 0, stream>>>(d3,
                                                                                      rows,
@@ -3204,15 +3512,30 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
   }
   std::swap(mask_device, scratch_mask_device);
 
-  device_quantile_from_histogram_masked_async(d3,
-                                              mask_device,
-                                              total,
-                                              clamp_float(static_cast<float>(final_q), 0.50f, 0.99f),
-                                              0.0f,
-                                              1.0f,
-                                              histogram_device,
-                                              score_threshold_device,
-                                              stream);
+  if (use_sampled_score_histograms) {
+    device_quantile_from_histogram_masked_sampled_async(d3,
+                                                        mask_device,
+                                                        rows,
+                                                        cols,
+                                                        score_histogram_stride,
+                                                        score_histogram_stride,
+                                                        clamp_float(static_cast<float>(final_q), 0.50f, 0.99f),
+                                                        0.0f,
+                                                        1.0f,
+                                                        histogram_device,
+                                                        score_threshold_device,
+                                                        stream);
+  } else {
+    device_quantile_from_histogram_masked_async(d3,
+                                                mask_device,
+                                                total,
+                                                clamp_float(static_cast<float>(final_q), 0.50f, 0.99f),
+                                                0.0f,
+                                                1.0f,
+                                                histogram_device,
+                                                score_threshold_device,
+                                                stream);
+  }
 
   coherent_power_threshold_mask_device_kernel<<<blocks, threads, 0, stream>>>(d3,
                                                                                mask_device,
@@ -3455,55 +3778,50 @@ bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
   if (cudaGetLastError() != cudaSuccess) {
     return false;
   }
-  const std::array<float, 2> scales{{1.6f, 3.2f}};
 
-  for (size_t scale_index = 0; scale_index < scales.size(); ++scale_index) {
-    const float grad_sigma = scales[scale_index];
-    if (!gaussian_blur_2d_cuda(
-            d6, rows, cols, grad_sigma, scratch.gaussian_kernel_device, scratch.gaussian_kernel_epoch, d0, d2, stream)) {
-      return false;
-    }
-    coherent_power_gradient_kernel<<<total_blocks, total_threads, 0, stream>>>(d2, rows, cols, d3, d4);
-    if (cudaGetLastError() != cudaSuccess) {
-      return false;
-    }
-    coherent_power_tensor_products_kernel<<<total_blocks, total_threads, 0, stream>>>(d3, d4, total, d1, d2, d5);
-    if (cudaGetLastError() != cudaSuccess) {
-      return false;
-    }
+  constexpr int kDirectionalTimeRadius = 7;
+  constexpr int kDirectionalFreqRadius = 2;
+  constexpr float kResidualMixWeight = 0.25f;
 
-    const float integ_sigma = std::max(1.0f, 1.8f * grad_sigma);
-    if (!gaussian_blur_2d_cuda(
-        d1, rows, cols, integ_sigma, scratch.gaussian_kernel_device, scratch.gaussian_kernel_epoch, d0, d1, stream) ||
-      !gaussian_blur_2d_cuda(
-        d2, rows, cols, integ_sigma, scratch.gaussian_kernel_device, scratch.gaussian_kernel_epoch, d0, d2, stream) ||
-      !gaussian_blur_2d_cuda(
-        d5, rows, cols, integ_sigma, scratch.gaussian_kernel_device, scratch.gaussian_kernel_epoch, d0, d5, stream)) {
-      return false;
-    }
-
-    coherent_power_eigen_metrics_kernel<<<total_blocks, total_threads, 0, stream>>>(d1,
-                                              d2,
-                                              d5,
-                                              total,
-                                              d3);
-    if (cudaGetLastError() != cudaSuccess) {
-      return false;
-    }
-    if (scale_index == 0) {
-      if (cudaMemcpyAsync(coherence_device,
-                          d3,
-                          static_cast<size_t>(total) * sizeof(float),
-                          cudaMemcpyDeviceToDevice,
-                          stream) != cudaSuccess) {
-        return false;
-      }
-    } else {
-      coherent_power_elementwise_max_inplace_kernel<<<total_blocks, total_threads, 0, stream>>>(d3, total, coherence_device);
-      if (cudaGetLastError() != cudaSuccess) {
-        return false;
-      }
-    }
+  coherent_power_box_mean_cols_kernel<<<total_blocks, total_threads, 0, stream>>>(d6,
+                                                                                   rows,
+                                                                                   cols,
+                                                                                   kDirectionalTimeRadius,
+                                                                                   d0);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+  coherent_power_box_mean_rows_kernel<<<total_blocks, total_threads, 0, stream>>>(d6,
+                                                                                   rows,
+                                                                                   cols,
+                                                                                   kDirectionalFreqRadius,
+                                                                                   d1);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+  coherent_power_subtract_clamp_kernel<<<total_blocks, total_threads, 0, stream>>>(d0,
+                                                                                     d1,
+                                                                                     total,
+                                                                                     d2);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+  coherent_power_weighted_sum_kernel<<<total_blocks, total_threads, 0, stream>>>(d2,
+                                                                                  d6,
+                                                                                  total,
+                                                                                  1.0f - kResidualMixWeight,
+                                                                                  kResidualMixWeight,
+                                                                                  d3);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+  coherent_power_normalize_clamp_kernel<<<total_blocks, total_threads, 0, stream>>>(d3,
+                                                                                      total,
+                                                                                      0.0f,
+                                                                                      1.0f,
+                                                                                      coherence_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
   }
 
   *coherence_device_out = coherence_device;
