@@ -37,10 +37,13 @@ struct CoherentPowerReferenceConfig {
   double power_excess_start_db = 3.0;
   double power_excess_full_db = 15.0;
   double power_local_blend = 0.25;
+  std::string coherence_source_mode = "structure_tensor";
   double coherence_gate_start = 0.15;
   double coherence_gate_full = 0.45;
   double coherence_bridge_bias = 0.05;
   double coherence_power_joint_weight = 0.70;
+  std::string score_threshold_mode = "quantile";
+  double fixed_score_threshold = 0.58;
   double coherence_power_support_q = 0.82;
   double coherence_power_q = 0.92;
   int min_component_size = 6;
@@ -177,10 +180,13 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<double> power_excess_start_db_;
   holoscan::Parameter<double> power_excess_full_db_;
   holoscan::Parameter<double> power_local_blend_;
+  holoscan::Parameter<std::string> coherence_source_mode_;
   holoscan::Parameter<double> coherence_gate_start_;
   holoscan::Parameter<double> coherence_gate_full_;
   holoscan::Parameter<double> coherence_bridge_bias_;
   holoscan::Parameter<double> coherence_power_joint_weight_;
+  holoscan::Parameter<std::string> score_threshold_mode_;
+  holoscan::Parameter<double> fixed_score_threshold_;
   holoscan::Parameter<double> coherence_power_support_q_;
   holoscan::Parameter<double> coherence_power_q_;
   holoscan::Parameter<int> min_component_size_;

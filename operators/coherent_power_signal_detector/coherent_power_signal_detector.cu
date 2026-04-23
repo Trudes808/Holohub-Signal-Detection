@@ -3140,6 +3140,11 @@ bool build_power_assist_map_device(const float* corrected_chunk,
   cudaStream_t stream = scratch.stream;
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
+  std::string normalized_power_assist_mode = power_assist_mode;
+  std::transform(normalized_power_assist_mode.begin(),
+                 normalized_power_assist_mode.end(),
+                 normalized_power_assist_mode.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
   auto time_stage_ms = [&](auto&& fn) {
     const auto stage_start = std::chrono::steady_clock::now();
     fn();
@@ -3198,7 +3203,8 @@ bool build_power_assist_map_device(const float* corrected_chunk,
     valid_max_db = 120.0f;
   }
 
-  const double floor_estimate_ms = time_stage_ms([&] {
+  const bool use_absolute_direct = normalized_power_assist_mode == "absolute_direct";
+  const double floor_estimate_ms = use_absolute_direct ? 0.0 : time_stage_ms([&] {
     device_quantile_from_histogram_valid_rows_async(corrected_db_device,
                                                     rows,
                                                     cols,
@@ -3218,7 +3224,9 @@ bool build_power_assist_map_device(const float* corrected_chunk,
     (*detail_ms_out)[kPowerSupportFloorEstimateStage] = floor_estimate_ms;
   }
 
-  const double local_relative_ms = time_stage_ms([&] {
+  const bool need_local_relative = normalized_power_assist_mode != "absolute_floor" &&
+                                   normalized_power_assist_mode != "absolute_direct";
+  const double local_relative_ms = need_local_relative ? time_stage_ms([&] {
     coherent_power_relative_db_scalar_floor_kernel<<<blocks, threads, 0, stream>>>(linear_power_device,
                                                                                     scalar1_device,
                                                                                     total,
@@ -3264,16 +3272,12 @@ bool build_power_assist_map_device(const float* corrected_chunk,
     if (cudaGetLastError() != cudaSuccess) {
       throw std::runtime_error("chunk local-relative normalize kernel failed");
     }
-  });
+  }) : 0.0;
   if (detail_ms_out != nullptr) {
     (*detail_ms_out)[kPowerSupportLocalRelativeStage] = local_relative_ms;
   }
 
-  std::transform(power_assist_mode.begin(),
-                 power_assist_mode.end(),
-                 power_assist_mode.begin(),
-                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-  if (power_assist_mode == "local_relative") {
+  if (normalized_power_assist_mode == "local_relative") {
     *power_px_device_out = local_power_device;
     return true;
   }
@@ -3281,7 +3285,13 @@ bool build_power_assist_map_device(const float* corrected_chunk,
   const float start_db = power_excess_start_db;
   const float full_db = std::max(power_excess_full_db, start_db + 1e-3f);
   const double absolute_assist_ms = time_stage_ms([&] {
-    if (corrected_chunk_on_device) {
+    if (use_absolute_direct) {
+      coherent_power_normalize_clamp_kernel<<<blocks, threads, 0, stream>>>(corrected_db_device,
+                                                                             total,
+                                                                             start_db,
+                                                                             1.0f / (full_db - start_db),
+                                                                             absolute_power_device);
+    } else if (corrected_chunk_on_device) {
       coherent_power_absolute_assist_device_floor_kernel<<<blocks, threads, 0, stream>>>(corrected_db_device,
                                                                                            rows,
                                                                                            cols,
@@ -3314,7 +3324,7 @@ bool build_power_assist_map_device(const float* corrected_chunk,
     (*detail_ms_out)[kPowerSupportAbsoluteAssistStage] = absolute_assist_ms;
   }
 
-  if (power_assist_mode == "absolute_floor") {
+  if (normalized_power_assist_mode == "absolute_floor" || normalized_power_assist_mode == "absolute_direct") {
     *power_px_device_out = absolute_power_device;
     return true;
   }
@@ -3343,6 +3353,8 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
                                int rows,
                                int cols,
                                const std::vector<uint8_t>& valid_row_mask,
+                               const std::string& score_threshold_mode,
+                               double fixed_score_threshold,
                                double support_q,
                                double final_q,
                                double coherence_gate_start,
@@ -3383,6 +3395,12 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
   const int blocks = (total + threads - 1) / threads;
   const bool use_sampled_score_histograms = rows >= 128 && cols >= 256;
   const int score_histogram_stride = use_sampled_score_histograms ? kScoreHistogramSampleStride : 1;
+  std::string normalized_score_threshold_mode = score_threshold_mode;
+  std::transform(normalized_score_threshold_mode.begin(),
+                 normalized_score_threshold_mode.end(),
+                 normalized_score_threshold_mode.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  const bool use_fixed_score_threshold = normalized_score_threshold_mode == "fixed";
 
   if (cudaMemcpyAsync(valid_row_mask_device,
                       valid_row_mask.data(),
@@ -3412,6 +3430,70 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk bridged/joint score kernel failed");
   }
+  if (use_fixed_score_threshold) {
+    coherent_power_apply_valid_row_mask_kernel<<<blocks, threads, 0, stream>>>(d3, rows, cols, valid_row_mask_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk score valid-mask kernel failed");
+    }
+
+    const float fixed_threshold = clamp_float(static_cast<float>(fixed_score_threshold), 0.0f, 1.0f);
+    coherent_power_threshold_valid_rows_kernel<<<blocks, threads, 0, stream>>>(d3,
+                                                                                rows,
+                                                                                cols,
+                                                                                valid_row_mask_device,
+                                                                                fixed_threshold,
+                                                                                mask_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk fixed threshold kernel failed");
+    }
+    coherent_power_majority_smooth_kernel<<<blocks, threads, 0, stream>>>(mask_device,
+                                                                           rows,
+                                                                           cols,
+                                                                           0,
+                                                                           scratch_mask_device);
+    if (cudaGetLastError() != cudaSuccess) {
+      throw std::runtime_error("chunk fixed-threshold majority smooth kernel failed");
+    }
+    std::swap(mask_device, scratch_mask_device);
+
+    if (score_px_device_out != nullptr) {
+      *score_px_device_out = d3;
+    }
+    if (mask_px_device_out != nullptr) {
+      *mask_px_device_out = mask_device;
+    }
+
+    if (!readback_host_outputs) {
+      support_threshold = fixed_threshold;
+      score_threshold = fixed_threshold;
+      score_px.clear();
+      mask_px.clear();
+      return;
+    }
+
+    score_px.assign(static_cast<size_t>(total), 0.0f);
+    mask_px.assign(static_cast<size_t>(total), 0);
+    support_threshold = fixed_threshold;
+    score_threshold = fixed_threshold;
+    if (cudaMemcpyAsync(score_px.data(),
+                        d3,
+                        static_cast<size_t>(total) * sizeof(float),
+                        cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess ||
+        cudaMemcpyAsync(mask_px.data(),
+                        mask_device,
+                        static_cast<size_t>(total) * sizeof(uint8_t),
+                        cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess ||
+        cudaStreamSynchronize(stream) != cudaSuccess) {
+      throw std::runtime_error("chunk fixed score/mask readback failed");
+    }
+    if (!filter_detection_mask) {
+      mask_px = prune_small_components(std::move(mask_px), rows, cols, min_component_size);
+    }
+    return;
+  }
+
   if (use_sampled_score_histograms) {
     device_histogram_all_sampled_async(d3,
                                        rows,
@@ -4819,10 +4901,13 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
                                                  double power_excess_start_db,
                                                  double power_excess_full_db,
                                                  double power_local_blend,
+                                                 const std::string& coherence_source_mode,
                                                  double coherence_gate_start,
                                                  double coherence_gate_full,
                                                  double coherence_bridge_bias,
                                                  double coherence_power_joint_weight,
+                                                 const std::string& score_threshold_mode,
+                                                 double fixed_score_threshold,
                                                  double support_q,
                                                  double final_q,
                                                  int min_component_size,
@@ -4854,17 +4939,27 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
   result.valid_score_mask = valid_row_mask_to_full_mask(chunk_valid_row_mask, cols);
   const size_t chunk_size = static_cast<size_t>(rows) * static_cast<size_t>(cols);
   const bool use_gpu_post_grouping = corrected_chunk_on_device && !capture_host_power_map;
+  std::string normalized_coherence_source_mode = coherence_source_mode;
+  std::transform(normalized_coherence_source_mode.begin(),
+                 normalized_coherence_source_mode.end(),
+                 normalized_coherence_source_mode.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  const bool bypass_coherence = normalized_coherence_source_mode == "power_assist";
 
   const float* coherence_px_device = nullptr;
-  result.stage_ms[kChunkStructureTensorStage] = time_chunk_stage_ms([&] {
-    if (!multi_scale_structure_tensor_coherence_cuda(corrected_chunk,
-                                                     corrected_chunk_on_device,
-                                                     rows,
-                                                     cols,
-                                                     &coherence_px_device)) {
-      throw std::runtime_error("CUDA structure-tensor path failed in detect_chunk_coherent_power");
-    }
-  });
+  if (bypass_coherence) {
+    result.stage_ms[kChunkStructureTensorStage] = 0.0;
+  } else {
+    result.stage_ms[kChunkStructureTensorStage] = time_chunk_stage_ms([&] {
+      if (!multi_scale_structure_tensor_coherence_cuda(corrected_chunk,
+                                                       corrected_chunk_on_device,
+                                                       rows,
+                                                       cols,
+                                                       &coherence_px_device)) {
+        throw std::runtime_error("CUDA structure-tensor path failed in detect_chunk_coherent_power");
+      }
+    });
+  }
   (void)coherence_weight;
   (void)power_weight;
   const float* power_px_device = nullptr;
@@ -4888,12 +4983,17 @@ DetectionChunkResult detect_chunk_coherent_power(const float* corrected_chunk,
       throw std::runtime_error("GPU power-assist path failed in detect_chunk_coherent_power");
     }
   });
+  if (bypass_coherence) {
+    coherence_px_device = power_px_device;
+  }
   result.stage_ms[kChunkScoreThresholdStage] = time_chunk_stage_ms([&] {
     run_chunk_score_masks_gpu(coherence_px_device,
                               power_px_device,
                               rows,
                               cols,
                               chunk_valid_row_mask,
+                              score_threshold_mode,
+                              fixed_score_threshold,
                               support_q,
                               final_q,
                               coherence_gate_start,
@@ -5002,10 +5102,13 @@ PipelineSummary run_reference_pipeline(const float* power_db,
                                        double power_excess_start_db,
                                        double power_excess_full_db,
                                        double power_local_blend,
+                                       const std::string& coherence_source_mode,
                                        double coherence_gate_start,
                                        double coherence_gate_full,
                                        double coherence_bridge_bias,
                                        double coherence_power_joint_weight,
+                                       const std::string& score_threshold_mode,
+                                       double fixed_score_threshold,
                                        double coherence_power_support_q,
                                        double coherence_power_q,
                                        int min_component_size,
@@ -5096,10 +5199,13 @@ PipelineSummary run_reference_pipeline(const float* power_db,
                                                     power_excess_start_db,
                                                     power_excess_full_db,
                                                     power_local_blend,
+                                                    coherence_source_mode,
                                                     coherence_gate_start,
                                                     coherence_gate_full,
                                                     coherence_bridge_bias,
                                                     coherence_power_joint_weight,
+                                                    score_threshold_mode,
+                                                    fixed_score_threshold,
                                                     coherence_power_support_q,
                                                     coherence_power_q,
                                                     min_component_size,
@@ -5186,10 +5292,13 @@ PipelineSummary run_reference_pipeline_corrected_impl(const float* corrected_sxx
                         double power_excess_start_db,
                         double power_excess_full_db,
                         double power_local_blend,
+                        const std::string& coherence_source_mode,
                         double coherence_gate_start,
                         double coherence_gate_full,
                         double coherence_bridge_bias,
                         double coherence_power_joint_weight,
+                        const std::string& score_threshold_mode,
+                        double fixed_score_threshold,
                         double coherence_power_support_q,
                         double coherence_power_q,
                         int min_component_size,
@@ -5278,10 +5387,13 @@ PipelineSummary run_reference_pipeline_corrected_impl(const float* corrected_sxx
                                                     power_excess_start_db,
                                                     power_excess_full_db,
                                                     power_local_blend,
+                                                    coherence_source_mode,
                                                     coherence_gate_start,
                                                     coherence_gate_full,
                                                     coherence_bridge_bias,
                                                     coherence_power_joint_weight,
+                                                    score_threshold_mode,
+                                                    fixed_score_threshold,
                                                     coherence_power_support_q,
                                                     coherence_power_q,
                                                     min_component_size,
@@ -5380,10 +5492,13 @@ PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
                                                  double power_excess_start_db,
                                                  double power_excess_full_db,
                                                  double power_local_blend,
+                                                 const std::string& coherence_source_mode,
                                                  double coherence_gate_start,
                                                  double coherence_gate_full,
                                                  double coherence_bridge_bias,
                                                  double coherence_power_joint_weight,
+                                                 const std::string& score_threshold_mode,
+                                                 double fixed_score_threshold,
                                                  double coherence_power_support_q,
                                                  double coherence_power_q,
                                                  int min_component_size,
@@ -5419,10 +5534,13 @@ PipelineSummary run_reference_pipeline_corrected(const float* corrected_sxx_db,
                                                power_excess_start_db,
                                                power_excess_full_db,
                                                power_local_blend,
+                                               coherence_source_mode,
                                                coherence_gate_start,
                                                coherence_gate_full,
                                                coherence_bridge_bias,
                                                coherence_power_joint_weight,
+                                               score_threshold_mode,
+                                               fixed_score_threshold,
                                                coherence_power_support_q,
                                                coherence_power_q,
                                                min_component_size,
@@ -5459,10 +5577,13 @@ PipelineSummary run_reference_pipeline_corrected_device(const float* corrected_s
                                                         double power_excess_start_db,
                                                         double power_excess_full_db,
                                                         double power_local_blend,
+                                                        const std::string& coherence_source_mode,
                                                         double coherence_gate_start,
                                                         double coherence_gate_full,
                                                         double coherence_bridge_bias,
                                                         double coherence_power_joint_weight,
+                                                        const std::string& score_threshold_mode,
+                                                        double fixed_score_threshold,
                                                         double coherence_power_support_q,
                                                         double coherence_power_q,
                                                         int min_component_size,
@@ -5498,10 +5619,13 @@ PipelineSummary run_reference_pipeline_corrected_device(const float* corrected_s
                                                power_excess_start_db,
                                                power_excess_full_db,
                                                power_local_blend,
+                                               coherence_source_mode,
                                                coherence_gate_start,
                                                coherence_gate_full,
                                                coherence_bridge_bias,
                                                coherence_power_joint_weight,
+                                               score_threshold_mode,
+                                               fixed_score_threshold,
                                                coherence_power_support_q,
                                                coherence_power_q,
                                                min_component_size,
@@ -5594,10 +5718,13 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
                                               config.power_excess_start_db,
                                               config.power_excess_full_db,
                                               config.power_local_blend,
+                                              config.coherence_source_mode,
                                               config.coherence_gate_start,
                                               config.coherence_gate_full,
                                               config.coherence_bridge_bias,
                                               config.coherence_power_joint_weight,
+                                              config.score_threshold_mode,
+                                              config.fixed_score_threshold,
                                               config.coherence_power_support_q,
                                               config.coherence_power_q,
                                               config.min_component_size,
@@ -5807,10 +5934,13 @@ CoherentPowerReferenceResult run_coherent_power_live_validation(
                                                                  config.power_excess_start_db,
                                                                  config.power_excess_full_db,
                                                                  config.power_local_blend,
+                                                                 config.coherence_source_mode,
                                                                  config.coherence_gate_start,
                                                                  config.coherence_gate_full,
                                                                  config.coherence_bridge_bias,
                                                                  config.coherence_power_joint_weight,
+                                                                 config.score_threshold_mode,
+                                                                 config.fixed_score_threshold,
                                                                  config.coherence_power_support_q,
                                                                  config.coherence_power_q,
                                                                  config.min_component_size,
@@ -5899,10 +6029,13 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(power_excess_start_db_, "power_excess_start_db", "Power excess start dB", "Notebook-derived absolute power assist ramp start above floor.", 3.0);
   spec.param(power_excess_full_db_, "power_excess_full_db", "Power excess full dB", "Notebook-derived absolute power assist full-scale point above floor.", 15.0);
   spec.param(power_local_blend_, "power_local_blend", "Power local blend", "Notebook-derived hybrid blend between absolute and local-relative power assist.", 0.25);
+  spec.param(coherence_source_mode_, "coherence_source_mode", "Coherence source mode", "Reference-path coherence source: structure_tensor or power_assist.", std::string("structure_tensor"));
   spec.param(coherence_gate_start_, "coherence_gate_start", "Coherence gate start", "Notebook-derived coherence gate ramp start.", 0.15);
   spec.param(coherence_gate_full_, "coherence_gate_full", "Coherence gate full", "Notebook-derived coherence gate full-scale point.", 0.45);
   spec.param(coherence_bridge_bias_, "coherence_bridge_bias", "Coherence bridge bias", "Notebook-derived power bridging bias under partial coherence.", 0.05);
   spec.param(coherence_power_joint_weight_, "coherence_power_joint_weight", "Coherence-power joint weight", "Notebook-derived weight between joint and bridged power scores.", 0.70);
+  spec.param(score_threshold_mode_, "score_threshold_mode", "Score threshold mode", "Reference-path score threshold mode: quantile or fixed.", std::string("quantile"));
+  spec.param(fixed_score_threshold_, "fixed_score_threshold", "Fixed score threshold", "Direct score threshold used when score_threshold_mode=fixed.", 0.58);
   spec.param(coherence_power_support_q_, "coherence_power_support_q", "Support quantile", "Notebook-derived support quantile.", 0.82);
   spec.param(coherence_power_q_, "coherence_power_q", "Final quantile", "Notebook-derived final score quantile.", 0.92);
   spec.param(min_component_size_, "min_component_size", "Minimum component size", "Notebook-derived minimum component size.", 6);
@@ -6471,10 +6604,13 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                                           power_excess_start_db_.get(),
                                                           power_excess_full_db_.get(),
                                                           power_local_blend_.get(),
+                                                          coherence_source_mode_.get(),
                                                           coherence_gate_start_.get(),
                                                           coherence_gate_full_.get(),
                                                           coherence_bridge_bias_.get(),
                                                           coherence_power_joint_weight_.get(),
+                                                          score_threshold_mode_.get(),
+                                                          fixed_score_threshold_.get(),
                                                           coherence_power_support_q_.get(),
                                                           coherence_power_q_.get(),
                                                           min_component_size_.get(),
@@ -6742,10 +6878,13 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     meta_out << "    \"power_excess_start_db\": " << power_excess_start_db_.get() << ",\n";
     meta_out << "    \"power_excess_full_db\": " << power_excess_full_db_.get() << ",\n";
     meta_out << "    \"power_local_blend\": " << power_local_blend_.get() << ",\n";
+    meta_out << "    \"coherence_source_mode\": \"" << coherence_source_mode_.get() << "\",\n";
     meta_out << "    \"coherence_gate_start\": " << coherence_gate_start_.get() << ",\n";
     meta_out << "    \"coherence_gate_full\": " << coherence_gate_full_.get() << ",\n";
     meta_out << "    \"coherence_bridge_bias\": " << coherence_bridge_bias_.get() << ",\n";
     meta_out << "    \"coherence_power_joint_weight\": " << coherence_power_joint_weight_.get() << ",\n";
+    meta_out << "    \"score_threshold_mode\": \"" << score_threshold_mode_.get() << "\",\n";
+    meta_out << "    \"fixed_score_threshold\": " << fixed_score_threshold_.get() << ",\n";
     meta_out << "    \"coherence_power_support_q\": " << coherence_power_support_q_.get() << ",\n";
     meta_out << "    \"coherence_power_q\": " << coherence_power_q_.get() << ",\n";
     meta_out << "    \"min_component_size\": " << min_component_size_.get() << ",\n";

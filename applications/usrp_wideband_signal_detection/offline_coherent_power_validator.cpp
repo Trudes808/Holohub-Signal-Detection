@@ -154,10 +154,13 @@ SnapshotMetadata load_snapshot_metadata(const std::filesystem::path& metadata_pa
   metadata.config.power_excess_start_db = extract_number<double>(text, "power_excess_start_db").value_or(metadata.config.power_excess_start_db);
   metadata.config.power_excess_full_db = extract_number<double>(text, "power_excess_full_db").value_or(metadata.config.power_excess_full_db);
   metadata.config.power_local_blend = extract_number<double>(text, "power_local_blend").value_or(metadata.config.power_local_blend);
+  metadata.config.coherence_source_mode = extract_string(text, "coherence_source_mode").value_or(metadata.config.coherence_source_mode);
   metadata.config.coherence_gate_start = extract_number<double>(text, "coherence_gate_start").value_or(metadata.config.coherence_gate_start);
   metadata.config.coherence_gate_full = extract_number<double>(text, "coherence_gate_full").value_or(metadata.config.coherence_gate_full);
   metadata.config.coherence_bridge_bias = extract_number<double>(text, "coherence_bridge_bias").value_or(metadata.config.coherence_bridge_bias);
   metadata.config.coherence_power_joint_weight = extract_number<double>(text, "coherence_power_joint_weight").value_or(metadata.config.coherence_power_joint_weight);
+  metadata.config.score_threshold_mode = extract_string(text, "score_threshold_mode").value_or(metadata.config.score_threshold_mode);
+  metadata.config.fixed_score_threshold = extract_number<double>(text, "fixed_score_threshold").value_or(metadata.config.fixed_score_threshold);
   metadata.config.coherence_power_support_q = extract_number<double>(text, "coherence_power_support_q").value_or(metadata.config.coherence_power_support_q);
   metadata.config.coherence_power_q = extract_number<double>(text, "coherence_power_q").value_or(metadata.config.coherence_power_q);
   metadata.config.min_component_size = extract_number<int>(text, "min_component_size").value_or(metadata.config.min_component_size);
