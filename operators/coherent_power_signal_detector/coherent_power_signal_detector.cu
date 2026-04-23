@@ -2132,7 +2132,7 @@ multi_scale_structure_tensor_gate(const std::vector<float>& sxx_db_local, int ro
   }
   const auto residual_n = normalize_map01_local(residual_db, 5.0f, 99.0f);
 
-  const std::array<float, 3> scales{{0.8f, 1.6f, 3.2f}};
+  const std::array<float, 2> scales{{0.8f, 1.6f}};
   std::vector<float> coherence_max(sxx_db_local.size(), 0.0f);
   std::vector<float> energy_max(sxx_db_local.size(), 0.0f);
   for (const float grad_sigma : scales) {
@@ -2951,7 +2951,7 @@ bool build_power_assist_map_device(const float* corrected_chunk,
                                                     rows,
                                                     cols,
                                                     valid_row_mask_device,
-                                                    0.30f,
+                                                    clamp_float(power_floor_global_q / 100.0f, 0.01f, 0.99f),
                                                     valid_min_db,
                                                     valid_max_db,
                                                     histogram_device,
@@ -3030,14 +3030,6 @@ bool build_power_assist_map_device(const float* corrected_chunk,
   const float full_db = std::max(power_excess_full_db, start_db + 1e-3f);
   const double absolute_assist_ms = time_stage_ms([&] {
     if (corrected_chunk_on_device) {
-      estimate_noise_floor_db_device_async(corrected_db_device,
-                                           rows,
-                                           cols,
-                                           valid_row_mask_device,
-                                           power_floor_global_q,
-                                           histogram_device,
-                                           scalar0_device,
-                                           stream);
       coherent_power_absolute_assist_device_floor_kernel<<<blocks, threads, 0, stream>>>(corrected_db_device,
                                                                                            rows,
                                                                                            cols,
@@ -3166,6 +3158,16 @@ void run_chunk_score_masks_gpu(const float* coherence_px_device,
   if (cudaGetLastError() != cudaSuccess) {
     throw std::runtime_error("chunk bridged/joint score kernel failed");
   }
+  normalize_map01_device_inplace_async(d3,
+                                       total,
+                                       5.0f,
+                                       95.0f,
+                                       0.0f,
+                                       1.0f,
+                                       histogram_device,
+                                       normalize_low_device,
+                                       normalize_high_device,
+                                       stream);
 
   coherent_power_apply_valid_row_mask_kernel<<<blocks, threads, 0, stream>>>(d3, rows, cols, valid_row_mask_device);
   if (cudaGetLastError() != cudaSuccess) {
@@ -3453,7 +3455,7 @@ bool multi_scale_structure_tensor_coherence_cuda(const float* sxx_db_local,
   if (cudaGetLastError() != cudaSuccess) {
     return false;
   }
-  const std::array<float, 3> scales{{0.8f, 1.6f, 3.2f}};
+  const std::array<float, 2> scales{{1.6f, 3.2f}};
 
   for (size_t scale_index = 0; scale_index < scales.size(); ++scale_index) {
     const float grad_sigma = scales[scale_index];
