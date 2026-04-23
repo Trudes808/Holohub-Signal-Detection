@@ -130,6 +130,8 @@ struct DinoTorchRuntimeBatchResult {
   int feature_dim = 0;
   DinoTorchRuntimeTiming timing;
   std::vector<float> patch_features_batch;
+  const float* patch_features_batch_device = nullptr;
+  std::shared_ptr<void> patch_features_batch_device_owner;
   std::vector<float> score_maps;
   const float* score_maps_device = nullptr;
   std::shared_ptr<void> score_maps_device_owner;

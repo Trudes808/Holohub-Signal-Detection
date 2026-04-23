@@ -123,6 +123,7 @@ add_holohub_application(usrp_freq_detection DEPENDS
 
 add_holohub_application(usrp_wideband_signal_detection DEPENDS
                         OPERATORS advanced_network
+                                  cuda_dino_detector
                                   coherent_power_signal_detector
                                   fft
                                   spectrogram

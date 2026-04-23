@@ -838,6 +838,10 @@ class DinoTorchRuntime::Impl {
         });
         if (config.return_patch_features && !patch_features_per_sample.empty()) {
           auto patch_features_batch = torch::stack(patch_features_per_sample, 0).contiguous();
+          auto patch_features_batch_device = patch_features_batch.contiguous();
+          auto patch_features_batch_device_owner = std::make_shared<torch::Tensor>(patch_features_batch_device);
+          result.patch_features_batch_device = patch_features_batch_device_owner->data_ptr<float>();
+          result.patch_features_batch_device_owner = patch_features_batch_device_owner;
           auto patch_features_cpu = patch_features_batch.device().is_cuda() ? patch_features_batch.to(torch::kCPU) : patch_features_batch;
           result.patch_rows = std::max(1, result.aligned_rows / std::max(1, input.patch_size));
           result.patch_cols = std::max(1, result.aligned_cols / std::max(1, input.patch_size));

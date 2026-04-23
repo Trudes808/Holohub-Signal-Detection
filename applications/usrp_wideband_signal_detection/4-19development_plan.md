@@ -1,5 +1,334 @@
 # DINO Retry Chunk-Merge Port Plan
 
+## Progress Update 2026-04-23T11:05:00-05:00
+
+- Implementation constraints are now clearer and they should guide the CUDA path from the start.
+- The CUDA detector is not required to preserve the current C++ execution organization such as literal chunk scheduling, as long as it remains detector-faithful and can be checked against the current C++ outputs.
+- The fast path should be explicitly device-resident: non-debug runs should skip host copies of intermediate products, and debug artifact export should be opt-in and focused on a selected chunk, tile, or comparable local surface.
+- The token budget around the DINO runtime should be treated as the real architectural constraint, not the current chunked C++ organization by itself.
+- That means the CUDA work should keep three viable execution families open: validator-faithful reference chunks for parity, token-budget-aware adaptive tiling on the full corrected frame, and a coarse-to-fine path that uses a cheap full-frame pass to select refinement windows before high-resolution DINO work.
+
+## Progress Update 2026-04-23T09:30:00-05:00
+
+- A full custom-CUDA DINO detector path is possible in this codebase, but it needs to be split into two different scopes so the plan stays technically honest.
+- Scope one is realistic now and should be the main target: custom CUDA for the validator-faithful full-frame setup, chunk extraction, coherence or structure-tensor gate generation, raw-patch-energy scoring support, positional deweighting support, residual-veto hybrid scoring, chunk projection, and global merge, while keeping the DINO model execution behind a runtime boundary.
+- Scope two is optional and should remain later: replacing LibTorch model execution itself with a dedicated inference engine such as TensorRT or a custom CUDA inference path. That is not the same task as porting the validated detector algorithm to CUDA, and it should not block the first end-to-end CUDA detector milestone.
+- Commit `b4513dcc25798944cc0e8f2fb68c75d7b86eaf70` is a useful precedent for the migration shape because the earlier coherent-power path already proved the repo can support operator-local CUDA kernels, offline validator entry points, and parity-preserving debug artifacts while the live path is still evolving.
+- The current DINO source of truth remains `offline_dino_validator_performance.cpp`, especially the already-landed GPU-capable helper entry points `structure_tensor_gate_gpu_batch_tensor(...)` and `run_residual_veto_hybrid_gpu_batch_device_inputs(...)`. The CUDA plan should grow from those helpers outward rather than starting from a blank `.cu` file.
+
+## Full CUDA DINO Implementation Plan 2026-04-23T09:30:00-05:00
+
+This section is the new plan for turning the validator-faithful DINO detector into a custom CUDA implementation while preserving offline parity checks against the current C++ reference path.
+
+### Feasibility Decision
+
+Yes, this is feasible if the work is scoped in the right order.
+
+The practical first milestone is not a hand-written CUDA replacement for the entire ViT forward pass. The practical first milestone is a CUDA-native detector pipeline around the already-validated DINO runtime contract:
+
+1. keep detector semantics aligned to `offline_dino_validator_performance.cpp` even if the CUDA execution organization later diverges from the literal reference chunk schedule
+2. keep model input and output semantics identical to the current `DinoTorchRuntime`
+3. move the heavy non-model detector math and data motion onto CUDA
+4. preserve a CPU or reference path long enough to prove parity stage by stage
+5. only after parity and timing are stable, decide whether Torch forward remains acceptable or whether a TensorRT or deeper custom inference path is justified
+
+If "full CUDA" is interpreted as "every detector stage except model execution is CUDA-native", that is a realistic near-term goal.
+
+If "full CUDA" is interpreted as "including a hand-written CUDA replacement for DINO model inference", that is a separate research project and should be treated as an optional post-parity acceleration track.
+
+### CUDA Source Of Truth
+
+Primary algorithm truth:
+
+1. `applications/usrp_wideband_signal_detection/offline_dino_validator_performance.cpp`
+2. `operators/cuda_dino_detector/cuda_dino_detector.cu`
+3. `operators/dinov3_signal_detector/dinov3_torch_runtime.cpp`
+4. `operators/dinov3_signal_detector/dinov3_torch_runtime.hpp`
+
+Previous CUDA implementation precedent:
+
+1. commit `b4513dcc25798944cc0e8f2fb68c75d7b86eaf70`
+2. `operators/coherent_power_signal_detector/coherent_power_signal_detector.cu`
+3. `applications/usrp_wideband_signal_detection/run_offline_coherent_power_validator_from_tensor.sh`
+
+Existing parity and debug surfaces to preserve:
+
+1. `applications/usrp_wideband_signal_detection/validate_offline_dino_subsection.sh`
+2. `notebooks/torchscript_dino_signal_detector_validation_v2_helpers.py`
+3. `notebooks/torchscript_dino_signal_detector_validation_v2.ipynb`
+
+### CUDA Port Invariants
+
+The custom CUDA plan must preserve these rules during the first implementation pass.
+
+1. `offline_dino_validator_performance.cpp` remains the algorithmic source of truth until the CUDA validator reproduces it.
+2. Chunk planning stays in source spectrogram coordinates.
+3. Frontend correction is still applied once on the full frame before chunk-local execution.
+3a. Non-debug execution should keep intermediate products on device unless a later measured bottleneck forces a different tradeoff.
+4. The live hybrid score source remains deweighted raw DINO energy from patch features when available.
+5. Trend-only positional deweighting remains the only supported raw-DINO deweighting contract.
+6. Debug artifact export remains opt-in and should be limited to one selected chunk, tile, or equivalent local surface.
+7. The CUDA path must be able to fall back to the current reference implementation for A or B comparisons.
+8. No CUDA acceleration pass is accepted without a matching artifact and mask comparison against the current C++ reference.
+
+### CUDA Non-Goals For The First Pass
+
+1. Do not hand-port the DINO transformer forward pass into custom kernels during the first CUDA detector milestone.
+2. Do not revive deleted grouped-DINO logic just because the CUDA path needs intermediate data.
+3. Do not optimize away debug artifact export before CUDA parity is established.
+4. Do not widen to the two-channel 500 MSps workflow before the single-channel CUDA path is stable.
+5. Do not collapse reference and CUDA code paths so early that validator regressions become impossible to localize.
+
+### Recommended CUDA Architecture Boundary
+
+Use a three-layer boundary.
+
+Layer C1: reference validator contract
+
+1. keep `offline_dino_validator_performance.cpp` as the readable algorithmic reference
+2. allow it to dispatch either reference helpers or CUDA helpers per stage
+3. preserve JSON, `.npy`, and debug-bundle writing here rather than inside CUDA kernels
+
+Layer C2: shared CUDA-safe detector helpers
+
+1. extract stable detector math into CUDA-safe helpers under the DINO operator surface or a new shared detector helper boundary
+2. keep these helpers free of CLI parsing, filesystem writes, and notebook shaping logic
+3. expose both parity-oriented reference chunk interfaces and more general tile or ROI interfaces so the CUDA path is not trapped in one execution shape
+
+Layer C3: runtime boundary
+
+1. keep DINO model execution behind `DinoTorchRuntime` initially
+2. treat patch features, score maps, and model input gray tensors as the stable contract across the boundary
+3. only later decide whether this boundary should swap to TensorRT or another engine
+
+### Phase C0: Freeze The CUDA Contract
+
+Tasks:
+
+1. Write down the exact stage inputs and outputs for the CUDA candidate stages: full-frame correction, chunk extraction, structure-tensor gate, raw-feature-energy score derivation, positional deweighting, residual-veto hybrid, chunk projection, and global merge.
+2. Classify every stage as one of: already GPU-capable, easy CUDA port, hard CUDA port, or keep on host for now.
+3. Mark the exact debug artifacts that must remain available for the selected chunk even when the main path is CUDA.
+4. Define one runtime flag family that selects `reference`, `cuda_partial`, or `cuda_full_detector` without changing artifact names.
+5. Define one execution-strategy flag family such as `reference_chunks`, `adaptive_tiles`, or `coarse_to_fine` so faster CUDA organizations can be evaluated without changing the public detector contract.
+
+Exit criteria:
+
+- one written CUDA contract exists for stage boundaries, buffers, flags, and debug artifacts
+- every detector stage is classified before new CUDA files are introduced
+
+### Phase C1: Create A Dedicated Offline CUDA Validator Entry Point
+
+Tasks:
+
+1. Add a new offline validator binary dedicated to the CUDA detector path rather than mutating the existing reference binary into an unreadable mixed path.
+2. Keep the current performance validator runnable in parallel so the CUDA path always has a known-good baseline.
+3. Mirror the coherent-power offline launcher shape with explicit host-to-container path mapping and output bundle directories.
+
+Recommended new files:
+
+1. `applications/usrp_wideband_signal_detection/offline_dino_cuda_validator.cpp`
+2. `applications/usrp_wideband_signal_detection/run_offline_dino_cuda_validator.sh`
+3. `applications/usrp_wideband_signal_detection/run_offline_dino_cuda_validator_from_tensor.sh`
+4. `applications/usrp_wideband_signal_detection/validate_offline_dino_cuda_subsection.sh`
+
+Exit criteria:
+
+- the CUDA validator can run from the same tensor snapshots and configs as the current performance validator
+- the CUDA validator writes its own artifact bundle without overwriting the reference bundle
+
+### Phase C2: Stand Up Shared CUDA Workspace And Buffer Reuse
+
+Tasks:
+
+1. Extract or mirror the reusable device-workspace pattern already present in `ChunkGpuWorkspace` so the CUDA validator and live operator can share the same allocation strategy.
+2. Introduce persistent device buffers for full-frame corrected data, per-batch chunk inputs, coherence intermediates, hybrid score intermediates, projected masks, and merge scratch.
+3. Separate buffer ownership from algorithm code so debug reruns can reuse the same staging areas without reallocating.
+4. Track capacity, stream ownership, and synchronization points explicitly in one helper boundary.
+
+Exit criteria:
+
+- the CUDA path can run repeated chunk batches without per-iteration `cudaMalloc` or `cudaFree`
+- the buffer lifetime model is shared between the offline validator and the operator-facing path
+
+### Phase C3: Port Full-Frame Setup And Chunk Staging To CUDA
+
+Tasks:
+
+1. Keep full-frame `power_db` and corrected spectrogram surfaces resident on device.
+2. Port any remaining host-side chunk extraction or chunk copy loops into CUDA staging helpers for the parity path.
+3. Preserve the existing calibrated uniform chunk planner for the parity strategy, but do not treat it as a permanent runtime constraint.
+4. Add the abstraction boundary needed to support either reference chunks, adaptive tiles, or later coarse-to-fine refinement windows against the same detector contract.
+
+Exit criteria:
+
+- the parity strategy reproduces the reference validator chunk counts and row spans exactly
+- non-debug staging no longer depends on repeated host-side materialization
+- the staging boundary is general enough to support later non-chunk execution strategies
+
+### Phase C4: Port Structure-Tensor Gate To The Shared CUDA Path
+
+Tasks:
+
+1. Promote `structure_tensor_gate_gpu_batch_tensor(...)` from validator-local helper status into the shared CUDA detector boundary.
+2. Make the CUDA gate path the default implementation for the offline CUDA validator while preserving the CPU fallback for differential comparison.
+3. Emit the same selected-chunk coherence artifacts the notebook currently expects.
+4. Measure both stage latency and artifact parity before touching downstream hybrid code.
+
+Exit criteria:
+
+- selected-chunk coherence artifacts match the reference validator within the accepted tolerance
+- stage timing shows the CUDA gate path is stable across repeated runs
+
+### Phase C5: Port Raw DINO Support And Positional Deweighting To CUDA
+
+Tasks:
+
+1. Move raw patch-feature energy derivation onto CUDA using the runtime patch-feature output as input.
+2. Port the trend-only positional deweighting contract onto CUDA and keep its parameters identical to the reference path.
+3. Keep the debug path able to materialize `patch_features`, raw DINO score, and deweighted raw DINO score for one selected chunk.
+4. Ensure the CUDA path can operate directly on batched patch-feature tensors without unnecessary host copies.
+
+Exit criteria:
+
+- raw and deweighted DINO score maps match the reference validator for the selected debug chunk
+- non-debug chunks no longer depend on host round-trips for raw score derivation
+
+### Phase C6: Port Residual-Veto Hybrid Postprocess To CUDA
+
+Tasks:
+
+1. Promote `run_residual_veto_hybrid_gpu_batch_device_inputs(...)` into the same shared CUDA helper boundary as the structure-tensor gate.
+2. Keep the CUDA hybrid implementation aligned to the current reference outputs for `keep_freq`, `keep_res`, residual gating, seed selection, combined score, and final mask.
+3. Preserve selected-chunk artifact dumping for all hybrid intermediates even if non-debug chunks stay device-resident.
+4. Keep a CPU fallback callable on exactly the same staged inputs for differential checks.
+
+Exit criteria:
+
+- selected-chunk hybrid intermediates and final mask match the reference validator
+- the main all-chunks path can execute coherence plus hybrid support without bulk host transfers
+
+### Phase C7: Port Chunk Projection, Boxing, And Global Merge To CUDA
+
+Tasks:
+
+1. Port chunk-local mask projection back into full-frame source coordinates using the same row offsets and overlap semantics as the reference path.
+2. Port the cheapest correct merge path first: projected mask accumulation and box-to-mask reconstruction, following the precedent from `coherent_power_signal_detector.cu`.
+3. Keep heavyweight or notebook-only regrouping logic on host only if parity proves it is not a hotspot.
+4. If chunk-local grouping remains host-side initially, minimize host transfers to compact grouped boxes and selected debug surfaces rather than full dense intermediates.
+
+Exit criteria:
+
+- the CUDA validator produces a full-frame merged mask and merged boxes that match the reference validator
+- the merge path exposes enough metadata to explain any parity drift
+
+### Phase C8: Add Offline CUDA Debug And Comparison Scripts
+
+The CUDA path needs its own debug scripts rather than overloading the current reference scripts.
+
+Required scripts:
+
+1. `run_offline_dino_cuda_validator.sh`
+   - launches the CUDA validator binary with the same tensor, config, output-dir, and debug-chunk options as the reference validator
+2. `run_offline_dino_cuda_validator_from_tensor.sh`
+   - mirrors the coherent-power host or container path mapping flow so tensor snapshots under `/tmp/usrp_spectrograms` can be replayed cleanly
+3. `validate_offline_dino_cuda_subsection.sh`
+   - runs rebuild if requested, runs the CUDA validator, and then runs comparison tooling against the reference C++ bundle
+4. `compare_offline_dino_cuda_subsection.py`
+   - compares one selected chunk stage by stage against the current reference validator bundle
+5. `compare_offline_dino_cuda_full_frame.py`
+   - compares projected global mask, merged mask, grouped boxes, and summary metrics for the full frame
+6. `run_offline_dino_cuda_performance.sh`
+   - captures timing-focused runs without changing artifact names or parity contracts
+
+Required artifact contract for the CUDA validator:
+
+1. `offline_stage_profile.json`
+2. `offline_chunk_plan.json`
+3. `offline_chunk_results.json`
+4. `chunk_debug/` selected-chunk `.npy` surfaces for corrected spectrogram, coherence, raw DINO score, deweighted DINO score, hybrid contribution, combined score, final mask, and grouped mask
+5. `projected_global_mask.npy`
+6. `merged_global_mask.npy`
+7. JSON summaries for projected boxes and merged boxes
+
+Exit criteria:
+
+- one command can run CUDA subsection validation against the frozen tensor snapshots
+- one command can run full-frame CUDA validation against the current C++ reference outputs
+
+### Phase C9: Extend The Notebook And Python Helper For CUDA Bundles
+
+Tasks:
+
+1. Extend `torchscript_dino_signal_detector_validation_v2_helpers.py` so it can load either a reference bundle or a CUDA bundle without changing notebook logic manually.
+2. Add bundle metadata that records whether a run came from `reference`, `cuda_partial`, or `cuda_full_detector`.
+3. Keep the notebook focused on visual parity rather than runtime orchestration.
+4. Ensure missing debug arrays fail loudly instead of silently degrading the comparison.
+
+Exit criteria:
+
+- the existing notebook can compare reference and CUDA bundles for the same selected chunk
+- CUDA parity failures can be localized by stage rather than only by final mask drift
+
+### Phase C10: Move The Proven CUDA Path Into The Live Operator
+
+Tasks:
+
+1. Once the offline CUDA validator is stable, port the same shared CUDA helpers into `cuda_dino_detector.cu`.
+2. Keep the operator debug path able to emit the same selected-chunk artifacts as the offline CUDA validator.
+3. Reuse the same device workspace strategy between the offline validator and the operator.
+4. Preserve a runtime switch that can compare the live CUDA detector path against the validator-faithful reference path during rollout.
+
+Exit criteria:
+
+- the live operator and offline CUDA validator use the same CUDA detector helpers
+- single-channel live outputs match the offline CUDA validator on frozen captures within the accepted parity window
+
+### Phase C11: Optional Model-Inference Replacement Track
+
+Only start this after the detector math around the model is already CUDA-native and parity-stable.
+
+Options in priority order:
+
+1. keep LibTorch if the detector-side CUDA work removes the dominant bottlenecks
+2. evaluate TensorRT for the DINO forward path while preserving the exact patch-feature contract needed by downstream CUDA stages
+3. only consider a deeper custom inference path if TensorRT cannot preserve the needed outputs or latency targets
+
+Exit criteria:
+
+- a concrete measurement shows model execution is still the dominant bottleneck after the detector-side CUDA migration
+- the replacement engine preserves the patch-feature and score-map contract required by the validated CUDA detector path
+
+### Validation Order For The CUDA Migration
+
+Run these checks after every major CUDA stage lands.
+
+1. selected debug chunk parity for corrected chunk, coherence gate, raw DINO score, deweighted DINO score, hybrid contribution, combined score, and final mask
+2. selected debug chunk grouped mask and grouped boxes parity
+3. all-chunks full-frame projected mask parity
+4. all-chunks merged final mask parity
+5. repeated-run stability on the same tensor and config
+6. only then live operator timing and throughput checks
+
+Required numeric checks:
+
+1. chunk plan exact row-span match
+2. per-stage mean absolute error and max absolute error for float intermediates
+3. final mask pixel agreement and IoU
+4. grouped box count and box extent deltas
+5. whole-run timing plus per-stage timing from `offline_stage_profile.json`
+
+### Immediate Next Tasks For The CUDA Track
+
+1. Add the new timestamped CUDA plan to this document and treat `offline_dino_validator_performance.cpp` as the current CUDA migration truth.
+2. Create the new offline CUDA validator entry point and launcher scripts before touching more operator code.
+3. Extract `structure_tensor_gate_gpu_batch_tensor(...)` and `run_residual_veto_hybrid_gpu_batch_device_inputs(...)` into a shared CUDA-safe helper boundary.
+4. Define the CUDA validator artifact contract and comparison scripts before broad kernel work so every later stage has a stable parity harness.
+5. Land the CUDA coherence path first, validate it, then land raw-score or deweighting CUDA, then hybrid CUDA, then merge CUDA.
+
+### Decision Summary
+
+The answer is yes, but the right plan is "full CUDA detector pipeline around a stable model-runtime boundary first, optional model-runtime replacement later". That is the shortest path to a trustworthy custom CUDA DINO implementation in this repo, and it matches the way the earlier coherent-power CUDA work was able to stay debuggable while performance work continued.
+
 ## Progress Update 2026-04-22
 
 - The live single-channel timing path is now in place, including operator stage timing, runtime service timing, and hybrid substage timing, so the current hotspot picture is based on measured runs rather than inference.

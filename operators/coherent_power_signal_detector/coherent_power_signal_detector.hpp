@@ -19,6 +19,7 @@ using coherent_power_in_t = std::tuple<matx::tensor_t<coherent_power_complex, 2>
 struct CoherentPowerReferenceConfig {
   int input_height = 256;
   int input_width = 512;
+  std::string backend_mode = "reference";
   double chunk_bandwidth_hz = 25.0e6;
   double chunk_overlap_hz = 6.25e6;
   double uncalibrated_chunk_fraction = 0.40;
@@ -59,6 +60,25 @@ struct CoherentPowerReferenceConfig {
 };
 
 struct CoherentPowerReferenceResult {
+  struct DetectionBoxRecord {
+    int freq_start = 0;
+    int freq_stop = 0;
+    int time_start = 0;
+    int time_stop = 0;
+    int freq_span = 0;
+    int time_span = 0;
+    int filled_area = 0;
+    float density = 0.0f;
+    float bbox_density = 0.0f;
+    float envelope_density = 0.0f;
+    float score_mean = 0.0f;
+    float score_peak = 0.0f;
+    std::string split_role = "unsplit";
+    bool split_applied = false;
+    int parent_component_id = -1;
+    std::vector<int> source_chunk_indices;
+  };
+
   int src_rows = 0;
   int src_cols = 0;
   int dst_rows = 0;
@@ -75,7 +95,9 @@ struct CoherentPowerReferenceResult {
   std::vector<float> merged_coherence;
   std::vector<float> merged_power;
   std::vector<float> merged_score;
+  std::vector<float> raw_projected_mask;
   std::vector<float> final_mask;
+  std::vector<DetectionBoxRecord> grouped_boxes;
 };
 
 CoherentPowerReferenceResult run_coherent_power_reference_validation(
@@ -135,6 +157,14 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
 
   struct ChannelTimingStats {
     uint64_t window_frames = 0;
+    uint64_t grouped_box_count_total = 0;
+    uint64_t grouped_box_count_max = 0;
+    uint64_t final_mask_nonzero_total = 0;
+    uint64_t final_mask_nonzero_max = 0;
+    uint64_t final_mask_component_count_total = 0;
+    uint64_t final_mask_component_count_max = 0;
+    uint64_t final_mask_grouped_box_count_total = 0;
+    uint64_t final_mask_grouped_box_count_max = 0;
     std::array<double, kTimingStageCount> total_ms {};
     std::array<double, kTimingStageCount> max_ms {};
     std::array<double, kReferenceTimingStageCount> reference_total_ms {};
@@ -156,6 +186,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<std::string> backend_mode_;
   holoscan::Parameter<bool> enable_mask_save_;
   holoscan::Parameter<bool> enable_tensor_snapshot_save_;
+  holoscan::Parameter<bool> save_reference_debug_artifacts_;
   holoscan::Parameter<int> save_every_n_frames_;
   holoscan::Parameter<int> max_masks_per_channel_;
   holoscan::Parameter<int> max_snapshots_per_channel_;

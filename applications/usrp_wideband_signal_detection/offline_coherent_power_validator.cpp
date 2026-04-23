@@ -14,6 +14,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <numeric>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -22,10 +23,24 @@
 
 namespace {
 
+std::string json_escape_string(const std::string& value) {
+  std::ostringstream escaped;
+  for (const char ch : value) {
+    switch (ch) {
+      case '\\': escaped << "\\\\"; break;
+      case '"': escaped << "\\\""; break;
+      case '\n': escaped << "\\n"; break;
+      case '\r': escaped << "\\r"; break;
+      case '\t': escaped << "\\t"; break;
+      default: escaped << ch; break;
+    }
+  }
+  return escaped.str();
+}
+
 struct ValidatorOptions {
   std::filesystem::path metadata_path;
   std::filesystem::path output_dir;
-  std::string pipeline_mode = "reference";
   bool verbose = false;
 };
 
@@ -136,6 +151,7 @@ SnapshotMetadata load_snapshot_metadata(const std::filesystem::path& metadata_pa
 
   metadata.config.input_height = metadata.input_height;
   metadata.config.input_width = metadata.input_width;
+  metadata.config.backend_mode = extract_string(text, "backend_mode").value_or(metadata.config.backend_mode);
   metadata.config.chunk_bandwidth_hz = extract_number<double>(text, "chunk_bandwidth_hz").value_or(metadata.config.chunk_bandwidth_hz);
   metadata.config.chunk_overlap_hz = extract_number<double>(text, "chunk_overlap_hz").value_or(metadata.config.chunk_overlap_hz);
   metadata.config.uncalibrated_chunk_fraction = extract_number<double>(text, "uncalibrated_chunk_fraction").value_or(metadata.config.uncalibrated_chunk_fraction);
@@ -444,12 +460,10 @@ ValidatorOptions parse_arguments(int argc, char** argv) {
       options.metadata_path = argv[++index];
     } else if (arg == "--output-dir" && index + 1 < argc) {
       options.output_dir = argv[++index];
-    } else if (arg == "--pipeline-mode" && index + 1 < argc) {
-      options.pipeline_mode = argv[++index];
     } else if (arg == "--verbose") {
       options.verbose = true;
     } else if (arg == "--help" || arg == "-h") {
-      std::cout << "Usage: " << argv[0] << " --snapshot-json PATH [--output-dir DIR] [--pipeline-mode reference|live_device] [--verbose]\n";
+      std::cout << "Usage: " << argv[0] << " --snapshot-json PATH [--output-dir DIR] [--verbose]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unknown argument: " + arg);
@@ -460,15 +474,6 @@ ValidatorOptions parse_arguments(int argc, char** argv) {
   }
   if (options.output_dir.empty()) {
     options.output_dir = options.metadata_path.parent_path() / "validator_artifacts";
-  }
-  std::transform(options.pipeline_mode.begin(), options.pipeline_mode.end(), options.pipeline_mode.begin(), [](unsigned char value) {
-    return static_cast<char>(std::tolower(value));
-  });
-  if (options.pipeline_mode == "current_live_path") {
-    options.pipeline_mode = "live_device";
-  }
-  if (options.pipeline_mode != "reference" && options.pipeline_mode != "live_device") {
-    throw std::runtime_error("--pipeline-mode must be one of: reference, live_device");
   }
   return options;
 }
@@ -538,74 +543,61 @@ int main(int argc, char** argv) {
                 << estimate.local_power_kernel_rows << "x" << estimate.local_power_kernel_cols
                 << ", estimated background samples=" << format_large_count(estimate.background_box_samples)
                 << std::endl;
-      log_stage("[offline_coherent_power_validator] running coherent reference validation...");
+      log_stage("[offline_coherent_power_validator] running coherent validator pipeline (operator_live)...");
     }
 
-        const bool use_live_device_pipeline = options.pipeline_mode == "live_device";
-        const auto result = use_live_device_pipeline
-                ? holoscan::ops::run_coherent_power_live_validation(
-                  tensor,
-                  validator_rows,
-                  validator_cols,
-                  metadata.resolution_hz,
-                  metadata.config)
-                : holoscan::ops::run_coherent_power_reference_validation(
-                  tensor,
-                  validator_rows,
-                  validator_cols,
-                  metadata.resolution_hz,
-                  metadata.config);
+    const auto result = holoscan::ops::run_coherent_power_live_validation(
+        tensor,
+        validator_rows,
+        validator_cols,
+        metadata.resolution_hz,
+        metadata.config);
     if (options.verbose) {
-      log_stage_done("coherent reference validation");
+      log_stage_done("coherent validator pipeline");
       log_stage("[offline_coherent_power_validator] writing validator artifacts...");
     }
 
-    std::optional<double> max_abs_power_db_diff;
-    std::optional<double> mean_abs_power_db_diff;
-    if (metadata.power_db_snapshot_path.has_value()) {
-      const auto power_db_array = load_npy_2d(*metadata.power_db_snapshot_path);
-      auto saved_power_db = to_float_matrix(power_db_array);
-      if (metadata.tensor_axis_order == "time_frequency") {
-        saved_power_db = transpose_float_matrix(saved_power_db, metadata.rows, metadata.cols);
-      }
-      if (saved_power_db.size() == result.power_db.size()) {
-        double max_diff = 0.0;
-        double total_diff = 0.0;
-        for (size_t index = 0; index < saved_power_db.size(); ++index) {
-          const double diff = std::abs(static_cast<double>(saved_power_db[index]) - static_cast<double>(result.power_db[index]));
-          max_diff = std::max(max_diff, diff);
-          total_diff += diff;
-        }
-        max_abs_power_db_diff = max_diff;
-        mean_abs_power_db_diff = total_diff / static_cast<double>(saved_power_db.size());
-      }
-    }
-
-    const auto power_db_npy = options.output_dir / "offline_power_db.npy";
     const auto corrected_npy = options.output_dir / "offline_corrected_sxx_db.npy";
-    const auto merged_coherence_npy = options.output_dir / "offline_merged_coherence.npy";
-    const auto merged_power_npy = options.output_dir / "offline_merged_power.npy";
-    const auto merged_score_npy = options.output_dir / "offline_merged_score.npy";
+    const auto raw_projected_mask_npy = options.output_dir / "offline_raw_projected_mask.npy";
     const auto mask_npy = options.output_dir / "offline_final_mask.npy";
-    const auto power_db_pgm = options.output_dir / "offline_power_db_preview.pgm";
     const auto corrected_pgm = options.output_dir / "offline_corrected_preview.pgm";
+    const auto raw_projected_mask_pgm = options.output_dir / "offline_raw_projected_mask.pgm";
     const auto mask_pgm = options.output_dir / "offline_final_mask.pgm";
     const auto overlay_pgm = options.output_dir / "offline_mask_overlay.pgm";
     const auto summary_json = options.output_dir / "offline_validation_summary.json";
 
-    write_npy_2d(power_db_npy, result.power_db.data(), result.power_db.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
     write_npy_2d(corrected_npy, result.corrected_sxx_db.data(), result.corrected_sxx_db.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
-    write_npy_2d(merged_coherence_npy, result.merged_coherence.data(), result.merged_coherence.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
-    write_npy_2d(merged_power_npy, result.merged_power.data(), result.merged_power.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
-    write_npy_2d(merged_score_npy, result.merged_score.data(), result.merged_score.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
+    if (!result.raw_projected_mask.empty()) {
+      write_npy_2d(raw_projected_mask_npy,
+                   result.raw_projected_mask.data(),
+                   result.raw_projected_mask.size() * sizeof(float),
+                   result.src_rows,
+                   result.src_cols,
+                   "<f4");
+    }
     write_npy_2d(mask_npy, result.final_mask.data(), result.final_mask.size() * sizeof(float), result.dst_rows, result.dst_cols, "<f4");
 
-    const auto power_db_preview = normalize_to_u8(result.power_db);
     const auto corrected_preview = normalize_to_u8(result.corrected_sxx_db);
+    const auto raw_projected_mask_preview = normalize_to_u8(result.raw_projected_mask);
     const auto final_mask_preview = normalize_to_u8(result.final_mask);
     const auto overlay_preview = overlay_mask_on_grayscale(result.corrected_sxx_db, result.final_mask.size() == result.corrected_sxx_db.size() ? result.final_mask : std::vector<float>{});
-    write_pgm(power_db_pgm, power_db_preview, result.src_cols, result.src_rows);
+    const size_t final_mask_nonzero_pixels = static_cast<size_t>(std::count_if(
+      result.final_mask.begin(), result.final_mask.end(), [](float value) { return value > 0.5f; }));
+    const int valid_rows = std::max(0, result.src_rows - (2 * result.ignore_bins_per_side));
+    const size_t valid_mask_pixels = static_cast<size_t>(std::max(0, valid_rows)) * static_cast<size_t>(std::max(0, result.src_cols));
+    const double final_mask_fill_ratio = valid_mask_pixels > 0
+        ? static_cast<double>(final_mask_nonzero_pixels) / static_cast<double>(valid_mask_pixels)
+        : 0.0;
+    std::vector<size_t> grouped_box_order(result.grouped_boxes.size());
+    std::iota(grouped_box_order.begin(), grouped_box_order.end(), static_cast<size_t>(0));
+    std::sort(grouped_box_order.begin(), grouped_box_order.end(), [&](size_t lhs, size_t rhs) {
+      return result.grouped_boxes[lhs].filled_area > result.grouped_boxes[rhs].filled_area;
+    });
+    const size_t grouped_box_debug_count = std::min<size_t>(5, grouped_box_order.size());
     write_pgm(corrected_pgm, corrected_preview, result.src_cols, result.src_rows);
+    if (!raw_projected_mask_preview.empty()) {
+      write_pgm(raw_projected_mask_pgm, raw_projected_mask_preview, result.src_cols, result.src_rows);
+    }
     write_pgm(mask_pgm, final_mask_preview, result.dst_cols, result.dst_rows);
     if (!overlay_preview.empty() && result.final_mask.size() == result.corrected_sxx_db.size()) {
       write_pgm(overlay_pgm, overlay_preview, result.src_cols, result.src_rows);
@@ -614,7 +606,8 @@ int main(int argc, char** argv) {
     std::ofstream summary(summary_json, std::ios::binary);
     summary << "{\n";
     summary << "  \"metadata_path\": \"" << options.metadata_path.string() << "\",\n";
-    summary << "  \"pipeline_mode\": \"" << options.pipeline_mode << "\",\n";
+    summary << "  \"pipeline_mode_effective\": \"operator_live\",\n";
+    summary << "  \"backend_mode_from_config\": \"" << metadata.config.backend_mode << "\",\n";
     summary << "  \"tensor_snapshot_path\": \"" << metadata.tensor_snapshot_path.string() << "\",\n";
     summary << "  \"rows\": " << result.src_rows << ",\n";
     summary << "  \"cols\": " << result.src_cols << ",\n";
@@ -628,25 +621,42 @@ int main(int argc, char** argv) {
         summary << "  \"sample_rate_hz\": " << result.sample_rate_hz << ",\n";
         summary << "  \"span_hz\": " << result.span_hz << ",\n";
     summary << "  \"ignore_bins_per_side\": " << result.ignore_bins_per_side << ",\n";
-    summary << "  \"grouped_box_count\": " << result.grouped_box_count << ",\n";
+        summary << "  \"grouped_box_count\": " << result.grouped_box_count << ",\n";
+    summary << "  \"final_mask_nonzero_pixels\": " << final_mask_nonzero_pixels << ",\n";
+        summary << "  \"final_mask_fill_ratio\": " << final_mask_fill_ratio << ",\n";
     summary << "  \"merged_threshold\": " << result.merged_threshold << ",\n";
     summary << "  \"seed_threshold\": " << result.seed_threshold << ",\n";
-    if (max_abs_power_db_diff.has_value()) {
-      summary << "  \"max_abs_power_db_diff\": " << *max_abs_power_db_diff << ",\n";
-      summary << "  \"mean_abs_power_db_diff\": " << *mean_abs_power_db_diff << ",\n";
-    } else {
-      summary << "  \"max_abs_power_db_diff\": null,\n";
-      summary << "  \"mean_abs_power_db_diff\": null,\n";
-    }
-    summary << "  \"power_db_npy\": \"" << power_db_npy.string() << "\",\n";
+        if (!result.raw_projected_mask.empty()) {
+          summary << "  \"raw_projected_mask_npy\": \"" << raw_projected_mask_npy.string() << "\",\n";
+          summary << "  \"raw_projected_mask_pgm\": \"" << raw_projected_mask_pgm.string() << "\",\n";
+        } else {
+          summary << "  \"raw_projected_mask_npy\": null,\n";
+          summary << "  \"raw_projected_mask_pgm\": null,\n";
+        }
+        summary << "  \"largest_grouped_boxes\": [\n";
+        for (size_t index = 0; index < grouped_box_debug_count; ++index) {
+          const auto& box = result.grouped_boxes[grouped_box_order[index]];
+          summary << "    {\"freq_start\": " << box.freq_start
+                  << ", \"freq_stop\": " << box.freq_stop
+                  << ", \"time_start\": " << box.time_start
+                  << ", \"time_stop\": " << box.time_stop
+                  << ", \"freq_span\": " << box.freq_span
+                  << ", \"time_span\": " << box.time_span
+                  << ", \"filled_area\": " << box.filled_area
+                  << ", \"density\": " << box.density
+                  << ", \"bbox_density\": " << box.bbox_density
+                  << ", \"envelope_density\": " << box.envelope_density
+                  << ", \"score_mean\": " << box.score_mean
+                  << ", \"score_peak\": " << box.score_peak
+                  << ", \"split_role\": \"" << json_escape_string(box.split_role) << "\"}"
+                  << (index + 1 < grouped_box_debug_count ? "," : "") << "\n";
+        }
+        summary << "  ],\n";
     summary << "  \"corrected_sxx_db_npy\": \"" << corrected_npy.string() << "\",\n";
-    summary << "  \"merged_coherence_npy\": \"" << merged_coherence_npy.string() << "\",\n";
-    summary << "  \"merged_power_npy\": \"" << merged_power_npy.string() << "\",\n";
-    summary << "  \"merged_score_npy\": \"" << merged_score_npy.string() << "\",\n";
     summary << "  \"final_mask_npy\": \"" << mask_npy.string() << "\",\n";
-    summary << "  \"power_db_preview_pgm\": \"" << power_db_pgm.string() << "\",\n";
     summary << "  \"corrected_preview_pgm\": \"" << corrected_pgm.string() << "\",\n";
-    summary << "  \"final_mask_pgm\": \"" << mask_pgm.string() << "\"\n";
+    summary << "  \"final_mask_pgm\": \"" << mask_pgm.string() << "\",\n";
+    summary << "  \"overlay_pgm\": \"" << overlay_pgm.string() << "\"\n";
     summary << "}\n";
     if (options.verbose) {
       log_stage_done("artifact write");
@@ -654,7 +664,8 @@ int main(int argc, char** argv) {
 
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "Coherent power offline validation\n";
-    std::cout << "  pipeline mode: " << options.pipeline_mode << "\n";
+    std::cout << "  pipeline mode effective: operator_live\n";
+    std::cout << "  backend mode from config: " << metadata.config.backend_mode << "\n";
     std::cout << "  metadata: " << options.metadata_path << "\n";
     std::cout << "  tensor snapshot: " << metadata.tensor_snapshot_path << "\n";
     std::cout << "  output dir: " << options.output_dir << "\n";
@@ -667,16 +678,29 @@ int main(int argc, char** argv) {
     std::cout << "  span hz: " << result.span_hz << "\n";
     std::cout << "  ignore bins per side: " << result.ignore_bins_per_side << "\n";
     std::cout << "  grouped box count: " << result.grouped_box_count << "\n";
+    std::cout << "  final mask nonzero pixels: " << final_mask_nonzero_pixels << "\n";
+    std::cout << "  final mask fill ratio: " << final_mask_fill_ratio << "\n";
     std::cout << "  merged threshold: " << result.merged_threshold << "\n";
     std::cout << "  seed threshold: " << result.seed_threshold << "\n";
-    if (max_abs_power_db_diff.has_value()) {
-      std::cout << "  power_db max abs diff: " << *max_abs_power_db_diff << "\n";
-      std::cout << "  power_db mean abs diff: " << *mean_abs_power_db_diff << "\n";
+    for (size_t index = 0; index < grouped_box_debug_count; ++index) {
+      const auto& box = result.grouped_boxes[grouped_box_order[index]];
+      std::cout << "  grouped box[" << index << "]: freq_span=" << box.freq_span
+                << " time_span=" << box.time_span
+                << " filled_area=" << box.filled_area
+                << " density=" << box.density
+                << " score_peak=" << box.score_peak
+                << " split_role=" << box.split_role << "\n";
     }
     if (options.verbose) {
       std::cout << "  wrote: " << summary_json << "\n";
       std::cout << "  wrote: " << corrected_pgm << "\n";
+      if (!raw_projected_mask_preview.empty()) {
+        std::cout << "  wrote: " << raw_projected_mask_pgm << "\n";
+      }
       std::cout << "  wrote: " << mask_pgm << "\n";
+      if (!overlay_preview.empty() && result.final_mask.size() == result.corrected_sxx_db.size()) {
+        std::cout << "  wrote: " << overlay_pgm << "\n";
+      }
     }
     return 0;
   } catch (const std::exception& error) {

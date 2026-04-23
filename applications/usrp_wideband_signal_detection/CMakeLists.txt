@@ -158,6 +158,7 @@ target_link_libraries(usrp_wideband_signal_detection
   PRIVATE
   matx::matx
   holoscan::ops::coherent_power_signal_detector
+  holoscan::ops::cuda_dino_detector
   CUDA::cudart
   holoscan::core
   holoscan::advanced_network
@@ -265,6 +266,7 @@ endforeach()
 target_include_directories(usrp_wideband_signal_detection
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/cuda_dino_detector
 )
 
 target_include_directories(offline_spectrogram_visualizer

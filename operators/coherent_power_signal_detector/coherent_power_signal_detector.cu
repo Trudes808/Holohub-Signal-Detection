@@ -101,6 +101,7 @@ constexpr std::array<const char*, holoscan::ops::CoherentPowerSignalDetector::kP
 constexpr int kQuantileHistogramBins = 1024;
 constexpr int kMaxGaussianKernelSize = 129;
 constexpr int kScoreHistogramSampleStride = 2;
+constexpr int kPowerFloorHistogramSampleStride = 2;
 
 struct ChunkPlanEntry {
   int chunk_index = 0;
@@ -384,9 +385,16 @@ struct PipelineSummary {
   std::vector<float> merged_coherence;
   std::vector<float> merged_power;
   std::vector<float> merged_score;
+  std::vector<float> raw_projected_mask;
   std::vector<float> final_mask;
+  std::vector<DetectionBox> grouped_boxes;
   int subsection_count = 0;
   int grouped_box_count = 0;
+  bool grouped_box_count_meaningful = true;
+  bool final_mask_metrics_meaningful = false;
+  int final_mask_component_count = 0;
+  int final_mask_grouped_box_count = 0;
+  bool final_mask_grouped_box_count_meaningful = false;
   int ignore_bins_per_side = 0;
   float merged_threshold = 0.0f;
   float seed_threshold = 0.0f;
@@ -515,6 +523,35 @@ void populate_reference_merged_maps(const std::vector<DetectionChunkResult>& chu
   }
 }
 
+std::vector<float> project_chunk_raw_masks_to_float_mask(const std::vector<DetectionChunkResult>& chunk_results,
+                                                         int rows,
+                                                         int cols,
+                                                         const std::vector<uint8_t>& valid_row_mask) {
+  std::vector<float> output(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0.0f);
+  for (const auto& chunk_result : chunk_results) {
+    const int row_start = chunk_result.chunk.row_start;
+    const int row_stop = chunk_result.chunk.row_stop;
+    const int chunk_rows = row_stop - row_start;
+    if (chunk_rows <= 0 || chunk_result.mask_px.empty()) {
+      continue;
+    }
+    for (int local_row = 0; local_row < chunk_rows; ++local_row) {
+      const int global_row = row_start + local_row;
+      if (global_row < 0 || global_row >= rows || !valid_row_mask[static_cast<size_t>(global_row)]) {
+        continue;
+      }
+      for (int col = 0; col < cols; ++col) {
+        const size_t local_index = static_cast<size_t>(local_row) * static_cast<size_t>(cols) + static_cast<size_t>(col);
+        if (local_index >= chunk_result.mask_px.size() || !chunk_result.mask_px[local_index]) {
+          continue;
+        }
+        output[static_cast<size_t>(global_row) * static_cast<size_t>(cols) + static_cast<size_t>(col)] = 1.0f;
+      }
+    }
+  }
+  return output;
+}
+
 std::string json_escape(const std::string& value) {
   std::string escaped;
   escaped.reserve(value.size() + 8);
@@ -626,6 +663,23 @@ bool write_npy_2d(const std::string& path,
   out.write(header.data(), static_cast<std::streamsize>(header.size()));
   out.write(reinterpret_cast<const char*>(payload), static_cast<std::streamsize>(payload_bytes));
   return out.good();
+}
+
+std::vector<uint8_t> float_unit_map_to_u8(const std::vector<float>& values) {
+  std::vector<uint8_t> image(values.size(), 0);
+  for (size_t index = 0; index < values.size(); ++index) {
+    const float clamped = std::min(1.0f, std::max(0.0f, values[index]));
+    image[index] = static_cast<uint8_t>(std::lround(clamped * 255.0f));
+  }
+  return image;
+}
+
+std::vector<uint8_t> binary_float_mask_to_u8(const std::vector<float>& values, float threshold = 0.5f) {
+  std::vector<uint8_t> image(values.size(), 0);
+  for (size_t index = 0; index < values.size(); ++index) {
+    image[index] = values[index] > threshold ? 255 : 0;
+  }
+  return image;
 }
 
 CanonicalTensorView canonical_tensor_view(int input_rows, int input_cols) {
@@ -3206,17 +3260,35 @@ bool build_power_assist_map_device(const float* corrected_chunk,
   }
 
   const bool use_absolute_direct = normalized_power_assist_mode == "absolute_direct";
+  const bool use_absolute_floor_fast = normalized_power_assist_mode == "absolute_floor_fast" ||
+                                       normalized_power_assist_mode == "absolute_floor_sampled";
+  const bool use_sampled_floor_histogram = use_absolute_floor_fast && rows >= 128 && cols >= 256;
   const double floor_estimate_ms = use_absolute_direct ? 0.0 : time_stage_ms([&] {
-    device_quantile_from_histogram_valid_rows_async(corrected_db_device,
-                                                    rows,
-                                                    cols,
-                                                    valid_row_mask_device,
-                                                    clamp_float(power_floor_global_q / 100.0f, 0.01f, 0.99f),
-                                                    valid_min_db,
-                                                    valid_max_db,
-                                                    histogram_device,
-                                                    scalar0_device,
-                                                    stream);
+    if (use_sampled_floor_histogram) {
+      device_quantile_from_histogram_valid_rows_sampled_async(corrected_db_device,
+                                                              rows,
+                                                              cols,
+                                                              valid_row_mask_device,
+                                                              kPowerFloorHistogramSampleStride,
+                                                              kPowerFloorHistogramSampleStride,
+                                                              clamp_float(power_floor_global_q / 100.0f, 0.01f, 0.99f),
+                                                              valid_min_db,
+                                                              valid_max_db,
+                                                              histogram_device,
+                                                              scalar0_device,
+                                                              stream);
+    } else {
+      device_quantile_from_histogram_valid_rows_async(corrected_db_device,
+                                                      rows,
+                                                      cols,
+                                                      valid_row_mask_device,
+                                                      clamp_float(power_floor_global_q / 100.0f, 0.01f, 0.99f),
+                                                      valid_min_db,
+                                                      valid_max_db,
+                                                      histogram_device,
+                                                      scalar0_device,
+                                                      stream);
+    }
     coherent_power_db_to_linear_scalar_kernel<<<1, 1, 0, stream>>>(scalar0_device, scalar1_device);
     if (cudaGetLastError() != cudaSuccess) {
       throw std::runtime_error("chunk local floor scalar kernel failed");
@@ -3227,6 +3299,8 @@ bool build_power_assist_map_device(const float* corrected_chunk,
   }
 
   const bool need_local_relative = normalized_power_assist_mode != "absolute_floor" &&
+                                   normalized_power_assist_mode != "absolute_floor_fast" &&
+                                   normalized_power_assist_mode != "absolute_floor_sampled" &&
                                    normalized_power_assist_mode != "absolute_direct";
   const double local_relative_ms = need_local_relative ? time_stage_ms([&] {
     coherent_power_relative_db_scalar_floor_kernel<<<blocks, threads, 0, stream>>>(linear_power_device,
@@ -3326,7 +3400,10 @@ bool build_power_assist_map_device(const float* corrected_chunk,
     (*detail_ms_out)[kPowerSupportAbsoluteAssistStage] = absolute_assist_ms;
   }
 
-  if (normalized_power_assist_mode == "absolute_floor" || normalized_power_assist_mode == "absolute_direct") {
+  if (normalized_power_assist_mode == "absolute_floor" ||
+      normalized_power_assist_mode == "absolute_floor_fast" ||
+      normalized_power_assist_mode == "absolute_floor_sampled" ||
+      normalized_power_assist_mode == "absolute_direct") {
     *power_px_device_out = absolute_power_device;
     return true;
   }
@@ -4603,6 +4680,134 @@ std::vector<uint8_t> boxes_to_mask(int rows,
   return mask;
 }
 
+std::vector<uint8_t> float_mask_to_binary_mask(const std::vector<float>& mask) {
+  std::vector<uint8_t> binary_mask(mask.size(), 0);
+  for (size_t index = 0; index < mask.size(); ++index) {
+    binary_mask[index] = mask[index] > 0.5f ? 1 : 0;
+  }
+  return binary_mask;
+}
+
+int count_mask_connected_components(const std::vector<uint8_t>& mask,
+                                    int rows,
+                                    int cols,
+                                    const std::vector<uint8_t>& valid_row_mask) {
+  if (mask.empty()) {
+    return 0;
+  }
+
+  std::vector<uint8_t> visited(mask.size(), 0);
+  const std::array<std::pair<int, int>, 4> neighbors{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
+  int component_count = 0;
+  for (int row = 0; row < rows; ++row) {
+    if (!valid_row_mask[static_cast<size_t>(row)]) {
+      continue;
+    }
+    for (int col = 0; col < cols; ++col) {
+      const size_t seed = flat_index(rows, cols, row, col);
+      if (!mask[seed] || visited[seed]) {
+        continue;
+      }
+      ++component_count;
+      std::queue<std::pair<int, int>> queue;
+      queue.push({row, col});
+      visited[seed] = 1;
+      while (!queue.empty()) {
+        const auto [current_row, current_col] = queue.front();
+        queue.pop();
+        for (const auto& [delta_row, delta_col] : neighbors) {
+          const int next_row = current_row + delta_row;
+          const int next_col = current_col + delta_col;
+          if (next_row < 0 || next_row >= rows || next_col < 0 || next_col >= cols) {
+            continue;
+          }
+          if (!valid_row_mask[static_cast<size_t>(next_row)]) {
+            continue;
+          }
+          const size_t next_index = flat_index(rows, cols, next_row, next_col);
+          if (!mask[next_index] || visited[next_index]) {
+            continue;
+          }
+          visited[next_index] = 1;
+          queue.push({next_row, next_col});
+        }
+      }
+    }
+  }
+  return component_count;
+}
+
+void populate_final_mask_diagnostics(PipelineSummary& summary,
+                                     int rows,
+                                     int cols,
+                                     const std::vector<uint8_t>& valid_row_mask,
+                                     bool filter_detection_mask,
+                                     int grouping_bridge_freq_px,
+                                     int grouping_bridge_time_px,
+                                     int grouping_min_component_size,
+                                     int grouping_min_freq_span_px,
+                                     int grouping_min_time_span_px,
+                                     double grouping_min_density,
+                                     double grouping_time_continuity_ratio) {
+  if (!summary.final_mask_metrics_meaningful) {
+    summary.final_mask_component_count = 0;
+    summary.final_mask_grouped_box_count = 0;
+    summary.final_mask_grouped_box_count_meaningful = false;
+    return;
+  }
+
+  if (summary.final_mask.empty()) {
+    summary.final_mask_component_count = 0;
+    summary.final_mask_grouped_box_count = 0;
+    summary.final_mask_grouped_box_count_meaningful = false;
+    return;
+  }
+
+  const std::vector<uint8_t> binary_mask = float_mask_to_binary_mask(summary.final_mask);
+  summary.final_mask_component_count = count_mask_connected_components(binary_mask, rows, cols, valid_row_mask);
+
+  std::vector<float> score_map(binary_mask.size(), 0.0f);
+  for (size_t index = 0; index < binary_mask.size(); ++index) {
+    score_map[index] = static_cast<float>(binary_mask[index]);
+  }
+  const auto grouped_from_final_mask = group_signal_mask_regions(binary_mask,
+                                                                 score_map,
+                                                                 rows,
+                                                                 cols,
+                                                                 valid_row_mask,
+                                                                 filter_detection_mask,
+                                                                 grouping_bridge_freq_px,
+                                                                 grouping_bridge_time_px,
+                                                                 grouping_min_component_size,
+                                                                 grouping_min_freq_span_px,
+                                                                 grouping_min_time_span_px,
+                                                                 static_cast<float>(grouping_min_density),
+                                                                 static_cast<float>(grouping_time_continuity_ratio));
+  summary.final_mask_grouped_box_count = static_cast<int>(grouped_from_final_mask.boxes.size());
+  summary.final_mask_grouped_box_count_meaningful = true;
+}
+
+holoscan::ops::CoherentPowerReferenceResult::DetectionBoxRecord to_detection_box_record(const DetectionBox& box) {
+  holoscan::ops::CoherentPowerReferenceResult::DetectionBoxRecord record;
+  record.freq_start = box.freq_start;
+  record.freq_stop = box.freq_stop;
+  record.time_start = box.time_start;
+  record.time_stop = box.time_stop;
+  record.freq_span = box.freq_span;
+  record.time_span = box.time_span;
+  record.filled_area = box.filled_area;
+  record.density = box.density;
+  record.bbox_density = box.bbox_density;
+  record.envelope_density = box.envelope_density;
+  record.score_mean = box.score_mean;
+  record.score_peak = box.score_peak;
+  record.split_role = box.split_role;
+  record.split_applied = box.split_applied;
+  record.parent_component_id = box.parent_component_id;
+  record.source_chunk_indices = box.source_chunk_indices;
+  return record;
+}
+
 bool boxes_overlap(const DetectionBox& box_a, const DetectionBox& box_b) {
   return box_a.freq_start < box_b.freq_stop && box_b.freq_start < box_a.freq_stop &&
          box_a.time_start < box_b.time_stop && box_b.time_start < box_a.time_stop;
@@ -5155,6 +5360,7 @@ PipelineSummary run_reference_pipeline(const float* power_db,
   PipelineSummary summary;
   summary.reference_stage_ms[kReferenceFrontendStage] = frontend_stage_ms;
   summary.ignore_bins_per_side = ignore_bins_per_side;
+  summary.grouped_box_count_meaningful = true;
 
   const auto chunk_plan = build_frequency_chunks(src_rows,
                                                  resolution_hz,
@@ -5244,6 +5450,7 @@ PipelineSummary run_reference_pipeline(const float* power_db,
   summary.reference_stage_ms[kReferenceChunkMaxStage] = chunk_max_ms;
   if (populate_merged_maps) {
     populate_reference_merged_maps(chunk_results, src_rows, src_cols, valid_row_mask, summary);
+    summary.raw_projected_mask = project_chunk_raw_masks_to_float_mask(chunk_results, src_rows, src_cols, valid_row_mask);
   }
 
   GroupingResult merged_grouping;
@@ -5261,6 +5468,7 @@ PipelineSummary run_reference_pipeline(const float* power_db,
                                                        grouping_min_time_span_px,
                                                        static_cast<float>(grouping_min_density),
                                                        static_cast<float>(grouping_time_continuity_ratio));
+    summary.grouped_boxes = merged_grouping.boxes;
     summary.grouped_box_count = static_cast<int>(merged_grouping.boxes.size());
     summary.merged_threshold = 0.0f;
     summary.seed_threshold = 0.0f;
@@ -5268,6 +5476,18 @@ PipelineSummary run_reference_pipeline(const float* power_db,
 
   summary.reference_stage_ms[kReferenceGroupingStage] = time_reference_stage_ms([&] {
     summary.final_mask = boxes_to_float_mask_cuda(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
+    populate_final_mask_diagnostics(summary,
+                                    src_rows,
+                                    src_cols,
+                                    valid_row_mask,
+                                    filter_detection_mask,
+                                    grouping_bridge_freq_px,
+                                    grouping_bridge_time_px,
+                                    std::max(grouping_min_component_size, min_component_size),
+                                    grouping_min_freq_span_px,
+                                    grouping_min_time_span_px,
+                                    grouping_min_density,
+                                    grouping_time_continuity_ratio);
   });
   return summary;
 }
@@ -5336,6 +5556,8 @@ PipelineSummary run_reference_pipeline_corrected_impl(const float* corrected_sxx
   }
 
   summary.reference_stage_ms[kReferenceFrontendStage] = frontend_stage_ms;
+  summary.grouped_box_count_meaningful = !(corrected_sxx_db_on_device && !populate_merged_maps);
+  summary.final_mask_metrics_meaningful = !(corrected_sxx_db_on_device && !populate_merged_maps);
 
   std::vector<ChunkPlanEntry> chunk_plan;
   if (corrected_sxx_db_on_device && !populate_merged_maps) {
@@ -5449,6 +5671,7 @@ PipelineSummary run_reference_pipeline_corrected_impl(const float* corrected_sxx
                                                        grouping_min_time_span_px,
                                                        static_cast<float>(grouping_min_density),
                                                        static_cast<float>(grouping_time_continuity_ratio));
+    summary.grouped_boxes = merged_grouping.boxes;
     summary.grouped_box_count = static_cast<int>(merged_grouping.boxes.size());
     summary.merged_threshold = 0.0f;
     summary.seed_threshold = 0.0f;
@@ -5468,6 +5691,18 @@ PipelineSummary run_reference_pipeline_corrected_impl(const float* corrected_sxx
       } else {
         summary.final_mask = boxes_to_float_mask_cuda(src_rows, src_cols, merged_grouping.boxes, valid_row_mask);
       }
+      populate_final_mask_diagnostics(summary,
+                                      src_rows,
+                                      src_cols,
+                                      valid_row_mask,
+                                      filter_detection_mask,
+                                      grouping_bridge_freq_px,
+                                      grouping_bridge_time_px,
+                                      std::max(grouping_min_component_size, min_component_size),
+                                      grouping_min_freq_span_px,
+                                      grouping_min_time_span_px,
+                                      grouping_min_density,
+                                      grouping_time_continuity_ratio);
     });
   }
   return summary;
@@ -5742,8 +5977,13 @@ CoherentPowerReferenceResult run_coherent_power_reference_validation(
   result.merged_coherence = summary.merged_coherence;
   result.merged_power = summary.merged_power;
   result.merged_score = summary.merged_score;
+  result.raw_projected_mask = summary.raw_projected_mask;
   result.final_mask = summary.final_mask;
   result.grouped_box_count = summary.grouped_box_count;
+  result.grouped_boxes.reserve(summary.grouped_boxes.size());
+  for (const auto& box : summary.grouped_boxes) {
+    result.grouped_boxes.push_back(to_detection_box_record(box));
+  }
   result.merged_threshold = summary.merged_threshold;
   result.seed_threshold = summary.seed_threshold;
   return result;
@@ -5916,51 +6156,56 @@ CoherentPowerReferenceResult run_coherent_power_live_validation(
     }
 
     const auto summary = run_reference_pipeline_corrected_device(corrected_db_device,
-                                                                 src_rows,
-                                                                 src_cols,
-                                                                 true,
-                                                                 true,
-                                                                 false,
-                                                                 ignore_bins_per_side,
-                                                                 resolution_hz,
-                                                                 config.chunk_bandwidth_hz,
-                                                                 config.chunk_overlap_hz,
-                                                                 config.uncalibrated_chunk_fraction,
-                                                                 config.uncalibrated_overlap_fraction,
-                                                                 config.ignore_sideband_percent,
-                                                                 config.coherence_weight,
-                                                                 config.power_weight,
-                                                                 config.power_assist_mode,
-                                                                 config.power_floor_time_q,
-                                                                 config.power_floor_global_q,
-                                                                 config.power_excess_start_db,
-                                                                 config.power_excess_full_db,
-                                                                 config.power_local_blend,
-                                                                 config.coherence_source_mode,
-                                                                 config.coherence_gate_start,
-                                                                 config.coherence_gate_full,
-                                                                 config.coherence_bridge_bias,
-                                                                 config.coherence_power_joint_weight,
-                                                                 config.score_threshold_mode,
-                                                                 config.fixed_score_threshold,
-                                                                 config.coherence_power_support_q,
-                                                                 config.coherence_power_q,
-                                                                 config.min_component_size,
-                                                                 config.filter_detection_mask,
-                                                                 config.grouping_seed_score_q,
-                                                                 config.grouping_bridge_freq_px,
-                                                                 config.grouping_bridge_time_px,
-                                                                 config.grouping_min_component_size,
-                                                                 config.grouping_min_freq_span_px,
-                                                                 config.grouping_min_time_span_px,
-                                                                 config.grouping_min_density,
-                                                                 config.grouping_time_continuity_ratio,
-                                                                 frontend_stage_ms);
+                     src_rows,
+                     src_cols,
+                     true,
+                     true,
+                     false,
+                     ignore_bins_per_side,
+                     resolution_hz,
+                     config.chunk_bandwidth_hz,
+                     config.chunk_overlap_hz,
+                     config.uncalibrated_chunk_fraction,
+                     config.uncalibrated_overlap_fraction,
+                     config.ignore_sideband_percent,
+                     config.coherence_weight,
+                     config.power_weight,
+                     config.power_assist_mode,
+                     config.power_floor_time_q,
+                     config.power_floor_global_q,
+                     config.power_excess_start_db,
+                     config.power_excess_full_db,
+                     config.power_local_blend,
+                     config.coherence_source_mode,
+                     config.coherence_gate_start,
+                     config.coherence_gate_full,
+                     config.coherence_bridge_bias,
+                     config.coherence_power_joint_weight,
+                     config.score_threshold_mode,
+                     config.fixed_score_threshold,
+                     config.coherence_power_support_q,
+                     config.coherence_power_q,
+                     config.min_component_size,
+                     config.filter_detection_mask,
+                     config.grouping_seed_score_q,
+                     config.grouping_bridge_freq_px,
+                     config.grouping_bridge_time_px,
+                     config.grouping_min_component_size,
+                     config.grouping_min_freq_span_px,
+                     config.grouping_min_time_span_px,
+                     config.grouping_min_density,
+                     config.grouping_time_continuity_ratio,
+                     frontend_stage_ms);
     result.merged_coherence = summary.merged_coherence;
     result.merged_power = summary.merged_power;
     result.merged_score = summary.merged_score;
+    result.raw_projected_mask = summary.raw_projected_mask;
     result.final_mask = summary.final_mask;
     result.grouped_box_count = summary.grouped_box_count;
+    result.grouped_boxes.reserve(summary.grouped_boxes.size());
+    for (const auto& box : summary.grouped_boxes) {
+      result.grouped_boxes.push_back(to_detection_box_record(box));
+    }
     result.merged_threshold = summary.merged_threshold;
     result.seed_threshold = summary.seed_threshold;
   } catch (...) {
@@ -6007,6 +6252,7 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(backend_mode_, "backend_mode", "Backend mode", "Detector backend mode: auto, fast_low_fidelity_mode, or reference.", std::string("auto"));
   spec.param(enable_mask_save_, "enable_mask_save", "Enable mask save", "Enable writing detector masks to disk for debug runs.", false);
   spec.param(enable_tensor_snapshot_save_, "enable_tensor_snapshot_save", "Enable tensor snapshot save", "Enable writing frozen detector input snapshots for offline parity runs.", false);
+  spec.param(save_reference_debug_artifacts_, "save_reference_debug_artifacts", "Save reference debug artifacts", "If true, writes reference-path merged maps and projected raw masks to disk from the live operator.", false);
   spec.param(save_every_n_frames_, "save_every_n_frames", "Save stride", "Save one detector mask every N frames per channel.", 1);
   spec.param(max_masks_per_channel_, "max_masks_per_channel", "Max masks per channel", "Maximum number of detector masks to save per channel for a run.", 5);
   spec.param(max_snapshots_per_channel_, "max_snapshots_per_channel", "Max snapshots per channel", "Maximum number of frozen detector input snapshots to save per channel for a run.", 2);
@@ -6025,7 +6271,7 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(frontend_max_boost_db_, "frontend_max_boost_db", "Frontend max boost", "Notebook-derived frontend max boost in dB.", 12.0);
   spec.param(coherence_weight_, "coherence_weight", "Coherence weight", "Notebook-derived coherence score weight.", 0.55);
   spec.param(power_weight_, "power_weight", "Power weight", "Notebook-derived power score weight.", 0.45);
-  spec.param(power_assist_mode_, "power_assist_mode", "Power assist mode", "Notebook-derived power assist mode: hybrid, local_relative, or absolute_floor.", std::string("hybrid"));
+  spec.param(power_assist_mode_, "power_assist_mode", "Power assist mode", "Notebook-derived power assist mode: hybrid, local_relative, absolute_floor, absolute_floor_fast, or absolute_direct.", std::string("hybrid"));
   spec.param(power_floor_time_q_, "power_floor_time_q", "Power floor time quantile", "Notebook-derived per-row noise floor quantile.", 25.0);
   spec.param(power_floor_global_q_, "power_floor_global_q", "Power floor global quantile", "Notebook-derived global noise floor quantile.", 30.0);
   spec.param(power_excess_start_db_, "power_excess_start_db", "Power excess start dB", "Notebook-derived absolute power assist ramp start above floor.", 3.0);
@@ -6241,7 +6487,7 @@ void CoherentPowerSignalDetector::initialize() {
   if (enable_mask_save_.get()) {
     std::filesystem::create_directories(output_dir_.get());
   }
-  if (enable_tensor_snapshot_save_.get()) {
+  if (enable_tensor_snapshot_save_.get() || save_reference_debug_artifacts_.get()) {
     std::filesystem::create_directories(tensor_snapshot_dir_.get());
   }
 }
@@ -6354,12 +6600,17 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                      (!(backend_is_low_fidelity || backend_is_legacy_fast) && (save_requested || require_reference_dimensions));
   const int output_rows = use_reference_backend ? src_rows : configured_analysis_rows;
   const int output_cols = use_reference_backend ? src_cols : configured_analysis_cols;
+  const bool debug_bundle_requested = enable_tensor_snapshot_save_.get() || save_reference_debug_artifacts_.get();
+  const bool should_save_snapshot_bundle = debug_bundle_requested &&
+                                           (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
+                                           (snapshots_saved_[channel_number] < max_snapshots_per_channel_.get());
   const bool should_save_mask = save_requested &&
                                 (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
                                 (masks_saved_[channel_number] < max_masks_per_channel_.get());
-  const bool should_save_tensor_snapshot = enable_tensor_snapshot_save_.get() &&
-                                           (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
-                                           (snapshots_saved_[channel_number] < max_snapshots_per_channel_.get());
+  const bool should_save_tensor_snapshot = enable_tensor_snapshot_save_.get() && should_save_snapshot_bundle;
+  const bool should_save_reference_debug_artifacts = save_reference_debug_artifacts_.get() &&
+                                                     should_save_snapshot_bundle &&
+                                                     use_reference_backend;
   const bool should_save_power_db_snapshot = should_save_tensor_snapshot && save_power_db_snapshot_.get();
   const bool frequency_axis_calibrated = resolution_hz > 0.0;
 
@@ -6456,6 +6707,13 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       buffers.row_elements = static_cast<size_t>(src_rows);
     }
 
+    if (buffers.frontend_reference_device == nullptr) {
+      const auto frontend_reference_result = cudaMalloc(reinterpret_cast<void**>(&buffers.frontend_reference_device), sizeof(float));
+      if (frontend_reference_result != cudaSuccess) {
+        throw std::runtime_error(std::string("frontend_reference buffer allocation failed: ") + cudaGetErrorString(frontend_reference_result));
+      }
+    }
+
     if (should_save_power_db_snapshot && buffers.power_db_host == nullptr) {
       const auto alloc_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.power_db_host), power_db_bytes);
       if (alloc_result != cudaSuccess) {
@@ -6532,6 +6790,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   FastGpuMetadataSummary fast_summary;
   std::string coherent_backend_name = use_reference_backend ? "coherent_power_reference_v1" : "coherent_power_fast_low_fidelity_v1";
   std::string coherent_variant_name = use_reference_backend ? "frontend_chunked_grouped_box_mask_v1" : "frontend_local_fast_low_fidelity_mask_v1";
+  const bool materialize_reference_final_mask = should_save_mask || should_save_reference_debug_artifacts || timing_enabled;
+  const bool populate_reference_merged_maps = should_save_mask || should_save_reference_debug_artifacts;
   time_step_ms(kPipelineStage, [&] {
     if (use_reference_backend) {
       const auto frontend_start = std::chrono::steady_clock::now();
@@ -6588,8 +6848,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       pipeline_summary = run_reference_pipeline_corrected_device(buffers.corrected_db_device,
                                                           src_rows,
                                                           src_cols,
-                                                          false,
-                                                          should_save_mask,
+                                  populate_reference_merged_maps,
+                                                          materialize_reference_final_mask,
                                                           timing_enabled,
                                                           ignore_bins_per_side,
                                                           resolution_hz,
@@ -6782,7 +7042,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       }
     }
 
-    if (!should_save_tensor_snapshot) {
+    if (!should_save_tensor_snapshot && !should_save_reference_debug_artifacts) {
       return;
     }
 
@@ -6806,8 +7066,16 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     const auto tensor_path = snapshot_stem + "_tensor.npy";
     const auto power_db_path = snapshot_stem + "_power_db.npy";
     const auto metadata_path = snapshot_stem + ".json";
+    const auto merged_coherence_path = snapshot_stem + "_merged_coherence.npy";
+    const auto merged_power_path = snapshot_stem + "_merged_power.npy";
+    const auto merged_score_path = snapshot_stem + "_merged_score.npy";
+    const auto raw_projected_mask_path = snapshot_stem + "_raw_projected_mask.npy";
+    const auto raw_projected_mask_pgm_path = snapshot_stem + "_raw_projected_mask.pgm";
+    const auto grouped_final_mask_path = snapshot_stem + "_grouped_final_mask.npy";
+    const auto grouped_final_mask_pgm_path = snapshot_stem + "_grouped_final_mask.pgm";
 
-    if (!write_npy_2d(tensor_path,
+    if (should_save_tensor_snapshot &&
+        !write_npy_2d(tensor_path,
                       buffers.input_tensor_host,
                       static_cast<size_t>(total_bins) * sizeof(coherent_power_complex),
                       src_rows,
@@ -6824,6 +7092,45 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                       src_cols,
                       "<f4")) {
       throw std::runtime_error("failed to write coherent power_db snapshot");
+    }
+
+    if (should_save_reference_debug_artifacts) {
+      const auto write_debug_map = [&](const std::string& path, const std::vector<float>& values) {
+        return !values.empty() &&
+               write_npy_2d(path,
+                            values.data(),
+                            values.size() * sizeof(float),
+                            src_rows,
+                            src_cols,
+                            "<f4");
+      };
+      if (!write_debug_map(merged_coherence_path, pipeline_summary.merged_coherence)) {
+        throw std::runtime_error("failed to write coherent merged coherence debug map");
+      }
+      if (!write_debug_map(merged_power_path, pipeline_summary.merged_power)) {
+        throw std::runtime_error("failed to write coherent merged power debug map");
+      }
+      if (!write_debug_map(merged_score_path, pipeline_summary.merged_score)) {
+        throw std::runtime_error("failed to write coherent merged score debug map");
+      }
+      if (!write_debug_map(raw_projected_mask_path, pipeline_summary.raw_projected_mask)) {
+        throw std::runtime_error("failed to write coherent raw projected mask debug map");
+      }
+      if (!write_debug_map(grouped_final_mask_path, pipeline_summary.final_mask)) {
+        throw std::runtime_error("failed to write coherent grouped final mask debug map");
+      }
+      if (!write_pgm(raw_projected_mask_pgm_path,
+                     binary_float_mask_to_u8(pipeline_summary.raw_projected_mask),
+                     src_cols,
+                     src_rows)) {
+        throw std::runtime_error("failed to write coherent raw projected mask preview");
+      }
+      if (!write_pgm(grouped_final_mask_pgm_path,
+                     binary_float_mask_to_u8(pipeline_summary.final_mask),
+                     src_cols,
+                     src_rows)) {
+        throw std::runtime_error("failed to write coherent grouped final mask preview");
+      }
     }
 
     const double center_frequency_hz = static_cast<double>(meta->get<uint64_t>("center_frequency", 0));
@@ -6850,7 +7157,11 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     meta_out << "  \"backend_mode_requested\": \"" << json_escape(backend_mode) << "\",\n";
     meta_out << "  \"backend_mode_effective\": \"" << json_escape(coherent_backend_name) << "\",\n";
     meta_out << "  \"pipeline_variant\": \"" << json_escape(coherent_variant_name) << "\",\n";
-    meta_out << "  \"tensor_snapshot_path\": \"" << json_escape(tensor_path) << "\",\n";
+    if (should_save_tensor_snapshot) {
+      meta_out << "  \"tensor_snapshot_path\": \"" << json_escape(tensor_path) << "\",\n";
+    } else {
+      meta_out << "  \"tensor_snapshot_path\": null,\n";
+    }
     if (should_save_power_db_snapshot) {
       meta_out << "  \"power_db_snapshot_path\": \"" << json_escape(power_db_path) << "\",\n";
     } else {
@@ -6860,6 +7171,19 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       meta_out << "  \"mask_path\": \"" << json_escape(mask_path) << "\",\n";
     } else {
       meta_out << "  \"mask_path\": null,\n";
+    }
+    if (should_save_reference_debug_artifacts) {
+      meta_out << "  \"reference_debug_artifacts\": {\n";
+      meta_out << "    \"merged_coherence_path\": \"" << json_escape(merged_coherence_path) << "\",\n";
+      meta_out << "    \"merged_power_path\": \"" << json_escape(merged_power_path) << "\",\n";
+      meta_out << "    \"merged_score_path\": \"" << json_escape(merged_score_path) << "\",\n";
+      meta_out << "    \"raw_projected_mask_path\": \"" << json_escape(raw_projected_mask_path) << "\",\n";
+      meta_out << "    \"raw_projected_mask_pgm_path\": \"" << json_escape(raw_projected_mask_pgm_path) << "\",\n";
+      meta_out << "    \"grouped_final_mask_path\": \"" << json_escape(grouped_final_mask_path) << "\",\n";
+      meta_out << "    \"grouped_final_mask_pgm_path\": \"" << json_escape(grouped_final_mask_pgm_path) << "\"\n";
+      meta_out << "  },\n";
+    } else {
+      meta_out << "  \"reference_debug_artifacts\": null,\n";
     }
     meta_out << "  \"config\": {\n";
     meta_out << "    \"chunk_bandwidth_hz\": " << chunk_bandwidth_hz_.get() << ",\n";
@@ -6906,10 +7230,17 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
     ++snapshots_saved_[channel_number];
     if (log_detections_.get()) {
-      HOLOSCAN_LOG_INFO("Saved coherent tensor snapshot for channel {} frame {} to {}",
-                        channel_number,
-                        frame_number,
-                        tensor_path);
+      if (should_save_tensor_snapshot) {
+        HOLOSCAN_LOG_INFO("Saved coherent tensor snapshot for channel {} frame {} to {}",
+                          channel_number,
+                          frame_number,
+                          tensor_path);
+      } else {
+        HOLOSCAN_LOG_INFO("Saved coherent reference debug bundle for channel {} frame {} under {}",
+                          channel_number,
+                          frame_number,
+                          snapshot_stem);
+      }
     }
   };
 
@@ -6923,12 +7254,32 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   meta->set("coherent_mask_width", static_cast<uint32_t>(output_cols));
   meta->set("coherent_backend", coherent_backend_name);
   meta->set("coherent_chunk_count", static_cast<uint32_t>(use_reference_backend ? pipeline_summary.subsection_count : fast_summary.subsection_count));
-  meta->set("coherent_grouped_box_count", static_cast<uint32_t>(use_reference_backend ? pipeline_summary.grouped_box_count : fast_summary.grouped_box_count));
+    const uint32_t coherent_grouped_box_count =
+      static_cast<uint32_t>(use_reference_backend ? pipeline_summary.grouped_box_count : fast_summary.grouped_box_count);
+    meta->set("coherent_grouped_box_count", coherent_grouped_box_count);
   meta->set("coherent_ignore_bins_per_side", use_reference_backend ? pipeline_summary.ignore_bins_per_side : fast_summary.ignore_bins_per_side);
   meta->set("coherent_merged_threshold", use_reference_backend ? pipeline_summary.merged_threshold : fast_summary.merged_threshold);
   meta->set("coherent_seed_threshold", use_reference_backend ? pipeline_summary.seed_threshold : fast_summary.seed_threshold);
   meta->set("coherent_pipeline_variant", coherent_variant_name);
   meta->set("coherent_timing_total_ms", stage_ms[kTotalStage]);
+  meta->set("coherent_grouped_box_count_meaningful",
+            use_reference_backend ? pipeline_summary.grouped_box_count_meaningful : true);
+  meta->set("coherent_final_mask_component_count",
+            static_cast<uint32_t>(use_reference_backend ? pipeline_summary.final_mask_component_count : 0));
+  meta->set("coherent_final_mask_grouped_box_count",
+            static_cast<uint32_t>(use_reference_backend ? pipeline_summary.final_mask_grouped_box_count : 0));
+  meta->set("coherent_final_mask_grouped_box_count_meaningful",
+            use_reference_backend ? pipeline_summary.final_mask_grouped_box_count_meaningful : false);
+  meta->set("coherent_final_mask_metrics_meaningful",
+            use_reference_backend ? pipeline_summary.final_mask_metrics_meaningful : false);
+  const uint32_t coherent_final_mask_nonzero_pixels = use_reference_backend
+      ? (pipeline_summary.final_mask_metrics_meaningful
+             ? static_cast<uint32_t>(std::count_if(pipeline_summary.final_mask.begin(),
+                                                   pipeline_summary.final_mask.end(),
+                                                   [](float value) { return value > 0.5f; }))
+             : 0U)
+      : 0U;
+  meta->set("coherent_final_mask_nonzero_pixels", coherent_final_mask_nonzero_pixels);
 
   if (!timing_enabled) {
     return;
@@ -6936,6 +7287,18 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
   auto& stats = timing_stats_[channel_number];
   ++stats.window_frames;
+  stats.grouped_box_count_total += coherent_grouped_box_count;
+  stats.grouped_box_count_max = std::max<uint64_t>(stats.grouped_box_count_max, coherent_grouped_box_count);
+  stats.final_mask_nonzero_total += coherent_final_mask_nonzero_pixels;
+  stats.final_mask_nonzero_max = std::max<uint64_t>(stats.final_mask_nonzero_max, coherent_final_mask_nonzero_pixels);
+  stats.final_mask_component_count_total += static_cast<uint64_t>(std::max(0, pipeline_summary.final_mask_component_count));
+  stats.final_mask_component_count_max = std::max<uint64_t>(
+      stats.final_mask_component_count_max,
+      static_cast<uint64_t>(std::max(0, pipeline_summary.final_mask_component_count)));
+  stats.final_mask_grouped_box_count_total += static_cast<uint64_t>(std::max(0, pipeline_summary.final_mask_grouped_box_count));
+  stats.final_mask_grouped_box_count_max = std::max<uint64_t>(
+      stats.final_mask_grouped_box_count_max,
+      static_cast<uint64_t>(std::max(0, pipeline_summary.final_mask_grouped_box_count)));
   for (size_t stage_index = 0; stage_index < kTimingStageCount; ++stage_index) {
     stats.total_ms[stage_index] += stage_ms[stage_index];
     stats.max_ms[stage_index] = std::max(stats.max_ms[stage_index], stage_ms[stage_index]);
@@ -6968,7 +7331,21 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   const double inv_frames = 1.0 / static_cast<double>(std::max<uint64_t>(1, stats.window_frames));
   std::ostringstream oss;
   oss << "Coherent power timing summary ch=" << channel_number
-      << " frames=" << stats.window_frames;
+      << " frames=" << stats.window_frames
+      << " grouped_box_count_mean=" << (static_cast<double>(stats.grouped_box_count_total) * inv_frames)
+      << " grouped_box_count_max=" << stats.grouped_box_count_max
+      << " grouped_box_count_meaningful="
+      << (use_reference_backend ? (pipeline_summary.grouped_box_count_meaningful ? 1 : 0) : 1)
+      << " final_mask_metrics_meaningful="
+      << (use_reference_backend ? (pipeline_summary.final_mask_metrics_meaningful ? 1 : 0) : 0)
+      << " final_mask_component_count_mean=" << (static_cast<double>(stats.final_mask_component_count_total) * inv_frames)
+      << " final_mask_component_count_max=" << stats.final_mask_component_count_max
+      << " final_mask_grouped_box_count_mean=" << (static_cast<double>(stats.final_mask_grouped_box_count_total) * inv_frames)
+      << " final_mask_grouped_box_count_max=" << stats.final_mask_grouped_box_count_max
+      << " final_mask_grouped_box_count_meaningful="
+      << (use_reference_backend ? (pipeline_summary.final_mask_grouped_box_count_meaningful ? 1 : 0) : 0)
+      << " final_mask_nonzero_mean=" << (static_cast<double>(stats.final_mask_nonzero_total) * inv_frames)
+      << " final_mask_nonzero_max=" << stats.final_mask_nonzero_max;
   for (size_t stage_index = 0; stage_index < kTimingStageCount; ++stage_index) {
     const double mean_ms = stats.total_ms[stage_index] * inv_frames;
     oss << ' ' << kTimingStageNames[stage_index] << "_mean=" << mean_ms

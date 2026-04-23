@@ -1940,6 +1940,7 @@ def _resolve_artifact_path(path_value: str | Path) -> Path:
     container_prefixes = {
         "/workspace/spectrograms": Path("/tmp/usrp_spectrograms"),
         "/workspace/dino_masks": Path("/tmp/usrp_dino_masks"),
+        "/workspace/coherent_power_snapshots": Path("/tmp/coherent_power_snapshots"),
         "/workspace/coherent_power_masks": Path("/tmp/coherent_power_masks"),
     }
     for prefix, host_root in container_prefixes.items():
@@ -1947,6 +1948,18 @@ def _resolve_artifact_path(path_value: str | Path) -> Path:
             suffix = path_text[len(prefix) :].lstrip("/")
             return host_root / suffix if suffix else host_root
     return path
+
+
+def _resolve_optional_artifact_path(path_value: str | Path | None) -> Path | None:
+    if path_value is None:
+        return None
+    return _resolve_artifact_path(path_value)
+
+
+def _load_optional_float_matrix(path_value: str | Path | None) -> np.ndarray | None:
+    if path_value is None:
+        return None
+    return np.load(path_value, allow_pickle=False).astype(np.float32)
 
 
 def _display_oriented(image: np.ndarray, display_transposed: bool, *, is_mask: bool = False) -> np.ndarray:
@@ -2049,18 +2062,48 @@ def load_offline_coherent_overlay_context(
 ) -> dict[str, Any]:
     tensor_path = Path(tensor_path)
     summary_path = Path(summary_path)
+
+    def _resolve_latest_validator_summary_path() -> Path | None:
+        validator_root = Path("/tmp/coherent_power_snapshots/validator_regression_check")
+        candidates = sorted(
+            validator_root.glob("*/offline_validation_summary.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
+
+    def _load_summary_with_resolved_paths(path: Path) -> dict[str, Any]:
+        loaded_summary = json.loads(path.read_text())
+        loaded_summary["metadata_path"] = str(_resolve_artifact_path(loaded_summary["metadata_path"]))
+        loaded_summary["corrected_sxx_db_npy"] = str(_resolve_artifact_path(loaded_summary["corrected_sxx_db_npy"]))
+        loaded_summary["final_mask_npy"] = str(_resolve_artifact_path(loaded_summary["final_mask_npy"]))
+        return loaded_summary
+
     if not summary_path.exists():
-        raise FileNotFoundError(f"Missing coherent validator summary: {summary_path}")
+        latest_summary_path = _resolve_latest_validator_summary_path()
+        if latest_summary_path is None:
+            raise FileNotFoundError(f"Missing coherent validator summary: {summary_path}")
+        summary_path = latest_summary_path
 
-    summary = json.loads(summary_path.read_text())
-    summary["metadata_path"] = str(_resolve_artifact_path(summary["metadata_path"]))
-    summary["corrected_sxx_db_npy"] = str(_resolve_artifact_path(summary["corrected_sxx_db_npy"]))
-    summary["merged_coherence_npy"] = str(_resolve_artifact_path(summary["merged_coherence_npy"]))
-    summary["merged_power_npy"] = str(_resolve_artifact_path(summary["merged_power_npy"]))
-    summary["merged_score_npy"] = str(_resolve_artifact_path(summary["merged_score_npy"]))
-    summary["final_mask_npy"] = str(_resolve_artifact_path(summary["final_mask_npy"]))
+    summary = _load_summary_with_resolved_paths(summary_path)
+    effective_pipeline_mode = str(summary.get("pipeline_mode_effective") or "operator_live").strip().lower()
 
-    metadata = json.loads(Path(summary["metadata_path"]).read_text())
+    metadata_path = Path(summary["metadata_path"])
+    if not metadata_path.exists():
+        latest_summary_path = _resolve_latest_validator_summary_path()
+        if latest_summary_path is not None and latest_summary_path != summary_path:
+            summary_path = latest_summary_path
+            summary = _load_summary_with_resolved_paths(summary_path)
+            effective_pipeline_mode = str(summary.get("pipeline_mode_effective") or "operator_live").strip().lower()
+            metadata_path = Path(summary["metadata_path"])
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Missing coherent snapshot metadata: {metadata_path}")
+
+    metadata = json.loads(metadata_path.read_text())
+    if not tensor_path.exists() and metadata.get("tensor_snapshot_path"):
+        metadata_tensor_path = Path(_resolve_artifact_path(metadata["tensor_snapshot_path"]))
+        if metadata_tensor_path.exists():
+            tensor_path = metadata_tensor_path
     coherent_cfg = _coherent_power_config_from_metadata(metadata["config"])
     input_record, power_db_snapshot, tensor_axis_order = _build_overlay_input_record(
         tensor_path,
@@ -2069,69 +2112,42 @@ def load_offline_coherent_overlay_context(
     )
 
     active_cfg = coherent_cfg
-    if target_chunk_rows is not None and target_overlap_rows is not None:
-        active_cfg = adapt_chunk_config_for_input_record(
-            input_record,
-            coherent_cfg,
-            target_chunk_rows=target_chunk_rows,
-            target_overlap_rows=target_overlap_rows,
-        )
-    pipeline_result = run_coherent_power_pipeline(input_record, active_cfg)
-
-    display_transposed = bool(
-        input_record.get(
-            "display_transposed",
-            input_kind_requires_display_transpose(input_record.get("input_kind")),
-        )
-    )
+    pipeline_result = None
     raw_sxx_db = np.asarray(input_record["sxx_db"], dtype=np.float32)
     corrected_db_raw = np.load(summary["corrected_sxx_db_npy"], allow_pickle=False).astype(np.float32)
-    cpp_merged_coherence_raw = np.load(summary["merged_coherence_npy"], allow_pickle=False).astype(np.float32)
-    cpp_merged_power_raw = np.load(summary["merged_power_npy"], allow_pickle=False).astype(np.float32)
-    cpp_merged_score_raw = np.load(summary["merged_score_npy"], allow_pickle=False).astype(np.float32)
     final_mask_raw = np.load(summary["final_mask_npy"], allow_pickle=False).astype(np.float32)
-    merged_coherence = np.asarray(pipeline_result["merged_coherence"], dtype=np.float32)
-    merged_power = np.asarray(pipeline_result["merged_power"], dtype=np.float32)
-    merged_score = np.asarray(pipeline_result["merged_score"], dtype=np.float32)
     ignore_bins_per_side = int(summary.get("ignore_bins_per_side", 0))
-    valid_row_mask = np.asarray(
-        pipeline_result.get(
-            "valid_row_mask",
-            pipeline_result.get("ignore_sideband", {}).get("valid_row_mask", np.ones(raw_sxx_db.shape[0], dtype=bool)),
-        ),
-        dtype=bool,
-    )
+    valid_row_mask = np.ones(raw_sxx_db.shape[0], dtype=bool)
+    if ignore_bins_per_side > 0:
+        valid_row_mask[:ignore_bins_per_side] = False
+        valid_row_mask[-ignore_bins_per_side:] = False
 
-    tensor_power_db = _display_oriented(raw_sxx_db, display_transposed)
-    corrected_db = _match_display_reference(corrected_db_raw, tensor_power_db)
-    cpp_merged_coherence = _match_display_reference(cpp_merged_coherence_raw, tensor_power_db)
-    cpp_merged_power = _match_display_reference(cpp_merged_power_raw, tensor_power_db)
-    cpp_merged_score = _match_display_reference(cpp_merged_score_raw, tensor_power_db)
-    display_mask = _match_display_reference(final_mask_raw, tensor_power_db, is_mask=True)
-    display_coherence = _display_oriented(merged_coherence, display_transposed)
-    display_power = _display_oriented(merged_power, display_transposed)
-    display_score = _display_oriented(merged_score, display_transposed)
-    main_plot_transposed = _actual_display_transposed(tensor_power_db, raw_sxx_db, display_transposed)
+    display_transposed = tensor_axis_order == "time_frequency"
+    corrected_db = _display_oriented(corrected_db_raw, display_transposed)
+    display_mask = _display_oriented(final_mask_raw, display_transposed, is_mask=True)
+    main_plot_transposed = _actual_display_transposed(corrected_db, corrected_db_raw, display_transposed)
 
     diagnostics = {
+        "pipeline_mode_effective": effective_pipeline_mode,
         "display_transposed": display_transposed,
         "main_plot_transposed": main_plot_transposed,
         "tensor_axis_order": tensor_axis_order,
-        "power_assist_mode": str(pipeline_result.get("power_assist_mode", "hybrid")),
-        "merged_noise_floor_db": float(pipeline_result.get("merged_noise_floor_db", 0.0)),
+        "power_assist_mode": None,
+        "merged_noise_floor_db": None,
         "tensor_analysis_shape": tuple(int(v) for v in raw_sxx_db.shape),
-        "tensor_display_shape": tuple(int(v) for v in tensor_power_db.shape),
+        "tensor_display_shape": tuple(int(v) for v in corrected_db.shape),
         "corrected_db_raw_shape": tuple(int(v) for v in corrected_db_raw.shape),
-        "cpp_merged_coherence_shape": tuple(int(v) for v in cpp_merged_coherence_raw.shape),
-        "cpp_merged_power_shape": tuple(int(v) for v in cpp_merged_power_raw.shape),
-        "cpp_merged_score_shape": tuple(int(v) for v in cpp_merged_score_raw.shape),
-        "display_coherence_shape": tuple(int(v) for v in display_coherence.shape),
+        "cpp_merged_coherence_shape": None,
+        "cpp_merged_power_shape": None,
+        "cpp_merged_score_shape": None,
+        "display_coherence_shape": None,
         "active_chunk_bandwidth_mhz": round(active_cfg.chunk_bandwidth_hz / 1e6, 3),
         "active_chunk_overlap_mhz": round(active_cfg.chunk_overlap_hz / 1e6, 3),
-        "chunk_count_python": len(pipeline_result.get("chunk_plan", [])),
+        "chunk_count_python": None,
         "ignore_bins_per_side": ignore_bins_per_side,
-        "merged_box_count_python": len(pipeline_result.get("merged_boxes", [])),
-        "grouped_box_count_cpp": int(summary.get("grouped_box_count", 0)),
+        "merged_box_count_python": None,
+        "grouped_box_count_cpp": None,
+        "grouped_boxes_cpp_loaded": 0,
         "summary": summary,
     }
 
@@ -2145,22 +2161,23 @@ def load_offline_coherent_overlay_context(
         "power_db_snapshot": power_db_snapshot,
         "raw_sxx_db": raw_sxx_db,
         "corrected_db_raw": corrected_db_raw,
-        "cpp_merged_coherence_raw": cpp_merged_coherence_raw,
-        "cpp_merged_power_raw": cpp_merged_power_raw,
-        "cpp_merged_score_raw": cpp_merged_score_raw,
+        "cpp_merged_coherence_raw": None,
+        "cpp_merged_power_raw": None,
+        "cpp_merged_score_raw": None,
         "final_mask_raw": final_mask_raw,
-        "merged_coherence": merged_coherence,
-        "merged_power": merged_power,
-        "merged_score": merged_score,
-        "tensor_power_db": tensor_power_db,
+        "merged_coherence": None,
+        "merged_power": None,
+        "merged_score": None,
+        "tensor_power_db": corrected_db,
         "corrected_db": corrected_db,
-        "cpp_merged_coherence": cpp_merged_coherence,
-        "cpp_merged_power": cpp_merged_power,
-        "cpp_merged_score": cpp_merged_score,
+        "cpp_merged_coherence": None,
+        "cpp_merged_power": None,
+        "cpp_merged_score": None,
         "display_mask": display_mask,
-        "display_coherence": display_coherence,
-        "display_power": display_power,
-        "display_score": display_score,
+        "cpp_grouped_boxes": [],
+        "display_coherence": None,
+        "display_power": None,
+        "display_score": None,
         "display_transposed": display_transposed,
         "main_plot_transposed": main_plot_transposed,
         "ignore_bins_per_side": ignore_bins_per_side,
@@ -2171,35 +2188,54 @@ def load_offline_coherent_overlay_context(
 
 def plot_cpp_offline_validation_maps(
     overlay_context: dict[str, Any],
-    figsize: tuple[int, int] = (30, 6),
+    figsize: tuple[int, int] = (18, 6),
 ):
     raw_sxx_db = np.asarray(overlay_context["raw_sxx_db"], dtype=np.float32)
-    corrected_db = np.asarray(overlay_context["corrected_db"], dtype=np.float32)
-    cpp_merged_coherence = np.asarray(overlay_context["cpp_merged_coherence"], dtype=np.float32)
-    cpp_merged_power = np.asarray(overlay_context["cpp_merged_power"], dtype=np.float32)
-    cpp_merged_score = np.asarray(overlay_context["cpp_merged_score"], dtype=np.float32)
-    display_mask = np.asarray(overlay_context["display_mask"], dtype=np.float32)
+    corrected_db_raw = np.asarray(overlay_context["corrected_db_raw"], dtype=np.float32)
+    final_mask_raw = np.asarray(overlay_context["final_mask_raw"], dtype=np.float32)
     ignore_bins_per_side = int(overlay_context.get("ignore_bins_per_side", 0))
-    requested_display_transposed = bool(overlay_context.get("display_transposed", overlay_context.get("main_plot_transposed", False)))
-    main_plot_transposed = _actual_display_transposed(corrected_db, raw_sxx_db, requested_display_transposed)
+    requested_display_transposed = bool(overlay_context.get("display_transposed", False))
+    display_reference = _orient_panel_for_display(corrected_db_raw, raw_sxx_db, requested_display_transposed)
+    main_plot_transposed = _actual_display_transposed(display_reference, raw_sxx_db, requested_display_transposed)
     valid_row_mask = np.asarray(
         overlay_context.get("valid_row_mask", np.ones(raw_sxx_db.shape[0], dtype=bool)),
         dtype=bool,
     )
 
-    fig, axes = plt.subplots(1, 5, figsize=figsize, constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
     raw_vmin, raw_vmax = _display_db_window(raw_sxx_db)
-    axes[0].imshow(corrected_db, aspect="auto", origin="lower", vmin=raw_vmin, vmax=raw_vmax, interpolation="nearest")
-    axes[0].set_title("C++ corrected wideband spectrogram")
-    axes[1].imshow(cpp_merged_coherence, aspect="auto", origin="lower", cmap="plasma", vmin=0.0, vmax=1.0, interpolation="nearest")
-    axes[1].set_title("C++ merged coherence")
-    axes[2].imshow(cpp_merged_power, aspect="auto", origin="lower", cmap="cividis", vmin=0.0, vmax=1.0, interpolation="nearest")
-    axes[2].set_title("C++ merged power assist")
-    axes[3].imshow(cpp_merged_score, aspect="auto", origin="lower", cmap="magma", vmin=0.0, vmax=1.0, interpolation="nearest")
-    axes[3].set_title("C++ coherence + power assist")
-    axes[4].imshow(corrected_db, aspect="auto", origin="lower", cmap="gray", vmin=raw_vmin, vmax=raw_vmax, interpolation="nearest")
-    axes[4].imshow(np.ma.masked_where(display_mask <= 0.5, display_mask), aspect="auto", origin="lower", cmap="autumn", alpha=0.45, interpolation="nearest")
-    axes[4].set_title("C++ final overlay")
+    _show_debug_panel(
+        axes[0],
+        corrected_db_raw,
+        "C++ corrected wideband spectrogram",
+        requested_display_transposed,
+        plt.rcParams.get("image.cmap", "viridis"),
+        raw_vmin,
+        raw_vmax,
+        reference=raw_sxx_db,
+    )
+    _show_debug_panel(
+        axes[1],
+        final_mask_raw > 0.5,
+        "C++ final mask",
+        requested_display_transposed,
+        "gray",
+        0.0,
+        1.0,
+        reference=raw_sxx_db,
+    )
+    _show_debug_overlay(
+        axes[2],
+        corrected_db_raw,
+        final_mask_raw > 0.5,
+        "C++ final overlay",
+        requested_display_transposed,
+        raw_vmin,
+        raw_vmax,
+        boxes=None,
+    )
 
     ignored_rows = np.flatnonzero(~valid_row_mask)
     if ignored_rows.size == 0 and ignore_bins_per_side > 0:
@@ -2545,6 +2581,45 @@ def plot_merged_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] 
     axes[3].imshow(np.where(support_display, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.18, interpolation="nearest")
     _draw_signal_boxes(axes[3], merged_boxes, actual_display_transposed)
     _show_debug_overlay(axes[4], corrected_sxx_db, merged_mask, "Python replay grouped final overlay", display_transposed, vmin, vmax, boxes=merged_boxes)
+    return fig, axes
+
+
+def plot_raw_detection_debug(pipeline_result: dict[str, Any], figsize: tuple[int, int] = (26, 5)):
+    corrected_sxx_db = np.asarray(pipeline_result["corrected_sxx_db"], dtype=np.float32)
+    merged_score = np.asarray(pipeline_result["merged_score"], dtype=np.float32)
+    merged_support = np.asarray(pipeline_result.get("merged_support", np.zeros_like(corrected_sxx_db, dtype=bool)), dtype=bool)
+    raw_merged_mask = np.asarray(pipeline_result.get("raw_merged_mask", np.zeros_like(corrected_sxx_db, dtype=bool)), dtype=bool)
+    merged_mask = np.asarray(pipeline_result.get("merged_mask", np.zeros_like(corrected_sxx_db, dtype=bool)), dtype=bool)
+    merged_boxes = list(pipeline_result.get("merged_boxes", []))
+    valid_row_mask = np.asarray(pipeline_result.get("valid_row_mask", np.ones(corrected_sxx_db.shape[0], dtype=bool)), dtype=bool)
+    display_transposed = bool(
+        pipeline_result["input_record"].get(
+            "display_transposed",
+            input_kind_requires_display_transpose(pipeline_result["input_record"].get("input_kind")),
+        )
+    )
+    threshold = float(pipeline_result.get("merged_threshold", 0.0))
+    valid_pixel_count = max(1, int(valid_row_mask.sum()) * int(corrected_sxx_db.shape[1]))
+    support_ratio = float(merged_support.sum()) / float(valid_pixel_count)
+    raw_ratio = float(raw_merged_mask.sum()) / float(valid_pixel_count)
+    grouped_ratio = float(merged_mask.sum()) / float(valid_pixel_count)
+    vmin, vmax = _display_db_window(corrected_sxx_db)
+
+    fig, axes = plt.subplots(1, 4, figsize=figsize, constrained_layout=True)
+    _show_debug_panel(axes[0], corrected_sxx_db, "Corrected spectrogram", display_transposed, "viridis", vmin, vmax)
+    _show_debug_panel(axes[1], merged_score, f"Merged score (threshold={threshold:.3f})", display_transposed, "magma", 0.0, 1.0, reference=corrected_sxx_db)
+    support_display = _orient_panel_for_display(merged_support, corrected_sxx_db, display_transposed)
+    raw_display = _orient_panel_for_display(raw_merged_mask, corrected_sxx_db, display_transposed)
+    actual_display_transposed = _actual_display_transposed(support_display, corrected_sxx_db, display_transposed)
+    axes[1].imshow(np.where(support_display, 1.0, np.nan), aspect="auto", origin="lower", cmap="winter", alpha=0.18, interpolation="nearest")
+    axes[1].set_title(f"Merged score + support ({support_ratio:.3f} support fill)")
+    _show_debug_overlay(axes[2], corrected_sxx_db, raw_merged_mask, f"Raw threshold mask ({raw_ratio:.3f} fill)", display_transposed, vmin, vmax, boxes=None)
+    _show_debug_overlay(axes[3], corrected_sxx_db, merged_mask, f"Grouped final mask ({grouped_ratio:.3f} fill)", display_transposed, vmin, vmax, boxes=merged_boxes)
+
+    ignored_rows = np.flatnonzero(~valid_row_mask)
+    for ax in axes:
+        _shade_ignored_rows(ax, ignored_rows, actual_display_transposed)
+        _set_spectrogram_axis_labels(ax, actual_display_transposed)
     return fig, axes
 
 
