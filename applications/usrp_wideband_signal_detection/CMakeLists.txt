@@ -360,7 +360,7 @@ endforeach()
     old_configs/config.yaml
     old_configs/config_coherent_power_debug_capture.yaml
     config_coherent_power_live_timing_reference.yaml
-    config_coherent_power_performance.yaml
+    config_coherent_power_performance_emit_stride1_two_channel.yaml
     old_configs/config_coherent_power_realtime_guarded.yaml
     config_coherent_power_validation.yaml
     config_torchscript_validation_capture_single_channel.yaml
