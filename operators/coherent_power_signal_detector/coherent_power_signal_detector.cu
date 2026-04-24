@@ -26,6 +26,8 @@
 #include <utility>
 #include <vector>
 
+#include <gxf/core/gxf.h>
+
 namespace {
 
 enum TimingStageIndex : size_t {
@@ -6253,6 +6255,7 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(enable_mask_save_, "enable_mask_save", "Enable mask save", "Enable writing detector masks to disk for debug runs.", false);
   spec.param(enable_tensor_snapshot_save_, "enable_tensor_snapshot_save", "Enable tensor snapshot save", "Enable writing frozen detector input snapshots for offline parity runs.", false);
   spec.param(save_reference_debug_artifacts_, "save_reference_debug_artifacts", "Save reference debug artifacts", "If true, writes reference-path merged maps and projected raw masks to disk from the live operator.", false);
+  spec.param(stop_after_debug_artifact_save_, "stop_after_debug_artifact_save", "Stop after debug artifact save", "If true, interrupts the graph immediately after the first reference debug bundle is written.", false);
   spec.param(save_every_n_frames_, "save_every_n_frames", "Save stride", "Save one detector mask every N frames per channel.", 1);
   spec.param(max_masks_per_channel_, "max_masks_per_channel", "Max masks per channel", "Maximum number of detector masks to save per channel for a run.", 5);
   spec.param(max_snapshots_per_channel_, "max_snapshots_per_channel", "Max snapshots per channel", "Maximum number of frozen detector input snapshots to save per channel for a run.", 2);
@@ -6494,7 +6497,7 @@ void CoherentPowerSignalDetector::initialize() {
 
 void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                           holoscan::OutputContext&,
-                                          holoscan::ExecutionContext&) {
+                                          holoscan::ExecutionContext& context) {
   auto input = op_input.receive<coherent_power_in_t>("in").value();
   auto& fft_tensor = std::get<0>(input);
   auto stream = std::get<1>(input);
@@ -7066,6 +7069,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     const auto tensor_path = snapshot_stem + "_tensor.npy";
     const auto power_db_path = snapshot_stem + "_power_db.npy";
     const auto metadata_path = snapshot_stem + ".json";
+    const auto corrected_db_path = snapshot_stem + "_corrected_sxx_db.npy";
+    const auto corrected_db_pgm_path = snapshot_stem + "_corrected_preview.pgm";
     const auto merged_coherence_path = snapshot_stem + "_merged_coherence.npy";
     const auto merged_power_path = snapshot_stem + "_merged_power.npy";
     const auto merged_score_path = snapshot_stem + "_merged_score.npy";
@@ -7095,41 +7100,78 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     }
 
     if (should_save_reference_debug_artifacts) {
-      const auto write_debug_map = [&](const std::string& path, const std::vector<float>& values) {
-        return !values.empty() &&
-               write_npy_2d(path,
-                            values.data(),
-                            values.size() * sizeof(float),
-                            src_rows,
-                            src_cols,
-                            "<f4");
+      std::vector<float> corrected_db_host(static_cast<size_t>(total_bins), 0.0f);
+      const auto corrected_copy_result = cudaMemcpy(corrected_db_host.data(),
+                                                    buffers.corrected_db_device,
+                                                    power_db_bytes,
+                                                    cudaMemcpyDeviceToHost);
+      if (corrected_copy_result != cudaSuccess) {
+        throw std::runtime_error(std::string("corrected_db debug copy failed: ") + cudaGetErrorString(corrected_copy_result));
+      }
+      const size_t expected_debug_map_size = static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols);
+      const auto write_required_debug_map = [&](const std::string& path,
+                                                const std::vector<float>& values,
+                                                const char* label) {
+        if (values.size() != expected_debug_map_size) {
+          std::ostringstream oss;
+          oss << "failed to write coherent " << label << " debug map: expected "
+              << expected_debug_map_size << " values for " << src_rows << "x" << src_cols
+              << " output, got " << values.size();
+          throw std::runtime_error(oss.str());
+        }
+        if (!write_npy_2d(path,
+                          values.data(),
+                          values.size() * sizeof(float),
+                          src_rows,
+                          src_cols,
+                          "<f4")) {
+          std::ostringstream oss;
+          oss << "failed to write coherent " << label << " debug map to " << path;
+          throw std::runtime_error(oss.str());
+        }
       };
-      if (!write_debug_map(merged_coherence_path, pipeline_summary.merged_coherence)) {
-        throw std::runtime_error("failed to write coherent merged coherence debug map");
+      write_required_debug_map(corrected_db_path, corrected_db_host, "corrected spectrogram");
+      write_required_debug_map(merged_coherence_path, pipeline_summary.merged_coherence, "merged coherence");
+      write_required_debug_map(merged_power_path, pipeline_summary.merged_power, "merged power");
+      write_required_debug_map(merged_score_path, pipeline_summary.merged_score, "merged score");
+      write_required_debug_map(grouped_final_mask_path, pipeline_summary.final_mask, "grouped final mask");
+
+      const bool has_raw_projected_mask = pipeline_summary.raw_projected_mask.size() == expected_debug_map_size;
+      if (has_raw_projected_mask) {
+        if (!write_npy_2d(raw_projected_mask_path,
+                          pipeline_summary.raw_projected_mask.data(),
+                          pipeline_summary.raw_projected_mask.size() * sizeof(float),
+                          src_rows,
+                          src_cols,
+                          "<f4")) {
+          HOLOSCAN_LOG_WARN("Failed to write coherent raw projected mask debug map to {}", raw_projected_mask_path);
+        } else if (!write_pgm(raw_projected_mask_pgm_path,
+                              binary_float_mask_to_u8(pipeline_summary.raw_projected_mask),
+                              src_cols,
+                              src_rows)) {
+          HOLOSCAN_LOG_WARN("Failed to write coherent raw projected mask preview to {}", raw_projected_mask_pgm_path);
+        }
+      } else {
+        HOLOSCAN_LOG_WARN("Skipping coherent raw projected mask debug artifact for channel {} frame {} because expected {} values for {}x{} output, got {}",
+                          channel_number,
+                          frame_number,
+                          expected_debug_map_size,
+                          src_rows,
+                          src_cols,
+                          pipeline_summary.raw_projected_mask.size());
       }
-      if (!write_debug_map(merged_power_path, pipeline_summary.merged_power)) {
-        throw std::runtime_error("failed to write coherent merged power debug map");
-      }
-      if (!write_debug_map(merged_score_path, pipeline_summary.merged_score)) {
-        throw std::runtime_error("failed to write coherent merged score debug map");
-      }
-      if (!write_debug_map(raw_projected_mask_path, pipeline_summary.raw_projected_mask)) {
-        throw std::runtime_error("failed to write coherent raw projected mask debug map");
-      }
-      if (!write_debug_map(grouped_final_mask_path, pipeline_summary.final_mask)) {
-        throw std::runtime_error("failed to write coherent grouped final mask debug map");
-      }
-      if (!write_pgm(raw_projected_mask_pgm_path,
-                     binary_float_mask_to_u8(pipeline_summary.raw_projected_mask),
-                     src_cols,
-                     src_rows)) {
-        throw std::runtime_error("failed to write coherent raw projected mask preview");
-      }
+
       if (!write_pgm(grouped_final_mask_pgm_path,
                      binary_float_mask_to_u8(pipeline_summary.final_mask),
                      src_cols,
                      src_rows)) {
         throw std::runtime_error("failed to write coherent grouped final mask preview");
+      }
+      if (!write_pgm(corrected_db_pgm_path,
+                     float_unit_map_to_u8(normalize_map01_local(corrected_db_host, 1.0f, 99.0f)),
+                     src_cols,
+                     src_rows)) {
+        throw std::runtime_error("failed to write coherent corrected spectrogram preview");
       }
     }
 
@@ -7172,13 +7214,22 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     } else {
       meta_out << "  \"mask_path\": null,\n";
     }
+    const bool raw_projected_mask_saved = should_save_reference_debug_artifacts &&
+                                          pipeline_summary.raw_projected_mask.size() == static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols);
     if (should_save_reference_debug_artifacts) {
       meta_out << "  \"reference_debug_artifacts\": {\n";
+      meta_out << "    \"corrected_db_path\": \"" << json_escape(corrected_db_path) << "\",\n";
+      meta_out << "    \"corrected_db_pgm_path\": \"" << json_escape(corrected_db_pgm_path) << "\",\n";
       meta_out << "    \"merged_coherence_path\": \"" << json_escape(merged_coherence_path) << "\",\n";
       meta_out << "    \"merged_power_path\": \"" << json_escape(merged_power_path) << "\",\n";
       meta_out << "    \"merged_score_path\": \"" << json_escape(merged_score_path) << "\",\n";
-      meta_out << "    \"raw_projected_mask_path\": \"" << json_escape(raw_projected_mask_path) << "\",\n";
-      meta_out << "    \"raw_projected_mask_pgm_path\": \"" << json_escape(raw_projected_mask_pgm_path) << "\",\n";
+      if (raw_projected_mask_saved) {
+        meta_out << "    \"raw_projected_mask_path\": \"" << json_escape(raw_projected_mask_path) << "\",\n";
+        meta_out << "    \"raw_projected_mask_pgm_path\": \"" << json_escape(raw_projected_mask_pgm_path) << "\",\n";
+      } else {
+        meta_out << "    \"raw_projected_mask_path\": null,\n";
+        meta_out << "    \"raw_projected_mask_pgm_path\": null,\n";
+      }
       meta_out << "    \"grouped_final_mask_path\": \"" << json_escape(grouped_final_mask_path) << "\",\n";
       meta_out << "    \"grouped_final_mask_pgm_path\": \"" << json_escape(grouped_final_mask_pgm_path) << "\"\n";
       meta_out << "  },\n";
@@ -7227,6 +7278,14 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     if (!meta_out.good()) {
       throw std::runtime_error("failed to write coherent snapshot metadata sidecar");
     }
+    meta_out.flush();
+    if (!meta_out.good()) {
+      throw std::runtime_error("failed to flush coherent snapshot metadata sidecar");
+    }
+    meta_out.close();
+    if (!meta_out) {
+      throw std::runtime_error("failed to close coherent snapshot metadata sidecar");
+    }
 
     ++snapshots_saved_[channel_number];
     if (log_detections_.get()) {
@@ -7241,6 +7300,13 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                           frame_number,
                           snapshot_stem);
       }
+    }
+
+    if (should_save_reference_debug_artifacts && stop_after_debug_artifact_save_.get()) {
+      HOLOSCAN_LOG_INFO("Stopping graph after coherent reference debug bundle save for channel {} frame {}",
+                        channel_number,
+                        frame_number);
+      GxfGraphInterrupt(context.context());
     }
   };
 

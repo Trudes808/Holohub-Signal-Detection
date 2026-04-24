@@ -3,24 +3,18 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <cuda/std/complex>
-#include <cuda_runtime.h>
-#include <dinov3_torch_runtime.hpp>
 #include <holoscan/core/execution_context.hpp>
 #include <holoscan/core/io_context.hpp>
 #include <holoscan/core/operator.hpp>
-#include <matx.h>
 
 #include <array>
 #include <memory>
 #include <string>
-#include <tuple>
 #include <vector>
 
 namespace holoscan::ops {
 
-using cuda_dino_complex = cuda::std::complex<float>;
-using cuda_dino_in_t = std::tuple<matx::tensor_t<cuda_dino_complex, 2>, cudaStream_t>;
+class DinoTorchRuntime;
 
 class CudaDinoDetector : public holoscan::Operator {
  public:
@@ -40,7 +34,7 @@ class CudaDinoDetector : public holoscan::Operator {
 
  private:
   struct ChannelBuffers {
-    cuda_dino_complex* analysis_tensor_device = nullptr;
+    void* analysis_tensor_device = nullptr;
     float* power_db_device = nullptr;
     float* corrected_db_device = nullptr;
     float* corrected_batch_device = nullptr;
@@ -74,6 +68,7 @@ class CudaDinoDetector : public holoscan::Operator {
   holoscan::Parameter<bool> debug_mode_;
   holoscan::Parameter<bool> enable_debug_artifact_host_copy_;
   holoscan::Parameter<int> debug_chunk_index_;
+  holoscan::Parameter<std::string> debug_artifact_output_dir_;
   holoscan::Parameter<std::string> execution_strategy_;
   holoscan::Parameter<int> max_tokens_per_inference_;
   holoscan::Parameter<double> chunk_bandwidth_hz_;
@@ -117,9 +112,10 @@ class CudaDinoDetector : public holoscan::Operator {
 
   uint64_t compute_count_ = 0;
   bool startup_log_emitted_ = false;
+  uint64_t artifact_dump_count_ = 0;
   std::vector<ChannelBuffers> channel_buffers_;
   std::vector<ChannelTimingStats> timing_stats_;
-  DinoTorchRuntime runtime_;
+  std::shared_ptr<DinoTorchRuntime> runtime_;
 
   void release_channel_buffers();
 };

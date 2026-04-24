@@ -118,14 +118,9 @@ fft:
   averaging_type: 1
   window_time: 0
   window_type: 0
-  # FFT length in bins. For this path it should stay aligned with burst_size.
   transform_points: 20480
-  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
   window_points: 20480
-  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
   resolution: 24414
-  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
-  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
   span: 500000000
   weighting_factor: 0
   f1_index: -10240
@@ -143,7 +138,7 @@ spectrogram:
   num_channels: 2
   enable_save: false
   enable_tensor_save: false
-  save_every_n_frames: 100
+  save_every_n_frames: 1
   max_images_per_channel: 0
   output_height: 256
   output_width: 512
@@ -156,10 +151,10 @@ dinov3_signal_detector:
   patch_size: 16
   emit_stride: 1
   mask_threshold_db: -20.0
-  log_detections: false
-  enable_mask_save: false
+  log_detections: true
+  enable_mask_save: true
   save_every_n_frames: 100
-  max_masks_per_channel: 0
+  max_masks_per_channel: 2
   output_dir: "/workspace/dino_masks"
   use_pytorch_backend: true
   inference_backend: "torchscript"
@@ -209,14 +204,20 @@ coherent_power_signal_detector:
   num_channels: 2
   input_height: 250
   input_width: 20480
-  # Full-rate aggressive profile for two-channel performance validation.
+  # Keep live-processing parameters aligned with the performance profile.
   emit_stride: 1
   log_detections: false
   backend_mode: "reference"
   enable_mask_save: false
-  save_every_n_frames: 100
+  save_every_n_frames: 1
   max_masks_per_channel: 0
   output_dir: "/workspace/coherent_power_masks"
+  enable_tensor_snapshot_save: false
+  save_reference_debug_artifacts: true
+  stop_after_debug_artifact_save: true
+  max_snapshots_per_channel: 1
+  tensor_snapshot_dir: "/workspace/coherent_power_snapshots/live_reference_debug"
+  save_power_db_snapshot: false
   chunk_bandwidth_hz: 37500000.0
   chunk_overlap_hz: 2000000.0
   uncalibrated_chunk_fraction: 0.40

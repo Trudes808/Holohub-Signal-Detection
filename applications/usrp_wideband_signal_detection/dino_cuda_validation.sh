@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 WORKING_DIR=$(pwd -P)
 
-CUDA_VALIDATOR_SCRIPT=${CUDA_VALIDATOR_SCRIPT:-${SCRIPT_DIR}/run_offline_dino_cuda_validator.sh}
+CUDA_VALIDATOR_SCRIPT=${CUDA_VALIDATOR_SCRIPT:-${SCRIPT_DIR}/run_offline_cuda_dino_operator_replay.sh}
 REFERENCE_VALIDATOR_SCRIPT=${REFERENCE_VALIDATOR_SCRIPT:-${SCRIPT_DIR}/run_offline_dino_validator_performance.sh}
 PLOT_SCRIPT=${PLOT_SCRIPT:-${SCRIPT_DIR}/plot_offline_dino_cuda_artifact_compare.py}
 
@@ -24,18 +24,18 @@ usage() {
   cat >&2 <<'EOF'
 Usage: dino_cuda_validation.sh --tensor-npy PATH [options]
 
-Runs the CUDA validator, the reference C++ validator, and the artifact compare plot.
+Runs the replayed live CUDA operator, the reference C++ validator, and the artifact compare plot.
 
 Options:
   --tensor-npy PATH             Input spectrogram tensor (.npy) to validate
-  --cuda-config PATH            Config to use for the CUDA validator wrapper
+  --cuda-config PATH            Config to use for the replayed CUDA operator
   --reference-config PATH       Config to use for the reference validator wrapper
-  --cuda-output-dir DIR         CUDA validator output directory
+  --cuda-output-dir DIR         CUDA operator output directory
   --reference-output-dir DIR    Reference validator output directory
   --plot-output PATH            Output PNG path for the comparison plot
   --debug-chunk-index N         Debug chunk index for both validators
   --stages K1 K2 ...            Explicit stage keys to pass to the plot script
-  --skip-cuda                   Do not run the CUDA validator
+  --skip-cuda                   Do not run the replayed CUDA operator
   --skip-reference              Do not run the reference validator
   --plot-only                   Only generate the plot from existing outputs
   --verbose                     Forward verbose mode to both validators
@@ -157,7 +157,7 @@ tensor_basename=$(basename "$tensor_path")
 tensor_stem=${tensor_basename%.npy}
 
 if [[ -z "$cuda_output_dir" ]]; then
-  cuda_output_dir="/tmp/usrp_spectrograms/dino_cuda_validator_artifacts/${tensor_stem}"
+  cuda_output_dir="/tmp/usrp_spectrograms/dino_cuda_operator_artifacts/${tensor_stem}"
 fi
 if [[ -z "$reference_output_dir" ]]; then
   reference_output_dir="/tmp/usrp_spectrograms/dino_validator_artifacts/${tensor_stem}"
@@ -180,7 +180,7 @@ if [[ "$skip_cuda" != "1" ]]; then
     cuda_cmd+=(--verbose)
   fi
 
-  echo "Running CUDA validator:" >&2
+  echo "Running replayed CUDA operator:" >&2
   printf '  %q' "${cuda_cmd[@]}" >&2
   printf '\n' >&2
   "${cuda_cmd[@]}"

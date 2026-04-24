@@ -4,14 +4,23 @@
 
 #include "cuda_dino_detector.hpp"
 #include "cuda_dino_torch_helpers.hpp"
+#include "cuda_dino_types.hpp"
+
+#include <dinov3_torch_runtime.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <cstdio>
+#include <cstring>
 #include <exception>
+#include <iomanip>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 
 namespace holoscan::ops {
@@ -95,6 +104,145 @@ struct DebugChunkResult {
   std::vector<uint8_t> grouped_mask_source;
   std::vector<DetectionBox> grouped_boxes;
 };
+
+bool write_npy_2d(const std::filesystem::path& path,
+                  const void* payload,
+                  size_t payload_bytes,
+                  int rows,
+                  int cols,
+                  const std::string& dtype_descr) {
+  const auto tmp_path = path.string() + ".tmp";
+  std::ofstream out(tmp_path, std::ios::binary);
+  if (!out.is_open()) {
+    return false;
+  }
+  std::ostringstream header_stream;
+  header_stream << "{'descr': '" << dtype_descr << "', 'fortran_order': False, 'shape': (" << rows << ", " << cols << "), }";
+  std::string header = header_stream.str();
+  const size_t preamble = 10;
+  size_t padding = 16 - ((preamble + header.size() + 1) % 16);
+  if (padding == 16) {
+    padding = 0;
+  }
+  header.append(padding, ' ');
+  header.push_back('\n');
+
+  out.write("\x93NUMPY", 6);
+  const unsigned char version[2] = {1, 0};
+  out.write(reinterpret_cast<const char*>(version), 2);
+  const uint16_t header_len = static_cast<uint16_t>(header.size());
+  const unsigned char header_bytes[2] = {
+      static_cast<unsigned char>(header_len & 0xFFU),
+      static_cast<unsigned char>((header_len >> 8U) & 0xFFU),
+  };
+  out.write(reinterpret_cast<const char*>(header_bytes), 2);
+  out.write(header.data(), static_cast<std::streamsize>(header.size()));
+  out.write(reinterpret_cast<const char*>(payload), static_cast<std::streamsize>(payload_bytes));
+  out.close();
+  if (!out.good()) {
+    std::error_code cleanup_error;
+    std::filesystem::remove(tmp_path, cleanup_error);
+    return false;
+  }
+  std::error_code remove_error;
+  std::filesystem::remove(path, remove_error);
+  std::error_code rename_error;
+  std::filesystem::rename(tmp_path, path, rename_error);
+  if (rename_error) {
+    std::error_code cleanup_error;
+    std::filesystem::remove(tmp_path, cleanup_error);
+    return false;
+  }
+  return true;
+}
+
+std::vector<float> mask_to_float(const std::vector<uint8_t>& input) {
+  std::vector<float> output(input.size(), 0.0f);
+  for (size_t index = 0; index < input.size(); ++index) {
+    output[index] = input[index] ? 1.0f : 0.0f;
+  }
+  return output;
+}
+
+std::string json_escape(const std::string& input) {
+  std::string output;
+  output.reserve(input.size());
+  for (const char ch : input) {
+    switch (ch) {
+      case '\\':
+        output += "\\\\";
+        break;
+      case '"':
+        output += "\\\"";
+        break;
+      case '\n':
+        output += "\\n";
+        break;
+      default:
+        output.push_back(ch);
+        break;
+    }
+  }
+  return output;
+}
+
+void write_text_file(const std::filesystem::path& path, const std::string& text) {
+  std::ofstream out(path, std::ios::binary);
+  if (!out.is_open()) {
+    throw std::runtime_error("failed to open output file: " + path.string());
+  }
+  out << text;
+  if (!out.good()) {
+    throw std::runtime_error("failed to write output file: " + path.string());
+  }
+}
+
+std::string detection_boxes_to_json(const std::vector<DetectionBox>& boxes) {
+  std::ostringstream out;
+  out << "[\n";
+  for (size_t index = 0; index < boxes.size(); ++index) {
+    const auto& box = boxes[index];
+    out << "  {\n";
+    out << "    \"freq_start\": " << box.freq_start << ",\n";
+    out << "    \"freq_stop\": " << box.freq_stop << ",\n";
+    out << "    \"time_start\": " << box.time_start << ",\n";
+    out << "    \"time_stop\": " << box.time_stop << ",\n";
+    out << "    \"filled_area\": " << box.filled_area << ",\n";
+    out << "    \"density\": " << std::setprecision(8) << box.density << ",\n";
+    out << "    \"bbox_density\": " << std::setprecision(8) << box.bbox_density << ",\n";
+    out << "    \"envelope_density\": " << std::setprecision(8) << box.envelope_density << ",\n";
+    out << "    \"score_mean\": " << std::setprecision(8) << box.score_mean << ",\n";
+    out << "    \"score_peak\": " << std::setprecision(8) << box.score_peak << "\n";
+    out << "  }";
+    if (index + 1 < boxes.size()) {
+      out << ",";
+    }
+    out << "\n";
+  }
+  out << "]\n";
+  return out.str();
+}
+
+std::string chunk_plan_to_json(const std::vector<ChunkPlanEntry>& chunk_plan) {
+  std::ostringstream out;
+  out << "[\n";
+  for (size_t index = 0; index < chunk_plan.size(); ++index) {
+    const auto& chunk = chunk_plan[index];
+    out << "  {\n";
+    out << "    \"chunk_index\": " << chunk.chunk_index << ",\n";
+    out << "    \"row_start\": " << chunk.row_start << ",\n";
+    out << "    \"row_stop\": " << chunk.row_stop << ",\n";
+    out << "    \"freq_start_hz\": " << std::setprecision(16) << chunk.freq_start_hz << ",\n";
+    out << "    \"freq_stop_hz\": " << std::setprecision(16) << chunk.freq_stop_hz << "\n";
+    out << "  }";
+    if (index + 1 < chunk_plan.size()) {
+      out << ",";
+    }
+    out << "\n";
+  }
+  out << "]\n";
+  return out.str();
+}
 
 struct GlobalMergedResult {
   std::vector<uint8_t> projected_grouped_mask;
@@ -233,6 +381,182 @@ std::vector<uint8_t> resize_mask_nearest(const std::vector<uint8_t>& input,
     }
   }
   return output;
+}
+
+void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
+                                    int chunk_count,
+                                    int selected_chunk_index,
+                                    int src_rows,
+                                    int src_cols,
+                                    const ChunkPlanEntry& selected_chunk,
+                                    const std::vector<float>& corrected_resized,
+                                    const std::vector<float>& raw_score_resized,
+                                    const std::vector<float>& coherence_gate_resized,
+                                    const DebugChunkResult& selected_debug_chunk,
+                                    const GlobalMergedResult& global_merged,
+                                    const std::vector<ChunkPlanEntry>& chunk_plan) {
+  std::filesystem::create_directories(output_dir / "chunk_debug");
+
+  const auto corrected_resized_path = output_dir / "chunk_debug" / "chunk_corrected_resized.npy";
+  const auto raw_score_path = output_dir / "chunk_debug" / "chunk_dino_score_raw.npy";
+  const auto raw_score_deweighted_path = output_dir / "chunk_debug" / "chunk_dino_score_raw_deweighted.npy";
+  const auto coherence_gate_path = output_dir / "chunk_debug" / "chunk_coherence_gate.npy";
+  const auto combined_score_path = output_dir / "chunk_debug" / "chunk_combined_score.npy";
+  const auto grouped_mask_path = output_dir / "chunk_debug" / "chunk_grouped_mask.npy";
+  const auto final_mask_path = output_dir / "chunk_debug" / "chunk_final_mask.npy";
+  const auto final_mask_source_path = output_dir / "chunk_debug" / "chunk_final_mask_source.npy";
+  const auto final_mask_projected_path = output_dir / "chunk_debug" / "chunk_final_mask_projected.npy";
+  const auto grouped_boxes_path = output_dir / "chunk_debug" / "chunk_grouped_boxes.json";
+  const auto chunk_debug_summary_path = output_dir / "chunk_debug" / "chunk_debug_summary.json";
+
+  const auto projected_grouped_mask_path = output_dir / "offline_projected_grouped_mask.npy";
+  const auto projected_grouped_score_path = output_dir / "offline_projected_grouped_score.npy";
+  const auto merged_box_mask_path = output_dir / "offline_merged_box_mask.npy";
+  const auto final_mask_global_path = output_dir / "offline_final_mask.npy";
+  const auto chunk_plan_path = output_dir / "offline_chunk_plan.json";
+  const auto projected_boxes_path = output_dir / "offline_projected_boxes.json";
+  const auto merged_boxes_path = output_dir / "offline_merged_boxes.json";
+  const auto summary_path = output_dir / "offline_validation_summary.json";
+
+  const auto grouped_mask_float = mask_to_float(selected_debug_chunk.grouped_mask_source);
+  const auto final_mask_float = mask_to_float(selected_debug_chunk.final_mask);
+  const auto projected_mask_float = mask_to_float(global_merged.projected_grouped_mask);
+  const auto merged_box_mask_float = mask_to_float(global_merged.merged_box_mask);
+  const auto stitched_final_mask_float = mask_to_float(global_merged.stitched_final_mask);
+  const auto final_mask_source_float = mask_to_float(resize_mask_nearest(selected_debug_chunk.final_mask,
+                                                                         selected_debug_chunk.dst_rows,
+                                                                         selected_debug_chunk.dst_cols,
+                                                                         selected_debug_chunk.src_rows,
+                                                                         selected_debug_chunk.src_cols));
+
+  if (!write_npy_2d(corrected_resized_path,
+                    corrected_resized.data(),
+                    corrected_resized.size() * sizeof(float),
+                    selected_debug_chunk.dst_rows,
+                    selected_debug_chunk.dst_cols,
+                    "<f4") ||
+      !write_npy_2d(raw_score_path,
+                    raw_score_resized.data(),
+                    raw_score_resized.size() * sizeof(float),
+                    selected_debug_chunk.dst_rows,
+                    selected_debug_chunk.dst_cols,
+                    "<f4") ||
+      !write_npy_2d(raw_score_deweighted_path,
+                    raw_score_resized.data(),
+                    raw_score_resized.size() * sizeof(float),
+                    selected_debug_chunk.dst_rows,
+                    selected_debug_chunk.dst_cols,
+                    "<f4") ||
+      !write_npy_2d(coherence_gate_path,
+                    coherence_gate_resized.data(),
+                    coherence_gate_resized.size() * sizeof(float),
+                    selected_debug_chunk.dst_rows,
+                    selected_debug_chunk.dst_cols,
+                    "<f4") ||
+      !write_npy_2d(combined_score_path,
+                    selected_debug_chunk.combined_score.data(),
+                    selected_debug_chunk.combined_score.size() * sizeof(float),
+                    selected_debug_chunk.dst_rows,
+                    selected_debug_chunk.dst_cols,
+                    "<f4") ||
+      !write_npy_2d(grouped_mask_path,
+                    grouped_mask_float.data(),
+                    grouped_mask_float.size() * sizeof(float),
+                    selected_debug_chunk.src_rows,
+                    selected_debug_chunk.src_cols,
+                    "<f4") ||
+      !write_npy_2d(final_mask_path,
+                    final_mask_float.data(),
+                    final_mask_float.size() * sizeof(float),
+                    selected_debug_chunk.dst_rows,
+                    selected_debug_chunk.dst_cols,
+                    "<f4") ||
+      !write_npy_2d(final_mask_source_path,
+                    final_mask_source_float.data(),
+                    final_mask_source_float.size() * sizeof(float),
+                    selected_debug_chunk.src_rows,
+                    selected_debug_chunk.src_cols,
+                    "<f4") ||
+      !write_npy_2d(final_mask_projected_path,
+                    final_mask_float.data(),
+                    final_mask_float.size() * sizeof(float),
+                    selected_debug_chunk.dst_rows,
+                    selected_debug_chunk.dst_cols,
+                    "<f4") ||
+      !write_npy_2d(projected_grouped_mask_path,
+                    projected_mask_float.data(),
+                    projected_mask_float.size() * sizeof(float),
+                    src_rows,
+                    src_cols,
+                    "<f4") ||
+      !write_npy_2d(projected_grouped_score_path,
+                    global_merged.projected_grouped_score.data(),
+                    global_merged.projected_grouped_score.size() * sizeof(float),
+                    src_rows,
+                    src_cols,
+                    "<f4") ||
+      !write_npy_2d(merged_box_mask_path,
+                    merged_box_mask_float.data(),
+                    merged_box_mask_float.size() * sizeof(float),
+                    src_rows,
+                    src_cols,
+                    "<f4") ||
+      !write_npy_2d(final_mask_global_path,
+                    stitched_final_mask_float.data(),
+                    stitched_final_mask_float.size() * sizeof(float),
+                    src_rows,
+                    src_cols,
+                    "<f4")) {
+    throw std::runtime_error("failed to serialize CUDA DINO operator artifact bundle to " + output_dir.string());
+  }
+
+  write_text_file(grouped_boxes_path, detection_boxes_to_json(selected_debug_chunk.grouped_boxes));
+  write_text_file(chunk_plan_path, chunk_plan_to_json(chunk_plan));
+  write_text_file(projected_boxes_path, detection_boxes_to_json(global_merged.projected_boxes));
+  write_text_file(merged_boxes_path, detection_boxes_to_json(global_merged.merged_boxes));
+
+  std::ostringstream chunk_debug_summary;
+  chunk_debug_summary << "{\n";
+  chunk_debug_summary << "  \"artifact_contract\": \"operator_live_cuda_dino_v1\",\n";
+  chunk_debug_summary << "  \"chunk_index\": " << selected_debug_chunk.chunk_index << ",\n";
+  chunk_debug_summary << "  \"chunk_count\": " << chunk_count << ",\n";
+  chunk_debug_summary << "  \"row_start\": " << selected_chunk.row_start << ",\n";
+  chunk_debug_summary << "  \"row_stop\": " << selected_chunk.row_stop << ",\n";
+  chunk_debug_summary << "  \"src_rows\": " << selected_debug_chunk.src_rows << ",\n";
+  chunk_debug_summary << "  \"src_cols\": " << selected_debug_chunk.src_cols << ",\n";
+  chunk_debug_summary << "  \"dst_rows\": " << selected_debug_chunk.dst_rows << ",\n";
+  chunk_debug_summary << "  \"dst_cols\": " << selected_debug_chunk.dst_cols << ",\n";
+  chunk_debug_summary << "  \"grouped_box_count\": " << selected_debug_chunk.grouped_boxes.size() << ",\n";
+  chunk_debug_summary << "  \"corrected_resized_npy\": \"" << json_escape(corrected_resized_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"dino_score_raw_npy\": \"" << json_escape(raw_score_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"dino_score_raw_deweighted_npy\": \"" << json_escape(raw_score_deweighted_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"coherence_gate_npy\": \"" << json_escape(coherence_gate_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"combined_score_npy\": \"" << json_escape(combined_score_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"grouped_mask_npy\": \"" << json_escape(grouped_mask_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"grouped_boxes_json\": \"" << json_escape(grouped_boxes_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"final_mask_npy\": \"" << json_escape(final_mask_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"final_mask_source_npy\": \"" << json_escape(final_mask_source_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"final_mask_projected_npy\": \"" << json_escape(final_mask_projected_path.string()) << "\"\n";
+  chunk_debug_summary << "}\n";
+  write_text_file(chunk_debug_summary_path, chunk_debug_summary.str());
+
+  std::ostringstream summary;
+  summary << "{\n";
+  summary << "  \"artifact_contract\": \"operator_live_cuda_dino_v1\",\n";
+  summary << "  \"chunk_count\": " << chunk_count << ",\n";
+  summary << "  \"selected_chunk_index\": " << selected_chunk_index << ",\n";
+  summary << "  \"src_rows\": " << src_rows << ",\n";
+  summary << "  \"src_cols\": " << src_cols << ",\n";
+  summary << "  \"projected_grouped_mask_npy\": \"" << json_escape(projected_grouped_mask_path.string()) << "\",\n";
+  summary << "  \"projected_grouped_score_npy\": \"" << json_escape(projected_grouped_score_path.string()) << "\",\n";
+  summary << "  \"merged_box_mask_npy\": \"" << json_escape(merged_box_mask_path.string()) << "\",\n";
+  summary << "  \"final_mask_npy\": \"" << json_escape(final_mask_global_path.string()) << "\",\n";
+  summary << "  \"chunk_plan_json\": \"" << json_escape(chunk_plan_path.string()) << "\",\n";
+  summary << "  \"projected_boxes_json\": \"" << json_escape(projected_boxes_path.string()) << "\",\n";
+  summary << "  \"merged_boxes_json\": \"" << json_escape(merged_boxes_path.string()) << "\",\n";
+  summary << "  \"chunk_debug_summary_json\": \"" << json_escape(chunk_debug_summary_path.string()) << "\"\n";
+  summary << "}\n";
+  write_text_file(summary_path, summary.str());
 }
 
 std::vector<int> build_nearest_resize_indices(int input_size, int output_size) {
@@ -1912,6 +2236,11 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Debug chunk index",
              "Selected chunk or tile index for artifact extraction in debug mode.",
              13);
+  spec.param(debug_artifact_output_dir_,
+             "debug_artifact_output_dir",
+             "Debug artifact output dir",
+             "When set, write a validator-style offline artifact bundle for the selected debug chunk.",
+             std::string(""));
   spec.param(execution_strategy_,
              "execution_strategy",
              "Execution strategy",
@@ -2119,6 +2448,9 @@ void CudaDinoDetector::initialize() {
   release_channel_buffers();
   channel_buffers_.assign(static_cast<size_t>(std::max(1, num_channels_.get())), ChannelBuffers{});
   timing_stats_.assign(static_cast<size_t>(std::max(1, num_channels_.get())), ChannelTimingStats{});
+  if (!runtime_) {
+    runtime_ = std::make_shared<DinoTorchRuntime>();
+  }
   std::fprintf(stderr,
                "[cuda_dino_detector] INFO: initialized backend_mode='%s' execution_strategy='%s' debug_mode=%d host_copy_debug_only=%d max_tokens_per_inference=%d input=%dx%d patch_size=%d emit_stride=%d chunk_bw_hz=%.3f overlap_hz=%.3f frontend_correction_enable=%d\n",
                backend_mode_.get().c_str(),
@@ -2276,10 +2608,11 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
   throw_if_cuda_error(cudaStreamWaitEvent(buffers.processing_stream, copy_complete_event, 0),
                       "cuda_dino_detector processing stream wait failed");
 
-  cuda_dino_power_db_kernel<<<blocks, threads, 0, buffers.processing_stream>>>(buffers.analysis_tensor_device,
-                                                                                src_rows,
-                                                                                src_cols,
-                                                                                buffers.power_db_device);
+  cuda_dino_power_db_kernel<<<blocks, threads, 0, buffers.processing_stream>>>(
+      static_cast<const cuda_dino_complex*>(buffers.analysis_tensor_device),
+      src_rows,
+      src_cols,
+      buffers.power_db_device);
   throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector power_db kernel launch failed");
 
   if (frontend_correction_enable_.get()) {
@@ -2470,7 +2803,10 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       runtime_input.span_hz = span_hz;
       runtime_input.corrected_db_batch_device = buffers.corrected_batch_device;
 
-      auto runtime_result = runtime_.run_batch(runtime_config, runtime_input);
+      if (!runtime_) {
+        runtime_ = std::make_shared<DinoTorchRuntime>();
+      }
+      auto runtime_result = runtime_->run_batch(runtime_config, runtime_input);
       if (runtime_result.success) {
         const bool resized_full_chunk = runtime_result.input_resized_to_target;
         if (runtime_result.patch_features_batch_device != nullptr && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 &&
@@ -2551,8 +2887,35 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     const bool debug_projection_merge_enabled =
         hybrid_ready && debug_mode_.get() && enable_debug_artifact_host_copy_.get();
     if (debug_projection_merge_enabled) {
+      const bool write_operator_artifacts = !debug_artifact_output_dir_.get().empty();
+      std::vector<float> corrected_batch;
+      std::vector<float> coherence_gate_batch;
+      std::vector<float> raw_score_batch;
       std::vector<float> hybrid_score_batch(batch_elements, 0.0f);
       std::vector<float> hybrid_mask_batch_float(batch_elements, 0.0f);
+      if (write_operator_artifacts) {
+        corrected_batch.assign(batch_elements, 0.0f);
+        coherence_gate_batch.assign(batch_elements, 0.0f);
+        raw_score_batch.assign(batch_elements, 0.0f);
+        throw_if_cuda_error(cudaMemcpyAsync(corrected_batch.data(),
+                                            buffers.corrected_batch_device,
+                                            batch_elements * sizeof(float),
+                                            cudaMemcpyDeviceToHost,
+                                            buffers.processing_stream),
+                            "cuda_dino_detector corrected batch debug copy failed");
+        throw_if_cuda_error(cudaMemcpyAsync(coherence_gate_batch.data(),
+                                            buffers.coherence_gate_batch_device,
+                                            batch_elements * sizeof(float),
+                                            cudaMemcpyDeviceToHost,
+                                            buffers.processing_stream),
+                            "cuda_dino_detector coherence gate debug copy failed");
+        throw_if_cuda_error(cudaMemcpyAsync(raw_score_batch.data(),
+                                            buffers.raw_dino_score_batch_device,
+                                            batch_elements * sizeof(float),
+                                            cudaMemcpyDeviceToHost,
+                                            buffers.processing_stream),
+                            "cuda_dino_detector raw DINO debug copy failed");
+      }
       throw_if_cuda_error(cudaMemcpyAsync(hybrid_score_batch.data(),
                                           buffers.hybrid_combined_score_batch_device,
                                           batch_elements * sizeof(float),
@@ -2650,6 +3013,54 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         meta->set("cuda_dino_debug_projected_fraction", static_cast<double>(mean_mask_value(global_merged.projected_grouped_mask)));
         meta->set("cuda_dino_debug_final_fraction", static_cast<double>(mean_mask_value(global_merged.merged_box_mask)));
         meta->set("cuda_dino_debug_connected_fraction", static_cast<double>(connected_fraction(global_merged.merged_box_mask, source_valid_mask)));
+      }
+      if (write_operator_artifacts && !debug_chunk_results.empty()) {
+        const int selected_batch_index = clamp_value(debug_chunk_index_.get(), 0, chunk_count - 1);
+        const auto& selected_debug_chunk = debug_chunk_results[static_cast<size_t>(selected_batch_index)];
+        const auto& selected_chunk = chunk_plan[static_cast<size_t>(selected_batch_index)];
+        const size_t chunk_elements = static_cast<size_t>(uniform_chunk_rows) * static_cast<size_t>(src_cols);
+        const size_t batch_offset = static_cast<size_t>(selected_batch_index) * chunk_elements;
+
+        std::vector<float> corrected_chunk(corrected_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset),
+                                           corrected_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset + chunk_elements));
+        std::vector<float> coherence_gate_chunk(coherence_gate_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset),
+                                                coherence_gate_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset + chunk_elements));
+        std::vector<float> raw_score_chunk(raw_score_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset),
+                                           raw_score_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset + chunk_elements));
+
+        const auto corrected_resized = resize_bilinear(corrected_chunk,
+                                                       uniform_chunk_rows,
+                                                       src_cols,
+                                                       selected_debug_chunk.dst_rows,
+                                                       selected_debug_chunk.dst_cols);
+        const auto coherence_gate_resized = resize_bilinear(coherence_gate_chunk,
+                                                            uniform_chunk_rows,
+                                                            src_cols,
+                                                            selected_debug_chunk.dst_rows,
+                                                            selected_debug_chunk.dst_cols);
+        const auto raw_score_resized = resize_bilinear(raw_score_chunk,
+                                                       uniform_chunk_rows,
+                                                       src_cols,
+                                                       selected_debug_chunk.dst_rows,
+                                                       selected_debug_chunk.dst_cols);
+
+        write_operator_artifact_bundle(debug_artifact_output_dir_.get(),
+                                       chunk_count,
+                                       selected_batch_index,
+                                       src_rows,
+                                       src_cols,
+                                       selected_chunk,
+                                       corrected_resized,
+                                       raw_score_resized,
+                                       coherence_gate_resized,
+                                       selected_debug_chunk,
+                                       global_merged,
+                                       chunk_plan);
+        ++artifact_dump_count_;
+        if (meta) {
+          meta->set("cuda_dino_debug_artifact_output_dir", debug_artifact_output_dir_.get());
+          meta->set("cuda_dino_debug_artifact_dump_count", artifact_dump_count_);
+        }
       }
     } else if (meta) {
       meta->set("cuda_dino_group_merge_ready", false);

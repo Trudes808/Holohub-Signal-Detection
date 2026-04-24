@@ -195,6 +195,15 @@ add_executable(offline_dino_validator
     offline_dino_validator_performance.cpp
   )
 
+add_executable(offline_cuda_dino_operator_replay
+  offline_cuda_dino_operator_replay.cpp
+)
+
+target_compile_definitions(offline_cuda_dino_operator_replay
+  PRIVATE
+  USRP_WIDEBAND_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
 target_link_libraries(offline_spectrogram_visualizer
   PRIVATE
   CUDA::cudart
@@ -220,6 +229,13 @@ target_link_libraries(offline_dino_validator_performance
   holoscan::ops::dinov3_signal_detector
 )
 
+target_link_libraries(offline_cuda_dino_operator_replay
+  PRIVATE
+  CUDA::cudart
+  holoscan::core
+  holoscan::ops::cuda_dino_detector
+)
+
 if(NOT Torch_FOUND)
   message(FATAL_ERROR "offline_dino_validator requires LibTorch, but find_package(Torch) failed. Ensure Python torch is installed in the build environment.")
 endif()
@@ -230,6 +246,11 @@ target_link_libraries(offline_dino_validator
 )
 
 target_link_libraries(offline_dino_validator_performance
+  PRIVATE
+  ${TORCH_LIBRARIES}
+)
+
+target_link_libraries(offline_cuda_dino_operator_replay
   PRIVATE
   ${TORCH_LIBRARIES}
 )
@@ -250,16 +271,19 @@ if(APP_NVJITLINK_LINK_ITEM)
   target_link_libraries(usrp_wideband_signal_detection PRIVATE ${APP_NVJITLINK_LINK_ITEM})
   target_link_libraries(offline_dino_validator PRIVATE ${APP_NVJITLINK_LINK_ITEM})
   target_link_libraries(offline_dino_validator_performance PRIVATE ${APP_NVJITLINK_LINK_ITEM})
+  target_link_libraries(offline_cuda_dino_operator_replay PRIVATE ${APP_NVJITLINK_LINK_ITEM})
 endif()
 
 target_link_directories(usrp_wideband_signal_detection PRIVATE ${CUDA_LINK_DIRS})
 target_link_directories(offline_dino_validator PRIVATE ${CUDA_LINK_DIRS})
 target_link_directories(offline_dino_validator_performance PRIVATE ${CUDA_LINK_DIRS})
+target_link_directories(offline_cuda_dino_operator_replay PRIVATE ${CUDA_LINK_DIRS})
 foreach(CUDA_LINK_DIR IN LISTS CUDA_LINK_DIRS)
   if(EXISTS "${CUDA_LINK_DIR}")
     target_link_options(usrp_wideband_signal_detection PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
     target_link_options(offline_dino_validator PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
     target_link_options(offline_dino_validator_performance PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
+    target_link_options(offline_cuda_dino_operator_replay PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
   endif()
 endforeach()
 

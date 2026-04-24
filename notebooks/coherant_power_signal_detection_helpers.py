@@ -1956,10 +1956,15 @@ def _resolve_optional_artifact_path(path_value: str | Path | None) -> Path | Non
     return _resolve_artifact_path(path_value)
 
 
-def _load_optional_float_matrix(path_value: str | Path | None) -> np.ndarray | None:
-    if path_value is None:
+def _load_optional_npy(path_value: str | Path | None) -> np.ndarray | None:
+    resolved_path = _resolve_optional_artifact_path(path_value)
+    if resolved_path is None:
         return None
-    return np.load(path_value, allow_pickle=False).astype(np.float32)
+    return np.load(resolved_path, allow_pickle=False).astype(np.float32)
+
+
+def _load_optional_float_matrix(path_value: str | Path | None) -> np.ndarray | None:
+    return _load_optional_npy(path_value)
 
 
 def _display_oriented(image: np.ndarray, display_transposed: bool, *, is_mask: bool = False) -> np.ndarray:
@@ -2052,38 +2057,188 @@ def _build_overlay_input_record(
     return input_record, power_db_snapshot, tensor_axis_order
 
 
+def _build_overlay_input_record_from_db_snapshot(
+    db_snapshot: np.ndarray,
+    metadata: dict[str, Any],
+    *,
+    tensor_axis_order_override: str | None = None,
+) -> tuple[dict[str, Any], np.ndarray, str]:
+    db_snapshot = np.asarray(db_snapshot, dtype=np.float32)
+    input_record: dict[str, Any] = {
+        "input_kind": "coherent_debug_db",
+    }
+
+    tensor_axis_order = str(
+        tensor_axis_order_override
+        or metadata.get("tensor_axis_order")
+        or ""
+    ).strip().lower()
+    if not tensor_axis_order:
+        tensor_axis_order = "frequency_time"
+
+    if tensor_axis_order == "frequency_time":
+        input_record["sxx_db"] = np.ascontiguousarray(db_snapshot)
+        input_record["display_sxx_db"] = np.ascontiguousarray(db_snapshot)
+        input_record["display_transposed"] = False
+    elif tensor_axis_order == "time_frequency":
+        input_record["sxx_db"] = np.ascontiguousarray(db_snapshot.T)
+        input_record["display_sxx_db"] = np.ascontiguousarray(db_snapshot)
+        input_record["display_transposed"] = True
+    else:
+        raise ValueError(f"Unsupported tensor_axis_order: {tensor_axis_order!r}")
+
+    input_record["tensor_axis_order"] = tensor_axis_order
+    input_record["frequency_axis_calibrated"] = bool(metadata.get("frequency_axis_calibrated", True))
+
+    freq_bins = int(input_record["sxx_db"].shape[0])
+    time_bins = int(input_record["sxx_db"].shape[1])
+    resolution_hz = float(metadata.get("resolution_hz", 0.0) or 0.0)
+    sample_rate_hz = float(metadata.get("sample_rate_hz", 0.0) or 0.0)
+    span_hz = float(metadata.get("span_hz", 0.0) or 0.0)
+
+    if sample_rate_hz <= 0.0 and span_hz > 0.0:
+        sample_rate_hz = span_hz
+    if span_hz <= 0.0 and sample_rate_hz > 0.0:
+        span_hz = sample_rate_hz
+    if resolution_hz <= 0.0 and span_hz > 0.0 and freq_bins > 0:
+        resolution_hz = span_hz / float(freq_bins)
+    if sample_rate_hz <= 0.0 and resolution_hz > 0.0:
+        sample_rate_hz = float(freq_bins) * resolution_hz
+    if span_hz <= 0.0 and resolution_hz > 0.0:
+        span_hz = float(freq_bins) * resolution_hz
+
+    if resolution_hz > 0.0:
+        input_record["freq_axis_hz"] = np.arange(freq_bins, dtype=np.float32) * resolution_hz
+    else:
+        input_record["freq_axis_hz"] = np.arange(freq_bins, dtype=np.float32)
+    input_record["time_axis_s"] = np.arange(time_bins, dtype=np.float32)
+    input_record["center_frequency_hz"] = float(metadata.get("center_frequency_hz", 0.0) or 0.0)
+    input_record["sample_rate_hz"] = sample_rate_hz if sample_rate_hz > 0.0 else None
+    input_record["span_hz"] = span_hz if span_hz > 0.0 else None
+    input_record["resolution_hz"] = resolution_hz if resolution_hz > 0.0 else None
+    input_record["raw_tensor_shape"] = tuple(int(v) for v in db_snapshot.shape)
+    input_record["resized_tensor_shape"] = tuple(int(v) for v in db_snapshot.shape)
+
+    return input_record, db_snapshot.astype(np.float32, copy=False), tensor_axis_order
+
+
+def _resolve_latest_validator_summary_path() -> Path | None:
+    validator_root = Path("/tmp/coherent_power_snapshots/validator_regression_check")
+    candidates = sorted(
+        validator_root.glob("*/offline_validation_summary.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _resolve_latest_reference_debug_metadata_path() -> Path | None:
+    snapshot_root = Path("/tmp/coherent_power_snapshots")
+    candidates = sorted(
+        snapshot_root.glob("**/coherent_power_snapshot_*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in candidates:
+        try:
+            metadata = json.loads(candidate.read_text())
+        except Exception:
+            continue
+        if isinstance(metadata.get("reference_debug_artifacts"), dict):
+            return candidate
+    return None
+
+
+def resolve_latest_coherent_overlay_sources(*, prefer_reference_debug: bool = True) -> dict[str, Any]:
+    reference_debug_metadata_path = _resolve_latest_reference_debug_metadata_path()
+    validator_summary_path = _resolve_latest_validator_summary_path()
+
+    if prefer_reference_debug and reference_debug_metadata_path is not None:
+        metadata = json.loads(reference_debug_metadata_path.read_text())
+        tensor_path = None
+        tensor_snapshot_path = metadata.get("tensor_snapshot_path")
+        if tensor_snapshot_path:
+            resolved_tensor_path = Path(_resolve_artifact_path(tensor_snapshot_path))
+            if resolved_tensor_path.exists():
+                tensor_path = resolved_tensor_path
+        return {
+            "mode": "live_reference_debug",
+            "metadata_path": reference_debug_metadata_path,
+            "summary_path": reference_debug_metadata_path,
+            "tensor_path": tensor_path,
+            "output_dir": reference_debug_metadata_path.parent,
+            "run_command": None,
+        }
+
+    if validator_summary_path is not None:
+        summary = json.loads(validator_summary_path.read_text())
+        tensor_path = None
+        tensor_snapshot_path = summary.get("tensor_snapshot_path")
+        if tensor_snapshot_path:
+            resolved_tensor_path = Path(_resolve_artifact_path(tensor_snapshot_path))
+            if resolved_tensor_path.exists():
+                tensor_path = resolved_tensor_path
+        return {
+            "mode": "offline_validator",
+            "metadata_path": Path(_resolve_artifact_path(summary["metadata_path"])),
+            "summary_path": validator_summary_path,
+            "tensor_path": tensor_path,
+            "output_dir": validator_summary_path.parent,
+            "run_command": None,
+        }
+
+    raise FileNotFoundError("No coherent live debug bundle or offline validator summary was found")
+
+
 def load_offline_coherent_overlay_context(
-    tensor_path: str | Path,
-    summary_path: str | Path,
+    tensor_path: str | Path | None,
+    summary_path: str | Path | None,
     *,
     target_chunk_rows: int | None = None,
     target_overlap_rows: int | None = None,
     tensor_axis_order_override: str | None = None,
+    prefer_reference_debug_bundle: bool = True,
 ) -> dict[str, Any]:
-    tensor_path = Path(tensor_path)
-    summary_path = Path(summary_path)
-
-    def _resolve_latest_validator_summary_path() -> Path | None:
-        validator_root = Path("/tmp/coherent_power_snapshots/validator_regression_check")
-        candidates = sorted(
-            validator_root.glob("*/offline_validation_summary.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        return candidates[0] if candidates else None
+    tensor_path = Path(tensor_path) if tensor_path is not None else None
+    summary_path = Path(summary_path) if summary_path is not None else None
 
     def _load_summary_with_resolved_paths(path: Path) -> dict[str, Any]:
         loaded_summary = json.loads(path.read_text())
+        if isinstance(loaded_summary.get("reference_debug_artifacts"), dict):
+            debug_artifacts = loaded_summary["reference_debug_artifacts"]
+            loaded_summary = {
+                "metadata_path": str(path),
+                "pipeline_mode_effective": "operator_live_reference_debug",
+                "backend_mode_from_config": str(loaded_summary.get("backend_mode_effective") or loaded_summary.get("backend_mode_requested") or "reference"),
+                "tensor_snapshot_path": loaded_summary.get("tensor_snapshot_path"),
+                "rows": int(loaded_summary.get("rows", 0) or 0),
+                "cols": int(loaded_summary.get("cols", 0) or 0),
+                "input_height": int(loaded_summary.get("input_height", 0) or 0),
+                "input_width": int(loaded_summary.get("input_width", 0) or 0),
+                "tensor_axis_order": loaded_summary.get("tensor_axis_order", "frequency_time"),
+                "frequency_axis_calibrated": bool(loaded_summary.get("frequency_axis_calibrated", True)),
+                "resolution_hz": float(loaded_summary.get("resolution_hz", 0.0) or 0.0),
+                "sample_rate_hz": float(loaded_summary.get("sample_rate_hz", 0.0) or 0.0),
+                "span_hz": float(loaded_summary.get("span_hz", 0.0) or 0.0),
+                "ignore_bins_per_side": int(loaded_summary.get("ignore_bins_per_side", 0) or 0),
+                "corrected_sxx_db_npy": str(_resolve_artifact_path(debug_artifacts["corrected_db_path"])),
+                "final_mask_npy": str(_resolve_artifact_path(debug_artifacts["grouped_final_mask_path"])),
+                "raw_projected_mask_npy": str(_resolve_artifact_path(debug_artifacts["raw_projected_mask_path"])) if debug_artifacts.get("raw_projected_mask_path") else None,
+            }
+            return loaded_summary
+
         loaded_summary["metadata_path"] = str(_resolve_artifact_path(loaded_summary["metadata_path"]))
         loaded_summary["corrected_sxx_db_npy"] = str(_resolve_artifact_path(loaded_summary["corrected_sxx_db_npy"]))
         loaded_summary["final_mask_npy"] = str(_resolve_artifact_path(loaded_summary["final_mask_npy"]))
+        if loaded_summary.get("raw_projected_mask_npy"):
+            loaded_summary["raw_projected_mask_npy"] = str(_resolve_artifact_path(loaded_summary["raw_projected_mask_npy"]))
         return loaded_summary
 
-    if not summary_path.exists():
-        latest_summary_path = _resolve_latest_validator_summary_path()
-        if latest_summary_path is None:
-            raise FileNotFoundError(f"Missing coherent validator summary: {summary_path}")
-        summary_path = latest_summary_path
+    if summary_path is None or not summary_path.exists():
+        resolved_sources = resolve_latest_coherent_overlay_sources(prefer_reference_debug=prefer_reference_debug_bundle)
+        summary_path = Path(resolved_sources["summary_path"])
+        if tensor_path is None:
+            tensor_path = resolved_sources.get("tensor_path")
 
     summary = _load_summary_with_resolved_paths(summary_path)
     effective_pipeline_mode = str(summary.get("pipeline_mode_effective") or "operator_live").strip().lower()
@@ -2100,22 +2255,30 @@ def load_offline_coherent_overlay_context(
         raise FileNotFoundError(f"Missing coherent snapshot metadata: {metadata_path}")
 
     metadata = json.loads(metadata_path.read_text())
-    if not tensor_path.exists() and metadata.get("tensor_snapshot_path"):
+    if (tensor_path is None or not tensor_path.exists()) and metadata.get("tensor_snapshot_path"):
         metadata_tensor_path = Path(_resolve_artifact_path(metadata["tensor_snapshot_path"]))
         if metadata_tensor_path.exists():
             tensor_path = metadata_tensor_path
     coherent_cfg = _coherent_power_config_from_metadata(metadata["config"])
-    input_record, power_db_snapshot, tensor_axis_order = _build_overlay_input_record(
-        tensor_path,
-        metadata,
-        tensor_axis_order_override=tensor_axis_order_override,
-    )
+    corrected_db_raw = np.load(summary["corrected_sxx_db_npy"], allow_pickle=False).astype(np.float32)
+    if tensor_path is not None and tensor_path.exists():
+        input_record, power_db_snapshot, tensor_axis_order = _build_overlay_input_record(
+            tensor_path,
+            metadata,
+            tensor_axis_order_override=tensor_axis_order_override,
+        )
+    else:
+        input_record, power_db_snapshot, tensor_axis_order = _build_overlay_input_record_from_db_snapshot(
+            corrected_db_raw,
+            metadata,
+            tensor_axis_order_override=tensor_axis_order_override,
+        )
 
     active_cfg = coherent_cfg
     pipeline_result = None
     raw_sxx_db = np.asarray(input_record["sxx_db"], dtype=np.float32)
-    corrected_db_raw = np.load(summary["corrected_sxx_db_npy"], allow_pickle=False).astype(np.float32)
     final_mask_raw = np.load(summary["final_mask_npy"], allow_pickle=False).astype(np.float32)
+    raw_projected_mask_raw = _load_optional_npy(summary.get("raw_projected_mask_npy"))
     ignore_bins_per_side = int(summary.get("ignore_bins_per_side", 0))
     valid_row_mask = np.ones(raw_sxx_db.shape[0], dtype=bool)
     if ignore_bins_per_side > 0:
@@ -2137,6 +2300,7 @@ def load_offline_coherent_overlay_context(
         "tensor_analysis_shape": tuple(int(v) for v in raw_sxx_db.shape),
         "tensor_display_shape": tuple(int(v) for v in corrected_db.shape),
         "corrected_db_raw_shape": tuple(int(v) for v in corrected_db_raw.shape),
+        "raw_projected_mask_raw_shape": None if raw_projected_mask_raw is None else tuple(int(v) for v in raw_projected_mask_raw.shape),
         "cpp_merged_coherence_shape": None,
         "cpp_merged_power_shape": None,
         "cpp_merged_score_shape": None,
@@ -2148,6 +2312,7 @@ def load_offline_coherent_overlay_context(
         "merged_box_count_python": None,
         "grouped_box_count_cpp": None,
         "grouped_boxes_cpp_loaded": 0,
+        "tensor_snapshot_available": bool(tensor_path is not None and Path(tensor_path).exists()),
         "summary": summary,
     }
 
@@ -2159,8 +2324,10 @@ def load_offline_coherent_overlay_context(
         "pipeline_result": pipeline_result,
         "input_record": input_record,
         "power_db_snapshot": power_db_snapshot,
+        "tensor_path": None if tensor_path is None else str(tensor_path),
         "raw_sxx_db": raw_sxx_db,
         "corrected_db_raw": corrected_db_raw,
+        "raw_projected_mask_raw": raw_projected_mask_raw,
         "cpp_merged_coherence_raw": None,
         "cpp_merged_power_raw": None,
         "cpp_merged_score_raw": None,
@@ -2182,6 +2349,7 @@ def load_offline_coherent_overlay_context(
         "main_plot_transposed": main_plot_transposed,
         "ignore_bins_per_side": ignore_bins_per_side,
         "valid_row_mask": valid_row_mask,
+        "tensor_snapshot_available": bool(tensor_path is not None and Path(tensor_path).exists()),
         "diagnostics": diagnostics,
     }
 
@@ -2192,6 +2360,7 @@ def plot_cpp_offline_validation_maps(
 ):
     raw_sxx_db = np.asarray(overlay_context["raw_sxx_db"], dtype=np.float32)
     corrected_db_raw = np.asarray(overlay_context["corrected_db_raw"], dtype=np.float32)
+    raw_projected_mask_raw = overlay_context.get("raw_projected_mask_raw")
     final_mask_raw = np.asarray(overlay_context["final_mask_raw"], dtype=np.float32)
     ignore_bins_per_side = int(overlay_context.get("ignore_bins_per_side", 0))
     requested_display_transposed = bool(overlay_context.get("display_transposed", False))
@@ -2202,7 +2371,8 @@ def plot_cpp_offline_validation_maps(
         dtype=bool,
     )
 
-    fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
+    panel_count = 4 if raw_projected_mask_raw is not None else 3
+    fig, axes = plt.subplots(1, panel_count, figsize=figsize, constrained_layout=True)
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
     raw_vmin, raw_vmax = _display_db_window(raw_sxx_db)
@@ -2216,8 +2386,21 @@ def plot_cpp_offline_validation_maps(
         raw_vmax,
         reference=raw_sxx_db,
     )
+    next_axis = 1
+    if raw_projected_mask_raw is not None:
+        _show_debug_panel(
+            axes[next_axis],
+            np.asarray(raw_projected_mask_raw, dtype=np.float32) > 0.5,
+            "C++ raw projected mask",
+            requested_display_transposed,
+            "gray",
+            0.0,
+            1.0,
+            reference=raw_sxx_db,
+        )
+        next_axis += 1
     _show_debug_panel(
-        axes[1],
+        axes[next_axis],
         final_mask_raw > 0.5,
         "C++ final mask",
         requested_display_transposed,
@@ -2227,7 +2410,7 @@ def plot_cpp_offline_validation_maps(
         reference=raw_sxx_db,
     )
     _show_debug_overlay(
-        axes[2],
+        axes[next_axis + 1],
         corrected_db_raw,
         final_mask_raw > 0.5,
         "C++ final overlay",
