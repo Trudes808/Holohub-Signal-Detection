@@ -186,7 +186,9 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<std::string> backend_mode_;
   holoscan::Parameter<bool> enable_mask_save_;
   holoscan::Parameter<bool> enable_tensor_snapshot_save_;
+  holoscan::Parameter<bool> save_reference_final_mask_only_;
   holoscan::Parameter<bool> save_reference_debug_artifacts_;
+  holoscan::Parameter<bool> stop_after_reference_final_mask_save_;
   holoscan::Parameter<bool> stop_after_debug_artifact_save_;
   holoscan::Parameter<int> save_every_n_frames_;
   holoscan::Parameter<int> max_masks_per_channel_;

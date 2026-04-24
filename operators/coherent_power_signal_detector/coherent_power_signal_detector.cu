@@ -6254,7 +6254,9 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(backend_mode_, "backend_mode", "Backend mode", "Detector backend mode: auto, fast_low_fidelity_mode, or reference.", std::string("auto"));
   spec.param(enable_mask_save_, "enable_mask_save", "Enable mask save", "Enable writing detector masks to disk for debug runs.", false);
   spec.param(enable_tensor_snapshot_save_, "enable_tensor_snapshot_save", "Enable tensor snapshot save", "Enable writing frozen detector input snapshots for offline parity runs.", false);
+  spec.param(save_reference_final_mask_only_, "save_reference_final_mask_only", "Save reference final mask only", "If true, saves the final mask from the live reference path without enabling merged-map debug artifacts.", false);
   spec.param(save_reference_debug_artifacts_, "save_reference_debug_artifacts", "Save reference debug artifacts", "If true, writes reference-path merged maps and projected raw masks to disk from the live operator.", false);
+  spec.param(stop_after_reference_final_mask_save_, "stop_after_reference_final_mask_save", "Stop after reference final mask save", "If true, interrupts the graph immediately after the first reference final-mask-only save.", false);
   spec.param(stop_after_debug_artifact_save_, "stop_after_debug_artifact_save", "Stop after debug artifact save", "If true, interrupts the graph immediately after the first reference debug bundle is written.", false);
   spec.param(save_every_n_frames_, "save_every_n_frames", "Save stride", "Save one detector mask every N frames per channel.", 1);
   spec.param(max_masks_per_channel_, "max_masks_per_channel", "Max masks per channel", "Maximum number of detector masks to save per channel for a run.", 5);
@@ -6373,7 +6375,7 @@ void CoherentPowerSignalDetector::initialize() {
     buffers.row_elements = reference_only_mode ? 0 : static_cast<size_t>(configured_rows);
     buffers.mask_elements = configured_elements;
 
-    if (enable_mask_save_.get()) {
+    if (enable_mask_save_.get() || save_reference_final_mask_only_.get()) {
       const auto host_mask_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.mask_host), configured_elements * sizeof(uint8_t));
       if (host_mask_result != cudaSuccess) {
         throw std::runtime_error(std::string("mask host buffer allocation failed: ") + cudaGetErrorString(host_mask_result));
@@ -6487,7 +6489,7 @@ void CoherentPowerSignalDetector::initialize() {
     }
   }
 
-  if (enable_mask_save_.get()) {
+  if (enable_mask_save_.get() || save_reference_final_mask_only_.get()) {
     std::filesystem::create_directories(output_dir_.get());
   }
   if (enable_tensor_snapshot_save_.get() || save_reference_debug_artifacts_.get()) {
@@ -6610,6 +6612,11 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   const bool should_save_mask = save_requested &&
                                 (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
                                 (masks_saved_[channel_number] < max_masks_per_channel_.get());
+  const bool should_save_reference_final_mask_only = save_reference_final_mask_only_.get() &&
+                                                     use_reference_backend &&
+                                                     (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
+                                                     (masks_saved_[channel_number] < max_masks_per_channel_.get());
+  const bool should_write_mask_image = should_save_mask || should_save_reference_final_mask_only;
   const bool should_save_tensor_snapshot = enable_tensor_snapshot_save_.get() && should_save_snapshot_bundle;
   const bool should_save_reference_debug_artifacts = save_reference_debug_artifacts_.get() &&
                                                      should_save_snapshot_bundle &&
@@ -6793,7 +6800,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   FastGpuMetadataSummary fast_summary;
   std::string coherent_backend_name = use_reference_backend ? "coherent_power_reference_v1" : "coherent_power_fast_low_fidelity_v1";
   std::string coherent_variant_name = use_reference_backend ? "frontend_chunked_grouped_box_mask_v1" : "frontend_local_fast_low_fidelity_mask_v1";
-  const bool materialize_reference_final_mask = should_save_mask || should_save_reference_debug_artifacts || timing_enabled;
+  const bool materialize_reference_final_mask = should_write_mask_image || should_save_reference_debug_artifacts || timing_enabled;
   const bool populate_reference_merged_maps = should_save_mask || should_save_reference_debug_artifacts;
   time_step_ms(kPipelineStage, [&] {
     if (use_reference_backend) {
@@ -7004,7 +7011,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
   auto maybe_save_debug_artifacts = [&] {
     std::string mask_path;
-    if (should_save_mask) {
+    if (should_write_mask_image) {
       std::vector<uint8_t> image;
       image.reserve(static_cast<size_t>(output_rows) * static_cast<size_t>(output_cols));
       if (use_reference_backend) {
@@ -7041,6 +7048,12 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                             channel_number,
                             frame_number,
                             mask_path);
+        }
+        if (should_save_reference_final_mask_only && stop_after_reference_final_mask_save_.get()) {
+          HOLOSCAN_LOG_INFO("Stopping graph after coherent reference final-mask-only save for channel {} frame {}",
+                            channel_number,
+                            frame_number);
+          GxfGraphInterrupt(context.context());
         }
       }
     }

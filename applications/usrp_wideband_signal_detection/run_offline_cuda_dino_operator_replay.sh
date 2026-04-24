@@ -209,15 +209,36 @@ if [[ ${docker_status} -ne 0 ]]; then
   exit ${docker_status}
 fi
 
-OUTPUT_DIR_FOR_VALIDATION="${output_dir}" python3 - <<'PY'
+OUTPUT_DIR_FOR_VALIDATION="${output_dir}" HOST_REPO_ROOT_FOR_VALIDATION="${HOST_REPO_ROOT}" python3 - <<'PY'
 import json
 import os
 import sys
 from pathlib import Path
 
 output_dir = Path(os.environ["OUTPUT_DIR_FOR_VALIDATION"]).resolve()
+host_repo_root = Path(os.environ["HOST_REPO_ROOT_FOR_VALIDATION"]).resolve()
 summary_path = output_dir / "offline_validation_summary.json"
 chunk_debug_summary_path = output_dir / "chunk_debug" / "chunk_debug_summary.json"
+
+
+def to_host_path(raw: str) -> Path:
+  path = Path(str(raw or ""))
+  text = str(path)
+  if not text:
+    return path
+  if text.startswith("/workspace/spectrograms/"):
+    return Path("/tmp/usrp_spectrograms") / text.removeprefix("/workspace/spectrograms/")
+  if text == "/workspace/spectrograms":
+    return Path("/tmp/usrp_spectrograms")
+  if text.startswith("/workspace/holohub/"):
+    return host_repo_root / text.removeprefix("/workspace/holohub/")
+  if text == "/workspace/holohub":
+    return host_repo_root
+  if text.startswith("/workspace/holohub-dev/"):
+    return host_repo_root / text.removeprefix("/workspace/holohub-dev/")
+  if text == "/workspace/holohub-dev":
+    return host_repo_root
+  return path
 
 failures = []
 if not summary_path.exists():
@@ -255,12 +276,12 @@ required_debug_artifacts = [
 ]
 
 for key in required_summary_artifacts:
-    path = Path(str(summary.get(key, "") or ""))
+    path = to_host_path(str(summary.get(key, "") or ""))
     if not path.exists():
         failures.append(f"missing summary artifact for {key}: {path}")
 
 for key in required_debug_artifacts:
-    path = Path(str(debug_summary.get(key, "") or ""))
+    path = to_host_path(str(debug_summary.get(key, "") or ""))
     if not path.exists():
         failures.append(f"missing debug artifact for {key}: {path}")
 
@@ -269,8 +290,8 @@ manifest = {
     "output_dir": str(output_dir),
     "summary_json": str(summary_path),
     "chunk_debug_summary_json": str(chunk_debug_summary_path),
-    "summary_artifacts": {key: str(summary.get(key, "")) for key in required_summary_artifacts},
-    "debug_artifacts": {key: str(debug_summary.get(key, "")) for key in required_debug_artifacts},
+    "summary_artifacts": {key: str(to_host_path(str(summary.get(key, "") or ""))) for key in required_summary_artifacts},
+    "debug_artifacts": {key: str(to_host_path(str(debug_summary.get(key, "") or ""))) for key in required_debug_artifacts},
 }
 manifest_path = output_dir / "cuda_artifact_manifest.json"
 manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
