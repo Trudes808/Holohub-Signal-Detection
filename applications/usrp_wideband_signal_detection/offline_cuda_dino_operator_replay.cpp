@@ -321,7 +321,9 @@ class OfflineCudaDinoOperatorReplayApp : public holoscan::Application {
         from_config("cuda_dino_detector"),
         Arg("channel_filter") = overrides_.channel_number,
         Arg("emit_stride") = 1,
-      Arg("debug_chunk_index") = overrides_.debug_chunk_index,
+        Arg("debug_mode") = true,
+        Arg("enable_debug_artifact_host_copy") = true,
+        Arg("debug_chunk_index") = overrides_.debug_chunk_index,
         Arg("debug_artifact_output_dir") = overrides_.output_dir);
 
     add_flow(replay, detector);

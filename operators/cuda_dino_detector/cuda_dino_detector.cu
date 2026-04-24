@@ -2789,6 +2789,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       runtime_config.imagenet_std = imagenet_std_.get();
       runtime_config.return_patch_features = true;
       runtime_config.return_final_mask_device = true;
+      runtime_config.compute_power_score = false;
       runtime_config.frontend_correction_enable = false;
 
       DinoTorchRuntimeBatchInput runtime_input;

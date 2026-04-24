@@ -135,7 +135,7 @@ if [[ -t 0 && -t 1 ]]; then
   docker_exec_flags=(-it)
 fi
 
-exec sudo docker exec "${docker_exec_flags[@]}" \
+sudo docker exec "${docker_exec_flags[@]}" \
   -e REPLAY_BIN="${container_replay_bin}" \
   -e REPLAY_NAME="${REPLAY_NAME}" \
   -e BUILD_APP_DIR="${BUILD_APP_DIR}" \
@@ -203,6 +203,11 @@ fi
 
 "${cmd[@]}"
 '
+
+docker_status=$?
+if [[ ${docker_status} -ne 0 ]]; then
+  exit ${docker_status}
+fi
 
 OUTPUT_DIR_FOR_VALIDATION="${output_dir}" python3 - <<'PY'
 import json
