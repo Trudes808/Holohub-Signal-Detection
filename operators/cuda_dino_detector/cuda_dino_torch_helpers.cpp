@@ -586,29 +586,43 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
     auto combined_input = keep_freq * (0.35 + 0.65 * residual_veto_gate);
     auto combined_score = normalize_map01_masked_minmax_torch_batch(combined_input, valid_mask);
 
-    std::vector<torch::Tensor> final_masks;
-    final_masks.reserve(static_cast<size_t>(batch_size));
+    std::vector<float> seed_freq_thresholds(static_cast<size_t>(batch_size), 1.0f);
+    std::vector<float> seed_res_thresholds(static_cast<size_t>(batch_size), 1.0f);
+    std::vector<float> combined_thresholds(static_cast<size_t>(batch_size), 1.0f);
     for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
       auto sample_valid = valid_mask[sample_index];
       auto active_freq = keep_freq[sample_index].masked_select(sample_valid);
       auto active_res = keep_res[sample_index].masked_select(sample_valid);
       auto active_combined = combined_score[sample_index].masked_select(sample_valid);
-      const float seed_freq_threshold = active_freq.numel() > 0 ? static_cast<float>(select_quantile_flat_batch_torch(active_freq.view({1, -1, 1}), 0.90).item<float>()) : 1.0f;
-      const float seed_res_threshold = active_res.numel() > 0 ? static_cast<float>(select_quantile_flat_batch_torch(active_res.view({1, -1, 1}), 0.82).item<float>()) : 1.0f;
-      const float combined_threshold = active_combined.numel() > 0 ? static_cast<float>(select_quantile_flat_batch_torch(active_combined.view({1, -1, 1}), 0.78).item<float>()) : 1.0f;
-      auto seed_mask = torch::logical_and(sample_valid,
-                                          torch::logical_and(keep_freq[sample_index] >= seed_freq_threshold,
-                                                             keep_res[sample_index] >= seed_res_threshold));
-      auto final_mask = torch::logical_and(seed_mask,
-                   torch::logical_and(sample_valid,
-                          combined_score[sample_index] >= static_cast<double>(combined_threshold) * 0.85));
-      auto closed_mask = binary_closing_rect_torch_batch(final_mask.unsqueeze(0), 7, 3);
-      auto filled_mask = binary_fill_holes_torch_batch(closed_mask);
-      auto filtered_mask = keep_large_components_torch_batch(filled_mask, min_component_size);
-      final_masks.push_back(filtered_mask.squeeze(0).to(torch::kFloat32));
+      seed_freq_thresholds[static_cast<size_t>(sample_index)] =
+          active_freq.numel() > 0 ? static_cast<float>(select_quantile_flat_batch_torch(active_freq.view({1, -1, 1}), 0.90).item<float>()) : 1.0f;
+      seed_res_thresholds[static_cast<size_t>(sample_index)] =
+          active_res.numel() > 0 ? static_cast<float>(select_quantile_flat_batch_torch(active_res.view({1, -1, 1}), 0.82).item<float>()) : 1.0f;
+      combined_thresholds[static_cast<size_t>(sample_index)] =
+          active_combined.numel() > 0 ? static_cast<float>(select_quantile_flat_batch_torch(active_combined.view({1, -1, 1}), 0.78).item<float>()) : 1.0f;
     }
 
-    auto final_mask_batch = torch::stack(final_masks, 0).contiguous();
+    auto threshold_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto seed_freq_threshold_tensor = torch::from_blob(seed_freq_thresholds.data(), {static_cast<int64_t>(batch_size), 1, 1}, threshold_options)
+                                          .clone()
+                                          .to(compute_device, keep_freq.scalar_type());
+    auto seed_res_threshold_tensor = torch::from_blob(seed_res_thresholds.data(), {static_cast<int64_t>(batch_size), 1, 1}, threshold_options)
+                                         .clone()
+                                         .to(compute_device, keep_res.scalar_type());
+    auto combined_threshold_tensor = torch::from_blob(combined_thresholds.data(), {static_cast<int64_t>(batch_size), 1, 1}, threshold_options)
+                                        .clone()
+                                        .to(compute_device, combined_score.scalar_type());
+
+    auto seed_mask_batch = torch::logical_and(valid_mask,
+                                              torch::logical_and(keep_freq >= seed_freq_threshold_tensor,
+                                                                 keep_res >= seed_res_threshold_tensor));
+    auto final_mask_batch = torch::logical_and(seed_mask_batch,
+                                               torch::logical_and(valid_mask,
+                                                                  combined_score >= combined_threshold_tensor * 0.85));
+    final_mask_batch = binary_closing_rect_torch_batch(final_mask_batch, 7, 3);
+    final_mask_batch = binary_fill_holes_torch_batch(final_mask_batch);
+    final_mask_batch = keep_large_components_torch_batch(final_mask_batch, min_component_size);
+    final_mask_batch = final_mask_batch.to(torch::kFloat32).contiguous();
     final_mask_batch = torch::where(valid_mask, final_mask_batch, torch::zeros_like(final_mask_batch));
 
     const bool combined_ok = cudaMemcpyAsync(output_combined_score_device,
