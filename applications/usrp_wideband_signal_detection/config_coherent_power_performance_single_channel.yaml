@@ -44,20 +44,6 @@ advanced_network:
           - local
         num_bufs: 131072
         buf_size: 4096
-      - name: "CH2_CHDR_Headers_RX_CPU"
-        kind: "huge"
-        affinity: 0
-        access:
-          - local
-        num_bufs: 131072
-        buf_size: 64
-      - name: "CH2_Data_RX_GPU"
-        kind: "device"
-        affinity: 0
-        access:
-          - local
-        num_bufs: 131072
-        buf_size: 4096
 
     interfaces:
       - name: sdr_data
@@ -73,14 +59,6 @@ advanced_network:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
                 - "CH1_Data_RX_GPU"
-            - name: "Channel 2 data"
-              id: 1
-              cpu_core: 11
-              batch_size: 1024
-              memory_regions:
-                - "Headers_RX_CPU"
-                - "CH2_CHDR_Headers_RX_CPU"
-                - "CH2_Data_RX_GPU"
 
           flows:
             - name: "Channel 1 data packets"
@@ -91,14 +69,6 @@ advanced_network:
               match:
                 udp_src: 49153
                 udp_dst: 1234
-            - name: "Channel 2 data packets"
-              id: 1
-              action:
-                type: queue
-                id: 1
-              match:
-                udp_src: 49153
-                udp_dst: 1235
 
 chdr_converter:
   interface_name: sdr_data
@@ -106,14 +76,14 @@ chdr_converter:
   num_packets_per_fft: 20
   num_ffts_per_batch: 512
   num_simul_batches: 4
-  num_channels: 2
+  num_channels: 1
   log_packets: false
   log_data: false
 
 fft:
   burst_size: 20480
   num_bursts: 512
-  num_channels: 2
+  num_channels: 1
   spectrum_type: 1
   averaging_type: 1
   window_time: 0
@@ -133,14 +103,14 @@ fft:
   window_time_delta: 0
 
 logger:
-  num_channels: 2
+  num_channels: 1
   log_interval: 5
 
 visualization:
   enable: false
 
 spectrogram:
-  num_channels: 2
+  num_channels: 1
   enable_save: false
   enable_tensor_save: false
   save_every_n_frames: 100
@@ -150,7 +120,7 @@ spectrogram:
   output_dir: "/workspace/spectrograms"
 
 dinov3_signal_detector:
-  num_channels: 2
+  num_channels: 1
   input_height: 256
   input_width: 512
   patch_size: 16
@@ -206,12 +176,15 @@ dinov3_signal_detector:
   timing_summary_window: 64
 
 coherent_power_signal_detector:
-  num_channels: 2
+  num_channels: 1
   input_height: 250
   input_width: 20480
-  emit_stride: 4
+  # Full-rate aggressive profile matching the active two-channel fast path,
+  # restricted to channel 0 only.
+  emit_stride: 1
   log_detections: false
   fast_performance: true
+  save_performance_path_artifacts: false
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0
@@ -231,7 +204,7 @@ coherent_power_signal_detector:
   power_assist_mode: "absolute_direct"
   coherence_source_mode: "power_assist"
   score_threshold_mode: "fixed"
-  fixed_score_threshold: 0.2
+  fixed_score_threshold: 0.4
   coherence_power_support_q: 0.82
   coherence_power_q: 0.92
   min_component_size: 1
