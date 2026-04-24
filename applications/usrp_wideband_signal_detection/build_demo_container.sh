@@ -96,6 +96,8 @@ fi
 
 mkdir -p "${SPECTROGRAM_HOST_DIR}" "${DINO_MASK_HOST_DIR}" "${COHERENT_SNAPSHOT_HOST_DIR}" "${COHERENT_MASK_HOST_DIR}"
 
+echo "Using repo checkout: ${REPO_ROOT}"
+
 if [[ "${SKIP_IMAGE_BUILD}" != "1" ]]; then
 	sudo ./holohub build-container "${APP_NAME}" --docker-file "${DOCKER_FILE}" --img "${IMAGE_NAME}" "$@"
 fi
@@ -150,6 +152,7 @@ DOCKER_RUN_CMD+=(
 "${DOCKER_RUN_CMD[@]}" >/dev/null
 
 echo "Started container ${CONTAINER_NAME} from image ${IMAGE_NAME}."
+echo "Mounted host repo: ${REPO_ROOT} -> /workspace/holohub"
 echo "Host spectrogram output: ${SPECTROGRAM_HOST_DIR}"
 echo "Host DINO mask output: ${DINO_MASK_HOST_DIR}"
 echo "Host coherent snapshot output: ${COHERENT_SNAPSHOT_HOST_DIR}"

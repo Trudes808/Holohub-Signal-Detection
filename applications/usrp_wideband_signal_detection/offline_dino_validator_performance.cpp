@@ -120,6 +120,8 @@ struct MaskComparison {
 
 struct HybridPostprocessResult {
   std::vector<uint8_t> mask;
+  std::vector<uint8_t> filled_mask;
+  std::vector<uint8_t> component_filtered_mask;
   std::vector<float> combined_score;
   float seed_freq_threshold = 1.0f;
   float seed_res_threshold = 1.0f;
@@ -258,6 +260,10 @@ struct ChunkRetryResult {
   std::vector<float> coherence_gate;
   std::vector<float> hybrid_contrib;
   std::vector<uint8_t> valid_mask;
+  std::vector<uint8_t> hybrid_filled_mask;
+  std::vector<uint8_t> hybrid_filled_mask_source;
+  std::vector<uint8_t> hybrid_component_filtered_mask;
+  std::vector<uint8_t> hybrid_component_filtered_mask_source;
   std::vector<uint8_t> final_mask;
   std::vector<uint8_t> final_mask_source;
   std::vector<uint8_t> grouped_mask;
@@ -2453,10 +2459,12 @@ HybridPostprocessResult run_residual_veto_hybrid_gpu(const std::vector<float>& h
 
     final_mask_vector = binary_closing_rect(final_mask_vector, rows, cols, 7, 3);
     final_mask_vector = binary_fill_holes(final_mask_vector, rows, cols);
+    result.filled_mask = final_mask_vector;
     for (size_t index = 0; index < final_mask_vector.size(); ++index) {
       final_mask_vector[index] = (final_mask_vector[index] && valid_mask[index]) ? 1 : 0;
     }
     final_mask_vector = keep_large_components(final_mask_vector, rows, cols, 24, &result.component_count);
+    result.component_filtered_mask = final_mask_vector;
     result.final_fraction = mean_mask_value(final_mask_vector);
     result.connected_fraction = connected_fraction(final_mask_vector, valid_mask);
     result.mask = std::move(final_mask_vector);
@@ -4748,10 +4756,12 @@ HybridPostprocessResult run_residual_veto_hybrid(const std::vector<float>& hybri
 
   final_mask = binary_closing_rect(final_mask, rows, cols, 7, 3);
   final_mask = binary_fill_holes(final_mask, rows, cols);
+  result.filled_mask = final_mask;
   for (size_t index = 0; index < final_mask.size(); ++index) {
     final_mask[index] = (final_mask[index] && valid_mask[index]) ? 1 : 0;
   }
   final_mask = keep_large_components(final_mask, rows, cols, 24, &result.component_count);
+  result.component_filtered_mask = final_mask;
   result.final_fraction = mean_mask_value(final_mask);
   result.connected_fraction = connected_fraction(final_mask, valid_mask);
   result.mask = std::move(final_mask);
@@ -5478,6 +5488,18 @@ ChunkRetryResult finalize_retry_chunk_postprocess(const ValidatorConfig& config,
   result.final_fraction = hybrid_result_source.final_fraction;
   result.connected_fraction = hybrid_result_source.connected_fraction;
   result.component_count = hybrid_result_source.component_count;
+  result.hybrid_filled_mask_source = hybrid_result_source.filled_mask;
+  result.hybrid_filled_mask = resize_mask_nearest(hybrid_result_source.filled_mask,
+                                                  result.src_rows,
+                                                  result.src_cols,
+                                                  result.dst_rows,
+                                                  result.dst_cols);
+  result.hybrid_component_filtered_mask_source = hybrid_result_source.component_filtered_mask;
+  result.hybrid_component_filtered_mask = resize_mask_nearest(hybrid_result_source.component_filtered_mask,
+                                                              result.src_rows,
+                                                              result.src_cols,
+                                                              result.dst_rows,
+                                                              result.dst_cols);
   result.final_mask_source = hybrid_result_source.mask;
   result.final_mask = resize_mask_nearest(hybrid_result_source.mask,
                                           result.src_rows,
@@ -6247,6 +6269,8 @@ int main(int argc, char** argv) {
       const auto debug_coherence_gate_path = chunk_debug_dir / "chunk_coherence_gate.npy";
       const auto debug_hybrid_contrib_path = chunk_debug_dir / "chunk_hybrid_contrib.npy";
       const auto debug_combined_score_path = chunk_debug_dir / "chunk_combined_score.npy";
+      const auto debug_hybrid_filled_mask_path = chunk_debug_dir / "chunk_hybrid_filled_mask.npy";
+      const auto debug_hybrid_component_filtered_mask_path = chunk_debug_dir / "chunk_hybrid_component_filtered_mask.npy";
       const auto debug_grouped_seed_score_path = chunk_debug_dir / "chunk_grouped_seed_score.npy";
       const auto debug_grouped_seed_persistence_path = chunk_debug_dir / "chunk_grouped_seed_persistence.npy";
       const auto debug_grouped_seed_contrast_path = chunk_debug_dir / "chunk_grouped_seed_contrast.npy";
@@ -6507,6 +6531,8 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"coherence_gate_npy\": \"" << json_escape(debug_coherence_gate_path.string()) << "\",\n";
       debug_summary_out << "  \"hybrid_contrib_npy\": \"" << json_escape(debug_hybrid_contrib_path.string()) << "\",\n";
       debug_summary_out << "  \"combined_score_npy\": \"" << json_escape(debug_combined_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"hybrid_filled_mask_npy\": \"" << json_escape(debug_hybrid_filled_mask_path.string()) << "\",\n";
+      debug_summary_out << "  \"hybrid_component_filtered_mask_npy\": \"" << json_escape(debug_hybrid_component_filtered_mask_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_score_npy\": \"" << json_escape(debug_grouped_seed_score_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_persistence_npy\": \"" << json_escape(debug_grouped_seed_persistence_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_contrast_npy\": \"" << json_escape(debug_grouped_seed_contrast_path.string()) << "\",\n";
@@ -6698,6 +6724,8 @@ int main(int argc, char** argv) {
       const auto debug_coherence_gate_path = chunk_debug_dir / "chunk_coherence_gate.npy";
       const auto debug_hybrid_contrib_path = chunk_debug_dir / "chunk_hybrid_contrib.npy";
       const auto debug_combined_score_path = chunk_debug_dir / "chunk_combined_score.npy";
+      const auto debug_hybrid_filled_mask_path = chunk_debug_dir / "chunk_hybrid_filled_mask.npy";
+      const auto debug_hybrid_component_filtered_mask_path = chunk_debug_dir / "chunk_hybrid_component_filtered_mask.npy";
       const auto debug_grouped_seed_score_path = chunk_debug_dir / "chunk_grouped_seed_score.npy";
       const auto debug_grouped_seed_persistence_path = chunk_debug_dir / "chunk_grouped_seed_persistence.npy";
       const auto debug_grouped_seed_contrast_path = chunk_debug_dir / "chunk_grouped_seed_contrast.npy";
@@ -6882,6 +6910,26 @@ int main(int argc, char** argv) {
                 mask_to_u8(stitched_debug_chunk.grouped_mask),
                 stitched_debug_chunk.dst_cols,
                 stitched_debug_chunk.dst_rows);
+      std::vector<float> debug_hybrid_filled_mask_float(stitched_debug_chunk.hybrid_filled_mask.size(), 0.0f);
+      for (size_t index = 0; index < stitched_debug_chunk.hybrid_filled_mask.size(); ++index) {
+        debug_hybrid_filled_mask_float[index] = stitched_debug_chunk.hybrid_filled_mask[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_hybrid_filled_mask_path,
+                   debug_hybrid_filled_mask_float.data(),
+                   debug_hybrid_filled_mask_float.size() * sizeof(float),
+                   stitched_debug_chunk.dst_rows,
+                   stitched_debug_chunk.dst_cols,
+                   "<f4");
+      std::vector<float> debug_hybrid_component_filtered_mask_float(stitched_debug_chunk.hybrid_component_filtered_mask.size(), 0.0f);
+      for (size_t index = 0; index < stitched_debug_chunk.hybrid_component_filtered_mask.size(); ++index) {
+        debug_hybrid_component_filtered_mask_float[index] = stitched_debug_chunk.hybrid_component_filtered_mask[index] ? 1.0f : 0.0f;
+      }
+      write_npy_2d(debug_hybrid_component_filtered_mask_path,
+                   debug_hybrid_component_filtered_mask_float.data(),
+                   debug_hybrid_component_filtered_mask_float.size() * sizeof(float),
+                   stitched_debug_chunk.dst_rows,
+                   stitched_debug_chunk.dst_cols,
+                   "<f4");
       std::vector<float> debug_final_mask_float(stitched_debug_chunk.final_mask.size(), 0.0f);
       for (size_t index = 0; index < stitched_debug_chunk.final_mask.size(); ++index) {
         debug_final_mask_float[index] = stitched_debug_chunk.final_mask[index] ? 1.0f : 0.0f;
@@ -7012,6 +7060,8 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"coherence_gate_npy\": \"" << json_escape(debug_coherence_gate_path.string()) << "\",\n";
       debug_summary_out << "  \"hybrid_contrib_npy\": \"" << json_escape(debug_hybrid_contrib_path.string()) << "\",\n";
       debug_summary_out << "  \"combined_score_npy\": \"" << json_escape(debug_combined_score_path.string()) << "\",\n";
+      debug_summary_out << "  \"hybrid_filled_mask_npy\": \"" << json_escape(debug_hybrid_filled_mask_path.string()) << "\",\n";
+      debug_summary_out << "  \"hybrid_component_filtered_mask_npy\": \"" << json_escape(debug_hybrid_component_filtered_mask_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_score_npy\": \"" << json_escape(debug_grouped_seed_score_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_persistence_npy\": \"" << json_escape(debug_grouped_seed_persistence_path.string()) << "\",\n";
       debug_summary_out << "  \"grouped_seed_contrast_npy\": \"" << json_escape(debug_grouped_seed_contrast_path.string()) << "\",\n";

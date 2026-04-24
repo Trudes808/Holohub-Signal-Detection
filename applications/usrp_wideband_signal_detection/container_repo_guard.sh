@@ -50,4 +50,6 @@ ensure_container_repo_mount_matches() {
     echo "Recreate it with ./build_demo_container.sh from ${expected_mount_root}." >&2
     exit 1
   fi
+
+  echo "Container ${container_name} mount verified: ${actual_mount_root} -> /workspace/holohub"
 }
