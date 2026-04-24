@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CONTAINER_NAME=${CONTAINER_NAME:-usrp_x410_signal_detection_demo}
 BUILD_APP_DIR=${BUILD_APP_DIR:-/workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection}
-CONFIG_NAME=${CONFIG_NAME:-config_torchscript_validation_single_channel.yaml}
+CONFIG_NAME=${CONFIG_NAME:-old_configs/config_torchscript_validation_single_channel.yaml}
 
 "${SCRIPT_DIR}/run_demo_container.sh"
 

@@ -15,7 +15,7 @@ constexpr const char* kHostMountedSpectrogramDir = "/workspace/spectrograms";
 constexpr const char* kHostMountedMaskDir = "/workspace/dino_masks";
 
 struct OfflineReplayOverrides {
-  std::string config_path = "config_offline_replay.yaml";
+  std::string config_path = "old_configs/config_offline_replay.yaml";
   std::string offline_dir;
   std::string mask_dir = kHostMountedMaskDir;
   std::string screenshot_path;

@@ -104,7 +104,7 @@ chdr_converter:
   interface_name: sdr_data
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 250
+  num_ffts_per_batch: 512
   num_simul_batches: 4
   num_channels: 2
   log_packets: false
@@ -112,16 +112,21 @@ chdr_converter:
 
 fft:
   burst_size: 20480
-  num_bursts: 250
+  num_bursts: 512
   num_channels: 2
   spectrum_type: 1
   averaging_type: 1
   window_time: 0
   window_type: 0
+  # FFT length in bins. For this path it should stay aligned with burst_size.
   transform_points: 20480
+  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
   window_points: 20480
-  resolution: 1250
-  span: 128000000
+  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
+  resolution: 24414
+  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
+  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
+  span: 500000000
   weighting_factor: 0
   f1_index: -10240
   f2_index: 10239
@@ -137,6 +142,7 @@ visualization:
 spectrogram:
   num_channels: 2
   enable_save: false
+  enable_tensor_save: false
   save_every_n_frames: 100
   max_images_per_channel: 0
   output_height: 256
@@ -201,11 +207,11 @@ dinov3_signal_detector:
 
 coherent_power_signal_detector:
   num_channels: 2
-  input_height: 256
-  input_width: 512
+  input_height: 250
+  input_width: 20480
   emit_stride: 1
   log_detections: true
-  backend_mode: "reference"
+  fast_performance: false
   enable_mask_save: true
   save_every_n_frames: 100
   max_masks_per_channel: 4
@@ -214,17 +220,28 @@ coherent_power_signal_detector:
   chunk_overlap_hz: 6250000.0
   uncalibrated_chunk_fraction: 0.40
   uncalibrated_overlap_fraction: 0.20
-  ignore_sideband_percent: 0.0
-  ignore_sideband_hz: 7000000.0
+  ignore_sideband_percent: 10.0
+  ignore_sideband_hz: 0.0
   frontend_row_q: 25.0
   frontend_reference_q: 75.0
   frontend_smooth_sigma: 12.0
   frontend_max_boost_db: 12.0
   coherence_weight: 0.55
   power_weight: 0.45
+  power_assist_mode: "hybrid"
+  power_floor_time_q: 25.0
+  power_floor_global_q: 30.0
+  power_excess_start_db: 3.0
+  power_excess_full_db: 15.0
+  power_local_blend: 0.25
+  coherence_gate_start: 0.15
+  coherence_gate_full: 0.45
+  coherence_bridge_bias: 0.05
+  coherence_power_joint_weight: 0.70
   coherence_power_support_q: 0.82
   coherence_power_q: 0.92
   min_component_size: 6
+  filter_detection_mask: true
   grouping_seed_score_q: 0.72
   grouping_bridge_freq_px: 33
   grouping_bridge_time_px: 5
@@ -232,6 +249,7 @@ coherent_power_signal_detector:
   grouping_min_freq_span_px: 18
   grouping_min_time_span_px: 2
   grouping_min_density: 0.06
+  grouping_time_continuity_ratio: 0.85
   timing_summary_enable: true
   timing_summary_every_n: 32
   timing_summary_window: 32

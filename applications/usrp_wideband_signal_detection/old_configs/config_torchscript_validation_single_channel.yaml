@@ -1,0 +1,261 @@
+# SPDX-FileCopyrightText: 2026 National Instruments Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+num_runs: -1
+
+pipeline:
+  enable_spectrogram: true
+  enable_detector: true
+  detector_type: "dinov3"
+  log_from_spectrogram: false
+
+scheduler:
+  worker_thread_number: 4
+  stop_on_deadlock: true
+  stop_on_deadlock_timeout: 500
+
+advanced_network:
+  cfg:
+    version: 1
+    manager: "dpdk"
+    master_core: 9
+    debug: false
+    log_level: "info"
+
+    memory_regions:
+      - name: "Headers_RX_CPU"
+        kind: "huge"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 51200
+        buf_size: 42
+      - name: "CH1_CHDR_Headers_RX_CPU"
+        kind: "huge"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 51200
+        buf_size: 64
+      - name: "CH1_Data_RX_GPU"
+        kind: "device"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 25000
+        buf_size: 4096
+      - name: "CH2_CHDR_Headers_RX_CPU"
+        kind: "huge"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 51200
+        buf_size: 64
+      - name: "CH2_Data_RX_GPU"
+        kind: "device"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 25000
+        buf_size: 4096
+
+    interfaces:
+      - name: sdr_data
+        address: 0000:a2:00.1
+        rx:
+          flow_isolation: true
+          queues:
+            - name: "Channel 1 data"
+              id: 0
+              cpu_core: 10
+              batch_size: 5000
+              memory_regions:
+                - "Headers_RX_CPU"
+                - "CH1_CHDR_Headers_RX_CPU"
+                - "CH1_Data_RX_GPU"
+            - name: "Channel 2 data"
+              id: 1
+              cpu_core: 11
+              batch_size: 5000
+              memory_regions:
+                - "Headers_RX_CPU"
+                - "CH2_CHDR_Headers_RX_CPU"
+                - "CH2_Data_RX_GPU"
+
+          flows:
+            - name: "Channel 1 data packets"
+              id: 0
+              action:
+                type: queue
+                id: 0
+              match:
+                udp_src: 49153
+                udp_dst: 1234
+            - name: "Channel 2 data packets"
+              id: 1
+              action:
+                type: queue
+                id: 1
+              match:
+                udp_src: 49153
+                udp_dst: 1235
+
+chdr_converter:
+  interface_name: sdr_data
+  num_complex_samples_per_packet: 1024
+  num_packets_per_fft: 20
+  num_ffts_per_batch: 250
+  num_simul_batches: 1
+  num_channels: 2
+  log_packets: false
+  log_data: false
+
+fft:
+  burst_size: 20480
+  num_bursts: 250
+  num_channels: 2
+  spectrum_type: 1
+  averaging_type: 1
+  window_time: 0
+  window_type: 0
+  # FFT length in bins. For this path it should stay aligned with burst_size.
+  transform_points: 20480
+  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
+  window_points: 20480
+  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
+  resolution: 24414
+  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
+  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
+  span: 500000000
+  weighting_factor: 0
+  f1_index: -10240
+  f2_index: 10239
+  window_time_delta: 0
+
+logger:
+  num_channels: 2
+  log_interval: 1
+
+visualization:
+  enable: false
+  renderer:
+    num_channels: 2
+    history_frames: 5
+    output_height: 256
+    output_width: 512
+    channel_filter: -1
+    tensor_name: "spectrogram"
+    blue_limit: 0.10
+    red_limit: 0.92
+    overlay_alpha: 0.38
+    center_frequency_hz: 0.0
+    fft_size: 20480
+    dino_chunk_rows: 256
+    dino_chunk_cols: 512
+  holoviz:
+    width: 1280
+    height: 720
+    window_title: "USRP Wideband Spectrogram"
+    fullscreen: false
+
+spectrogram:
+  num_channels: 2
+  enable_save: true
+  save_every_n_frames: 1
+  max_images_per_channel: 5
+  output_height: 256
+  output_width: 512
+  output_dir: "/workspace/spectrograms"
+
+dinov3_signal_detector:
+  num_channels: 2
+  input_height: 256
+  input_width: 512
+  patch_size: 16
+  emit_stride: 1
+  mask_threshold_db: -20.0
+  log_detections: true
+  backend_mode: "reference"
+  enable_mask_save: true
+  save_every_n_frames: 1
+  max_masks_per_channel: 5
+  output_dir: "/workspace/dino_masks"
+  use_pytorch_backend: true
+  inference_backend: "torchscript"
+  model_name: "dinov3_vitb16"
+  model_repo_path: "/workspace/models/dinov3"
+  weights_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
+  model_script_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"
+  torchscript_init_mode: "load_cuda_eval"
+  strict_model_forward: true
+  imagenet_mean: [0.485, 0.456, 0.406]
+  imagenet_std: [0.229, 0.224, 0.225]
+  fft_size: 20480
+  noverlap: 256
+  ignore_sideband_hz: 7000000.0
+  frontend_correction_enable: true
+  frontend_correction_row_q: 25.0
+  frontend_correction_smooth_sigma: 12.0
+  frontend_correction_reference_q: 75.0
+  frontend_correction_max_boost_db: 12.0
+  frontend_correction_soft_knee_db: 4.0
+  frontend_correction_edge_taper_fraction: 0.10
+  frontend_correction_edge_taper_sigma: 6.0
+  frontend_correction_edge_target_drop_db: 2.5
+  frontend_edge_guard_floor: 0.35
+  dino_coherence_gate_floor: 0.25
+  texture_q: 0.90
+  texture_k: 6
+  power_q: 0.90
+  dino_group_k: 8
+  dino_group_spatial_weight: 0.35
+  dino_group_score_q: 0.60
+  pipeline_final_threshold: 0.20
+  pipeline_final_threshold_no_speckle: 0.10
+  pipeline_gap_floor: 0.10
+  pipeline_component_min_size: 5
+  pipeline_component_min_size_no_speckle: 2
+  pipeline_power_rescue_floor: 0.10
+  pipeline_power_rescue_gain: 2.0
+  pipeline_strong_speckle_min_component: 10
+  pipeline_texture_speckle_clean_threshold: 0.85
+  pipeline_texture_speckle_strong_threshold: 0.20
+  timing_summary_enable: true
+  timing_summary_every_n: 1
+  timing_summary_window: 1
+
+coherent_power_signal_detector:
+  num_channels: 1
+  input_height: 256
+  input_width: 512
+  emit_stride: 1
+  log_detections: false
+  enable_mask_save: true
+  save_every_n_frames: 1
+  max_masks_per_channel: 5
+  output_dir: "/workspace/coherent_power_masks"
+  chunk_bandwidth_hz: 25000000.0
+  chunk_overlap_hz: 6250000.0
+  uncalibrated_chunk_fraction: 0.40
+  uncalibrated_overlap_fraction: 0.20
+  ignore_sideband_percent: 0.0
+  ignore_sideband_hz: 7000000.0
+  frontend_row_q: 25.0
+  frontend_reference_q: 75.0
+  frontend_smooth_sigma: 12.0
+  frontend_max_boost_db: 12.0
+  coherence_weight: 0.55
+  power_weight: 0.45
+  coherence_power_support_q: 0.82
+  coherence_power_q: 0.92
+  min_component_size: 6
+  grouping_seed_score_q: 0.72
+  grouping_bridge_freq_px: 33
+  grouping_bridge_time_px: 5
+  grouping_min_component_size: 24
+  grouping_min_freq_span_px: 18
+  grouping_min_time_span_px: 2
+  grouping_min_density: 0.06
+  timing_summary_enable: true
+  timing_summary_every_n: 1
+  timing_summary_window: 1

@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <vector>
 #include <matx.h>
 #include "holoscan/holoscan.hpp"
 
@@ -21,10 +23,20 @@ class FFT : public Operator {
      void initialize() override;
      void setup(OperatorSpec& spec) override;
      void compute(InputContext& input, OutputContext& output, ExecutionContext& context) override;
+     void stop() override;
 
  private:
+     struct ChannelIngressStats {
+         uint64_t samples = 0;
+         double total_chdr_to_fft_ms = 0.0;
+         double max_chdr_to_fft_ms = 0.0;
+     };
+
      tensor_t<complex, 3> outputs;
+     std::vector<ChannelIngressStats> ingress_stats;
+     std::vector<uint64_t> output_frame_count;
      Parameter<int> burst_size;
+     Parameter<int> emit_stride;
      Parameter<int> num_bursts;
      Parameter<uint16_t> num_channels;
      Parameter<uint8_t> spectrum_type;

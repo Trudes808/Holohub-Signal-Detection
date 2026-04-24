@@ -28,6 +28,15 @@ Current backend summary:
 - live coherent-power runs no longer default to the full host reference path when mask saving is disabled
 - performance tuning is now focused on GPU-side grouping/parity work rather than the entire detector hot path
 
+Latest validation/debug progress as of 2026-04-14:
+
+- FFT metadata now derives `span` and `resolution` from live metadata instead of stale config defaults, which fixed the earlier bad notebook-side sideband interpretation.
+- coherent debug snapshots now save canonical frequency-by-time tensors plus sidecar metadata that includes `tensor_axis_order`, `sample_rate_hz`, `span_hz`, original input shape, and the detector config used for the frame.
+- the offline validator now reads and reports the new snapshot metadata fields, and the coherent validation notebook now prefers sidecar `sample_rate_hz` and `span_hz` over fallback reconstruction.
+- fresh debug-capture artifacts were successfully written on host for both channels under `/tmp/coherent_power_snapshots` and `/tmp/coherent_power_masks`, including tensor snapshots, power-dB snapshots, masks, and JSON sidecars.
+- notebook replay against the new channel-0 snapshot is now working cleanly and is considered a good functional validation milestone for the reference path.
+- one follow-up semantic question remains open: the new sidecar is self-consistent at `128e6` span/sample-rate for the coherent stage, but we still need to decide whether and how the original `500e6` source rate should be propagated or represented in downstream metadata.
+
 Latest runtime evidence after the fast GPU backend landed:
 
 - coherent live runs now show a clear improvement over the earlier host-heavy path: the run can recover after a few startup `Fell behind in processing on GPU!` errors and then sustain several seconds in the roughly 337-409 MSps/channel range
@@ -58,7 +67,7 @@ Primary algorithm source:
 Primary app integration points:
 
 - `applications/usrp_wideband_signal_detection/main.cpp`
-- `applications/usrp_wideband_signal_detection/config.yaml`
+- `applications/usrp_wideband_signal_detection/old_configs/config.yaml`
 - `applications/usrp_wideband_signal_detection/config_*.yaml`
 - `applications/usrp_wideband_signal_detection/CMakeLists.txt`
 - `applications/usrp_wideband_signal_detection/README.md`
@@ -76,7 +85,14 @@ Primary operator reference implementation to mirror structurally:
 The current implementation now has two coherent detector variants that must be evaluated differently:
 
 - `backend_mode: "reference"` is the notebook-faithful path and should be verified for algorithmic parity against `run_coherent_power_pipeline(...)` in `coherant_power_signal_detection_helpers.py`
-- `backend_mode: "fast_gpu"` is the realtime path and should be verified for operational usefulness, stability, and broad detection agreement rather than exact numeric parity with the notebook
+- `backend_mode: "fast_low_fidelity_mode"` is the realtime path and should be verified for operational usefulness, stability, and broad detection agreement rather than exact numeric parity with the notebook
+
+Current verification state as of 2026-04-14:
+
+- reference-backend frozen-snapshot replay is now in good shape on the notebook side
+- the snapshot capture path has been validated end-to-end with real artifacts from a new debug run
+- the remaining reference-path task is to complete the offline C++ validator replay on the same fresh snapshot and record the final notebook-vs-validator parity summary
+- the remaining realtime-path task is to rerun the coherent performance profile and confirm current throughput after the latest metadata/orientation/runtime fixes
 
 ### What Should Match The Notebook
 
@@ -105,7 +121,7 @@ These differences are expected today and should not be treated as bugs unless we
 - the fast GPU backend is not notebook-faithful:
   - it does not run chunk planning, chunk-local notebook grouping, merged global grouping, or final box rasterization
   - it uses a simplified local score path built from frontend correction, directional local means, local background subtraction, thresholding, and mask cleanup
-  - it emits `coherent_power_fast_gpu_v1` metadata and is intended to trade exact parity for sustained realtime throughput
+  - it emits `coherent_power_fast_low_fidelity_v1` metadata and is intended to trade exact parity for sustained realtime throughput
 - the fast frontend reference calculation is approximate:
   - the fast path uses a device-side approximation for the frontend reference level instead of the notebook's exact percentile over the smoothed row response
 - some notebook diagnostics are intentionally absent from the runtime operator:
@@ -121,6 +137,7 @@ These differences are expected today and should not be treated as bugs unless we
 1. Reference-backend parity on offline captures
    - Run `config_coherent_power_validation.yaml` with `backend_mode: "reference"` on fixed saved inputs used by the notebook.
    - Compare final masks, grouped box counts, `ignore_bins_per_side`, `merged_threshold`, and `seed_threshold` against notebook outputs.
+  - Status 2026-04-14: partially complete. Fresh frozen snapshots and notebook replay are working; offline C++ validator parity still needs one completed replay run on the new artifact set.
 
 2. Intermediate-stage parity checks
    - Add or reuse offline harness outputs so the reference backend can be compared against notebook intermediates for:
@@ -135,8 +152,9 @@ These differences are expected today and should not be treated as bugs unless we
    - Require semantic agreement on final mask and grouped boxes, with only small tolerance for threshold drift due to Python vs C++ numerics and implementation details.
 
 4. Fast-backend usefulness validation
-   - Compare `backend_mode: "fast_gpu"` against the notebook/reference backend on the same fixed captures.
+  - Compare `backend_mode: "fast_low_fidelity_mode"` against the notebook/reference backend on the same fixed captures.
    - Verify that strong signals are still detected, false negatives remain acceptable, and mask morphology remains usable for the downstream task even though exact box parity is not expected.
+  - Status 2026-04-14: config review complete. `config_coherent_power_performance.yaml` is confirmed to point at the current coherent fast-GPU path and to retain the latest coherent thresholds/grouping settings while using throughput-oriented knobs (`emit_stride: 4`, no artifact saves, reduced batching).
 
 5. Realtime acceptance validation
    - Continue using `config_coherent_power_performance.yaml` for sustained-rate checks.
@@ -150,6 +168,114 @@ These differences are expected today and should not be treated as bugs unless we
 7. Outstanding parity gap review
    - Decide whether `grouping_time_continuity_ratio` and notebook reject-reason diagnostics need to be surfaced in the operator.
    - Decide whether the fast path must ever emit notebook-style grouped boxes, or whether its current mask-only contract is sufficient for realtime use.
+
+## Remaining 4/14 Follow-Ups
+
+1. Complete offline validator parity on the fresh debug snapshot
+  - Run `offline_coherent_power_validator` inside the demo container against `/tmp/coherent_power_snapshots/coherent_power_snapshot_ch0_f1_1776216376855_20480x250.json`.
+  - Rerun the coherent validation notebook comparison cell against the generated `offline_validation_summary.json` and record the final corrected-spectrogram and mask agreement numbers.
+
+2. Verify current throughput with the latest coherent fast path
+  - Rebuild/sync the runtime app using `rebuild_demo_container_app.sh`.
+  - Run `config_coherent_power_performance.yaml` through `run_coherent_power_performance.sh`.
+  - Record sustained per-channel MSps, whether startup-only `Fell behind in processing on GPU!` remains, and whether RX starvation stays at zero.
+
+3. Resolve the `500e6` metadata semantics question
+  - Decide whether the coherent snapshot sidecar should continue to describe the coherent-stage analyzed span (`128e6`) only, or whether it should additionally carry the original upstream capture rate/span (`500e6`) as a distinct field.
+  - Update notebook/validator expectations once that semantic contract is chosen.
+
+4. Capture the 4/14 validation milestone explicitly
+  - Reference snapshot save path is working.
+  - Notebook replay on the new snapshot looks good.
+  - Performance config is verified current and ready for the next throughput run.
+
+## 4/14 Development Plan
+
+### Recommended Equivalence Harness
+
+The best way to prove notebook and operator equivalence is to stop comparing live runs against each other and instead compare both implementations against the exact same frozen detector input.
+
+Use a two-level golden-artifact strategy:
+
+1. golden complex tensor snapshot
+  - save the exact `tuple<tensor_t<complex, 2>, cudaStream_t>` detector input for one emitted frame before `coherent_power_power_db_kernel(...)`
+  - write it as a `.npy` complex64 array so the notebook can load it directly through the existing `tensor_npy` path
+  - this validates end-to-end parity from operator input onward, including the C++ power-to-dB conversion
+
+2. golden power-dB snapshot
+  - also save the post-kernel `power_db` frame as a float32 `.npy`
+  - use this only as a stage-isolation aid when the complex-tensor replay disagrees
+  - this lets us distinguish `complex -> power_db` drift from downstream coherent-power pipeline drift
+
+Each saved frame should include a small sidecar metadata file, for example `<stem>.json`, with at least:
+
+- `channel_number`
+- `frame_number`
+- `rows`
+- `cols`
+- `resolution_hz`
+- `center_frequency_hz` if present
+- `frequency_axis_calibrated`
+- `ignore_bins_per_side`
+- `backend_mode`
+- a full copy of the coherent detector config used for the run
+
+The metadata sidecar matters because the notebook `tensor_npy` loader currently treats tensors as uncalibrated by default, while the live operator may derive sideband-ignore behavior from `resolution`. Without this sidecar, we can accidentally compare two different problem statements.
+
+### Offline Comparison Workflow
+
+Add one explicit offline debug harness for the coherent detector rather than trying to reuse the live app for this step.
+
+Recommended flow:
+
+1. debug capture run
+  - run the normal app with a debug config that saves a bounded number of golden tensor snapshots, power-dB snapshots, final masks, and sidecar metadata
+  - keep this path off by default and enable it only with a dedicated config such as `old_configs/config_coherent_power_debug_capture.yaml`
+
+2. notebook replay
+  - load the saved complex tensor snapshot in the notebook using the existing `tensor_npy` input path
+  - override the notebook config from the sidecar metadata so the notebook uses the same detector parameters and calibrated-vs-uncalibrated assumptions as the operator run
+  - save intermediate artifacts for the frozen frame: corrected spectrogram, chunk plan, chunk score maps, grouped boxes, merged score map, merged boxes, and final mask
+
+3. offline C++ replay
+  - add a small offline coherent-power replay executable or debug mode that loads the same saved snapshot and metadata without DPDK, networking, or scheduler noise
+  - route that snapshot through the reference backend only
+  - emit the same intermediate artifacts and printouts as the notebook-facing comparison set
+
+4. compare artifacts in tiers
+  - tier 1: `power_db`
+  - tier 2: frontend correction outputs (`row_floor`, smoothed response, reference level, boost profile, corrected spectrogram)
+  - tier 3: chunk plan and per-chunk thresholds
+  - tier 4: per-chunk masks and grouped boxes
+  - tier 5: merged score map, merged boxes, and final binary mask
+
+This tiered comparison is better than only comparing final masks because it tells us where the pipelines diverge instead of merely telling us that they diverged.
+
+### Practical Implementation Notes
+
+For this repo, the most useful first increment is:
+
+- add `enable_tensor_snapshot_save`, `tensor_snapshot_dir`, `save_power_db_snapshot`, and `max_snapshots_per_channel` to `coherent_power_signal_detector`
+- save the complex tensor snapshot before `coherent_power_power_db_kernel(...)`
+- save the float32 `power_db` snapshot immediately after the kernel in reference/debug runs
+- write a JSON sidecar next to each saved snapshot
+- add a notebook cell path that loads a snapshot directory entry instead of a generic `.pgm`
+- add an offline C++ reference replay target that prints stage scalars and optionally writes `.npy` or `.png` debug artifacts
+
+The operator should remain responsible only for bounded snapshot capture during a live debug run. The detailed printouts, plots, and artifact comparison should happen in the notebook replay path and the offline C++ replay path, where determinism is much higher and iteration is much faster.
+
+### Acceptance Criteria For Equivalence
+
+Treat notebook and offline C++ reference replay as equivalent when, for the same frozen snapshot and config:
+
+- `power_db` matches within a small floating-point tolerance
+- frontend correction outputs match within tolerance
+- chunk boundaries are identical
+- per-chunk thresholds differ only within tolerance
+- grouped boxes match exactly or differ only by an agreed one-pixel boundary tolerance
+- final merged mask has near-perfect overlap, with any residual mismatch explained by a known numeric tolerance rather than unexplained algorithm drift
+
+Only after the frozen-snapshot reference paths agree should we compare the fast GPU backend against the reference path for usefulness rather than exact parity.
 
 ## What The Notebook Actually Does
 
@@ -247,7 +373,7 @@ Only split if needed. Start with one `.cu` implementation file and extract later
 
 ### Configs
 
-- `applications/usrp_wideband_signal_detection/config.yaml`
+- `applications/usrp_wideband_signal_detection/old_configs/config.yaml`
 - every `applications/usrp_wideband_signal_detection/config_*.yaml`
   - add `pipeline.detector_type`
   - keep the existing `dinov3_signal_detector` block intact
@@ -691,7 +817,7 @@ Start by reading these files in this order:
 2. `operators/dinov3_signal_detector/dinov3_signal_detector.hpp`
 3. `operators/dinov3_signal_detector/dinov3_signal_detector.cu`
 4. `applications/usrp_wideband_signal_detection/main.cpp`
-5. `applications/usrp_wideband_signal_detection/config.yaml`
+5. `applications/usrp_wideband_signal_detection/old_configs/config.yaml`
 6. `applications/usrp_wideband_signal_detection/CMakeLists.txt`
 
 That sequence gives the algorithm first, then the operator pattern, then the app integration points.

@@ -15,9 +15,16 @@ struct DinoTorchRuntimeConfig {
   std::string inference_backend;
   std::string model_script_path;
   std::string torchscript_init_mode;
+  std::string torch_dtype = "fp32";
+  bool legacy_fast_gray_preprocess = false;
   std::vector<double> imagenet_mean;
   std::vector<double> imagenet_std;
   bool return_final_mask = true;
+  bool return_final_mask_device = false;
+  bool return_pre_model_gray = false;
+  bool return_patch_features = false;
+  bool compute_dino_threshold = true;
+  bool compute_power_score = true;
   double ignore_sideband_hz = 0.0;
   bool frontend_correction_enable = true;
   double frontend_correction_row_q = 25.0;
@@ -29,6 +36,8 @@ struct DinoTorchRuntimeConfig {
   double frontend_correction_edge_taper_sigma = 6.0;
   double frontend_correction_edge_target_drop_db = 2.5;
   double power_q = 0.90;
+  int dino_group_k = 8;
+  double dino_group_spatial_weight = 0.35;
   double dino_group_score_q = 0.60;
   double pipeline_final_threshold = 0.20;
   double pipeline_gap_floor = 0.10;
@@ -49,6 +58,20 @@ struct DinoTorchRuntimeInput {
   double span_hz = 0.0;
   const std::vector<float>* power_db = nullptr;
   const float* power_db_device = nullptr;
+  const float* corrected_db_device = nullptr;
+};
+
+struct DinoTorchRuntimeBatchInput {
+  int batch_size = 0;
+  int src_rows = 0;
+  int src_cols = 0;
+  int dst_rows = 0;
+  int dst_cols = 0;
+  int patch_size = 16;
+  cudaStream_t cuda_stream = nullptr;
+  double resolution_hz = 0.0;
+  double span_hz = 0.0;
+  const float* corrected_db_batch_device = nullptr;
 };
 
 struct DinoTorchRuntimeTiming {
@@ -60,6 +83,7 @@ struct DinoTorchRuntimeTiming {
   double dino_score_ms = 0.0;
   double power_score_ms = 0.0;
   double fusion_ms = 0.0;
+  double score_to_cpu_ms = 0.0;
 };
 
 struct DinoTorchRuntimeResult {
@@ -69,6 +93,7 @@ struct DinoTorchRuntimeResult {
   std::string error_detail;
   std::string backend_used = "pytorch_placeholder";
   bool torchscript_forward_ready = false;
+  bool input_resized_to_target = false;
   int ignore_bins_per_side = 0;
   double freq_bin_hz = 0.0;
   int aligned_rows = 0;
@@ -77,7 +102,65 @@ struct DinoTorchRuntimeResult {
   double power_threshold = 0.0;
   double final_threshold = 0.0;
   DinoTorchRuntimeTiming timing;
+  std::vector<float> pre_model_gray;
+  int patch_rows = 0;
+  int patch_cols = 0;
+  int feature_dim = 0;
+  std::vector<float> patch_features;
+  std::vector<float> score_map;
   std::vector<float> final_mask;
+  const float* score_map_device = nullptr;
+  const float* final_mask_device = nullptr;
+  std::shared_ptr<void> score_map_device_owner;
+  std::shared_ptr<void> final_mask_device_owner;
+};
+
+struct DinoTorchRuntimeBatchResult {
+  bool success = false;
+  std::string error_stage;
+  std::string error_message;
+  std::string error_detail;
+  std::string backend_used = "pytorch_placeholder";
+  bool torchscript_forward_ready = false;
+  bool input_resized_to_target = false;
+  int aligned_rows = 0;
+  int aligned_cols = 0;
+  int patch_rows = 0;
+  int patch_cols = 0;
+  int feature_dim = 0;
+  DinoTorchRuntimeTiming timing;
+  std::vector<float> patch_features_batch;
+  const float* patch_features_batch_device = nullptr;
+  std::shared_ptr<void> patch_features_batch_device_owner;
+  std::vector<float> score_maps;
+  const float* score_maps_device = nullptr;
+  std::shared_ptr<void> score_maps_device_owner;
+  std::vector<double> dino_thresholds;
+  std::vector<double> final_thresholds;
+};
+
+struct DinoHybridPostGpuInput {
+  int src_rows = 0;
+  int dst_rows = 0;
+  int dst_cols = 0;
+  int ignore_bins_per_side = 0;
+  cudaStream_t cuda_stream = nullptr;
+  const float* dino_score_device = nullptr;
+  const float* coherence_gate_device = nullptr;
+};
+
+struct DinoHybridPostGpuResult {
+  bool success = false;
+  std::string error_message;
+  std::string error_detail;
+  float seed_freq_threshold = 1.0f;
+  float seed_res_threshold = 1.0f;
+  float grow_freq_threshold = 1.0f;
+  float grow_res_threshold = 1.0f;
+  float combined_threshold = 1.0f;
+  std::vector<uint8_t> seed_mask;
+  std::vector<uint8_t> grow_mask;
+  std::vector<uint8_t> combined_gate_mask;
 };
 
 class DinoTorchRuntime {
@@ -91,6 +174,16 @@ class DinoTorchRuntime {
   DinoTorchRuntime& operator=(DinoTorchRuntime&&) noexcept;
 
   DinoTorchRuntimeResult run(const DinoTorchRuntimeConfig& config, const DinoTorchRuntimeInput& input);
+  DinoTorchRuntimeBatchResult run_batch(const DinoTorchRuntimeConfig& config, const DinoTorchRuntimeBatchInput& input);
+  DinoHybridPostGpuResult run_hybrid_post_gpu(const DinoHybridPostGpuInput& input);
+  void warmup(const DinoTorchRuntimeConfig& config,
+              int src_rows,
+              int src_cols,
+              int dst_rows,
+              int dst_cols,
+              int patch_size,
+              int batch_size = 1,
+              cudaStream_t cuda_stream = nullptr);
 
  private:
   class Impl;

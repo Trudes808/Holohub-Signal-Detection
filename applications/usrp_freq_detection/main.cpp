@@ -15,7 +15,10 @@ class LogOp: public holoscan::Operator {
     LogOp() = default;
 
     void setup(holoscan::OperatorSpec& spec) override {
-        spec.input<in_t>("in");
+        auto& input_port = spec.input<in_t>("in", holoscan::IOSpec::IOSize{8});
+        input_port.conditions().emplace_back(
+            holoscan::ConditionType::kMessageAvailable,
+            std::make_shared<holoscan::MessageAvailableCondition>(size_t{1}));
         spec.param(num_channels_, "num_channels",
             "Number of Channels",
             "The number of RF channels being processed.", 1);
@@ -63,12 +66,13 @@ class LogOp: public holoscan::Operator {
         // Log statistics
         auto seconds = std::chrono::duration<double>(elapsed_[channel_num]).count();
         if (total_samples_[channel_num] > 0 && seconds >= log_interval_) {
-            auto duration = std::chrono::duration<double>(interval).count();
+            const double samples_per_second = static_cast<double>(total_samples_[channel_num]) / seconds;
+            const double bits_per_second = static_cast<double>(total_samples_[channel_num]) * sizeof(int16_t) * 2 * 8 / seconds;
             HOLOSCAN_LOG_INFO("Processed {} samples from channel {} at {:.2f} MSps ({:.2f} Gbps)",
                             total_samples_[channel_num],
                             channel_num,
-                            num_samples / duration / 1e6,
-                            num_bits / duration / 1e9);
+                            samples_per_second / 1e6,
+                            bits_per_second / 1e9);
             total_samples_[channel_num] = 0;
             elapsed_[channel_num] = std::chrono::steady_clock::duration::zero();
         }
@@ -123,29 +127,39 @@ class UsrpFreqDetectPipeline : public holoscan::Application {
         auto chdrConverterOp = make_operator<ops::ChdrConverterOpRx>(
             "chdrConverterOp",
             from_config("chdr_converter"));
+        const int pipeline_channels = std::max(1, from_config("chdr_converter.num_channels").as<int>());
 
-        auto fftOp = make_operator<ops::FFT>(
-            "fftOp",
-            from_config("fft"));
+        std::vector<std::shared_ptr<holoscan::Operator>> fftOps;
+        std::vector<std::shared_ptr<holoscan::Operator>> spectrogramOps;
+        std::vector<std::shared_ptr<holoscan::Operator>> logOps;
+        fftOps.reserve(static_cast<size_t>(pipeline_channels));
+        spectrogramOps.reserve(static_cast<size_t>(pipeline_channels));
+        logOps.reserve(static_cast<size_t>(pipeline_channels));
 
-        auto spectrogramOp = make_operator<ops::Spectrogram>(
-            "spectrogramOp",
-            from_config("spectrogram"));
-
-        auto logOp = make_operator<LogOp>(
-            "logOp",
-            from_config("logger"),
-            make_condition<CountCondition>(from_config("num_runs").as<int64_t>())
-            // make_condition<CudaStreamCondition>("stream_sync", Arg("receiver", "in"))
-        );
+        for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+            fftOps.push_back(make_operator<ops::FFT>(
+                std::string("fftOpCh") + std::to_string(channel_index),
+                from_config("fft")));
+            spectrogramOps.push_back(make_operator<ops::Spectrogram>(
+                std::string("spectrogramOpCh") + std::to_string(channel_index),
+                from_config("spectrogram")));
+            logOps.push_back(make_operator<LogOp>(
+                std::string("logOpCh") + std::to_string(channel_index),
+                from_config("logger"),
+                make_condition<CountCondition>(from_config("num_runs").as<int64_t>())));
+        }
 
         add_operator(chdrConverterOp);
-        add_operator(fftOp);
-        add_operator(spectrogramOp);
-        add_operator(logOp);
-        add_flow(chdrConverterOp, fftOp);
-        add_flow(fftOp, spectrogramOp);
-        add_flow(fftOp, logOp);
+        for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+            add_operator(fftOps[static_cast<size_t>(channel_index)]);
+            add_operator(spectrogramOps[static_cast<size_t>(channel_index)]);
+            add_operator(logOps[static_cast<size_t>(channel_index)]);
+
+            const char* chdr_port = channel_index == 0 ? "out0" : "out1";
+            add_flow(chdrConverterOp, fftOps[static_cast<size_t>(channel_index)], {{chdr_port, "in"}});
+            add_flow(fftOps[static_cast<size_t>(channel_index)], spectrogramOps[static_cast<size_t>(channel_index)]);
+            add_flow(fftOps[static_cast<size_t>(channel_index)], logOps[static_cast<size_t>(channel_index)]);
+        }
     }
 };
 

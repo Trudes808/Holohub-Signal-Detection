@@ -40,7 +40,7 @@
             }]
         },
         "run": {
-            "command": "<holohub_app_bin>/usrp_wideband_signal_detection config.yaml",
+            "command": "<holohub_app_bin>/usrp_wideband_signal_detection old_configs/config.yaml",
             "workdir": "holohub_bin"
         }
     }

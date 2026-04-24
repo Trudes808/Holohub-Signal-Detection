@@ -11,14 +11,13 @@ Provides a C++/CUDA signal-detection stage for the wideband USRP pipeline.
 
 The current implementation is no longer a pure threshold scaffold. It now:
 - consumes FFT-domain tensors (`tensor_t<complex, 2>`),
-- applies notebook-derived GPU preprocessing using LibTorch when Torch is available,
-- supports optional frontend correction and sideband-ignore cropping,
-- prepares notebook-aligned model inputs using grayscale-triplicate plus ImageNet normalization,
-- runs TorchScript model forward when configured and available,
-- derives a debug-ready detector mask from DINO feature energy plus power rescue fusion, and
-- emits timing and preprocessing metadata for parity and optimization work.
+- uses the coherent-power detector's per-channel allocation and reuse model,
+- computes frontend correction and a coherent-style GPU gate before DINO inference,
+- uses LibTorch only to produce a DINO score map when Torch is available,
+- runs the notebook-derived residual-veto hybrid postprocess in the operator, and
+- emits timing and hybrid-threshold metadata for parity and optimization work.
 
-This is intended as the verification-ready bridge between the notebook pipeline and the future fully ported GPU postprocess path.
+This version is the in-place replacement for the earlier scaffold: coherent real-time shell, old DINO runtime only for model execution, and the notebook's later hybrid logic for final mask generation.
 
 ## Configuration
 
@@ -31,6 +30,7 @@ dinov3_signal_detector:
   emit_stride: 1
   mask_threshold_db: -20.0
   log_detections: true
+  backend_mode: "reference"
   enable_mask_save: false
   save_every_n_frames: 1
   max_masks_per_channel: 5
@@ -59,6 +59,7 @@ dinov3_signal_detector:
   frontend_correction_edge_target_drop_db: 2.5
   frontend_edge_guard_floor: 0.35
   dino_coherence_gate_floor: 0.25
+  dino_coherence_gate_span_db: 3.0
   texture_q: 0.90
   texture_k: 6
   power_q: 0.90
@@ -91,6 +92,7 @@ Metadata keys written:
 - `dino_mask_width`
 - `dino_mask_threshold_db`
 - `dino_backend`
+- `dino_backend_mode`
 - `dino_model_name`
 - `dino_weights_path`
 - `dino_model_script_path`
@@ -104,25 +106,40 @@ Metadata keys written:
 - `dino_power_score_threshold`
 - `dino_pipeline_final_threshold`
 - `dino_pipeline_variant`
+- `dino_coherence_gate_floor`
+- `dino_coherence_gate_span_db`
+- `dino_seed_freq_threshold`
+- `dino_seed_res_threshold`
+- `dino_grow_freq_threshold`
+- `dino_grow_res_threshold`
+- `dino_component_count`
+- `dino_mask_fraction`
+- `dino_connected_fraction`
 - `dino_timing_total_ms`
 
 ## Current ML status
 
-- `use_pytorch_backend=true` activates a PyTorch GPU tensor-processing path if Torch is available at build/runtime.
+- `use_pytorch_backend=true` activates the LibTorch runtime path when Torch is available at build/runtime.
+- `backend_mode` controls the operator-side postprocess path:
+  - `reference`: keep the notebook-faithful coherent-shell residual-veto hybrid path.
+- Validation and production parity requires `backend_mode=reference` everywhere that is intended to validate or represent production mask generation. `emit_stride` may change for throughput tuning, but `backend_mode` must not.
 - `inference_backend` controls behavior:
-  - `torchscript`: attempts TorchScript model forward using `model_script_path`, then derives a score map from the returned tensor.
-  - `pytorch_placeholder`: skips model forward and uses the notebook-aligned preprocess path with a placeholder DINO score derived from the corrected power image.
-  - `cuda_threshold_fallback`: uses CUDA kernel path only.
-- The current Torch path ports the notebook preprocessing constants and timing checkpoints first. It does not yet implement the full notebook grouping, coherence, and connected-component cleanup stages exactly.
-- `frontend_correction_enable` and `ignore_sideband_hz` are the first notebook constants promoted into the C++ hot path.
+  - `torchscript`: attempts TorchScript model forward using `model_script_path`, then returns a DINO score map to the operator.
+  - `pytorch_placeholder`: retains the runtime entry point but does not provide a production DINO score.
+  - `cuda_threshold_fallback`: bypasses the DINO runtime and uses the coherent-style gate as the fallback score.
+- The current hot path is split intentionally:
+  - coherent-style GPU preprocessing and gate generation live in the operator,
+  - DINO model execution lives in the Torch runtime helper,
+  - final hybrid mask generation lives in the operator.
+- `frontend_correction_enable`, `ignore_sideband_hz`, `dino_coherence_gate_floor`, and `dino_coherence_gate_span_db` are the active controls for the coherent-shell hybrid path.
 - `timing_summary_enable=true` emits mean/max timing summaries for the major detector stages every `timing_summary_every_n` emitted frames.
 - `torchscript_init_mode` controls how far C++ initialization proceeds before compute begins:
   - `load_only`: load the TorchScript file only.
   - `load_cpu_eval`: load and call `eval()` on CPU.
   - `load_cuda_no_eval`: load and move the module to CUDA.
   - `load_cuda_eval`: load, move to CUDA, and call `eval()`.
-- If TorchScript load/forward fails and `strict_model_forward=false`, execution falls back to `pytorch_placeholder`.
-- If `torchscript_init_mode` leaves the module off CUDA, the operator logs that TorchScript is not forward-ready and uses `pytorch_placeholder` during compute.
+  - If TorchScript load/forward fails and `strict_model_forward=false`, execution falls back to the coherent-style gate path for that frame.
+  - The final operator mask now follows the residual-veto hybrid notebook logic rather than the earlier DINO-plus-power fusion path.
 - The selected runtime weight is `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth` and is expected to be staged under `/workspace/models/dinov3/weights` inside the Holohub container.
 - The expected TorchScript runtime artifact path is `/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts`.
 - For validation runs, keep `strict_model_forward=true` so model-load or model-forward issues are surfaced immediately.
@@ -131,5 +148,5 @@ Metadata keys written:
 ## Verification Notes
 
 - Use `applications/usrp_wideband_signal_detection/config_torchscript_validation.yaml` for strict reproduction-oriented bring-up.
-- Compare the operator metadata and timing summaries against `signal_detection_holoscanv1.ipynb` before making optimization changes.
-- Treat the current detector as notebook-faithful in preprocessing and parameterization, but still partial in postprocess parity until grouping/coherence cleanup is ported fully.
+- Compare the operator metadata and timing summaries against `signal_detection_holoscan_retry_dino.ipynb`, especially the final residual-veto hybrid experiment.
+- The active implementation is closest to: coherent-power shell plus notebook cell-14-style hybrid cleanup.

@@ -55,3 +55,6 @@ tmp/
 
 # Licenses
 rti_license.dat
+
+# Notebook-generated validator artifacts
+notebooks/validator_artifacts/

@@ -1,0 +1,38 @@
+{
+  "operator": {
+    "name": "CUDA DINO Detector",
+    "authors": [
+      {
+        "name": "Sage Trudeau",
+        "affiliation": "UT Austin"
+      }
+    ],
+    "language": ["C++"],
+    "version": "0.1.0",
+    "changelog": {
+      "0.1.0": "Initial standalone C++/CUDA operator scaffold for the custom CUDA DINO detector path"
+    },
+    "holoscan_sdk": {
+      "minimum_required_version": "2.5.0",
+      "tested_versions": [
+        "2.6.0",
+        "3.0.0",
+        "3.4.0"
+      ]
+    },
+    "platforms": [
+      "x86_64"
+    ],
+    "tags": ["Signal Processing", "CUDA", "DINOv3", "Inference"],
+    "ranking": 2,
+    "requirements": {
+      "libraries": [
+        {
+          "name": "MatX",
+          "version": "0.9.0",
+          "url": "https://github.com/NVIDIA/MatX.git"
+        }
+      ]
+    }
+  }
+}
