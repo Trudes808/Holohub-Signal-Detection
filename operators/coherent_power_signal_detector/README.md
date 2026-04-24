@@ -18,7 +18,7 @@ The current implementation is a phase-2 skeleton intended to establish:
 
 The full notebook-derived coherent-power algorithm is planned to replace the placeholder compute path incrementally.
 
-Validation and production parity rule: configs used to validate or represent production mask generation must keep the same `backend_mode`. `emit_stride` may vary for throughput tuning, but the mask-generation backend must not.
+Validation and production parity rule: configs used to validate or represent production mask generation must keep the same `fast_performance` setting. `emit_stride` may vary for throughput tuning, but the selected path must not.
 
 The old low-fidelity runtime shortcut previously named `fast_gpu` has been renamed to `fast_low_fidelity_mode` to make its tradeoff explicit.
 
@@ -31,7 +31,7 @@ coherent_power_signal_detector:
   input_width: 512
   emit_stride: 1
   log_detections: false
-  backend_mode: "reference"
+  fast_performance: false
   enable_mask_save: false
   enable_tensor_snapshot_save: false
   save_every_n_frames: 1

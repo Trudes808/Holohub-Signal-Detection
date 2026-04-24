@@ -2132,7 +2132,7 @@ def _resolve_latest_validator_summary_path() -> Path | None:
     return candidates[0] if candidates else None
 
 
-def _resolve_latest_reference_debug_metadata_path() -> Path | None:
+def _resolve_latest_live_artifact_metadata_path() -> Path | None:
     snapshot_root = Path("/tmp/coherent_power_snapshots")
     candidates = sorted(
         snapshot_root.glob("**/coherent_power_snapshot_*.json"),
@@ -2146,27 +2146,32 @@ def _resolve_latest_reference_debug_metadata_path() -> Path | None:
             continue
         if isinstance(metadata.get("reference_debug_artifacts"), dict):
             return candidate
+        if isinstance(metadata.get("performance_path_artifacts"), dict):
+            return candidate
     return None
 
 
 def resolve_latest_coherent_overlay_sources(*, prefer_reference_debug: bool = True) -> dict[str, Any]:
-    reference_debug_metadata_path = _resolve_latest_reference_debug_metadata_path()
+    live_artifact_metadata_path = _resolve_latest_live_artifact_metadata_path()
     validator_summary_path = _resolve_latest_validator_summary_path()
 
-    if prefer_reference_debug and reference_debug_metadata_path is not None:
-        metadata = json.loads(reference_debug_metadata_path.read_text())
+    if prefer_reference_debug and live_artifact_metadata_path is not None:
+        metadata = json.loads(live_artifact_metadata_path.read_text())
         tensor_path = None
         tensor_snapshot_path = metadata.get("tensor_snapshot_path")
         if tensor_snapshot_path:
             resolved_tensor_path = Path(_resolve_artifact_path(tensor_snapshot_path))
             if resolved_tensor_path.exists():
                 tensor_path = resolved_tensor_path
+        live_mode = "live_reference_debug"
+        if isinstance(metadata.get("performance_path_artifacts"), dict):
+            live_mode = "live_performance_path_debug"
         return {
-            "mode": "live_reference_debug",
-            "metadata_path": reference_debug_metadata_path,
-            "summary_path": reference_debug_metadata_path,
+            "mode": live_mode,
+            "metadata_path": live_artifact_metadata_path,
+            "summary_path": live_artifact_metadata_path,
             "tensor_path": tensor_path,
-            "output_dir": reference_debug_metadata_path.parent,
+            "output_dir": live_artifact_metadata_path.parent,
             "run_command": None,
         }
 
@@ -2209,7 +2214,7 @@ def load_offline_coherent_overlay_context(
             loaded_summary = {
                 "metadata_path": str(path),
                 "pipeline_mode_effective": "operator_live_reference_debug",
-                "backend_mode_from_config": str(loaded_summary.get("backend_mode_effective") or loaded_summary.get("backend_mode_requested") or "reference"),
+                "backend_mode_from_config": str(loaded_summary.get("path_mode_effective") or ("fast_performance" if loaded_summary.get("fast_performance") else "reference")),
                 "tensor_snapshot_path": loaded_summary.get("tensor_snapshot_path"),
                 "rows": int(loaded_summary.get("rows", 0) or 0),
                 "cols": int(loaded_summary.get("cols", 0) or 0),
@@ -2224,6 +2229,33 @@ def load_offline_coherent_overlay_context(
                 "corrected_sxx_db_npy": str(_resolve_artifact_path(debug_artifacts["corrected_db_path"])),
                 "final_mask_npy": str(_resolve_artifact_path(debug_artifacts["grouped_final_mask_path"])),
                 "raw_projected_mask_npy": str(_resolve_artifact_path(debug_artifacts["raw_projected_mask_path"])) if debug_artifacts.get("raw_projected_mask_path") else None,
+            }
+            return loaded_summary
+
+        if isinstance(loaded_summary.get("performance_path_artifacts"), dict):
+            debug_artifacts = loaded_summary["performance_path_artifacts"]
+            loaded_summary = {
+                "metadata_path": str(path),
+                "pipeline_mode_effective": "operator_live_performance_path_debug",
+                "backend_mode_from_config": str(loaded_summary.get("path_mode_effective") or ("fast_performance" if loaded_summary.get("fast_performance") else "reference")),
+                "tensor_snapshot_path": loaded_summary.get("tensor_snapshot_path"),
+                "rows": int(loaded_summary.get("rows", 0) or 0),
+                "cols": int(loaded_summary.get("cols", 0) or 0),
+                "input_height": int(loaded_summary.get("input_height", 0) or 0),
+                "input_width": int(loaded_summary.get("input_width", 0) or 0),
+                "tensor_axis_order": loaded_summary.get("tensor_axis_order", "frequency_time"),
+                "frequency_axis_calibrated": bool(loaded_summary.get("frequency_axis_calibrated", True)),
+                "resolution_hz": float(loaded_summary.get("resolution_hz", 0.0) or 0.0),
+                "sample_rate_hz": float(loaded_summary.get("sample_rate_hz", 0.0) or 0.0),
+                "span_hz": float(loaded_summary.get("span_hz", 0.0) or 0.0),
+                "ignore_bins_per_side": int(loaded_summary.get("ignore_bins_per_side", 0) or 0),
+                "corrected_sxx_db_npy": str(_resolve_artifact_path(debug_artifacts["corrected_db_path"])),
+                "merged_surface_npy": str(_resolve_artifact_path(debug_artifacts["merged_surface_path"])) if debug_artifacts.get("merged_surface_path") else None,
+                "support_surface_npy": str(_resolve_artifact_path(debug_artifacts["support_surface_path"])) if debug_artifacts.get("support_surface_path") else None,
+                "coherence_surface_npy": str(_resolve_artifact_path(debug_artifacts["coherence_surface_path"])) if debug_artifacts.get("coherence_surface_path") else None,
+                "mask_components_npy": str(_resolve_artifact_path(debug_artifacts["mask_components_path"])) if debug_artifacts.get("mask_components_path") else None,
+                "final_mask_npy": str(_resolve_artifact_path(debug_artifacts["final_mask_path"])),
+                "raw_projected_mask_npy": None,
             }
             return loaded_summary
 

@@ -212,7 +212,8 @@ coherent_power_signal_detector:
   # Full-rate aggressive profile for two-channel performance validation.
   emit_stride: 1
   log_detections: false
-  backend_mode: "reference"
+  fast_performance: true
+  save_performance_path_artifacts: false
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0

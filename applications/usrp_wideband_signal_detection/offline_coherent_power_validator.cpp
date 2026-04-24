@@ -151,7 +151,6 @@ SnapshotMetadata load_snapshot_metadata(const std::filesystem::path& metadata_pa
 
   metadata.config.input_height = metadata.input_height;
   metadata.config.input_width = metadata.input_width;
-  metadata.config.backend_mode = extract_string(text, "backend_mode").value_or(metadata.config.backend_mode);
   metadata.config.chunk_bandwidth_hz = extract_number<double>(text, "chunk_bandwidth_hz").value_or(metadata.config.chunk_bandwidth_hz);
   metadata.config.chunk_overlap_hz = extract_number<double>(text, "chunk_overlap_hz").value_or(metadata.config.chunk_overlap_hz);
   metadata.config.uncalibrated_chunk_fraction = extract_number<double>(text, "uncalibrated_chunk_fraction").value_or(metadata.config.uncalibrated_chunk_fraction);
@@ -607,7 +606,7 @@ int main(int argc, char** argv) {
     summary << "{\n";
     summary << "  \"metadata_path\": \"" << options.metadata_path.string() << "\",\n";
     summary << "  \"pipeline_mode_effective\": \"operator_live\",\n";
-    summary << "  \"backend_mode_from_config\": \"" << metadata.config.backend_mode << "\",\n";
+    summary << "  \"fast_performance_from_config\": " << (extract_string(read_text_file(options.metadata_path), "fast_performance").value_or("false")) << ",\n";
     summary << "  \"tensor_snapshot_path\": \"" << metadata.tensor_snapshot_path.string() << "\",\n";
     summary << "  \"rows\": " << result.src_rows << ",\n";
     summary << "  \"cols\": " << result.src_cols << ",\n";
@@ -665,7 +664,9 @@ int main(int argc, char** argv) {
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "Coherent power offline validation\n";
     std::cout << "  pipeline mode effective: operator_live\n";
-    std::cout << "  backend mode from config: " << metadata.config.backend_mode << "\n";
+    std::cout << "  fast_performance from config: "
+          << extract_string(read_text_file(options.metadata_path), "fast_performance").value_or("false")
+          << "\n";
     std::cout << "  metadata: " << options.metadata_path << "\n";
     std::cout << "  tensor snapshot: " << metadata.tensor_snapshot_path << "\n";
     std::cout << "  output dir: " << options.output_dir << "\n";

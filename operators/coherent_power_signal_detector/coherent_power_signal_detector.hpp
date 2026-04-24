@@ -19,7 +19,6 @@ using coherent_power_in_t = std::tuple<matx::tensor_t<coherent_power_complex, 2>
 struct CoherentPowerReferenceConfig {
   int input_height = 256;
   int input_width = 512;
-  std::string backend_mode = "reference";
   double chunk_bandwidth_hz = 25.0e6;
   double chunk_overlap_hz = 6.25e6;
   double uncalibrated_chunk_fraction = 0.40;
@@ -183,13 +182,10 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<int> emit_stride_;
   holoscan::Parameter<int> channel_filter_;
   holoscan::Parameter<bool> log_detections_;
-  holoscan::Parameter<std::string> backend_mode_;
+  holoscan::Parameter<bool> fast_performance_;
+  holoscan::Parameter<bool> save_performance_path_artifacts_;
   holoscan::Parameter<bool> enable_mask_save_;
   holoscan::Parameter<bool> enable_tensor_snapshot_save_;
-  holoscan::Parameter<bool> save_reference_final_mask_only_;
-  holoscan::Parameter<bool> save_reference_debug_artifacts_;
-  holoscan::Parameter<bool> stop_after_reference_final_mask_save_;
-  holoscan::Parameter<bool> stop_after_debug_artifact_save_;
   holoscan::Parameter<int> save_every_n_frames_;
   holoscan::Parameter<int> max_masks_per_channel_;
   holoscan::Parameter<int> max_snapshots_per_channel_;
@@ -250,8 +246,10 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   std::vector<uint64_t> frame_count_;
   std::vector<int> masks_saved_;
   std::vector<int> snapshots_saved_;
+  std::vector<int> path_artifacts_saved_;
   std::vector<ChannelTimingStats> timing_stats_;
   std::vector<ChannelBuffers> channel_buffers_;
+  std::atomic<bool> stop_requested_ {false};
 };
 
 }  // namespace holoscan::ops

@@ -59,6 +59,8 @@ skip_cuda=0
 skip_reference=0
 plot_only=0
 stage_keys=()
+cuda_elapsed_ms=
+reference_elapsed_ms=
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -183,7 +185,10 @@ if [[ "$skip_cuda" != "1" ]]; then
   echo "Running replayed CUDA operator:" >&2
   printf '  %q' "${cuda_cmd[@]}" >&2
   printf '\n' >&2
+  cuda_start_ns=$(date +%s%N)
   "${cuda_cmd[@]}"
+  cuda_end_ns=$(date +%s%N)
+  cuda_elapsed_ms=$(( (cuda_end_ns - cuda_start_ns) / 1000000 ))
 fi
 
 if [[ "$skip_reference" != "1" ]]; then
@@ -198,7 +203,10 @@ if [[ "$skip_reference" != "1" ]]; then
   echo "Running reference validator:" >&2
   printf '  %q' "${reference_cmd[@]}" >&2
   printf '\n' >&2
+  reference_start_ns=$(date +%s%N)
   "${reference_cmd[@]}"
+  reference_end_ns=$(date +%s%N)
+  reference_elapsed_ms=$(( (reference_end_ns - reference_start_ns) / 1000000 ))
 fi
 
 if [[ ! -d "$cuda_output_dir" ]]; then
@@ -211,6 +219,12 @@ if [[ ! -d "$reference_output_dir" ]]; then
 fi
 
 plot_cmd=("$PLOT_SCRIPT" --cuda-output-dir "$cuda_output_dir" --reference-output-dir "$reference_output_dir" --output "$plot_output")
+if [[ -n "$cuda_elapsed_ms" ]]; then
+  plot_cmd+=(--cuda-elapsed-ms "$cuda_elapsed_ms")
+fi
+if [[ -n "$reference_elapsed_ms" ]]; then
+  plot_cmd+=(--reference-elapsed-ms "$reference_elapsed_ms")
+fi
 if [[ ${#stage_keys[@]} -gt 0 ]]; then
   plot_cmd+=(--stages "${stage_keys[@]}")
 fi

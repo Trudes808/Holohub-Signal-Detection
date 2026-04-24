@@ -207,17 +207,12 @@ coherent_power_signal_detector:
   # Keep live-processing parameters aligned with the performance profile.
   emit_stride: 1
   log_detections: false
-  backend_mode: "reference"
+  fast_performance: false
+  save_performance_path_artifacts: true
   enable_mask_save: false
-  save_every_n_frames: 1
+  save_every_n_frames: 100
   max_masks_per_channel: 0
   output_dir: "/workspace/coherent_power_masks"
-  enable_tensor_snapshot_save: false
-  save_reference_debug_artifacts: true
-  stop_after_debug_artifact_save: true
-  max_snapshots_per_channel: 1
-  tensor_snapshot_dir: "/workspace/coherent_power_snapshots/live_reference_debug"
-  save_power_db_snapshot: false
   chunk_bandwidth_hz: 37500000.0
   chunk_overlap_hz: 2000000.0
   uncalibrated_chunk_fraction: 0.40

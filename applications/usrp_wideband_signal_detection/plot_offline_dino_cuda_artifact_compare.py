@@ -65,6 +65,26 @@ def resolve_debug_summary(output_dir: Path) -> tuple[Path, dict]:
     return summary_path, load_json(summary_path)
 
 
+def resolve_validation_summary(output_dir: Path) -> tuple[Path, dict]:
+    manifest_path = output_dir / "cuda_artifact_manifest.json"
+    if manifest_path.exists():
+        manifest = load_json(manifest_path)
+        summary_key = "summary_json" if "summary_json" in manifest else "offline_validation_summary_json"
+        summary_path = resolve_host_path(manifest.get(summary_key, output_dir / "offline_validation_summary.json"))
+    else:
+        summary_path = (output_dir / "offline_validation_summary.json").resolve()
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Missing validation summary: {summary_path}")
+    return summary_path, load_json(summary_path)
+
+
+def resolve_stage_profile(output_dir: Path) -> Path | None:
+    stage_profile_path = (output_dir / "offline_stage_profile.json").resolve()
+    if stage_profile_path.exists():
+        return stage_profile_path
+    return None
+
+
 def load_stage_array(summary: dict, key: str) -> np.ndarray:
     path = resolve_host_path(str(summary.get(key, "") or ""))
     if not path.exists():
@@ -75,14 +95,165 @@ def load_stage_array(summary: dict, key: str) -> np.ndarray:
 def common_stage_keys(summary: dict, preferred: Iterable[str]) -> list[str]:
     keys = []
     for key in preferred:
-                if key in summary and str(summary.get(key, "") or ""):
-                        keys.append(key)
+        if key in summary and str(summary.get(key, "") or ""):
+            keys.append(key)
     return keys
 
 
 def stage_title(key: str) -> str:
     title = key.removesuffix("_npy")
     return title.replace("_", " ")
+
+
+def format_shape(shape: tuple[int, ...]) -> str:
+    return "x".join(str(dim) for dim in shape)
+
+
+def is_binaryish(array: np.ndarray) -> bool:
+    if array.size == 0:
+        return False
+    unique = np.unique(array)
+    return bool(np.all(np.isin(unique, [0.0, 1.0])))
+
+
+def summarize_stage_pair(reference_array: np.ndarray, cuda_array: np.ndarray) -> dict[str, str]:
+    summary = {
+        "ref_shape": format_shape(reference_array.shape),
+        "cuda_shape": format_shape(cuda_array.shape),
+        "mean_abs": "n/a",
+        "max_abs": "n/a",
+        "overlap": "n/a",
+    }
+    if reference_array.shape != cuda_array.shape:
+        return summary
+
+    diff = np.abs(cuda_array.astype(np.float32) - reference_array.astype(np.float32))
+    summary["mean_abs"] = f"{float(diff.mean()):.6f}"
+    summary["max_abs"] = f"{float(diff.max(initial=0.0)):.6f}"
+
+    if is_binaryish(reference_array) and is_binaryish(cuda_array):
+        reference_mask = reference_array > 0.5
+        cuda_mask = cuda_array > 0.5
+        intersection = int(np.logical_and(reference_mask, cuda_mask).sum())
+        union = int(np.logical_or(reference_mask, cuda_mask).sum())
+        differing = int(np.logical_xor(reference_mask, cuda_mask).sum())
+        iou = 1.0 if union == 0 else intersection / union
+        summary["overlap"] = f"iou={iou:.4f} diff_px={differing}"
+    return summary
+
+
+def print_stage_summary(cuda_summary: dict,
+                        reference_summary: dict,
+                        cuda_arrays: list[tuple[str, np.ndarray]],
+                        reference_arrays: list[tuple[str, np.ndarray]]) -> None:
+    print("Stage parity summary:")
+    print(f"{'stage':<28} {'reference':>12} {'cuda':>12} {'mean_abs':>12} {'max_abs':>12} {'overlap':>24}")
+    reference_map = dict(reference_arrays)
+    cuda_map = dict(cuda_arrays)
+    for stage_name, cuda_array in cuda_arrays:
+        reference_array = reference_map[stage_name]
+        summary = summarize_stage_pair(reference_array, cuda_array)
+        print(
+            f"{stage_name:<28} {summary['ref_shape']:>12} {summary['cuda_shape']:>12} "
+            f"{summary['mean_abs']:>12} {summary['max_abs']:>12} {summary['overlap']:>24}"
+        )
+
+    reference_boxes = int(reference_summary.get("grouped_box_count", 0) or 0)
+    cuda_boxes = int(cuda_summary.get("grouped_box_count", 0) or 0)
+    print(f"Grouped boxes: reference={reference_boxes} cuda={cuda_boxes} delta={cuda_boxes - reference_boxes:+d}")
+
+
+def load_stage_profile_aggregates(path: Path | None) -> dict[str, float]:
+    if path is None:
+        return {}
+    payload = load_json(path)
+    aggregates = {}
+    for entry in payload.get("aggregates", []):
+        stage = str(entry.get("stage", "") or "")
+        if not stage:
+            continue
+        aggregates[stage] = float(entry.get("total_ms", 0.0) or 0.0)
+    return aggregates
+
+
+def load_operator_timing_summary(validation_summary: dict, debug_summary: dict) -> dict[str, float]:
+    for payload in (validation_summary, debug_summary):
+        timing = payload.get("operator_timing_ms")
+        if isinstance(timing, dict):
+            result: dict[str, float] = {}
+            for key, value in timing.items():
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed <= 0.0:
+                    continue
+                result[str(key)] = parsed
+            if result:
+                return result
+    return {}
+
+
+def print_timing_summary(cuda_elapsed_ms: float | None,
+                         reference_elapsed_ms: float | None,
+                         reference_stage_profile_path: Path | None,
+                         cuda_validation_summary: dict,
+                         cuda_debug_summary: dict) -> None:
+    print("Timing summary (ms):")
+    print(f"{'metric':<28} {'cuda':>12} {'reference':>12} {'delta':>12}")
+
+    def format_ms(value: float | None) -> str:
+        if value is None:
+            return "n/a"
+        return f"{value:.3f}"
+
+    def format_delta(cuda_value: float | None, reference_value: float | None) -> str:
+        if cuda_value is None or reference_value is None:
+            return "n/a"
+        return f"{cuda_value - reference_value:+.3f}"
+
+    rows: list[tuple[str, float | None, float | None]] = [
+        ("wall_clock_total", cuda_elapsed_ms, reference_elapsed_ms),
+    ]
+
+    reference_aggregates = load_stage_profile_aggregates(reference_stage_profile_path)
+    cuda_aggregates = load_operator_timing_summary(cuda_validation_summary, cuda_debug_summary)
+    metric_map = [
+        ("runtime_warmup", None, "runtime_warmup"),
+        ("power_db_from_tensor", "power_db", "power_db_from_tensor"),
+        ("frontend_correction", "frontend", "frontend_correction"),
+        ("chunk_planning", "chunk_plan", "chunk_planning"),
+        ("chunk_pack", "chunk_pack", None),
+        ("chunk_coherence", "coherence_batch", "chunk_coherence"),
+        ("chunk_torch_runtime_batch", "runtime_batch", "chunk_torch_runtime_batch"),
+        ("chunk_model_prep_batch", "runtime_model_prep", "chunk_model_prep_batch"),
+        ("chunk_torch_forward_batch", "runtime_torch_forward", "chunk_torch_forward_batch"),
+        ("chunk_dino_score_batch", "runtime_dino_score", "chunk_dino_score_batch"),
+        ("chunk_score_projection", "raw_score_projection", "chunk_score_projection"),
+        ("chunk_hybrid_support_batch", "hybrid_batch", "chunk_hybrid_support_batch"),
+        ("debug_device_to_host", "debug_device_to_host", None),
+        ("global_merge", "global_merge", "global_merge"),
+        ("artifact_serialization", "artifact_serialization", "artifact_serialization"),
+        ("debug_chunk_rerun_total", None, "debug_chunk_rerun_total"),
+        ("debug_artifact_serialization", None, "debug_artifact_serialization"),
+    ]
+    for label, cuda_key, reference_key in metric_map:
+        cuda_value = cuda_aggregates.get(cuda_key) if cuda_key else None
+        reference_value = reference_aggregates.get(reference_key) if reference_key else None
+        if cuda_value is None and reference_value is None:
+            continue
+        rows.append((label, cuda_value, reference_value))
+
+    for metric, cuda_value, reference_value in rows:
+        print(
+            f"{metric:<28} {format_ms(cuda_value):>12} {format_ms(reference_value):>12} "
+            f"{format_delta(cuda_value, reference_value):>12}"
+        )
+
+    if cuda_elapsed_ms is not None and reference_elapsed_ms is not None and reference_elapsed_ms > 0.0:
+        ratio = cuda_elapsed_ms / reference_elapsed_ms
+        delta = cuda_elapsed_ms - reference_elapsed_ms
+        print(f"Wall-clock delta: {delta:+.3f} ms ({ratio:.3f}x cuda/reference)")
 
 
 def plot_single_bundle(stage_arrays: list[tuple[str, np.ndarray]], output_path: Path) -> None:
@@ -134,6 +305,8 @@ def main() -> int:
     parser.add_argument("--reference-output-dir", help="Reference validator output directory for side-by-side comparison")
     parser.add_argument("--stages", nargs="*", default=DEFAULT_STAGE_KEYS, help="Chunk-debug artifact summary keys to plot")
     parser.add_argument("--output", help="Output PNG path")
+    parser.add_argument("--cuda-elapsed-ms", type=float, help="Wall-clock runtime for the CUDA operator replay")
+    parser.add_argument("--reference-elapsed-ms", type=float, help="Wall-clock runtime for the reference validator")
     args = parser.parse_args()
 
     cuda_output_dir = Path(args.cuda_output_dir).expanduser().resolve()
@@ -149,12 +322,20 @@ def main() -> int:
     if args.reference_output_dir:
         reference_output_dir = Path(args.reference_output_dir).expanduser().resolve()
         _, reference_summary = resolve_debug_summary(reference_output_dir)
+        _, cuda_validation_summary = resolve_validation_summary(cuda_output_dir)
+        _, _ = resolve_validation_summary(reference_output_dir)
         reference_stages = common_stage_keys(reference_summary, selected_stages)
         if reference_stages != selected_stages:
             missing = sorted(set(selected_stages) - set(reference_stages))
             raise SystemExit(f"Reference bundle is missing requested stages: {missing}")
         reference_arrays = [(key, load_stage_array(reference_summary, key)) for key in selected_stages]
         plot_comparison(cuda_arrays, reference_arrays, output_path)
+        print_stage_summary(cuda_summary, reference_summary, cuda_arrays, reference_arrays)
+        print_timing_summary(args.cuda_elapsed_ms,
+                             args.reference_elapsed_ms,
+                             resolve_stage_profile(reference_output_dir),
+                             cuda_validation_summary,
+                             cuda_summary)
         print(f"Wrote CUDA vs reference artifact comparison plot: {output_path}")
     else:
         plot_single_bundle(cuda_arrays, output_path)

@@ -85,6 +85,10 @@ constexpr std::array<const char*, holoscan::ops::CoherentPowerSignalDetector::kC
     "chunk_grouping_ms",
   };
 
+constexpr uint64_t kPathArtifactCaptureFrame = 8;
+constexpr std::string_view kReferencePathArtifactDir = "/workspace/coherent_power_snapshots/live_reference_debug";
+constexpr std::string_view kPerformancePathArtifactDir = "/workspace/coherent_power_snapshots/performance_path_debug";
+
 enum PowerSupportTimingStageIndex : size_t {
   kPowerSupportFloorEstimateStage = 0,
   kPowerSupportLocalRelativeStage,
@@ -878,6 +882,7 @@ __global__ void coherent_power_fast_score_kernel(const float* corrected,
                                                  int rows,
                                                  int cols,
                                                  int ignore_bins_per_side,
+                                                 bool bypass_coherence,
                                                  float coherence_weight,
                                                  float power_weight,
                                                  float power_floor_db,
@@ -905,9 +910,40 @@ __global__ void coherent_power_fast_score_kernel(const float* corrected,
   const float coherence_db = time_mean[idx] - freq_mean[idx];
   const float support = fminf(fmaxf((support_db - power_floor_db) / fmaxf(power_span_db, 1e-6f), 0.0f), 1.0f);
   const float coherence = fminf(fmaxf((coherence_db - coherence_floor_db) / fmaxf(coherence_span_db, 1e-6f), 0.0f), 1.0f);
-  const float combined = coherence_weight * coherence + power_weight * support;
+  const float effective_coherence = bypass_coherence ? support : coherence;
+  const float combined = coherence_weight * effective_coherence + power_weight * support;
   score[idx] = combined;
-  mask[idx] = (combined >= score_threshold && support > 0.0f && coherence > 0.0f) ? 1 : 0;
+  mask[idx] = (combined >= score_threshold && support > 0.0f && effective_coherence > 0.0f) ? 1 : 0;
+}
+
+__global__ void coherent_power_fast_power_assist_score_kernel(const float* corrected,
+                                                              const float* background,
+                                                              int rows,
+                                                              int cols,
+                                                              int ignore_bins_per_side,
+                                                              float power_floor_db,
+                                                              float power_span_db,
+                                                              float score_threshold,
+                                                              float* score,
+                                                              uint8_t* mask) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const int row = idx / cols;
+  const bool valid_row = row >= ignore_bins_per_side && row < (rows - ignore_bins_per_side);
+  if (!valid_row) {
+    score[idx] = 0.0f;
+    mask[idx] = 0;
+    return;
+  }
+
+  const float support_db = corrected[idx] - background[idx];
+  const float support = fminf(fmaxf((support_db - power_floor_db) / fmaxf(power_span_db, 1e-6f), 0.0f), 1.0f);
+  score[idx] = support;
+  mask[idx] = (support >= score_threshold && support > 0.0f) ? 1 : 0;
 }
 
 __global__ void coherent_power_majority_smooth_kernel(const uint8_t* input,
@@ -4739,6 +4775,58 @@ int count_mask_connected_components(const std::vector<uint8_t>& mask,
   return component_count;
 }
 
+std::vector<float> label_mask_connected_components(const std::vector<uint8_t>& mask,
+                                                   int rows,
+                                                   int cols,
+                                                   const std::vector<uint8_t>& valid_row_mask) {
+  std::vector<float> component_labels(mask.size(), 0.0f);
+  if (mask.empty()) {
+    return component_labels;
+  }
+
+  std::vector<uint8_t> visited(mask.size(), 0);
+  const std::array<std::pair<int, int>, 4> neighbors{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
+  int component_id = 0;
+  for (int row = 0; row < rows; ++row) {
+    if (!valid_row_mask[static_cast<size_t>(row)]) {
+      continue;
+    }
+    for (int col = 0; col < cols; ++col) {
+      const size_t seed = flat_index(rows, cols, row, col);
+      if (!mask[seed] || visited[seed]) {
+        continue;
+      }
+      ++component_id;
+      std::queue<std::pair<int, int>> queue;
+      queue.push({row, col});
+      visited[seed] = 1;
+      component_labels[seed] = static_cast<float>(component_id);
+      while (!queue.empty()) {
+        const auto [current_row, current_col] = queue.front();
+        queue.pop();
+        for (const auto& [delta_row, delta_col] : neighbors) {
+          const int next_row = current_row + delta_row;
+          const int next_col = current_col + delta_col;
+          if (next_row < 0 || next_row >= rows || next_col < 0 || next_col >= cols) {
+            continue;
+          }
+          if (!valid_row_mask[static_cast<size_t>(next_row)]) {
+            continue;
+          }
+          const size_t next_index = flat_index(rows, cols, next_row, next_col);
+          if (!mask[next_index] || visited[next_index]) {
+            continue;
+          }
+          visited[next_index] = 1;
+          component_labels[next_index] = static_cast<float>(component_id);
+          queue.push({next_row, next_col});
+        }
+      }
+    }
+  }
+  return component_labels;
+}
+
 void populate_final_mask_diagnostics(PipelineSummary& summary,
                                      int rows,
                                      int cols,
@@ -6251,13 +6339,10 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(emit_stride_, "emit_stride", "Emit stride", "Emit one output every N input frames per channel.", 1);
   spec.param(channel_filter_, "channel_filter", "Channel filter", "If non-negative, only process frames for this channel number.", -1);
   spec.param(log_detections_, "log_detections", "Log detections", "If true, logs detector execution details.", false);
-  spec.param(backend_mode_, "backend_mode", "Backend mode", "Detector backend mode: auto, fast_low_fidelity_mode, or reference.", std::string("auto"));
+  spec.param(fast_performance_, "fast_performance", "Fast performance path", "If true, use the lean reference performance path. If false, use the fuller reference debug path.", true);
+  spec.param(save_performance_path_artifacts_, "save_performance_path_artifacts", "Save path artifacts", "If true, save frame-8 artifacts for each active channel from the currently selected path and stop after all channels are captured.", false);
   spec.param(enable_mask_save_, "enable_mask_save", "Enable mask save", "Enable writing detector masks to disk for debug runs.", false);
   spec.param(enable_tensor_snapshot_save_, "enable_tensor_snapshot_save", "Enable tensor snapshot save", "Enable writing frozen detector input snapshots for offline parity runs.", false);
-  spec.param(save_reference_final_mask_only_, "save_reference_final_mask_only", "Save reference final mask only", "If true, saves the final mask from the live reference path without enabling merged-map debug artifacts.", false);
-  spec.param(save_reference_debug_artifacts_, "save_reference_debug_artifacts", "Save reference debug artifacts", "If true, writes reference-path merged maps and projected raw masks to disk from the live operator.", false);
-  spec.param(stop_after_reference_final_mask_save_, "stop_after_reference_final_mask_save", "Stop after reference final mask save", "If true, interrupts the graph immediately after the first reference final-mask-only save.", false);
-  spec.param(stop_after_debug_artifact_save_, "stop_after_debug_artifact_save", "Stop after debug artifact save", "If true, interrupts the graph immediately after the first reference debug bundle is written.", false);
   spec.param(save_every_n_frames_, "save_every_n_frames", "Save stride", "Save one detector mask every N frames per channel.", 1);
   spec.param(max_masks_per_channel_, "max_masks_per_channel", "Max masks per channel", "Maximum number of detector masks to save per channel for a run.", 5);
   spec.param(max_snapshots_per_channel_, "max_snapshots_per_channel", "Max snapshots per channel", "Maximum number of frozen detector input snapshots to save per channel for a run.", 2);
@@ -6318,10 +6403,12 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
 
 void CoherentPowerSignalDetector::initialize() {
   holoscan::Operator::initialize();
+  stop_requested_.store(false, std::memory_order_relaxed);
 
   frame_count_.assign(num_channels_.get(), 0);
   masks_saved_.assign(num_channels_.get(), 0);
   snapshots_saved_.assign(num_channels_.get(), 0);
+  path_artifacts_saved_.assign(num_channels_.get(), 0);
   timing_stats_.assign(num_channels_.get(), ChannelTimingStats {});
   channel_buffers_.assign(num_channels_.get(), ChannelBuffers {});
 
@@ -6347,8 +6434,7 @@ void CoherentPowerSignalDetector::initialize() {
     }
   };
 
-  const auto backend_mode = backend_mode_.get();
-  const bool reference_only_mode = backend_mode == "reference";
+  const bool reference_only_mode = !fast_performance_.get();
 
   for (auto& buffers : channel_buffers_) {
     allocate_device_float(buffers.power_db_device, configured_elements);
@@ -6375,7 +6461,7 @@ void CoherentPowerSignalDetector::initialize() {
     buffers.row_elements = reference_only_mode ? 0 : static_cast<size_t>(configured_rows);
     buffers.mask_elements = configured_elements;
 
-    if (enable_mask_save_.get() || save_reference_final_mask_only_.get()) {
+    if (enable_mask_save_.get()) {
       const auto host_mask_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.mask_host), configured_elements * sizeof(uint8_t));
       if (host_mask_result != cudaSuccess) {
         throw std::runtime_error(std::string("mask host buffer allocation failed: ") + cudaGetErrorString(host_mask_result));
@@ -6383,7 +6469,7 @@ void CoherentPowerSignalDetector::initialize() {
     }
   }
 
-  if (!channel_buffers_.empty() && backend_mode != "reference") {
+  if (!channel_buffers_.empty() && fast_performance_.get()) {
     const size_t frame_bytes = configured_elements * sizeof(float);
     const size_t row_bytes = static_cast<size_t>(configured_rows) * sizeof(float);
     const size_t mask_bytes = configured_elements * sizeof(uint8_t);
@@ -6467,6 +6553,7 @@ void CoherentPowerSignalDetector::initialize() {
                                                             configured_rows,
                                                             configured_cols,
                                                             0,
+                                                            false,
                                                             static_cast<float>(coherence_weight_.get()),
                                                             static_cast<float>(power_weight_.get()),
                                                             static_cast<float>(fast_power_floor_db_.get()),
@@ -6489,11 +6576,14 @@ void CoherentPowerSignalDetector::initialize() {
     }
   }
 
-  if (enable_mask_save_.get() || save_reference_final_mask_only_.get()) {
+  if (enable_mask_save_.get()) {
     std::filesystem::create_directories(output_dir_.get());
   }
-  if (enable_tensor_snapshot_save_.get() || save_reference_debug_artifacts_.get()) {
+  if (enable_tensor_snapshot_save_.get()) {
     std::filesystem::create_directories(tensor_snapshot_dir_.get());
+  }
+  if (save_performance_path_artifacts_.get()) {
+    std::filesystem::create_directories(std::string(fast_performance_.get() ? kPerformancePathArtifactDir : kReferencePathArtifactDir));
   }
 }
 
@@ -6589,38 +6679,25 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   const size_t mask_bytes = static_cast<size_t>(total_bins) * sizeof(uint8_t);
   auto& buffers = channel_buffers_[channel_number];
 
-  const auto backend_mode = backend_mode_.get();
-  const bool backend_is_reference = backend_mode == "reference";
-  const bool backend_is_low_fidelity = backend_mode == "fast_low_fidelity_mode";
-  const bool backend_is_legacy_fast = backend_mode == "fast_gpu";
-  const bool backend_is_auto = backend_mode == "auto";
-  if (backend_is_legacy_fast) {
-    HOLOSCAN_LOG_WARN("coherent backend_mode='fast_gpu' is deprecated; use 'fast_low_fidelity_mode' instead.");
-  } else if (!backend_is_reference && !backend_is_low_fidelity && !backend_is_auto) {
-    HOLOSCAN_LOG_WARN("Unsupported coherent backend_mode='{}'. Falling back to auto.", backend_mode);
-  }
-  const bool save_requested = enable_mask_save_.get();
   const bool require_reference_dimensions = src_rows != configured_analysis_rows || src_cols != configured_analysis_cols;
-  const bool use_reference_backend = backend_is_reference ||
-                                     (!(backend_is_low_fidelity || backend_is_legacy_fast) && (save_requested || require_reference_dimensions));
+  const bool save_requested = enable_mask_save_.get();
+  const bool fast_performance_path = fast_performance_.get();
+  const bool use_reference_backend = !fast_performance_path;
+  const bool should_save_path_artifacts = save_performance_path_artifacts_.get() &&
+                                          frame_number == kPathArtifactCaptureFrame &&
+                                          path_artifacts_saved_[channel_number] == 0;
   const int output_rows = use_reference_backend ? src_rows : configured_analysis_rows;
   const int output_cols = use_reference_backend ? src_cols : configured_analysis_cols;
-  const bool debug_bundle_requested = enable_tensor_snapshot_save_.get() || save_reference_debug_artifacts_.get();
+  const bool debug_bundle_requested = enable_tensor_snapshot_save_.get();
   const bool should_save_snapshot_bundle = debug_bundle_requested &&
                                            (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
                                            (snapshots_saved_[channel_number] < max_snapshots_per_channel_.get());
   const bool should_save_mask = save_requested &&
                                 (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
                                 (masks_saved_[channel_number] < max_masks_per_channel_.get());
-  const bool should_save_reference_final_mask_only = save_reference_final_mask_only_.get() &&
-                                                     use_reference_backend &&
-                                                     (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0) &&
-                                                     (masks_saved_[channel_number] < max_masks_per_channel_.get());
-  const bool should_write_mask_image = should_save_mask || should_save_reference_final_mask_only;
+  const bool should_write_mask_image = should_save_mask;
   const bool should_save_tensor_snapshot = enable_tensor_snapshot_save_.get() && should_save_snapshot_bundle;
-  const bool should_save_reference_debug_artifacts = save_reference_debug_artifacts_.get() &&
-                                                     should_save_snapshot_bundle &&
-                                                     use_reference_backend;
+  const bool should_save_reference_debug_artifacts = should_save_path_artifacts && !fast_performance_path;
   const bool should_save_power_db_snapshot = should_save_tensor_snapshot && save_power_db_snapshot_.get();
   const bool frequency_axis_calibrated = resolution_hz > 0.0;
 
@@ -6800,8 +6877,14 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   FastGpuMetadataSummary fast_summary;
   std::string coherent_backend_name = use_reference_backend ? "coherent_power_reference_v1" : "coherent_power_fast_low_fidelity_v1";
   std::string coherent_variant_name = use_reference_backend ? "frontend_chunked_grouped_box_mask_v1" : "frontend_local_fast_low_fidelity_mask_v1";
-  const bool materialize_reference_final_mask = should_write_mask_image || should_save_reference_debug_artifacts || timing_enabled;
-  const bool populate_reference_merged_maps = should_save_mask || should_save_reference_debug_artifacts;
+  const bool materialize_reference_final_mask = should_write_mask_image || should_save_reference_debug_artifacts || should_save_path_artifacts || timing_enabled;
+  const bool populate_reference_merged_maps = should_save_mask || should_save_reference_debug_artifacts || (should_save_path_artifacts && !fast_performance_path);
+  std::string normalized_coherence_source_mode = coherence_source_mode_.get();
+  std::transform(normalized_coherence_source_mode.begin(),
+                 normalized_coherence_source_mode.end(),
+                 normalized_coherence_source_mode.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  const bool fast_path_bypass_coherence = normalized_coherence_source_mode == "power_assist";
   time_step_ms(kPipelineStage, [&] {
     if (use_reference_backend) {
       const auto frontend_start = std::chrono::steady_clock::now();
@@ -6946,16 +7029,6 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     coherent_power_box_mean_cols_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
                                                                          src_rows,
                                                                          src_cols,
-                                                                         std::max(1, fast_time_smooth_radius_.get()),
-                                                                         buffers.time_mean_device);
-    coherent_power_box_mean_rows_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
-                                                                         src_rows,
-                                                                         src_cols,
-                                                                         std::max(1, fast_freq_smooth_radius_.get()),
-                                                                         buffers.freq_mean_device);
-    coherent_power_box_mean_cols_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
-                                                                         src_rows,
-                                                                         src_cols,
                                                                          std::max(1, fast_background_time_radius_.get()),
                                                                          buffers.box_filter_scratch_device);
     coherent_power_box_mean_rows_kernel<<<blocks, threads, 0, stream>>>(buffers.box_filter_scratch_device,
@@ -6968,22 +7041,46 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       throw std::runtime_error(std::string("separable box_mean kernel launch failed: ") + cudaGetErrorString(kernel_result));
     }
 
-    coherent_power_fast_score_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
-                                                                      buffers.time_mean_device,
-                                                                      buffers.freq_mean_device,
-                                                                      buffers.background_device,
-                                                                      src_rows,
-                                                                      src_cols,
-                                                                      ignore_bins_per_side,
-                                                                      static_cast<float>(coherence_weight_.get()),
-                                                                      static_cast<float>(power_weight_.get()),
-                                                                      static_cast<float>(fast_power_floor_db_.get()),
-                                                                      static_cast<float>(fast_power_span_db_.get()),
-                                                                      static_cast<float>(fast_coherence_floor_db_.get()),
-                                                                      static_cast<float>(fast_coherence_span_db_.get()),
-                                                                      static_cast<float>(fast_score_threshold_.get()),
-                                                                      buffers.score_device,
-                                                                      buffers.mask_device);
+    if (fast_path_bypass_coherence) {
+      coherent_power_fast_power_assist_score_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+                                                                                     buffers.background_device,
+                                                                                     src_rows,
+                                                                                     src_cols,
+                                                                                     ignore_bins_per_side,
+                                                                                     static_cast<float>(fast_power_floor_db_.get()),
+                                                                                     static_cast<float>(fast_power_span_db_.get()),
+                                                                                     static_cast<float>(fast_score_threshold_.get()),
+                                                                                     buffers.score_device,
+                                                                                     buffers.mask_device);
+    } else {
+      coherent_power_box_mean_cols_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+                                                                           src_rows,
+                                                                           src_cols,
+                                                                           std::max(1, fast_time_smooth_radius_.get()),
+                                                                           buffers.time_mean_device);
+      coherent_power_box_mean_rows_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+                                                                           src_rows,
+                                                                           src_cols,
+                                                                           std::max(1, fast_freq_smooth_radius_.get()),
+                                                                           buffers.freq_mean_device);
+      coherent_power_fast_score_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+                                                                        buffers.time_mean_device,
+                                                                        buffers.freq_mean_device,
+                                                                        buffers.background_device,
+                                                                        src_rows,
+                                                                        src_cols,
+                                                                        ignore_bins_per_side,
+                                                                        false,
+                                                                        static_cast<float>(coherence_weight_.get()),
+                                                                        static_cast<float>(power_weight_.get()),
+                                                                        static_cast<float>(fast_power_floor_db_.get()),
+                                                                        static_cast<float>(fast_power_span_db_.get()),
+                                                                        static_cast<float>(fast_coherence_floor_db_.get()),
+                                                                        static_cast<float>(fast_coherence_span_db_.get()),
+                                                                        static_cast<float>(fast_score_threshold_.get()),
+                                                                        buffers.score_device,
+                                                                        buffers.mask_device);
+    }
     kernel_result = cudaGetLastError();
     if (kernel_result != cudaSuccess) {
       throw std::runtime_error(std::string("fast_score kernel launch failed: ") + cudaGetErrorString(kernel_result));
@@ -7049,17 +7146,13 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                             frame_number,
                             mask_path);
         }
-        if (should_save_reference_final_mask_only && stop_after_reference_final_mask_save_.get()) {
-          HOLOSCAN_LOG_INFO("Stopping graph after coherent reference final-mask-only save for channel {} frame {}",
-                            channel_number,
-                            frame_number);
-          GxfGraphInterrupt(context.context());
-        }
       }
     }
 
     if (!should_save_tensor_snapshot && !should_save_reference_debug_artifacts) {
-      return;
+      if (!should_save_path_artifacts) {
+        return;
+      }
     }
 
     if (should_save_power_db_snapshot && !use_reference_backend) {
@@ -7091,7 +7184,6 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     const auto raw_projected_mask_pgm_path = snapshot_stem + "_raw_projected_mask.pgm";
     const auto grouped_final_mask_path = snapshot_stem + "_grouped_final_mask.npy";
     const auto grouped_final_mask_pgm_path = snapshot_stem + "_grouped_final_mask.pgm";
-
     if (should_save_tensor_snapshot &&
         !write_npy_2d(tensor_path,
                       buffers.input_tensor_host,
@@ -7188,6 +7280,345 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       }
     }
 
+    if (should_save_path_artifacts) {
+      std::vector<float> corrected_db_host(static_cast<size_t>(total_bins), 0.0f);
+      const auto corrected_copy_result = cudaMemcpy(corrected_db_host.data(),
+                                                    buffers.corrected_db_device,
+                                                    power_db_bytes,
+                                                    cudaMemcpyDeviceToHost);
+      if (corrected_copy_result != cudaSuccess) {
+        throw std::runtime_error(std::string("path artifact corrected_db copy failed: ") + cudaGetErrorString(corrected_copy_result));
+      }
+      const std::string path_artifact_root = std::string(fast_performance_path ? kPerformancePathArtifactDir : kReferencePathArtifactDir);
+      const auto path_snapshot_stem = make_debug_artifact_stem(path_artifact_root, channel_number, frame_number, src_rows, src_cols);
+      const auto path_metadata_path = path_snapshot_stem + ".json";
+      const auto path_corrected_db_path = path_snapshot_stem + "_corrected_sxx_db.npy";
+      const auto path_corrected_db_pgm_path = path_snapshot_stem + "_corrected_preview.pgm";
+      const auto path_final_mask_path = fast_performance_path ? path_snapshot_stem + "_performance_final_mask.npy" : path_snapshot_stem + "_grouped_final_mask.npy";
+      const auto path_final_mask_pgm_path = fast_performance_path ? path_snapshot_stem + "_performance_final_mask.pgm" : path_snapshot_stem + "_grouped_final_mask.pgm";
+      const auto path_merged_surface_path = path_snapshot_stem + "_merged_surface.npy";
+      const auto path_merged_surface_pgm_path = path_snapshot_stem + "_merged_surface.pgm";
+      const auto path_support_surface_path = path_snapshot_stem + "_support_surface.npy";
+      const auto path_support_surface_pgm_path = path_snapshot_stem + "_support_surface.pgm";
+      const auto path_coherence_surface_path = path_snapshot_stem + "_coherence_surface.npy";
+      const auto path_coherence_surface_pgm_path = path_snapshot_stem + "_coherence_surface.pgm";
+      const auto path_mask_components_path = path_snapshot_stem + "_mask_components.npy";
+      const auto path_mask_components_pgm_path = path_snapshot_stem + "_mask_components.pgm";
+      if (!write_npy_2d(path_corrected_db_path,
+                        corrected_db_host.data(),
+                        corrected_db_host.size() * sizeof(float),
+                        src_rows,
+                        src_cols,
+                        "<f4")) {
+        throw std::runtime_error("failed to write path artifact corrected spectrogram");
+      }
+      if (!write_pgm(path_corrected_db_pgm_path,
+                     float_unit_map_to_u8(normalize_map01_local(corrected_db_host, 1.0f, 99.0f)),
+                     src_cols,
+                     src_rows)) {
+        throw std::runtime_error("failed to write path artifact corrected preview");
+      }
+
+      if (fast_performance_path) {
+        std::vector<float> merged_surface_host(static_cast<size_t>(total_bins), 0.0f);
+        const auto merged_surface_copy_result = cudaMemcpy(merged_surface_host.data(),
+                                                           buffers.score_device,
+                                                           power_db_bytes,
+                                                           cudaMemcpyDeviceToHost);
+        if (merged_surface_copy_result != cudaSuccess) {
+          throw std::runtime_error(std::string("path artifact merged surface copy failed: ") + cudaGetErrorString(merged_surface_copy_result));
+        }
+        std::vector<float> background_host(static_cast<size_t>(total_bins), 0.0f);
+        const auto background_copy_result = cudaMemcpy(background_host.data(),
+                                                       buffers.background_device,
+                                                       power_db_bytes,
+                                                       cudaMemcpyDeviceToHost);
+        if (background_copy_result != cudaSuccess) {
+          throw std::runtime_error(std::string("path artifact background copy failed: ") + cudaGetErrorString(background_copy_result));
+        }
+        std::vector<uint8_t> final_mask_host(static_cast<size_t>(total_bins), 0);
+        const auto final_mask_copy_result = cudaMemcpy(final_mask_host.data(),
+                                                       buffers.mask_device,
+                                                       mask_bytes,
+                                                       cudaMemcpyDeviceToHost);
+        if (final_mask_copy_result != cudaSuccess) {
+          throw std::runtime_error(std::string("path artifact final mask copy failed: ") + cudaGetErrorString(final_mask_copy_result));
+        }
+        std::vector<uint8_t> per_row_valid_mask(static_cast<size_t>(src_rows), 1);
+        for (int row = 0; row < src_rows; ++row) {
+          const bool valid = row >= ignore_bins_per_side && row < (src_rows - ignore_bins_per_side);
+          per_row_valid_mask[static_cast<size_t>(row)] = valid ? 1 : 0;
+          if (!valid) {
+            const size_t row_offset = static_cast<size_t>(row) * static_cast<size_t>(src_cols);
+            std::fill(final_mask_host.begin() + row_offset,
+                      final_mask_host.begin() + row_offset + static_cast<size_t>(src_cols),
+                      static_cast<uint8_t>(0));
+          }
+        }
+        std::vector<float> support_surface_host(static_cast<size_t>(total_bins), 0.0f);
+        std::vector<float> coherence_surface_host(static_cast<size_t>(total_bins), 0.0f);
+        std::vector<float> time_mean_host;
+        std::vector<float> freq_mean_host;
+        if (!fast_path_bypass_coherence) {
+          time_mean_host.assign(static_cast<size_t>(total_bins), 0.0f);
+          const auto time_mean_copy_result = cudaMemcpy(time_mean_host.data(),
+                                                        buffers.time_mean_device,
+                                                        power_db_bytes,
+                                                        cudaMemcpyDeviceToHost);
+          if (time_mean_copy_result != cudaSuccess) {
+            throw std::runtime_error(std::string("path artifact time-mean copy failed: ") + cudaGetErrorString(time_mean_copy_result));
+          }
+          freq_mean_host.assign(static_cast<size_t>(total_bins), 0.0f);
+          const auto freq_mean_copy_result = cudaMemcpy(freq_mean_host.data(),
+                                                        buffers.freq_mean_device,
+                                                        power_db_bytes,
+                                                        cudaMemcpyDeviceToHost);
+          if (freq_mean_copy_result != cudaSuccess) {
+            throw std::runtime_error(std::string("path artifact freq-mean copy failed: ") + cudaGetErrorString(freq_mean_copy_result));
+          }
+        }
+        for (int row = 0; row < src_rows; ++row) {
+          const bool valid = per_row_valid_mask[static_cast<size_t>(row)] != 0;
+          const size_t row_offset = static_cast<size_t>(row) * static_cast<size_t>(src_cols);
+          for (int col = 0; col < src_cols; ++col) {
+            const size_t index = row_offset + static_cast<size_t>(col);
+            if (!valid) {
+              support_surface_host[index] = 0.0f;
+              coherence_surface_host[index] = 0.0f;
+              continue;
+            }
+            const float support_db = corrected_db_host[index] - background_host[index];
+            support_surface_host[index] = std::clamp(
+                (support_db - static_cast<float>(fast_power_floor_db_.get())) /
+                    std::max(static_cast<float>(fast_power_span_db_.get()), 1e-6f),
+                0.0f,
+                1.0f);
+            if (fast_path_bypass_coherence) {
+              coherence_surface_host[index] = 0.0f;
+            } else {
+              const float coherence_db = time_mean_host[index] - freq_mean_host[index];
+              coherence_surface_host[index] = std::clamp(
+                (coherence_db - static_cast<float>(fast_coherence_floor_db_.get())) /
+                  std::max(static_cast<float>(fast_coherence_span_db_.get()), 1e-6f),
+                0.0f,
+                1.0f);
+            }
+          }
+        }
+        const std::vector<float> mask_components_host =
+            label_mask_connected_components(final_mask_host, src_rows, src_cols, per_row_valid_mask);
+        std::vector<float> final_mask_float(final_mask_host.size(), 0.0f);
+        for (size_t index = 0; index < final_mask_host.size(); ++index) {
+          final_mask_float[index] = final_mask_host[index] ? 1.0f : 0.0f;
+        }
+        if (!write_npy_2d(path_merged_surface_path,
+                          merged_surface_host.data(),
+                          merged_surface_host.size() * sizeof(float),
+                          src_rows,
+                          src_cols,
+                          "<f4")) {
+          throw std::runtime_error("failed to write path artifact merged surface");
+        }
+        if (!write_pgm(path_merged_surface_pgm_path,
+                       float_unit_map_to_u8(normalize_map01_local(merged_surface_host, 1.0f, 99.0f)),
+                       src_cols,
+                       src_rows)) {
+          throw std::runtime_error("failed to write path artifact merged surface preview");
+        }
+        if (!write_npy_2d(path_support_surface_path,
+                          support_surface_host.data(),
+                          support_surface_host.size() * sizeof(float),
+                          src_rows,
+                          src_cols,
+                          "<f4")) {
+          throw std::runtime_error("failed to write path artifact support surface");
+        }
+        if (!write_pgm(path_support_surface_pgm_path,
+                       float_unit_map_to_u8(support_surface_host),
+                       src_cols,
+                       src_rows)) {
+          throw std::runtime_error("failed to write path artifact support surface preview");
+        }
+        if (!write_npy_2d(path_coherence_surface_path,
+                          coherence_surface_host.data(),
+                          coherence_surface_host.size() * sizeof(float),
+                          src_rows,
+                          src_cols,
+                          "<f4")) {
+          throw std::runtime_error("failed to write path artifact coherence surface");
+        }
+        if (!write_pgm(path_coherence_surface_pgm_path,
+                       float_unit_map_to_u8(coherence_surface_host),
+                       src_cols,
+                       src_rows)) {
+          throw std::runtime_error("failed to write path artifact coherence surface preview");
+        }
+        if (!write_npy_2d(path_mask_components_path,
+                          mask_components_host.data(),
+                          mask_components_host.size() * sizeof(float),
+                          src_rows,
+                          src_cols,
+                          "<f4")) {
+          throw std::runtime_error("failed to write path artifact mask components");
+        }
+        if (!write_pgm(path_mask_components_pgm_path,
+                       float_unit_map_to_u8(normalize_map01_local(mask_components_host, 0.0f, 100.0f)),
+                       src_cols,
+                       src_rows)) {
+          throw std::runtime_error("failed to write path artifact mask components preview");
+        }
+        if (!write_npy_2d(path_final_mask_path,
+                          final_mask_float.data(),
+                          final_mask_float.size() * sizeof(float),
+                          src_rows,
+                          src_cols,
+                          "<f4")) {
+          throw std::runtime_error("failed to write path artifact final mask");
+        }
+        if (!write_pgm(path_final_mask_pgm_path,
+                       binary_float_mask_to_u8(final_mask_float),
+                       src_cols,
+                       src_rows)) {
+          throw std::runtime_error("failed to write path artifact final mask preview");
+        }
+      } else {
+        if (!write_npy_2d(path_final_mask_path,
+                          pipeline_summary.final_mask.data(),
+                          pipeline_summary.final_mask.size() * sizeof(float),
+                          src_rows,
+                          src_cols,
+                          "<f4")) {
+          throw std::runtime_error("failed to write path artifact final mask");
+        }
+        if (!write_pgm(path_final_mask_pgm_path,
+                       binary_float_mask_to_u8(pipeline_summary.final_mask),
+                       src_cols,
+                       src_rows)) {
+          throw std::runtime_error("failed to write path artifact final mask preview");
+        }
+      }
+
+      std::ofstream path_meta_out(path_metadata_path, std::ios::binary);
+      if (!path_meta_out.is_open()) {
+        throw std::runtime_error("failed to open path artifact metadata sidecar");
+      }
+      path_meta_out << "{\n";
+      path_meta_out << "  \"channel_number\": " << channel_number << ",\n";
+      path_meta_out << "  \"frame_number\": " << frame_number << ",\n";
+      path_meta_out << "  \"rows\": " << src_rows << ",\n";
+      path_meta_out << "  \"cols\": " << src_cols << ",\n";
+      path_meta_out << "  \"original_input_rows\": " << input_rows << ",\n";
+      path_meta_out << "  \"original_input_cols\": " << input_cols << ",\n";
+      path_meta_out << "  \"tensor_axis_order\": \"frequency_time\",\n";
+      path_meta_out << "  \"input_height\": " << output_rows << ",\n";
+      path_meta_out << "  \"input_width\": " << output_cols << ",\n";
+      path_meta_out << "  \"resolution_hz\": " << resolution_hz << ",\n";
+      path_meta_out << "  \"sample_rate_hz\": " << sample_rate_hz << ",\n";
+      path_meta_out << "  \"span_hz\": " << span_hz << ",\n";
+      path_meta_out << "  \"frequency_axis_calibrated\": " << json_bool(frequency_axis_calibrated) << ",\n";
+      path_meta_out << "  \"ignore_bins_per_side\": " << ignore_bins_per_side << ",\n";
+      path_meta_out << "  \"fast_performance\": " << json_bool(fast_performance_path) << ",\n";
+      path_meta_out << "  \"path_mode_effective\": \"" << json_escape(fast_performance_path ? std::string("fast_performance") : std::string("reference")) << "\",\n";
+      path_meta_out << "  \"pipeline_variant\": \"" << json_escape(fast_performance_path ? std::string("performance_path_reference_mask_v1") : coherent_variant_name) << "\",\n";
+      path_meta_out << "  \"tensor_snapshot_path\": null,\n";
+      path_meta_out << "  \"power_db_snapshot_path\": null,\n";
+      path_meta_out << "  \"mask_path\": null,\n";
+      if (fast_performance_path) {
+        path_meta_out << "  \"performance_path_artifacts\": {\n";
+        path_meta_out << "    \"corrected_db_path\": \"" << json_escape(path_corrected_db_path) << "\",\n";
+        path_meta_out << "    \"corrected_db_pgm_path\": \"" << json_escape(path_corrected_db_pgm_path) << "\",\n";
+        path_meta_out << "    \"merged_surface_path\": \"" << json_escape(path_merged_surface_path) << "\",\n";
+        path_meta_out << "    \"merged_surface_pgm_path\": \"" << json_escape(path_merged_surface_pgm_path) << "\",\n";
+        path_meta_out << "    \"support_surface_path\": \"" << json_escape(path_support_surface_path) << "\",\n";
+        path_meta_out << "    \"support_surface_pgm_path\": \"" << json_escape(path_support_surface_pgm_path) << "\",\n";
+        path_meta_out << "    \"coherence_surface_path\": \"" << json_escape(path_coherence_surface_path) << "\",\n";
+        path_meta_out << "    \"coherence_surface_pgm_path\": \"" << json_escape(path_coherence_surface_pgm_path) << "\",\n";
+        path_meta_out << "    \"mask_components_path\": \"" << json_escape(path_mask_components_path) << "\",\n";
+        path_meta_out << "    \"mask_components_pgm_path\": \"" << json_escape(path_mask_components_pgm_path) << "\",\n";
+        path_meta_out << "    \"final_mask_path\": \"" << json_escape(path_final_mask_path) << "\",\n";
+        path_meta_out << "    \"final_mask_pgm_path\": \"" << json_escape(path_final_mask_pgm_path) << "\"\n";
+        path_meta_out << "  },\n";
+        path_meta_out << "  \"reference_debug_artifacts\": null,\n";
+      } else {
+        path_meta_out << "  \"performance_path_artifacts\": null,\n";
+        path_meta_out << "  \"reference_debug_artifacts\": {\n";
+        path_meta_out << "    \"corrected_db_path\": \"" << json_escape(path_corrected_db_path) << "\",\n";
+        path_meta_out << "    \"corrected_db_pgm_path\": \"" << json_escape(path_corrected_db_pgm_path) << "\",\n";
+        path_meta_out << "    \"merged_coherence_path\": \"" << json_escape(merged_coherence_path) << "\",\n";
+        path_meta_out << "    \"merged_power_path\": \"" << json_escape(merged_power_path) << "\",\n";
+        path_meta_out << "    \"merged_score_path\": \"" << json_escape(merged_score_path) << "\",\n";
+        path_meta_out << "    \"raw_projected_mask_path\": null,\n";
+        path_meta_out << "    \"raw_projected_mask_pgm_path\": null,\n";
+        path_meta_out << "    \"grouped_final_mask_path\": \"" << json_escape(path_final_mask_path) << "\",\n";
+        path_meta_out << "    \"grouped_final_mask_pgm_path\": \"" << json_escape(path_final_mask_pgm_path) << "\"\n";
+        path_meta_out << "  },\n";
+      }
+      path_meta_out << "  \"config\": {\n";
+      path_meta_out << "    \"chunk_bandwidth_hz\": " << chunk_bandwidth_hz_.get() << ",\n";
+      path_meta_out << "    \"chunk_overlap_hz\": " << chunk_overlap_hz_.get() << ",\n";
+      path_meta_out << "    \"uncalibrated_chunk_fraction\": " << uncalibrated_chunk_fraction_.get() << ",\n";
+      path_meta_out << "    \"uncalibrated_overlap_fraction\": " << uncalibrated_overlap_fraction_.get() << ",\n";
+      path_meta_out << "    \"ignore_sideband_percent\": " << ignore_sideband_percent_.get() << ",\n";
+      path_meta_out << "    \"ignore_sideband_hz\": " << ignore_sideband_hz_.get() << ",\n";
+      path_meta_out << "    \"frontend_row_q\": " << frontend_row_q_.get() << ",\n";
+      path_meta_out << "    \"frontend_reference_q\": " << frontend_reference_q_.get() << ",\n";
+      path_meta_out << "    \"frontend_smooth_sigma\": " << frontend_smooth_sigma_.get() << ",\n";
+      path_meta_out << "    \"frontend_max_boost_db\": " << frontend_max_boost_db_.get() << ",\n";
+      path_meta_out << "    \"coherence_weight\": " << coherence_weight_.get() << ",\n";
+      path_meta_out << "    \"power_weight\": " << power_weight_.get() << ",\n";
+      path_meta_out << "    \"power_assist_mode\": \"" << power_assist_mode_.get() << "\",\n";
+      path_meta_out << "    \"power_floor_time_q\": " << power_floor_time_q_.get() << ",\n";
+      path_meta_out << "    \"power_floor_global_q\": " << power_floor_global_q_.get() << ",\n";
+      path_meta_out << "    \"power_excess_start_db\": " << power_excess_start_db_.get() << ",\n";
+      path_meta_out << "    \"power_excess_full_db\": " << power_excess_full_db_.get() << ",\n";
+      path_meta_out << "    \"power_local_blend\": " << power_local_blend_.get() << ",\n";
+      path_meta_out << "    \"coherence_source_mode\": \"" << coherence_source_mode_.get() << "\",\n";
+      path_meta_out << "    \"coherence_gate_start\": " << coherence_gate_start_.get() << ",\n";
+      path_meta_out << "    \"coherence_gate_full\": " << coherence_gate_full_.get() << ",\n";
+      path_meta_out << "    \"coherence_bridge_bias\": " << coherence_bridge_bias_.get() << ",\n";
+      path_meta_out << "    \"coherence_power_joint_weight\": " << coherence_power_joint_weight_.get() << ",\n";
+      path_meta_out << "    \"score_threshold_mode\": \"" << score_threshold_mode_.get() << "\",\n";
+      path_meta_out << "    \"fixed_score_threshold\": " << fixed_score_threshold_.get() << ",\n";
+      path_meta_out << "    \"coherence_power_support_q\": " << coherence_power_support_q_.get() << ",\n";
+      path_meta_out << "    \"coherence_power_q\": " << coherence_power_q_.get() << ",\n";
+      path_meta_out << "    \"min_component_size\": " << min_component_size_.get() << ",\n";
+      path_meta_out << "    \"grouping_seed_score_q\": " << grouping_seed_score_q_.get() << ",\n";
+      path_meta_out << "    \"grouping_bridge_freq_px\": " << grouping_bridge_freq_px_.get() << ",\n";
+      path_meta_out << "    \"grouping_bridge_time_px\": " << grouping_bridge_time_px_.get() << ",\n";
+      path_meta_out << "    \"grouping_min_component_size\": " << grouping_min_component_size_.get() << ",\n";
+      path_meta_out << "    \"grouping_min_freq_span_px\": " << grouping_min_freq_span_px_.get() << ",\n";
+      path_meta_out << "    \"grouping_min_time_span_px\": " << grouping_min_time_span_px_.get() << ",\n";
+      path_meta_out << "    \"grouping_min_density\": " << grouping_min_density_.get() << ",\n";
+      path_meta_out << "    \"grouping_time_continuity_ratio\": " << grouping_time_continuity_ratio_.get() << "\n";
+      path_meta_out << "  }\n";
+      path_meta_out << "}\n";
+      if (!path_meta_out.good()) {
+        throw std::runtime_error("failed to write path artifact metadata sidecar");
+      }
+      path_meta_out.flush();
+      path_meta_out.close();
+      path_artifacts_saved_[channel_number] = 1;
+
+      const int channel_filter = channel_filter_.get();
+      bool all_channels_captured = true;
+      for (size_t channel_index = 0; channel_index < path_artifacts_saved_.size(); ++channel_index) {
+        if (channel_filter >= 0 && static_cast<int>(channel_index) != channel_filter) {
+          continue;
+        }
+        if (path_artifacts_saved_[channel_index] == 0) {
+          all_channels_captured = false;
+          break;
+        }
+      }
+      if (all_channels_captured && !stop_requested_.exchange(true, std::memory_order_relaxed)) {
+        HOLOSCAN_LOG_INFO("Stopping graph after saving path artifacts for all active channels at frame {}", frame_number);
+        GxfGraphInterrupt(context.context());
+      }
+      if (!should_save_tensor_snapshot) {
+        return;
+      }
+    }
+
     const double center_frequency_hz = static_cast<double>(meta->get<uint64_t>("center_frequency", 0));
     std::ofstream meta_out(metadata_path, std::ios::binary);
     if (!meta_out.is_open()) {
@@ -7209,8 +7640,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     meta_out << "  \"center_frequency_hz\": " << center_frequency_hz << ",\n";
     meta_out << "  \"frequency_axis_calibrated\": " << json_bool(frequency_axis_calibrated) << ",\n";
     meta_out << "  \"ignore_bins_per_side\": " << ignore_bins_per_side << ",\n";
-    meta_out << "  \"backend_mode_requested\": \"" << json_escape(backend_mode) << "\",\n";
-    meta_out << "  \"backend_mode_effective\": \"" << json_escape(coherent_backend_name) << "\",\n";
+    meta_out << "  \"fast_performance\": " << json_bool(fast_performance_path) << ",\n";
+    meta_out << "  \"path_mode_effective\": \"" << json_escape(fast_performance_path ? std::string("fast_performance") : std::string("reference")) << "\",\n";
     meta_out << "  \"pipeline_variant\": \"" << json_escape(coherent_variant_name) << "\",\n";
     if (should_save_tensor_snapshot) {
       meta_out << "  \"tensor_snapshot_path\": \"" << json_escape(tensor_path) << "\",\n";
@@ -7315,12 +7746,6 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       }
     }
 
-    if (should_save_reference_debug_artifacts && stop_after_debug_artifact_save_.get()) {
-      HOLOSCAN_LOG_INFO("Stopping graph after coherent reference debug bundle save for channel {} frame {}",
-                        channel_number,
-                        frame_number);
-      GxfGraphInterrupt(context.context());
-    }
   };
 
   time_step_ms(kMaskSaveStage, maybe_save_debug_artifacts);

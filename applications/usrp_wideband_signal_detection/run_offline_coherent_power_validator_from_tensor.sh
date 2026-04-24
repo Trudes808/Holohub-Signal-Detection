@@ -261,7 +261,7 @@ metadata = {
     "config": {
         key: coherent[key]
         for key in (
-            "backend_mode", "chunk_bandwidth_hz", "chunk_overlap_hz", "uncalibrated_chunk_fraction",
+        "fast_performance", "chunk_bandwidth_hz", "chunk_overlap_hz", "uncalibrated_chunk_fraction",
             "uncalibrated_overlap_fraction", "ignore_sideband_percent", "ignore_sideband_hz", "frontend_row_q",
             "frontend_reference_q", "frontend_smooth_sigma", "frontend_max_boost_db", "coherence_weight",
             "power_weight", "power_assist_mode", "power_floor_time_q", "power_floor_global_q",

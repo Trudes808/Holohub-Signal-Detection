@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 
 namespace holoscan::ops {
 
@@ -143,21 +144,24 @@ torch::Tensor normalize_map01_masked_minmax_torch_batch(const torch::Tensor& inp
   if (input.dim() != 3 || valid_mask.dim() != 3) {
     return torch::zeros_like(input);
   }
-  auto output = torch::zeros_like(input, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
-  auto flat_input = input.reshape({input.size(0), -1});
-  auto flat_valid = valid_mask.reshape({valid_mask.size(0), -1});
-  for (int64_t batch_index = 0; batch_index < input.size(0); ++batch_index) {
-    auto active = flat_input[batch_index].masked_select(flat_valid[batch_index]);
-    if (active.numel() == 0) {
-      continue;
-    }
-    const double lo = active.min().item<double>();
-    const double hi = active.max().item<double>();
-    const double scale = std::max(hi - lo, 1.0e-6);
-    auto normalized = torch::clamp((input[batch_index] - lo) / scale, 0.0, 1.0).to(torch::kFloat32);
-    output[batch_index] = torch::where(valid_mask[batch_index], normalized, torch::zeros_like(normalized));
-  }
-  return output.contiguous();
+  auto input_float = input.to(torch::kFloat32);
+  auto flat_input = input_float.reshape({input.size(0), -1});
+  auto flat_valid = valid_mask.reshape({valid_mask.size(0), -1}).to(torch::kBool);
+
+  auto pos_inf = torch::full_like(flat_input, std::numeric_limits<float>::infinity());
+  auto neg_inf = torch::full_like(flat_input, -std::numeric_limits<float>::infinity());
+  auto masked_min_input = torch::where(flat_valid, flat_input, pos_inf);
+  auto masked_max_input = torch::where(flat_valid, flat_input, neg_inf);
+
+  auto lo = std::get<0>(masked_min_input.min(1, true)).view({input.size(0), 1, 1});
+  auto hi = std::get<0>(masked_max_input.max(1, true)).view({input.size(0), 1, 1});
+  auto has_valid = flat_valid.any(1, true).view({input.size(0), 1, 1});
+  auto safe_lo = torch::where(has_valid, lo, torch::zeros_like(lo));
+  auto safe_hi = torch::where(has_valid, hi, torch::ones_like(hi));
+  auto scale = torch::clamp_min(safe_hi - safe_lo, 1.0e-6);
+  auto normalized = torch::clamp((input_float - safe_lo) / scale, 0.0, 1.0);
+  auto zeros = torch::zeros_like(normalized);
+  return torch::where(valid_mask.to(torch::kBool), torch::where(has_valid, normalized, zeros), zeros).contiguous();
 }
 
 torch::Tensor gaussian_kernel_tensor_torch(double sigma, const c10::Device& device, c10::ScalarType dtype) {

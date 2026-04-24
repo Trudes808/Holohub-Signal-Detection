@@ -211,7 +211,7 @@ coherent_power_signal_detector:
   input_width: 20480
   emit_stride: 4
   log_detections: false
-  backend_mode: "reference"
+  fast_performance: true
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0

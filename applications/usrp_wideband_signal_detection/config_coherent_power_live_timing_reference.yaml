@@ -208,7 +208,7 @@ coherent_power_signal_detector:
   # reference detector much less often than the throughput profile.
   emit_stride: 8
   log_detections: false
-  backend_mode: "reference"
+  fast_performance: false
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -100,10 +101,36 @@ struct DebugChunkResult {
   int dst_rows = 0;
   int dst_cols = 0;
   std::vector<uint8_t> final_mask;
+  std::vector<uint8_t> final_mask_source;
   std::vector<float> combined_score;
   std::vector<uint8_t> grouped_mask_source;
   std::vector<DetectionBox> grouped_boxes;
 };
+
+struct OperatorTimingProfile {
+  double total_compute_ms = 0.0;
+  double power_db_ms = 0.0;
+  double frontend_ms = 0.0;
+  double chunk_plan_ms = 0.0;
+  double chunk_pack_ms = 0.0;
+  double coherence_batch_ms = 0.0;
+  double runtime_batch_ms = 0.0;
+  double runtime_crop_align_ms = 0.0;
+  double runtime_resize_ms = 0.0;
+  double runtime_model_prep_ms = 0.0;
+  double runtime_torch_forward_ms = 0.0;
+  double runtime_dino_score_ms = 0.0;
+  double raw_score_projection_ms = 0.0;
+  double hybrid_batch_ms = 0.0;
+  double debug_device_to_host_ms = 0.0;
+  double debug_chunk_grouping_ms = 0.0;
+  double global_merge_ms = 0.0;
+  double artifact_serialization_ms = 0.0;
+};
+
+double elapsed_ms_since(const std::chrono::steady_clock::time_point& start_time) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_time).count();
+}
 
 bool write_npy_2d(const std::filesystem::path& path,
                   const void* payload,
@@ -394,7 +421,8 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
                                     const std::vector<float>& coherence_gate_resized,
                                     const DebugChunkResult& selected_debug_chunk,
                                     const GlobalMergedResult& global_merged,
-                                    const std::vector<ChunkPlanEntry>& chunk_plan) {
+                                    const std::vector<ChunkPlanEntry>& chunk_plan,
+                                    const OperatorTimingProfile& timing_profile) {
   std::filesystem::create_directories(output_dir / "chunk_debug");
 
   const auto corrected_resized_path = output_dir / "chunk_debug" / "chunk_corrected_resized.npy";
@@ -423,11 +451,17 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   const auto projected_mask_float = mask_to_float(global_merged.projected_grouped_mask);
   const auto merged_box_mask_float = mask_to_float(global_merged.merged_box_mask);
   const auto stitched_final_mask_float = mask_to_float(global_merged.stitched_final_mask);
-  const auto final_mask_source_float = mask_to_float(resize_mask_nearest(selected_debug_chunk.final_mask,
-                                                                         selected_debug_chunk.dst_rows,
-                                                                         selected_debug_chunk.dst_cols,
-                                                                         selected_debug_chunk.src_rows,
-                                                                         selected_debug_chunk.src_cols));
+  const auto grouped_mask_projected_float = mask_to_float(resize_mask_nearest(selected_debug_chunk.grouped_mask_source,
+                                                                              selected_debug_chunk.src_rows,
+                                                                              selected_debug_chunk.src_cols,
+                                                                              selected_debug_chunk.dst_rows,
+                                                                              selected_debug_chunk.dst_cols));
+  const auto final_mask_source_float = mask_to_float(selected_debug_chunk.final_mask_source);
+  const auto final_mask_projected_float = mask_to_float(resize_mask_nearest(selected_debug_chunk.final_mask,
+                                                                            selected_debug_chunk.dst_rows,
+                                                                            selected_debug_chunk.dst_cols,
+                                                                            selected_debug_chunk.src_rows,
+                                                                            selected_debug_chunk.src_cols));
 
   if (!write_npy_2d(corrected_resized_path,
                     corrected_resized.data(),
@@ -460,10 +494,10 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
                     selected_debug_chunk.dst_cols,
                     "<f4") ||
       !write_npy_2d(grouped_mask_path,
-                    grouped_mask_float.data(),
-                    grouped_mask_float.size() * sizeof(float),
-                    selected_debug_chunk.src_rows,
-                    selected_debug_chunk.src_cols,
+                    grouped_mask_projected_float.data(),
+                    grouped_mask_projected_float.size() * sizeof(float),
+                    selected_debug_chunk.dst_rows,
+                    selected_debug_chunk.dst_cols,
                     "<f4") ||
       !write_npy_2d(final_mask_path,
                     final_mask_float.data(),
@@ -478,10 +512,10 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
                     selected_debug_chunk.src_cols,
                     "<f4") ||
       !write_npy_2d(final_mask_projected_path,
-                    final_mask_float.data(),
-                    final_mask_float.size() * sizeof(float),
-                    selected_debug_chunk.dst_rows,
-                    selected_debug_chunk.dst_cols,
+                    final_mask_projected_float.data(),
+                    final_mask_projected_float.size() * sizeof(float),
+                    selected_debug_chunk.src_rows,
+                    selected_debug_chunk.src_cols,
                     "<f4") ||
       !write_npy_2d(projected_grouped_mask_path,
                     projected_mask_float.data(),
@@ -527,6 +561,26 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   chunk_debug_summary << "  \"dst_rows\": " << selected_debug_chunk.dst_rows << ",\n";
   chunk_debug_summary << "  \"dst_cols\": " << selected_debug_chunk.dst_cols << ",\n";
   chunk_debug_summary << "  \"grouped_box_count\": " << selected_debug_chunk.grouped_boxes.size() << ",\n";
+  chunk_debug_summary << "  \"operator_timing_ms\": {\n";
+  chunk_debug_summary << "    \"total_compute\": " << timing_profile.total_compute_ms << ",\n";
+  chunk_debug_summary << "    \"power_db\": " << timing_profile.power_db_ms << ",\n";
+  chunk_debug_summary << "    \"frontend\": " << timing_profile.frontend_ms << ",\n";
+  chunk_debug_summary << "    \"chunk_plan\": " << timing_profile.chunk_plan_ms << ",\n";
+  chunk_debug_summary << "    \"chunk_pack\": " << timing_profile.chunk_pack_ms << ",\n";
+  chunk_debug_summary << "    \"coherence_batch\": " << timing_profile.coherence_batch_ms << ",\n";
+  chunk_debug_summary << "    \"runtime_batch\": " << timing_profile.runtime_batch_ms << ",\n";
+  chunk_debug_summary << "    \"runtime_crop_align\": " << timing_profile.runtime_crop_align_ms << ",\n";
+  chunk_debug_summary << "    \"runtime_resize\": " << timing_profile.runtime_resize_ms << ",\n";
+  chunk_debug_summary << "    \"runtime_model_prep\": " << timing_profile.runtime_model_prep_ms << ",\n";
+  chunk_debug_summary << "    \"runtime_torch_forward\": " << timing_profile.runtime_torch_forward_ms << ",\n";
+  chunk_debug_summary << "    \"runtime_dino_score\": " << timing_profile.runtime_dino_score_ms << ",\n";
+  chunk_debug_summary << "    \"raw_score_projection\": " << timing_profile.raw_score_projection_ms << ",\n";
+  chunk_debug_summary << "    \"hybrid_batch\": " << timing_profile.hybrid_batch_ms << ",\n";
+  chunk_debug_summary << "    \"debug_device_to_host\": " << timing_profile.debug_device_to_host_ms << ",\n";
+  chunk_debug_summary << "    \"debug_chunk_grouping\": " << timing_profile.debug_chunk_grouping_ms << ",\n";
+  chunk_debug_summary << "    \"global_merge\": " << timing_profile.global_merge_ms << ",\n";
+  chunk_debug_summary << "    \"artifact_serialization\": " << timing_profile.artifact_serialization_ms << "\n";
+  chunk_debug_summary << "  },\n";
   chunk_debug_summary << "  \"corrected_resized_npy\": \"" << json_escape(corrected_resized_path.string()) << "\",\n";
   chunk_debug_summary << "  \"dino_score_raw_npy\": \"" << json_escape(raw_score_path.string()) << "\",\n";
   chunk_debug_summary << "  \"dino_score_raw_deweighted_npy\": \"" << json_escape(raw_score_deweighted_path.string()) << "\",\n";
@@ -547,6 +601,26 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   summary << "  \"selected_chunk_index\": " << selected_chunk_index << ",\n";
   summary << "  \"src_rows\": " << src_rows << ",\n";
   summary << "  \"src_cols\": " << src_cols << ",\n";
+  summary << "  \"operator_timing_ms\": {\n";
+  summary << "    \"total_compute\": " << timing_profile.total_compute_ms << ",\n";
+  summary << "    \"power_db\": " << timing_profile.power_db_ms << ",\n";
+  summary << "    \"frontend\": " << timing_profile.frontend_ms << ",\n";
+  summary << "    \"chunk_plan\": " << timing_profile.chunk_plan_ms << ",\n";
+  summary << "    \"chunk_pack\": " << timing_profile.chunk_pack_ms << ",\n";
+  summary << "    \"coherence_batch\": " << timing_profile.coherence_batch_ms << ",\n";
+  summary << "    \"runtime_batch\": " << timing_profile.runtime_batch_ms << ",\n";
+  summary << "    \"runtime_crop_align\": " << timing_profile.runtime_crop_align_ms << ",\n";
+  summary << "    \"runtime_resize\": " << timing_profile.runtime_resize_ms << ",\n";
+  summary << "    \"runtime_model_prep\": " << timing_profile.runtime_model_prep_ms << ",\n";
+  summary << "    \"runtime_torch_forward\": " << timing_profile.runtime_torch_forward_ms << ",\n";
+  summary << "    \"runtime_dino_score\": " << timing_profile.runtime_dino_score_ms << ",\n";
+  summary << "    \"raw_score_projection\": " << timing_profile.raw_score_projection_ms << ",\n";
+  summary << "    \"hybrid_batch\": " << timing_profile.hybrid_batch_ms << ",\n";
+  summary << "    \"debug_device_to_host\": " << timing_profile.debug_device_to_host_ms << ",\n";
+  summary << "    \"debug_chunk_grouping\": " << timing_profile.debug_chunk_grouping_ms << ",\n";
+  summary << "    \"global_merge\": " << timing_profile.global_merge_ms << ",\n";
+  summary << "    \"artifact_serialization\": " << timing_profile.artifact_serialization_ms << "\n";
+  summary << "  },\n";
   summary << "  \"projected_grouped_mask_npy\": \"" << json_escape(projected_grouped_mask_path.string()) << "\",\n";
   summary << "  \"projected_grouped_score_npy\": \"" << json_escape(projected_grouped_score_path.string()) << "\",\n";
   summary << "  \"merged_box_mask_npy\": \"" << json_escape(merged_box_mask_path.string()) << "\",\n";
@@ -2451,6 +2525,26 @@ void CudaDinoDetector::initialize() {
   if (!runtime_) {
     runtime_ = std::make_shared<DinoTorchRuntime>();
   }
+  if (is_truthy_backend_mode(backend_mode_.get()) && inference_backend_.get() == "torchscript" && !model_script_path_.get().empty()) {
+    DinoTorchRuntimeConfig runtime_config;
+    runtime_config.inference_backend = inference_backend_.get();
+    runtime_config.model_script_path = model_script_path_.get();
+    runtime_config.torchscript_init_mode = torchscript_init_mode_.get();
+    runtime_config.torch_dtype = torch_dtype_.get();
+    runtime_config.imagenet_mean = imagenet_mean_.get();
+    runtime_config.imagenet_std = imagenet_std_.get();
+    runtime_config.return_patch_features = true;
+    runtime_config.return_final_mask_device = true;
+    runtime_config.compute_power_score = false;
+    runtime_config.frontend_correction_enable = false;
+
+    runtime_->warmup(runtime_config,
+                     std::max(1, input_height_.get()),
+                     std::max(1, input_width_.get()),
+                     std::max(1, input_height_.get()),
+                     std::max(1, input_width_.get()),
+                     std::max(1, patch_size_.get()));
+  }
   std::fprintf(stderr,
                "[cuda_dino_detector] INFO: initialized backend_mode='%s' execution_strategy='%s' debug_mode=%d host_copy_debug_only=%d max_tokens_per_inference=%d input=%dx%d patch_size=%d emit_stride=%d chunk_bw_hz=%.3f overlap_hz=%.3f frontend_correction_enable=%d\n",
                backend_mode_.get().c_str(),
@@ -2485,6 +2579,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
   }
 
   const auto& [fft_tensor, fft_stream] = *maybe_input;
+  const auto compute_start_time = std::chrono::steady_clock::now();
   auto meta = metadata();
   const uint16_t channel_number = meta ? meta->get<uint16_t>("channel_number", 0) : 0;
   const int channel_filter = channel_filter_.get();
@@ -2512,6 +2607,9 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
   }
   auto& buffers = channel_buffers_[local_channel_index];
   const size_t frame_elements = static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols);
+  const bool capture_operator_timing =
+      debug_mode_.get() && enable_debug_artifact_host_copy_.get() && !debug_artifact_output_dir_.get().empty();
+  OperatorTimingProfile timing_profile;
 
   if (buffers.processing_stream == nullptr) {
     throw_if_cuda_error(cudaStreamCreateWithFlags(&buffers.processing_stream, cudaStreamNonBlocking),
@@ -2608,13 +2706,20 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
   throw_if_cuda_error(cudaStreamWaitEvent(buffers.processing_stream, copy_complete_event, 0),
                       "cuda_dino_detector processing stream wait failed");
 
+  const auto power_db_start_time = std::chrono::steady_clock::now();
   cuda_dino_power_db_kernel<<<blocks, threads, 0, buffers.processing_stream>>>(
       static_cast<const cuda_dino_complex*>(buffers.analysis_tensor_device),
       src_rows,
       src_cols,
       buffers.power_db_device);
   throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector power_db kernel launch failed");
+  if (capture_operator_timing) {
+    throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                        "cuda_dino_detector power_db timing synchronization failed");
+    timing_profile.power_db_ms = elapsed_ms_since(power_db_start_time);
+  }
 
+  const auto frontend_start_time = std::chrono::steady_clock::now();
   if (frontend_correction_enable_.get()) {
     const int row_blocks = (src_rows + threads - 1) / threads;
     const int smooth_radius = std::max(
@@ -2649,6 +2754,11 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                         buffers.processing_stream),
                         "cuda_dino_detector corrected_db copy failed");
   }
+                  if (capture_operator_timing) {
+                    throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                                        "cuda_dino_detector frontend timing synchronization failed");
+                    timing_profile.frontend_ms = elapsed_ms_since(frontend_start_time);
+                  }
 
   int chunk_count = 0;
   int ignore_bins_per_side = 0;
@@ -2672,6 +2782,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
   }
 
   if (execution_strategy_.get() == "reference_chunks") {
+    const auto chunk_plan_start_time = std::chrono::steady_clock::now();
     const double chunk_bin_hz = (std::isfinite(resolution_hz) && resolution_hz > 0.0) ? resolution_hz : 1.0;
     const auto source_freq_axis_hz = build_frequency_axis_hz(src_rows, resolution_hz);
     const auto planned_selection = select_uniform_chunk_plan_with_minimal_sideband_trim(src_rows,
@@ -2692,6 +2803,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     if (!chunk_plan_has_uniform_rows(chunk_plan)) {
       throw std::runtime_error("cuda_dino_detector reference_chunks requires uniform chunk row counts");
     }
+    timing_profile.chunk_plan_ms = elapsed_ms_since(chunk_plan_start_time);
 
     chunk_count = static_cast<int>(chunk_plan.size());
     const int uniform_chunk_rows = chunk_row_count(chunk_plan.front());
@@ -2735,6 +2847,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       buffers.chunk_row_start_capacity = static_cast<size_t>(chunk_count);
     }
 
+    const auto chunk_pack_start_time = std::chrono::steady_clock::now();
     std::vector<int> chunk_row_starts(static_cast<size_t>(chunk_count), 0);
     for (int index = 0; index < chunk_count; ++index) {
       chunk_row_starts[static_cast<size_t>(index)] = chunk_plan[static_cast<size_t>(index)].row_start;
@@ -2756,6 +2869,11 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                                      chunk_count,
                                                                                                      buffers.corrected_batch_device);
     throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector reference chunk pack kernel launch failed");
+    if (capture_operator_timing) {
+      throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                          "cuda_dino_detector chunk pack timing synchronization failed");
+      timing_profile.chunk_pack_ms = elapsed_ms_since(chunk_pack_start_time);
+    }
 
     std::vector<uint8_t> chunk_valid_rows_batch(static_cast<size_t>(chunk_count) * static_cast<size_t>(uniform_chunk_rows), 1);
     for (int batch_index = 0; batch_index < chunk_count; ++batch_index) {
@@ -2769,6 +2887,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       }
     }
 
+    const auto coherence_start_time = std::chrono::steady_clock::now();
     const bool coherence_ready = compute_structure_tensor_gate_gpu_batch_to_device(buffers.corrected_batch_device,
                                                                                    chunk_count,
                                                                                    uniform_chunk_rows,
@@ -2776,6 +2895,11 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                    chunk_valid_rows_batch,
                                                                                    buffers.coherence_gate_batch_device,
                                                                                    buffers.processing_stream);
+    if (capture_operator_timing) {
+      throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                          "cuda_dino_detector coherence timing synchronization failed");
+      timing_profile.coherence_batch_ms = elapsed_ms_since(coherence_start_time);
+    }
 
     bool raw_score_ready = false;
     std::string raw_score_source = "none";
@@ -2807,11 +2931,19 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       if (!runtime_) {
         runtime_ = std::make_shared<DinoTorchRuntime>();
       }
+      const auto runtime_start_time = std::chrono::steady_clock::now();
       auto runtime_result = runtime_->run_batch(runtime_config, runtime_input);
+      timing_profile.runtime_batch_ms = elapsed_ms_since(runtime_start_time);
       if (runtime_result.success) {
+        timing_profile.runtime_crop_align_ms = runtime_result.timing.crop_align_ms;
+        timing_profile.runtime_resize_ms = runtime_result.timing.resize_ms;
+        timing_profile.runtime_model_prep_ms = runtime_result.timing.model_prep_ms;
+        timing_profile.runtime_torch_forward_ms = runtime_result.timing.torch_forward_ms;
+        timing_profile.runtime_dino_score_ms = runtime_result.timing.dino_score_ms;
         const bool resized_full_chunk = runtime_result.input_resized_to_target;
         if (runtime_result.patch_features_batch_device != nullptr && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 &&
             runtime_result.feature_dim > 0) {
+          const auto raw_score_start_time = std::chrono::steady_clock::now();
           raw_score_ready = compute_deweighted_raw_dino_score_gpu_batch_to_device(runtime_result.patch_features_batch_device,
                                                                                   chunk_count,
                                                                                   runtime_result.patch_rows,
@@ -2825,8 +2957,14 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                   resized_full_chunk,
                                                                                   buffers.raw_dino_score_batch_device,
                                                                                   buffers.processing_stream);
+          if (capture_operator_timing) {
+            throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                                "cuda_dino_detector raw score timing synchronization failed");
+            timing_profile.raw_score_projection_ms = elapsed_ms_since(raw_score_start_time);
+          }
           raw_score_source = raw_score_ready ? "patch_features" : "none";
         } else if (runtime_result.score_maps_device != nullptr) {
+          const auto raw_score_start_time = std::chrono::steady_clock::now();
           raw_score_ready = project_runtime_score_batch_to_device(runtime_result.score_maps_device,
                                                                   chunk_count,
                                                                   input_height_.get(),
@@ -2838,6 +2976,11 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                   resized_full_chunk,
                                                                   buffers.raw_dino_score_batch_device,
                                                                   buffers.processing_stream);
+          if (capture_operator_timing) {
+            throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                                "cuda_dino_detector raw score timing synchronization failed");
+            timing_profile.raw_score_projection_ms = elapsed_ms_since(raw_score_start_time);
+          }
           raw_score_source = raw_score_ready ? "score_map_fallback" : "none";
         }
         if (meta) {
@@ -2865,6 +3008,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
 
     bool hybrid_ready = false;
     if (coherence_ready && raw_score_ready) {
+      const auto hybrid_start_time = std::chrono::steady_clock::now();
       hybrid_ready = compute_residual_veto_hybrid_gpu_batch_to_device(buffers.raw_dino_score_batch_device,
                                                                       buffers.coherence_gate_batch_device,
                                                                       chunk_count,
@@ -2876,6 +3020,11 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                       buffers.hybrid_combined_score_batch_device,
                                                                       buffers.hybrid_final_mask_batch_device,
                                                                       buffers.processing_stream);
+      if (capture_operator_timing) {
+        throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                            "cuda_dino_detector hybrid timing synchronization failed");
+        timing_profile.hybrid_batch_ms = elapsed_ms_since(hybrid_start_time);
+      }
     }
     if (meta) {
       meta->set("cuda_dino_hybrid_ready", hybrid_ready);
@@ -2889,6 +3038,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         hybrid_ready && debug_mode_.get() && enable_debug_artifact_host_copy_.get();
     if (debug_projection_merge_enabled) {
       const bool write_operator_artifacts = !debug_artifact_output_dir_.get().empty();
+      const auto debug_device_to_host_start_time = std::chrono::steady_clock::now();
       std::vector<float> corrected_batch;
       std::vector<float> coherence_gate_batch;
       std::vector<float> raw_score_batch;
@@ -2931,11 +3081,13 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                           "cuda_dino_detector hybrid final mask debug copy failed");
       throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
                           "cuda_dino_detector hybrid debug synchronization failed");
+      timing_profile.debug_device_to_host_ms = elapsed_ms_since(debug_device_to_host_start_time);
 
       std::vector<DebugChunkResult> debug_chunk_results;
       debug_chunk_results.reserve(static_cast<size_t>(chunk_count));
 
       const size_t chunk_elements = static_cast<size_t>(uniform_chunk_rows) * static_cast<size_t>(src_cols);
+      const auto debug_grouping_start_time = std::chrono::steady_clock::now();
       for (int batch_index = 0; batch_index < chunk_count; ++batch_index) {
         const auto& chunk = chunk_plan[static_cast<size_t>(batch_index)];
         const size_t batch_offset = static_cast<size_t>(batch_index) * chunk_elements;
@@ -2972,6 +3124,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         debug_chunk_result.src_cols = src_cols;
         debug_chunk_result.dst_rows = std::max(1, input_height_.get());
         debug_chunk_result.dst_cols = std::max(1, input_width_.get());
+        debug_chunk_result.final_mask_source = chunk_mask;
         debug_chunk_result.final_mask = resize_mask_nearest(chunk_mask,
                                                             uniform_chunk_rows,
                                                             src_cols,
@@ -2993,7 +3146,9 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         }
         debug_chunk_results.push_back(std::move(debug_chunk_result));
       }
+      timing_profile.debug_chunk_grouping_ms = elapsed_ms_since(debug_grouping_start_time);
 
+      const auto global_merge_start_time = std::chrono::steady_clock::now();
       const auto global_merged = build_global_merged_result(debug_chunk_results,
                                                             filter_detection_mask_.get(),
                                                             grouping_bridge_freq_px_.get(),
@@ -3006,6 +3161,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                             src_rows,
                                                             src_cols,
                                                             planned_selection.valid_row_mask);
+                                          timing_profile.global_merge_ms = elapsed_ms_since(global_merge_start_time);
       const auto source_valid_mask = expand_row_valid_mask(planned_selection.valid_row_mask, src_cols);
       if (meta) {
         meta->set("cuda_dino_group_merge_ready", true);
@@ -3045,6 +3201,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                        selected_debug_chunk.dst_rows,
                                                        selected_debug_chunk.dst_cols);
 
+        timing_profile.total_compute_ms = elapsed_ms_since(compute_start_time);
         write_operator_artifact_bundle(debug_artifact_output_dir_.get(),
                                        chunk_count,
                                        selected_batch_index,
@@ -3056,7 +3213,8 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                        coherence_gate_resized,
                                        selected_debug_chunk,
                                        global_merged,
-                                       chunk_plan);
+                                       chunk_plan,
+                                       timing_profile);
         ++artifact_dump_count_;
         if (meta) {
           meta->set("cuda_dino_debug_artifact_output_dir", debug_artifact_output_dir_.get());
@@ -3074,7 +3232,10 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     meta->set("cuda_dino_chunk_count", static_cast<uint32_t>(std::max(0, chunk_count)));
     meta->set("cuda_dino_ignore_bins_per_side", ignore_bins_per_side);
     meta->set("cuda_dino_freq_bin_hz", resolution_hz);
+    meta->set("cuda_dino_total_compute_ms", elapsed_ms_since(compute_start_time));
   }
+
+  timing_profile.total_compute_ms = elapsed_ms_since(compute_start_time);
 
   if (copy_complete_event != nullptr) {
     cudaEventDestroy(copy_complete_event);
