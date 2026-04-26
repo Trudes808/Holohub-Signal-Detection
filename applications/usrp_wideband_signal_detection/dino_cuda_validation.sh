@@ -167,6 +167,13 @@ fi
 if [[ -z "$plot_output" ]]; then
   plot_output="${cuda_output_dir}/chunk_debug/cuda_vs_reference_compare.png"
 fi
+plot_output_ext="${plot_output##*.}"
+plot_output_base="${plot_output%.*}"
+if [[ "$plot_output_base" == "$plot_output" ]]; then
+  timing_plot_output="${plot_output}_timing"
+else
+  timing_plot_output="${plot_output_base}_timing.${plot_output_ext}"
+fi
 
 if [[ "$plot_only" == "1" ]]; then
   skip_cuda=1
@@ -238,4 +245,5 @@ cat <<EOF
 CUDA output dir: $cuda_output_dir
 Reference output dir: $reference_output_dir
 Comparison plot: $plot_output
+Timing plot: $timing_plot_output
 EOF

@@ -18,8 +18,42 @@ DEFAULT_STAGE_KEYS = [
     "coherence_gate_npy",
     "hybrid_contrib_npy",
     "combined_score_npy",
+    "hybrid_filled_mask_npy",
+    "hybrid_component_filtered_mask_npy",
     "final_mask_npy",
 ]
+
+
+TIMING_METRIC_MAP = [
+    ("runtime_warmup", None, "runtime_warmup", 0),
+    ("power_db_from_tensor", "power_db", "power_db_from_tensor", 0),
+    ("frontend_correction", "frontend", "frontend_correction", 0),
+    ("chunk_planning", "chunk_plan", "chunk_planning", 0),
+    ("chunk_pack", "chunk_pack", None, 0),
+    ("chunk_coherence", "coherence_batch", "chunk_coherence", 0),
+    ("chunk_torch_runtime_batch", "runtime_batch", "chunk_torch_runtime_batch", 0),
+    ("chunk_model_prep_batch", "runtime_model_prep", "chunk_model_prep_batch", 1),
+    ("chunk_torch_forward_batch", "runtime_torch_forward", "chunk_torch_forward_batch", 1),
+    ("chunk_dino_score_batch", "runtime_dino_score", "chunk_dino_score_batch", 1),
+    ("chunk_score_projection", "raw_score_projection", "chunk_score_projection", 0),
+    ("chunk_hybrid_support_batch", "hybrid_batch", "chunk_hybrid_support_batch", 0),
+    ("hybrid_normalization", "hybrid_normalization", None, 1),
+    ("hybrid_residual_stack", "hybrid_residual_stack", None, 1),
+    ("hybrid_threshold_extract", "hybrid_threshold_extract", None, 1),
+    ("hybrid_closing", "hybrid_closing", None, 1),
+    ("hybrid_fill_holes", "hybrid_fill_holes", None, 1),
+    ("hybrid_component_filter", "hybrid_component_filter", None, 1),
+    ("hybrid_output_copy", "hybrid_output_copy", None, 1),
+    ("debug_device_to_host", "debug_device_to_host", None, 0),
+    ("global_merge", "global_merge", "global_merge", 0),
+    ("artifact_serialization", "artifact_serialization", "artifact_serialization", 0),
+    ("debug_chunk_rerun_total", None, "debug_chunk_rerun_total", 0),
+    ("debug_artifact_serialization", None, "debug_artifact_serialization", 1),
+]
+
+
+def format_timing_label(label: str, indent_level: int) -> str:
+    return f"{'  ' * max(indent_level, 0)}{label}"
 
 
 def repo_root() -> Path:
@@ -194,6 +228,26 @@ def load_operator_timing_summary(validation_summary: dict, debug_summary: dict) 
     return {}
 
 
+def build_timing_rows(cuda_elapsed_ms: float | None,
+                      reference_elapsed_ms: float | None,
+                      reference_stage_profile_path: Path | None,
+                      cuda_validation_summary: dict,
+                      cuda_debug_summary: dict) -> list[tuple[str, str, int, float | None, float | None]]:
+    rows: list[tuple[str, str, int, float | None, float | None]] = [
+        ("wall_clock_total", format_timing_label("wall_clock_total", 0), 0, cuda_elapsed_ms, reference_elapsed_ms),
+    ]
+
+    reference_aggregates = load_stage_profile_aggregates(reference_stage_profile_path)
+    cuda_aggregates = load_operator_timing_summary(cuda_validation_summary, cuda_debug_summary)
+    for label, cuda_key, reference_key, indent_level in TIMING_METRIC_MAP:
+        cuda_value = cuda_aggregates.get(cuda_key) if cuda_key else None
+        reference_value = reference_aggregates.get(reference_key) if reference_key else None
+        if cuda_value is None and reference_value is None:
+            continue
+        rows.append((label, format_timing_label(label, indent_level), indent_level, cuda_value, reference_value))
+    return rows
+
+
 def print_timing_summary(cuda_elapsed_ms: float | None,
                          reference_elapsed_ms: float | None,
                          reference_stage_profile_path: Path | None,
@@ -212,41 +266,15 @@ def print_timing_summary(cuda_elapsed_ms: float | None,
             return "n/a"
         return f"{cuda_value - reference_value:+.3f}"
 
-    rows: list[tuple[str, float | None, float | None]] = [
-        ("wall_clock_total", cuda_elapsed_ms, reference_elapsed_ms),
-    ]
+    rows = build_timing_rows(cuda_elapsed_ms,
+                             reference_elapsed_ms,
+                             reference_stage_profile_path,
+                             cuda_validation_summary,
+                             cuda_debug_summary)
 
-    reference_aggregates = load_stage_profile_aggregates(reference_stage_profile_path)
-    cuda_aggregates = load_operator_timing_summary(cuda_validation_summary, cuda_debug_summary)
-    metric_map = [
-        ("runtime_warmup", None, "runtime_warmup"),
-        ("power_db_from_tensor", "power_db", "power_db_from_tensor"),
-        ("frontend_correction", "frontend", "frontend_correction"),
-        ("chunk_planning", "chunk_plan", "chunk_planning"),
-        ("chunk_pack", "chunk_pack", None),
-        ("chunk_coherence", "coherence_batch", "chunk_coherence"),
-        ("chunk_torch_runtime_batch", "runtime_batch", "chunk_torch_runtime_batch"),
-        ("chunk_model_prep_batch", "runtime_model_prep", "chunk_model_prep_batch"),
-        ("chunk_torch_forward_batch", "runtime_torch_forward", "chunk_torch_forward_batch"),
-        ("chunk_dino_score_batch", "runtime_dino_score", "chunk_dino_score_batch"),
-        ("chunk_score_projection", "raw_score_projection", "chunk_score_projection"),
-        ("chunk_hybrid_support_batch", "hybrid_batch", "chunk_hybrid_support_batch"),
-        ("debug_device_to_host", "debug_device_to_host", None),
-        ("global_merge", "global_merge", "global_merge"),
-        ("artifact_serialization", "artifact_serialization", "artifact_serialization"),
-        ("debug_chunk_rerun_total", None, "debug_chunk_rerun_total"),
-        ("debug_artifact_serialization", None, "debug_artifact_serialization"),
-    ]
-    for label, cuda_key, reference_key in metric_map:
-        cuda_value = cuda_aggregates.get(cuda_key) if cuda_key else None
-        reference_value = reference_aggregates.get(reference_key) if reference_key else None
-        if cuda_value is None and reference_value is None:
-            continue
-        rows.append((label, cuda_value, reference_value))
-
-    for metric, cuda_value, reference_value in rows:
+    for _, display_label, _, cuda_value, reference_value in rows:
         print(
-            f"{metric:<28} {format_ms(cuda_value):>12} {format_ms(reference_value):>12} "
+            f"{display_label:<28} {format_ms(cuda_value):>12} {format_ms(reference_value):>12} "
             f"{format_delta(cuda_value, reference_value):>12}"
         )
 
@@ -254,6 +282,56 @@ def print_timing_summary(cuda_elapsed_ms: float | None,
         ratio = cuda_elapsed_ms / reference_elapsed_ms
         delta = cuda_elapsed_ms - reference_elapsed_ms
         print(f"Wall-clock delta: {delta:+.3f} ms ({ratio:.3f}x cuda/reference)")
+
+
+def timing_plot_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}_timing{output_path.suffix}")
+
+
+def plot_timing_summary(rows: list[tuple[str, str, int, float | None, float | None]], output_path: Path) -> None:
+    labels = [display_label for _, display_label, _, _, _ in rows]
+    cuda_values = np.array([np.nan if cuda_value is None else float(cuda_value) for _, _, _, cuda_value, _ in rows], dtype=np.float32)
+    reference_values = np.array([np.nan if reference_value is None else float(reference_value) for _, _, _, _, reference_value in rows], dtype=np.float32)
+
+    y = np.arange(len(labels), dtype=np.float32)
+    bar_height = 0.38
+    fig_height = max(4.0, 0.45 * len(labels) + 1.5)
+    fig, axis = plt.subplots(figsize=(14, fig_height))
+
+    cuda_plot = np.nan_to_num(cuda_values, nan=0.0)
+    reference_plot = np.nan_to_num(reference_values, nan=0.0)
+    cuda_mask = ~np.isnan(cuda_values)
+    reference_mask = ~np.isnan(reference_values)
+
+    axis.barh(y[cuda_mask] - bar_height / 2.0, cuda_plot[cuda_mask], height=bar_height, label="CUDA", color="#1f77b4")
+    axis.barh(y[reference_mask] + bar_height / 2.0, reference_plot[reference_mask], height=bar_height, label="Reference", color="#ff7f0e")
+
+    axis.set_yticks(y)
+    axis.set_yticklabels(labels)
+    axis.invert_yaxis()
+    axis.set_xlabel("Milliseconds")
+    axis.set_title("CUDA vs Reference Timing Summary")
+    axis.grid(axis="x", linestyle=":", alpha=0.4)
+    axis.legend()
+
+    for index, (_, _, _, cuda_value, reference_value) in enumerate(rows):
+        delta_text = "n/a"
+        if cuda_value is not None and reference_value is not None:
+            delta_text = f"Δ {cuda_value - reference_value:+.3f}"
+        elif cuda_value is not None:
+            delta_text = f"CUDA {cuda_value:.3f}"
+        elif reference_value is not None:
+            delta_text = f"Ref {reference_value:.3f}"
+        max_value = max(
+            0.0,
+            0.0 if cuda_value is None else float(cuda_value),
+            0.0 if reference_value is None else float(reference_value),
+        )
+        axis.text(max_value + max(1.0, 0.01 * max_value), y[index], delta_text, va="center", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
 
 
 def plot_single_bundle(stage_arrays: list[tuple[str, np.ndarray]], output_path: Path) -> None:
@@ -331,12 +409,20 @@ def main() -> int:
         reference_arrays = [(key, load_stage_array(reference_summary, key)) for key in selected_stages]
         plot_comparison(cuda_arrays, reference_arrays, output_path)
         print_stage_summary(cuda_summary, reference_summary, cuda_arrays, reference_arrays)
+        timing_rows = build_timing_rows(args.cuda_elapsed_ms,
+                                        args.reference_elapsed_ms,
+                                        resolve_stage_profile(reference_output_dir),
+                                        cuda_validation_summary,
+                                        cuda_summary)
         print_timing_summary(args.cuda_elapsed_ms,
                              args.reference_elapsed_ms,
                              resolve_stage_profile(reference_output_dir),
                              cuda_validation_summary,
                              cuda_summary)
+        timing_output = timing_plot_path(output_path)
+        plot_timing_summary(timing_rows, timing_output)
         print(f"Wrote CUDA vs reference artifact comparison plot: {output_path}")
+        print(f"Wrote CUDA vs reference timing plot: {timing_output}")
     else:
         plot_single_bundle(cuda_arrays, output_path)
         print(f"Wrote CUDA artifact plot: {output_path}")

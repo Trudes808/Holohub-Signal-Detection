@@ -42,6 +42,8 @@ class CudaDinoDetector : public holoscan::Operator {
     float* raw_dino_score_batch_device = nullptr;
     float* hybrid_combined_score_batch_device = nullptr;
     float* hybrid_final_mask_batch_device = nullptr;
+    uint8_t* hybrid_filled_mask_batch_device = nullptr;
+    uint8_t* hybrid_component_filtered_mask_batch_device = nullptr;
     float* row_stat_device = nullptr;
     float* row_smooth_device = nullptr;
     float* frontend_reference_device = nullptr;

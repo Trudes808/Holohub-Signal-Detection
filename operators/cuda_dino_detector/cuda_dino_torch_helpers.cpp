@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
@@ -41,6 +42,45 @@ torch::Tensor normalize_map01_quantile_torch_batch(const torch::Tensor& input, d
   auto hi = select_quantile_flat_batch_torch(input, high_q);
   auto scale = torch::clamp_min(hi - lo, 1e-6);
   return torch::clamp((input - lo) / scale, 0.0, 1.0);
+}
+
+torch::Tensor masked_quantile_histogram_torch_batch(const torch::Tensor& input,
+                                                    const torch::Tensor& mask,
+                                                    double q,
+                                                    int64_t bin_count = 256,
+                                                    float fallback = 1.0f) {
+  if (input.dim() != 3 || mask.sizes() != input.sizes()) {
+    return torch::full({std::max<int64_t>(input.size(0), 0), 1, 1}, fallback, input.options());
+  }
+
+  const auto batch_size = input.size(0);
+  if (batch_size <= 0) {
+    return torch::zeros({0, 1, 1}, input.options());
+  }
+
+  bin_count = std::max<int64_t>(bin_count, 2);
+  auto values = torch::clamp(input.to(torch::kFloat32), 0.0, 1.0).reshape({batch_size, -1}).contiguous();
+  auto flat_mask = mask.to(torch::kBool).reshape({batch_size, -1}).contiguous();
+  auto counts = flat_mask.sum(1, false, torch::kLong);
+
+  auto thresholds = torch::full({batch_size}, fallback, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
+  if (!counts.gt(0).any().item<bool>()) {
+    return thresholds.view({batch_size, 1, 1}).to(input.scalar_type());
+  }
+
+  auto bins = torch::clamp((values * static_cast<double>(bin_count - 1)).round().to(torch::kLong), 0, bin_count - 1);
+  auto masked_bins = torch::where(flat_mask, bins, torch::zeros_like(bins));
+  auto histogram = torch::zeros({batch_size, bin_count}, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
+  histogram.scatter_add_(1, masked_bins, flat_mask.to(torch::kFloat32));
+
+  const double clamped_q = std::clamp(q, 0.0, 1.0);
+  auto target = torch::clamp((counts.to(torch::kFloat32) - 1.0f) * clamped_q, 0.0, std::numeric_limits<float>::max()).round().to(torch::kLong) + 1;
+  auto cumulative = histogram.cumsum(1);
+  auto reached = cumulative >= target.unsqueeze(1).to(torch::kFloat32);
+  auto quantile_bins = std::get<1>(reached.to(torch::kInt64).max(1, false));
+  auto quantile_values = quantile_bins.to(torch::kFloat32) / static_cast<float>(bin_count - 1);
+  thresholds = torch::where(counts.gt(0), quantile_values, thresholds);
+  return thresholds.view({batch_size, 1, 1}).to(input.scalar_type());
 }
 
 torch::Tensor positional_design_matrix_torch(int patch_rows,
@@ -356,70 +396,13 @@ bool compute_structure_tensor_gate_gpu_batch_to_device(const float* corrected_ba
                                                        const std::vector<uint8_t>& valid_row_mask_batch,
                                                        float* output_gate_device,
                                                        cudaStream_t cuda_stream) {
-  if (batch_size <= 0 || rows <= 0 || cols <= 0 || corrected_batch_device == nullptr || output_gate_device == nullptr ||
-      valid_row_mask_batch.size() != static_cast<size_t>(batch_size) * static_cast<size_t>(rows)) {
-    return false;
-  }
-
-  try {
-    torch::InferenceMode inference_mode_guard(true);
-    const c10::Device compute_device(torch::kCUDA, 0);
-    const auto torch_stream = cuda_stream
-                                  ? c10::cuda::getStreamFromExternal(cuda_stream, compute_device.index())
-                                  : c10::cuda::getDefaultCUDAStream(compute_device.index());
-    c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
-
-    auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(compute_device);
-    auto corrected = torch::from_blob(const_cast<float*>(corrected_batch_device),
-                                      {static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
-                                      float_options)
-                         .contiguous();
-    auto valid_mask_gpu = torch::from_blob(const_cast<uint8_t*>(valid_row_mask_batch.data()),
-                                           {static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), 1},
-                                           torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
-                              .to(compute_device, torch::kBool)
-                              .expand({static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), static_cast<int64_t>(cols)});
-
-    const int bg_freq = std::max(9, 2 * std::max(1, rows / 24) + 1);
-    const int bg_time = std::max(9, 2 * std::max(1, cols / 24) + 1);
-    auto background = uniform_filter_2d_nearest_torch_batch(corrected,
-                                                            std::max(1, bg_freq),
-                                                            std::max(1, bg_time));
-    auto residual_db = torch::clamp_min(corrected - background, 0.0);
-    auto residual_n = normalize_map01_quantile_torch_batch(residual_db, 0.05, 0.99);
-
-    const std::array<double, 3> scales = {0.8, 1.6, 3.2};
-    auto gate_max = torch::zeros_like(corrected, float_options);
-    for (double grad_sigma : scales) {
-      const double integ_sigma = std::max(1.0, 1.8 * grad_sigma);
-      auto grad_f = gaussian_first_derivative_rows_2d_torch_batch(residual_n, grad_sigma);
-      auto grad_t = gaussian_first_derivative_cols_2d_torch_batch(residual_n, grad_sigma);
-      auto j_ff = gaussian_blur_2d_torch_batch(grad_f * grad_f, integ_sigma, integ_sigma);
-      auto j_ft = gaussian_blur_2d_torch_batch(grad_f * grad_t, integ_sigma, integ_sigma);
-      auto j_tt = gaussian_blur_2d_torch_batch(grad_t * grad_t, integ_sigma, integ_sigma);
-
-      auto delta = torch::sqrt(torch::clamp_min((j_ff - j_tt) * (j_ff - j_tt) + 4.0f * (j_ft * j_ft), 0.0));
-      auto lambda1 = 0.5f * (j_ff + j_tt + delta);
-      auto lambda2 = 0.5f * (j_ff + j_tt - delta);
-      auto coherence = (lambda1 - lambda2) / torch::clamp_min(lambda1 + lambda2, 1.0e-6);
-      auto energy = lambda1 + lambda2;
-
-      auto coherence_n = normalize_map01_quantile_torch_batch(coherence, 0.05, 0.99);
-      auto energy_n = normalize_map01_quantile_torch_batch(energy, 0.05, 0.99);
-      auto gate_value = coherence_n * torch::sqrt(torch::clamp_min(energy_n, 0.0));
-      gate_max = torch::maximum(gate_max, gate_value);
-    }
-
-    auto gate = normalize_map01_quantile_torch_batch(gate_max, 0.05, 0.99).to(torch::kFloat32);
-    gate = torch::where(valid_mask_gpu, gate, torch::zeros_like(gate)).contiguous();
-    return cudaMemcpyAsync(output_gate_device,
-                           gate.data_ptr<float>(),
-                           static_cast<size_t>(gate.numel()) * sizeof(float),
-                           cudaMemcpyDeviceToDevice,
-                           cuda_stream) == cudaSuccess;
-  } catch (...) {
-    return false;
-  }
+  return compute_fast_directional_coherence_gate_gpu_batch_to_device(corrected_batch_device,
+                                                                     batch_size,
+                                                                     rows,
+                                                                     cols,
+                                                                     valid_row_mask_batch,
+                                                                     output_gate_device,
+                                                                     cuda_stream);
 }
 
 bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_features_batch_device,
@@ -535,7 +518,10 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                       int min_component_size,
                                                       float* output_combined_score_device,
                                                       float* output_final_mask_device,
-                                                      cudaStream_t cuda_stream) {
+                                                      uint8_t* output_filled_mask_batch_device,
+                                                      uint8_t* output_component_filtered_mask_batch_device,
+                                                      cudaStream_t cuda_stream,
+                                                      CudaHybridStageTiming* stage_timing) {
   if (batch_size <= 0 || rows <= 0 || cols <= 0 || dino_score_batch_device == nullptr || coherence_batch_device == nullptr ||
       output_combined_score_device == nullptr || output_final_mask_device == nullptr ||
       valid_row_mask_batch.size() != static_cast<size_t>(batch_size) * static_cast<size_t>(rows)) {
@@ -570,10 +556,16 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                           .to(compute_device, torch::kBool);
     auto valid_mask = valid_rows.expand({static_cast<int64_t>(batch_size), static_cast<int64_t>(rows), static_cast<int64_t>(cols)}).contiguous();
 
+    const auto normalization_start = std::chrono::steady_clock::now();
     auto dino_norm = normalize_map01_quantile_torch_batch(dino_score, 0.05, 0.95);
     auto coherence_norm = normalize_map01_quantile_torch_batch(coherence, 0.05, 0.99);
     auto contrib = (dino_norm * coherence_norm).contiguous();
+    if (stage_timing != nullptr) {
+      stage_timing->normalization_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - normalization_start).count();
+    }
 
+    const auto residual_stack_start = std::chrono::steady_clock::now();
     auto base_norm = normalize_map01_masked_minmax_torch_batch(contrib, valid_mask);
     auto envelope_map = normalize_map01_masked_minmax_torch_batch(gaussian_blur_2d_torch_batch(base_norm, 6.0, 1.4), valid_mask);
     auto base_blur = gaussian_blur_2d_torch_batch(base_norm, 4.0, 1.0);
@@ -585,33 +577,19 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
     auto residual_veto_gate = torch::clamp((keep_res - 0.30) / 0.70, 0.0, 1.0);
     auto combined_input = keep_freq * (0.35 + 0.65 * residual_veto_gate);
     auto combined_score = normalize_map01_masked_minmax_torch_batch(combined_input, valid_mask);
-
-    std::vector<float> seed_freq_thresholds(static_cast<size_t>(batch_size), 1.0f);
-    std::vector<float> seed_res_thresholds(static_cast<size_t>(batch_size), 1.0f);
-    std::vector<float> combined_thresholds(static_cast<size_t>(batch_size), 1.0f);
-    for (int sample_index = 0; sample_index < batch_size; ++sample_index) {
-      auto sample_valid = valid_mask[sample_index];
-      auto active_freq = keep_freq[sample_index].masked_select(sample_valid);
-      auto active_res = keep_res[sample_index].masked_select(sample_valid);
-      auto active_combined = combined_score[sample_index].masked_select(sample_valid);
-      seed_freq_thresholds[static_cast<size_t>(sample_index)] =
-          active_freq.numel() > 0 ? static_cast<float>(select_quantile_flat_batch_torch(active_freq.view({1, -1, 1}), 0.90).item<float>()) : 1.0f;
-      seed_res_thresholds[static_cast<size_t>(sample_index)] =
-          active_res.numel() > 0 ? static_cast<float>(select_quantile_flat_batch_torch(active_res.view({1, -1, 1}), 0.82).item<float>()) : 1.0f;
-      combined_thresholds[static_cast<size_t>(sample_index)] =
-          active_combined.numel() > 0 ? static_cast<float>(select_quantile_flat_batch_torch(active_combined.view({1, -1, 1}), 0.78).item<float>()) : 1.0f;
+    if (stage_timing != nullptr) {
+      stage_timing->residual_stack_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - residual_stack_start).count();
     }
 
-    auto threshold_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-    auto seed_freq_threshold_tensor = torch::from_blob(seed_freq_thresholds.data(), {static_cast<int64_t>(batch_size), 1, 1}, threshold_options)
-                                          .clone()
-                                          .to(compute_device, keep_freq.scalar_type());
-    auto seed_res_threshold_tensor = torch::from_blob(seed_res_thresholds.data(), {static_cast<int64_t>(batch_size), 1, 1}, threshold_options)
-                                         .clone()
-                                         .to(compute_device, keep_res.scalar_type());
-    auto combined_threshold_tensor = torch::from_blob(combined_thresholds.data(), {static_cast<int64_t>(batch_size), 1, 1}, threshold_options)
-                                        .clone()
-                                        .to(compute_device, combined_score.scalar_type());
+    const auto threshold_extract_start = std::chrono::steady_clock::now();
+    auto seed_freq_threshold_tensor = masked_quantile_histogram_torch_batch(keep_freq, valid_mask, 0.90, 256, 1.0f);
+    auto seed_res_threshold_tensor = masked_quantile_histogram_torch_batch(keep_res, valid_mask, 0.82, 256, 1.0f);
+    auto combined_threshold_tensor = masked_quantile_histogram_torch_batch(combined_score, valid_mask, 0.78, 256, 1.0f);
+    if (stage_timing != nullptr) {
+      stage_timing->threshold_extract_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - threshold_extract_start).count();
+    }
 
     auto seed_mask_batch = torch::logical_and(valid_mask,
                                               torch::logical_and(keep_freq >= seed_freq_threshold_tensor,
@@ -619,12 +597,86 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
     auto final_mask_batch = torch::logical_and(seed_mask_batch,
                                                torch::logical_and(valid_mask,
                                                                   combined_score >= combined_threshold_tensor * 0.85));
-    final_mask_batch = binary_closing_rect_torch_batch(final_mask_batch, 7, 3);
-    final_mask_batch = binary_fill_holes_torch_batch(final_mask_batch);
-    final_mask_batch = keep_large_components_torch_batch(final_mask_batch, min_component_size);
-    final_mask_batch = final_mask_batch.to(torch::kFloat32).contiguous();
+    const auto closing_start = std::chrono::steady_clock::now();
+    auto closed_mask_batch = binary_closing_rect_torch_batch(final_mask_batch, 7, 3);
+    if (stage_timing != nullptr) {
+      stage_timing->closing_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - closing_start).count();
+    }
+
+    std::vector<torch::Tensor> filtered_masks;
+    filtered_masks.reserve(static_cast<size_t>(batch_size));
+    double total_fill_holes_ms = 0.0;
+    double total_component_filter_ms = 0.0;
+    auto closed_mask_u8 = closed_mask_batch.to(torch::kUInt8).contiguous();
+    auto filled_mask_u8 = torch::zeros_like(closed_mask_u8, torch::TensorOptions().dtype(torch::kUInt8).device(compute_device));
+    const auto fill_holes_start = std::chrono::steady_clock::now();
+    const bool fill_holes_ok = binary_fill_holes_cuda_batch_to_device(closed_mask_u8.data_ptr<uint8_t>(),
+                                                                      batch_size,
+                                                                      rows,
+                                                                      cols,
+                                                                      filled_mask_u8.data_ptr<uint8_t>(),
+                                                                      cuda_stream);
+    if (!fill_holes_ok) {
+      return false;
+    }
+    if (stage_timing != nullptr) {
+      cudaStreamSynchronize(cuda_stream);
+    }
+    total_fill_holes_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fill_holes_start).count();
+    auto filled_mask_valid_u8 = torch::where(valid_mask,
+                         filled_mask_u8.to(torch::kBool),
+                         torch::zeros_like(valid_mask))
+                    .to(torch::kUInt8)
+                    .contiguous();
+    auto filtered_mask_u8 = torch::zeros_like(filled_mask_u8, torch::TensorOptions().dtype(torch::kUInt8).device(compute_device));
+    const auto component_filter_start = std::chrono::steady_clock::now();
+    const bool component_filter_ok = keep_large_components_cuda_batch_to_device(filled_mask_valid_u8.data_ptr<uint8_t>(),
+                                                                                batch_size,
+                                                                                rows,
+                                                                                cols,
+                                                                                min_component_size,
+                                                                                filtered_mask_u8.data_ptr<uint8_t>(),
+                                                                                cuda_stream);
+    if (!component_filter_ok) {
+      return false;
+    }
+    if (stage_timing != nullptr) {
+      cudaStreamSynchronize(cuda_stream);
+    }
+    total_component_filter_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - component_filter_start).count();
+    if (stage_timing != nullptr) {
+      stage_timing->fill_holes_ms = total_fill_holes_ms;
+      stage_timing->component_filter_ms = total_component_filter_ms;
+    }
+
+    if (output_filled_mask_batch_device != nullptr) {
+      const bool filled_copy_ok = cudaMemcpyAsync(output_filled_mask_batch_device,
+                                                  filled_mask_u8.data_ptr<uint8_t>(),
+                                                  static_cast<size_t>(filled_mask_u8.numel()) * sizeof(uint8_t),
+                                                  cudaMemcpyDeviceToDevice,
+                                                  cuda_stream) == cudaSuccess;
+      if (!filled_copy_ok) {
+        return false;
+      }
+    }
+    if (output_component_filtered_mask_batch_device != nullptr) {
+      const bool filtered_copy_ok = cudaMemcpyAsync(output_component_filtered_mask_batch_device,
+                                                    filtered_mask_u8.data_ptr<uint8_t>(),
+                                                    static_cast<size_t>(filtered_mask_u8.numel()) * sizeof(uint8_t),
+                                                    cudaMemcpyDeviceToDevice,
+                                                    cuda_stream) == cudaSuccess;
+      if (!filtered_copy_ok) {
+        return false;
+      }
+    }
+
+    final_mask_batch = filtered_mask_u8.to(torch::kFloat32).contiguous();
     final_mask_batch = torch::where(valid_mask, final_mask_batch, torch::zeros_like(final_mask_batch));
 
+    const auto output_copy_start = std::chrono::steady_clock::now();
     const bool combined_ok = cudaMemcpyAsync(output_combined_score_device,
                                              combined_score.data_ptr<float>(),
                                              static_cast<size_t>(combined_score.numel()) * sizeof(float),
@@ -635,6 +687,10 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                          static_cast<size_t>(final_mask_batch.numel()) * sizeof(float),
                                          cudaMemcpyDeviceToDevice,
                                          cuda_stream) == cudaSuccess;
+    if (stage_timing != nullptr) {
+      stage_timing->output_copy_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - output_copy_start).count();
+    }
     return combined_ok && mask_ok;
   } catch (...) {
     return false;
@@ -654,14 +710,13 @@ bool compute_structure_tensor_gate_gpu_batch_to_device(const float* corrected_ba
                                                        const std::vector<uint8_t>& valid_row_mask_batch,
                                                        float* output_gate_device,
                                                        cudaStream_t cuda_stream) {
-  (void)corrected_batch_device;
-  (void)batch_size;
-  (void)rows;
-  (void)cols;
-  (void)valid_row_mask_batch;
-  (void)output_gate_device;
-  (void)cuda_stream;
-  return false;
+  return compute_fast_directional_coherence_gate_gpu_batch_to_device(corrected_batch_device,
+                                                                     batch_size,
+                                                                     rows,
+                                                                     cols,
+                                                                     valid_row_mask_batch,
+                                                                     output_gate_device,
+                                                                     cuda_stream);
 }
 
 bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_features_batch_device,
@@ -728,7 +783,10 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                       int min_component_size,
                                                       float* output_combined_score_device,
                                                       float* output_final_mask_device,
-                                                      cudaStream_t cuda_stream) {
+                                                      uint8_t* output_filled_mask_batch_device,
+                                                      uint8_t* output_component_filtered_mask_batch_device,
+                                                      cudaStream_t cuda_stream,
+                                                      CudaHybridStageTiming* stage_timing) {
   (void)dino_score_batch_device;
   (void)coherence_batch_device;
   (void)batch_size;
@@ -739,7 +797,10 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
   (void)min_component_size;
   (void)output_combined_score_device;
   (void)output_final_mask_device;
+  (void)output_filled_mask_batch_device;
+  (void)output_component_filtered_mask_batch_device;
   (void)cuda_stream;
+  (void)stage_timing;
   return false;
 }
 
