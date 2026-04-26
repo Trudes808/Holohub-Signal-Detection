@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 #include "coherent_power_signal_detector.hpp"
+#include "../../applications/usrp_wideband_signal_detection/spectrogram_visualization.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -6332,6 +6333,7 @@ CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
 
 void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.input<coherent_power_in_t>("in");
+  spec.output<holoscan::ops::DetectorMaskMessage>("mask_out").condition(holoscan::ConditionType::kNone);
 
   spec.param(num_channels_, "num_channels", "Number of channels", "Number of channels in the stream.", 1);
   spec.param(input_height_, "input_height", "Input height", "Detector output height.", 256);
@@ -6588,7 +6590,7 @@ void CoherentPowerSignalDetector::initialize() {
 }
 
 void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
-                                          holoscan::OutputContext&,
+                                          holoscan::OutputContext& op_output,
                                           holoscan::ExecutionContext& context) {
   auto input = op_input.receive<coherent_power_in_t>("in").value();
   auto& fft_tensor = std::get<0>(input);
@@ -7875,8 +7877,19 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
           << ' ' << kPowerSupportTimingStageNames[stage_index] << "_peak_max=" << stats.power_support_stage_max_ms[stage_index];
     }
   }
+
   HOLOSCAN_LOG_INFO("{}", oss.str());
   stats = ChannelTimingStats {};
+
+  // Emit mask to visualization if available
+  if (!pipeline_summary.final_mask.empty()) {
+    holoscan::ops::DetectorMaskMessage mask_msg;
+    mask_msg.pixels = binary_float_mask_to_u8(pipeline_summary.final_mask);
+    mask_msg.width = output_cols;
+    mask_msg.height = output_rows;
+    mask_msg.channel = channel_number;
+    op_output.emit(mask_msg, "mask_out");
+  }
 }
 
-}  // namespace holoscan::ops
+}   // namespace holoscan::ops

@@ -1940,7 +1940,7 @@ def _resolve_artifact_path(path_value: str | Path) -> Path:
     container_prefixes = {
         "/workspace/spectrograms": Path("/tmp/usrp_spectrograms"),
         "/workspace/dino_masks": Path("/tmp/usrp_dino_masks"),
-        "/workspace/coherent_power_snapshots": Path("/tmp/coherent_power_snapshots"),
+        "/workspace/coherent_power_snapshots": Path("/home/dm57767/coherent_power_snapshots"),
         "/workspace/coherent_power_masks": Path("/tmp/coherent_power_masks"),
     }
     for prefix, host_root in container_prefixes.items():
@@ -2133,7 +2133,7 @@ def _resolve_latest_validator_summary_path() -> Path | None:
 
 
 def _resolve_latest_live_artifact_metadata_path() -> Path | None:
-    snapshot_root = Path("/tmp/coherent_power_snapshots")
+    snapshot_root = Path("/home/dm57767/coherent_power_snapshots/performance_path_debug")
     candidates = sorted(
         snapshot_root.glob("**/coherent_power_snapshot_*.json"),
         key=lambda path: path.stat().st_mtime,

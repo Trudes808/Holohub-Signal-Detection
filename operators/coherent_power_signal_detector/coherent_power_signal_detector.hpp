@@ -127,9 +127,10 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
 
   void setup(holoscan::OperatorSpec& spec) override;
   void initialize() override;
+
   void compute(holoscan::InputContext& op_input,
-               holoscan::OutputContext&,
-               holoscan::ExecutionContext& context) override;
+             holoscan::OutputContext& op_output,
+             holoscan::ExecutionContext& context) override;
 
  private:
   struct ChannelBuffers {

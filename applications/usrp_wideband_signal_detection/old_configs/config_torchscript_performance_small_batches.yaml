@@ -152,6 +152,9 @@ visualization:
     fft_size: 20480
     dino_chunk_rows: 256
     dino_chunk_cols: 512
+    db_floor: -20.0
+    db_ceil: 10.0
+    row_average_n: 4
   holoviz:
     width: 1280
     height: 720

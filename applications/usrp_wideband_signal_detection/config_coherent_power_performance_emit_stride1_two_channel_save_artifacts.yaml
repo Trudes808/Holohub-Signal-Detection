@@ -214,10 +214,10 @@ coherent_power_signal_detector:
   log_detections: false
   fast_performance: true
   save_performance_path_artifacts: true
-  enable_mask_save: false
+  enable_mask_save: true
   save_every_n_frames: 100
   max_masks_per_channel: 0
-  output_dir: "/workspace/coherent_power_masks"
+  output_dir: "/workspace/coherent_power_snapshots"
   chunk_bandwidth_hz: 37500000.0
   chunk_overlap_hz: 2000000.0
   uncalibrated_chunk_fraction: 0.40
@@ -237,7 +237,7 @@ coherent_power_signal_detector:
   coherence_power_support_q: 0.82
   coherence_power_q: 0.92
   min_component_size: 1
-  filter_detection_mask: false
+  filter_detection_mask: true
   grouping_seed_score_q: 0.72
   grouping_bridge_freq_px: 33
   grouping_bridge_time_px: 5

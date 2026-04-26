@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <ctime>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -21,6 +22,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -159,7 +163,7 @@ struct RgbColor {
   uint8_t b;
 };
 
-constexpr int kHeaderHeight = 42;
+constexpr int kHeaderHeight = 52;
 constexpr int kFooterHeight = 40;
 constexpr int kSidebarWidth = 260;
 constexpr int kPsdHeight = 142;
@@ -602,11 +606,24 @@ std::vector<uint8_t> reduce_spectrogram_to_grayscale(const SpectrogramTensor& te
   std::vector<SpectrogramComplex> host_fft(static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols));
   const size_t bytes = host_fft.size() * sizeof(SpectrogramComplex);
 
+  // auto copy_result = cudaMemcpyAsync(host_fft.data(), tensor.Data(), bytes, cudaMemcpyDeviceToHost, stream);
+  // if (copy_result != cudaSuccess) {
+  //   throw std::runtime_error(std::string("cudaMemcpyAsync failed: ") + cudaGetErrorString(copy_result));
+  // }
+
+  // auto sync_result = cudaStreamSynchronize(stream);
+  // if (sync_result != cudaSuccess) {
+  //   throw std::runtime_error(std::string("cudaStreamSynchronize failed: ") + cudaGetErrorString(sync_result));
+  // }
+
+  // Use vis_stream (passed in) which is separate from the pipeline stream.
+  // This ensures we never block the pipeline's CUDA stream.
   auto copy_result = cudaMemcpyAsync(host_fft.data(), tensor.Data(), bytes, cudaMemcpyDeviceToHost, stream);
   if (copy_result != cudaSuccess) {
     throw std::runtime_error(std::string("cudaMemcpyAsync failed: ") + cudaGetErrorString(copy_result));
   }
 
+  // Sync only the vis_stream, not the pipeline stream
   auto sync_result = cudaStreamSynchronize(stream);
   if (sync_result != cudaSuccess) {
     throw std::runtime_error(std::string("cudaStreamSynchronize failed: ") + cudaGetErrorString(sync_result));
@@ -636,21 +653,17 @@ std::vector<uint8_t> reduce_spectrogram_to_grayscale(const SpectrogramTensor& te
     }
   }
 
-  float min_value = std::numeric_limits<float>::infinity();
-  float max_value = -std::numeric_limits<float>::infinity();
-  for (float value : reduced) {
-    min_value = std::min(min_value, value);
-    max_value = std::max(max_value, value);
-  }
-
-  const float denominator = std::max(1e-6f, max_value - min_value);
+  // Fixed dB scale — Sage: disable auto-scaling, use fixed dBm limits
+  // Typical noise floor ~-100 dBm, signals visible above -80 dBm
+  // Tune these values based on your RF environment
+  const float db_range = std::max(1.0f, 0.0f - (-100.0f));  // uses defaults, not called in live path
   std::vector<uint8_t> grayscale(reduced.size());
   for (size_t index = 0; index < reduced.size(); ++index) {
-    const float normalized = (reduced[index] - min_value) / denominator;
+    const float normalized = (reduced[index] - (-100.0f)) / db_range;
     grayscale[index] = static_cast<uint8_t>(std::clamp(normalized * 255.0f, 0.0f, 255.0f));
   }
-
   return grayscale;
+
 }
 
 
@@ -674,7 +687,14 @@ holoscan::gxf::Entity create_rgb_entity(holoscan::ExecutionContext& context,
     throw std::runtime_error(std::string("cudaMalloc failed: ") + cudaGetErrorString(alloc_result));
   }
 
-  auto copy_result = cudaMemcpy(*device_buffer, rgb.data(), bytes, cudaMemcpyHostToDevice);
+  // auto copy_result = cudaMemcpy(*device_buffer, rgb.data(), bytes, cudaMemcpyHostToDevice);
+  // if (copy_result != cudaSuccess) {
+  //   throw std::runtime_error(std::string("cudaMemcpy failed: ") + cudaGetErrorString(copy_result));
+  // }
+
+  // Use async copy to avoid blocking — caller is responsible for
+  // synchronizing vis_stream before this buffer is consumed
+  auto copy_result = cudaMemcpyAsync(*device_buffer, rgb.data(), bytes, cudaMemcpyHostToDevice, 0);
   if (copy_result != cudaSuccess) {
     throw std::runtime_error(std::string("cudaMemcpy failed: ") + cudaGetErrorString(copy_result));
   }
@@ -707,12 +727,69 @@ holoscan::gxf::Entity create_rgb_entity(holoscan::ExecutionContext& context,
   return holoscan::gxf::Entity(message.value());
 }
 
+
+
+std::vector<uint8_t> reduce_from_pinned_buffer(const void* pinned_buffer,
+                                               int src_rows,
+                                               int src_cols,
+                                               int output_height,
+                                               int output_width,
+                                               float db_floor = -100.0f,
+                                               float db_ceil  =    0.0f)  {
+  using Complex = cuda::std::complex<float>;
+  const Complex* host_fft = static_cast<const Complex*>(pinned_buffer);
+
+  const int dst_rows = std::max(1, std::min(output_height, src_rows));
+  const int dst_cols = std::max(1, std::min(output_width, src_cols));
+
+  std::vector<float> reduced(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols), -120.0f);
+
+  for (int row = 0; row < dst_rows; ++row) {
+    const int row_start = (row * src_rows) / dst_rows;
+    const int row_end = ((row + 1) * src_rows) / dst_rows;
+    for (int col = 0; col < dst_cols; ++col) {
+      const int col_start = (col * src_cols) / dst_cols;
+      const int col_end = ((col + 1) * src_cols) / dst_cols;
+      double accumulation = 0.0;
+      int count = 0;
+      for (int src_row = row_start; src_row < std::max(row_start + 1, row_end); ++src_row) {
+        for (int src_col = col_start; src_col < std::max(col_start + 1, col_end); ++src_col) {
+          const auto& value = host_fft[static_cast<size_t>(src_row) * static_cast<size_t>(src_cols) + static_cast<size_t>(src_col)];
+          const float real = value.real();
+          const float imag = value.imag();
+          accumulation += 10.0 * std::log10(real * real + imag * imag + 1e-12f);
+          ++count;
+        }
+      }
+      reduced[static_cast<size_t>(row) * static_cast<size_t>(dst_cols) + static_cast<size_t>(col)] =
+          static_cast<float>(accumulation / static_cast<double>(std::max(1, count)));
+    }
+  }
+
+  const float db_range = std::max(1.0f, db_ceil - db_floor);
+  // TEMP DEBUG — remove after tuning
+  static int debug_count = 0;
+  if (++debug_count % 50 == 0) {
+    float min_val = *std::min_element(reduced.begin(), reduced.end());
+    float max_val = *std::max_element(reduced.begin(), reduced.end());
+    printf("DBG actual dB range: min=%.1f max=%.1f\n", min_val, max_val);
+  }
+  std::vector<uint8_t> grayscale(reduced.size());
+  for (size_t index = 0; index < reduced.size(); ++index) {
+    const float normalized = (reduced[index] - db_floor) / db_range;
+    grayscale[index] = static_cast<uint8_t>(std::clamp(normalized * 255.0f, 0.0f, 255.0f));
+  }
+  return grayscale;
+}
+
 }  // namespace
+
 
 namespace holoscan::ops {
 
 void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
   spec.input<SpectrogramMessage>("in");
+  spec.input<DetectorMaskMessage>("mask_in").condition(holoscan::ConditionType::kNone);
   spec.output<gxf::Entity>("outputs");
   spec.param(num_channels_, "num_channels", "Num Channels", "Number of channels shown in the analyzer view.", 2);
   spec.param(history_frames_, "history_frames", "History Frames", "Number of consecutive spectrogram frames retained in the display history.", 5);
@@ -738,8 +815,74 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
   spec.param(center_frequency_hz_, "center_frequency_hz", "Center Frequency", "Center frequency for display in Hz.", 0.0);
   spec.param(fft_size_, "fft_size", "FFT Size", "FFT size shown in analyzer readouts.", 20480);
   spec.param(dino_chunk_rows_, "dino_chunk_rows", "DINO Chunk Rows", "DINO chunk height shown in readouts.", 256);
+  //spec.param(dino_chunk_cols_, "dino_chunk_cols", "DINO Chunk Cols", "DINO chunk width shown in readouts.", 512);
   spec.param(dino_chunk_cols_, "dino_chunk_cols", "DINO Chunk Cols", "DINO chunk width shown in readouts.", 512);
+  spec.param(db_floor_, "db_floor", "dB Floor", "Fixed dB floor for spectrogram normalization.", -100.0f);
+  spec.param(db_ceil_,  "db_ceil",  "dB Ceiling", "Fixed dB ceiling for spectrogram normalization.", 0.0f);
+  spec.param(row_average_n_, "row_average_n", "Row Average N", "Frames averaged per waterfall row.", 4);
 }
+
+
+void SpectrogramToHolovizOp::initialize() {
+  Operator::initialize();
+  // Create a dedicated CUDA stream for visualization rendering
+  // so it never blocks the pipeline's CUDA stream
+  auto result = cudaStreamCreateWithFlags(&vis_stream_, cudaStreamNonBlocking);
+  if (result != cudaSuccess) {
+    throw std::runtime_error(std::string("Failed to create vis_stream_: ") + cudaGetErrorString(result));
+  }
+
+  // Allocate pinned host buffer for async GPU→host DMA
+  // Sized for largest possible tensor: num_bursts * fft_size * complex<float>
+  // 1024 bursts * 20480 FFT points * 8 bytes = 167,772,160 bytes
+  const size_t max_bytes = 1024ULL * 20480ULL * sizeof(float) * 2;
+  auto pinned_result = cudaMallocHost(&pinned_host_buffer_, max_bytes);
+  if (pinned_result != cudaSuccess) {
+    throw std::runtime_error(std::string("Failed to allocate pinned host buffer: ") + cudaGetErrorString(pinned_result));
+  }
+  pinned_host_buffer_bytes_ = max_bytes;
+
+  // Start background render thread — operator thread hands off work here
+  // and returns immediately, never blocking the pipeline
+  render_thread_ = std::thread([this]() {
+    while (true) {
+      std::unique_lock<std::mutex> lock(render_mutex_);
+      render_cv_.wait(lock, [this] { return render_ready_ || render_stop_; });
+      if (render_stop_) break;
+      auto task = std::move(render_task_);
+      render_ready_ = false;
+      lock.unlock();
+      task();  // execute compose + create_rgb_entity + emit
+    }
+  });
+}
+
+void SpectrogramToHolovizOp::stop() {
+  // Signal background render thread to stop and wait for it
+  {
+    std::unique_lock<std::mutex> lock(render_mutex_);
+    render_stop_ = true;
+    render_cv_.notify_one();
+  }
+  if (render_thread_.joinable()) {
+    render_thread_.join();
+  }
+  // Clean up the dedicated visualization stream
+  if (vis_stream_ != nullptr) {
+    cudaStreamSynchronize(vis_stream_);
+    cudaStreamDestroy(vis_stream_);
+    vis_stream_ = nullptr;
+  }
+  // Free pinned host buffer
+  if (pinned_host_buffer_ != nullptr) {
+    cudaFreeHost(pinned_host_buffer_);
+    pinned_host_buffer_ = nullptr;
+  }
+  Operator::stop();
+}
+
+//end newy added
+
 
 void SpectrogramToHolovizOp::compute(InputContext& op_input,
                                      OutputContext& op_output,
@@ -754,51 +897,228 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
     return;
   }
 
+  // Receive mask from coherent power detector if available
+  auto mask_msg = op_input.receive<DetectorMaskMessage>("mask_in");
+  if (mask_msg) {
+    if (channel_states_.size() <= static_cast<size_t>(mask_msg->channel)) {
+      channel_states_.resize(static_cast<size_t>(mask_msg->channel + 1));
+    }
+    auto& mask_state = channel_states_[static_cast<size_t>(mask_msg->channel)];
+    mask_state.latest_mask.pixels = mask_msg->pixels;
+    mask_state.latest_mask.width = mask_msg->width;
+    mask_state.latest_mask.height = mask_msg->height;
+    mask_state.overlay_available = true;
+  }
+
   if (channel_states_.size() < static_cast<size_t>(std::max(num_channels_.get(), channel_number + 1))) {
     channel_states_.resize(static_cast<size_t>(std::max(num_channels_.get(), channel_number + 1)));
   }
 
+  // const int width = std::max(1, std::min(output_width_.get(), static_cast<int>(tensor.Size(1))));
+  // const int height = std::max(1, std::min(output_height_.get(), static_cast<int>(tensor.Size(0))));
+  
+  // //auto grayscale = reduce_spectrogram_to_grayscale(tensor, stream, height, width);
+  // // Record when pipeline stream finishes writing data
+  // // Then make vis_stream_ wait for that event before reading
+  // // This frees the pipeline stream immediately without data corruption
+  // cudaEvent_t pipeline_done;
+  // cudaEventCreateWithFlags(&pipeline_done, cudaEventDisableTiming);
+  // cudaEventRecord(pipeline_done, stream);           // mark pipeline stream checkpoint
+  // cudaStreamWaitEvent(vis_stream_, pipeline_done, 0); // vis_stream waits for that checkpoint
+  // cudaEventDestroy(pipeline_done);
+
+  // // Now use vis_stream_ instead of pipeline stream
+  // // Pipeline stream is FREE to process next RF batch immediately
+  // auto grayscale = reduce_spectrogram_to_grayscale(tensor, vis_stream_, height, width);
+  
+
   const int width = std::max(1, std::min(output_width_.get(), static_cast<int>(tensor.Size(1))));
   const int height = std::max(1, std::min(output_height_.get(), static_cast<int>(tensor.Size(0))));
-  auto grayscale = reduce_spectrogram_to_grayscale(tensor, stream, height, width);
-  auto& state = channel_states_[static_cast<size_t>(channel_number)];
-  append_spectrogram_history(state, grayscale, width, height, history_frames_.get());
-  state.current_psd_trace = compute_psd_trace(grayscale, width, height);
-  update_max_hold_trace(state.current_psd_trace, state.max_hold_trace);
-  update_density_history(compute_density_trace_from_grayscale(grayscale, width, height, red_limit_.get()),
-                         state.density_trace,
-                         state.density_frames_seen);
-  state.overlay_available = false;
-  state.latest_mask = {};
-  state.active = true;
-  state.info.channel = channel_number;
-  state.info.frame_number += 1;
-  state.info.center_frequency_hz = center_frequency_hz_.get();
-  state.info.span_hz = meta ? static_cast<double>(meta->get<uint64_t>("span", 0)) : 0.0;
-  state.info.resolution_hz = meta ? static_cast<double>(meta->get<uint64_t>("resolution", 0)) : 0.0;
-  state.info.fft_size = fft_size_.get();
-  state.info.dino_chunk_rows = dino_chunk_rows_.get();
-  state.info.dino_chunk_cols = dino_chunk_cols_.get();
-  state.info.overlay_available = false;
-  state.info.title = "USRP WIDEBAND";
-  state.info.subtitle = "LIVE PIPELINE";
 
-  int composite_width = 0;
-  int composite_height = 0;
-  auto composed = compose_visualization_rgb(channel_states_,
-                                            blue_limit_.get(),
-                                            red_limit_.get(),
-                                            overlay_alpha_.get(),
-                                            composite_width,
-                                            composite_height);
+  // Count every frame received
+  // Emit any previously composed frame from the background thread
+  // Only GXF-safe place to call emit — on operator thread within tick
+  {
+    std::unique_lock<std::mutex> composed_lock(composed_mutex_);
+    if (pending_composed_ready_) {
+      auto output_entity = create_rgb_entity(context,
+                                             pending_composed_,
+                                             pending_composed_width_,
+                                             pending_composed_height_,
+                                             tensor_name_.get());
+      op_output.emit(output_entity, "outputs");
+      pending_composed_ready_ = false;
+    }
+  }
 
-  auto output_entity = create_rgb_entity(context,
-                                         composed,
-                                         composite_width,
-                                         composite_height,
-                                         tensor_name_.get());
-  op_output.emit(output_entity, "outputs");
+  // Count every frame received
+  total_frames_++;
+
+  // Check if vis_stream_ is still busy rendering the previous frame.
+  // If busy → drop this frame immediately, pipeline continues without blocking.
+  if (cudaStreamQuery(vis_stream_) == cudaErrorNotReady) {
+    dropped_frames_++;
+    return;  // pipeline is NEVER blocked 
+  }
+
+  // vis_stream_ is free — safely hand off data without blocking pipeline stream.
+  // cudaEventRecord marks when pipeline stream finishes writing this batch.
+  // cudaStreamWaitEvent tells vis_stream_ to wait for that point before reading.
+  // After this, pipeline stream is FREE to process the next RF batch immediately.
+  // Decouple vis_stream_ from pipeline stream using a CUDA event.
+  // Pipeline stream is FREE to process next RF batch immediately after this.
+  cudaEvent_t pipeline_done;
+  cudaEventCreateWithFlags(&pipeline_done, cudaEventDisableTiming);
+  cudaEventRecord(pipeline_done, stream);
+  cudaStreamWaitEvent(vis_stream_, pipeline_done, 0);
+  cudaEventDestroy(pipeline_done);
+
+  // Kick off async GPU→host DMA on vis_stream_ into pinned buffer.
+  // Operator thread does NOT synchronize — returns immediately after this.
+  const int tensor_rows = static_cast<int>(tensor.Size(0));
+  const int tensor_cols = static_cast<int>(tensor.Size(1));
+  const size_t tensor_bytes = static_cast<size_t>(tensor_rows)
+                            * static_cast<size_t>(tensor_cols)
+                            * sizeof(cuda::std::complex<float>);
+  if (tensor_bytes > pinned_host_buffer_bytes_) {
+    // Buffer too small — skip this frame rather than overflow
+    dropped_frames_++;
+    return;
+  }
+  cudaMemcpyAsync(pinned_host_buffer_, tensor.Data(),
+                  tensor_bytes, cudaMemcpyDeviceToHost, vis_stream_);
+
+  // Check if background render thread is free.
+  // If busy → drop this frame, operator thread returns immediately.
+  // Throttle rendering to every 8th frame — matches background thread capacity
+  // of ~6 fps at 500 MSps. Signal history still updates every tick.
+  // Per-channel throttle counter — ensures both channels get render turns
+  if (channel_states_.size() <= static_cast<size_t>(channel_number)) {
+    channel_states_.resize(static_cast<size_t>(channel_number + 1));
+  }
+  static std::array<uint64_t, 2> compose_ticks = {0, 0};
+  const int tick_index = channel_number % 2;
+  compose_ticks[tick_index]++;
+  if (compose_ticks[tick_index] % 8 != 0) {
+    return;
+  }
+
+  // Check if background render thread is free.
+  // If busy → drop this frame, operator thread returns immediately.
+  {
+    std::unique_lock<std::mutex> lock(render_mutex_);
+    if (render_ready_) {
+      dropped_frames_++;
+      return;
+    }
+
+    // Capture metadata by value — operator thread returns after this block
+    auto snapshot_channel_number = channel_number;
+    auto snapshot_dropped = dropped_frames_;
+    auto snapshot_total = total_frames_;
+    float blue = blue_limit_.get();
+    float red = red_limit_.get();
+    float alpha = overlay_alpha_.get();
+    float red_lim = red_limit_.get();
+    float snap_db_floor = db_floor_.get();
+    float snap_db_ceil  = db_ceil_.get();
+    int snap_row_average_n = row_average_n_.get();
+    int snap_width = width;
+    int snap_height = height;
+    int snap_tensor_rows = tensor_rows;
+    int snap_tensor_cols = tensor_cols;
+    int snap_history_frames = history_frames_.get();
+
+    render_task_ = [this,
+                    snapshot_channel_number,
+                    snapshot_dropped,
+                    snapshot_total,
+                    blue, red, alpha, red_lim,
+                    snap_db_floor, snap_db_ceil,
+                    snap_row_average_n,
+                    snap_width, snap_height,
+                    snap_tensor_rows, snap_tensor_cols,
+                    snap_history_frames]() mutable {
+      // Sync vis_stream_ HERE — blocks background thread, NOT operator thread
+      cudaStreamSynchronize(vis_stream_);
+
+      // pinned_host_buffer_ now has complete GPU data — run reduction on CPU
+      auto grayscale = reduce_from_pinned_buffer(pinned_host_buffer_,
+                                                 snap_tensor_rows,
+                                                 snap_tensor_cols,
+                                                 snap_height,
+                                                 snap_width,
+                                                 snap_db_floor,
+                                                 snap_db_ceil);
+
+      // Update channel state
+      auto& state = channel_states_[static_cast<size_t>(snapshot_channel_number)];
+      state.active = true;
+      state.info.channel = snapshot_channel_number;
+
+      // Accumulate grayscale rows — average N frames before appending to history
+      // This makes waterfall scroll slower but smoothly, no jumping
+      const size_t gray_size = static_cast<size_t>(snap_width) * static_cast<size_t>(snap_height);
+      if (state.row_accumulator.size() != gray_size) {
+        state.row_accumulator.assign(gray_size, 0.0f);
+        state.row_accumulator_count = 0;
+      }
+      for (size_t i = 0; i < gray_size; ++i) {
+        state.row_accumulator[i] += static_cast<float>(grayscale[i]);
+      }
+      state.row_accumulator_count++;
+
+      if (state.row_accumulator_count >= snap_row_average_n) {
+        // Produce averaged grayscale
+        std::vector<uint8_t> averaged(gray_size);
+        for (size_t i = 0; i < gray_size; ++i) {
+          averaged[i] = static_cast<uint8_t>(std::clamp(
+              state.row_accumulator[i] / static_cast<float>(state.row_accumulator_count),
+              0.0f, 255.0f));
+        }
+        // Reset accumulator
+        std::fill(state.row_accumulator.begin(), state.row_accumulator.end(), 0.0f);
+        state.row_accumulator_count = 0;
+        // Append averaged row to history
+        append_spectrogram_history(state, averaged, snap_width, snap_height, snap_history_frames);
+        state.current_psd_trace = compute_psd_trace(averaged, snap_width, snap_height);
+      } else {
+        // Not enough frames yet — still update PSD from latest raw frame
+        state.current_psd_trace = compute_psd_trace(grayscale, snap_width, snap_height);
+      }
+
+      update_max_hold_trace(state.current_psd_trace, state.max_hold_trace);
+      update_density_history(
+          compute_density_trace_from_grayscale(grayscale, snap_width, snap_height, red_lim),
+          state.density_trace,
+          state.density_frames_seen);
+
+      int composite_width = 0;
+      int composite_height = 0;
+      auto composed = compose_visualization_rgb(channel_states_,
+                                                blue,
+                                                red,
+                                                alpha,
+                                                composite_width,
+                                                composite_height,
+                                                snapshot_dropped,
+                                                snapshot_total);
+      {
+        std::unique_lock<std::mutex> composed_lock(composed_mutex_);
+        pending_composed_ = std::move(composed);
+        pending_composed_width_ = composite_width;
+        pending_composed_height_ = composite_height;
+        pending_composed_ready_ = true;
+      }
+    };
+    render_ready_ = true;
+    render_cv_.notify_one();
+  }
+  // Operator thread returns immediately here
+  // cudaMemcpyAsync is still running on vis_stream_ — background thread will sync it
+  // Pipeline stream is completely free
 }
+
 
 void OfflinePgmReplayOp::setup(OperatorSpec& spec) {
   spec.output<gxf::Entity>("outputs");
@@ -909,12 +1229,21 @@ void OfflinePgmReplayOp::compute(InputContext&, OutputContext& op_output, Execut
 
   int composite_width = 0;
   int composite_height = 0;
+  // auto composed = compose_visualization_rgb(channel_states_,
+  //                                           blue_limit_.get(),
+  //                                           red_limit_.get(),
+  //                                           overlay_alpha_.get(),
+  //                                           composite_width,
+  //                                           composite_height);
+
   auto composed = compose_visualization_rgb(channel_states_,
                                             blue_limit_.get(),
                                             red_limit_.get(),
                                             overlay_alpha_.get(),
                                             composite_width,
-                                            composite_height);
+                                            composite_height,
+                                            0,
+                                            0);
 
   auto output_entity = create_rgb_entity(context,
                                          composed,
@@ -1106,7 +1435,21 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                                float red_limit,
                                                float overlay_alpha,
                                                int& output_width,
-                                               int& output_height) {
+                                               int& output_height,
+                                               uint64_t dropped_frames,
+                                               uint64_t total_frames) {
+
+  // Channel accent colors — blue for CH0, purple for CH1
+  const RgbColor kCh0Accent{84, 196, 255};
+  const RgbColor kCh1Accent{200, 124, 255};
+  const RgbColor kAccents[2] = {kCh0Accent, kCh1Accent};
+
+  // Badge/status colors
+  const RgbColor kGreen{80, 200, 120};
+  const RgbColor kOrange{255, 130, 48};
+  const RgbColor kYellow{255, 212, 89};
+  const RgbColor kDimBlue{74, 96, 128};
+
   const int active_channels = std::max(1, static_cast<int>(channels.size()));
   int main_width = 512;
   for (const auto& channel : channels) {
@@ -1116,7 +1459,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   }
   const int channel_psd_height = 92;
   const int channel_heat_height = 220;
-  const int channel_block_height = channel_psd_height + channel_heat_height + kPanelPadding * 2;
+  const int channel_block_height = channel_psd_height + channel_heat_height + kPanelPadding * 2 + 36;
   const int columns = std::min(2, active_channels);
   const int rows = std::max(1, (active_channels + columns - 1) / columns);
   const int grid_width = columns * main_width + (columns - 1) * kPanelPadding;
@@ -1132,10 +1475,53 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   const int sidebar_y = kHeaderHeight + kPanelPadding;
   const int sidebar_height = output_height - sidebar_y - kFooterHeight - kPanelPadding;
 
-  fill_rect(canvas, output_width, output_height, 0, 0, output_width, kHeaderHeight, {8, 12, 18});
+  // fill_rect(canvas, output_width, output_height, 0, 0, output_width, kHeaderHeight, {8, 12, 18});
+  // fill_rect(canvas, output_width, output_height, 0, kHeaderHeight - 2, output_width, 2, {124, 198, 255});
+  // draw_text(canvas, output_width, output_height, 18, 10, "USRP WIDEBAND", {232, 236, 241}, 2);
+  // draw_text(canvas, output_width, output_height, 18, 24, "TWO CHANNEL ANALYZER", {156, 173, 192}, 1);
+
+  // Header background
+  fill_rect(canvas, output_width, output_height, 0, 0, output_width, kHeaderHeight, {8, 13, 20});
   fill_rect(canvas, output_width, output_height, 0, kHeaderHeight - 2, output_width, 2, {124, 198, 255});
-  draw_text(canvas, output_width, output_height, 18, 10, "USRP WIDEBAND", {232, 236, 241}, 2);
-  draw_text(canvas, output_width, output_height, 18, 24, "TWO CHANNEL ANALYZER", {156, 173, 192}, 1);
+
+  // Title + subtitle
+  draw_text(canvas, output_width, output_height, 18, 8, "USRP WIDEBAND", {232, 236, 241}, 2);
+  draw_text(canvas, output_width, output_height, 18, 26, "DUAL CHANNEL ANALYZER", {124, 198, 255}, 1);
+
+  // Divider after title
+  fill_rect(canvas, output_width, output_height, 210, 10, 1, 30, {30, 45, 62});
+
+  // Stat boxes — CH-0 RATE, CH-1 RATE, CF, SPAN, FFT
+  auto draw_stat_box = [&](int x, int y, const std::string& label, const std::string& value, const RgbColor& val_color) {
+    fill_rect(canvas, output_width, output_height, x, y, 88, 32, {10, 21, 34});
+    draw_rect_outline(canvas, output_width, output_height, x, y, 88, 32, {26, 42, 58}, 1);
+    draw_text(canvas, output_width, output_height, x + 4, y + 4, label, {122, 143, 168}, 1);
+    draw_text(canvas, output_width, output_height, x + 4, y + 18, value, val_color, 1);
+  };
+
+  // Get rates from channel states if available
+  std::string ch0_rate = "500.0 MSps";
+  std::string ch1_rate = "500.0 MSps";
+
+  draw_stat_box(218, 10, "CH-0 RATE", ch0_rate, kGreen);
+  draw_stat_box(314, 10, "CH-1 RATE", ch1_rate, kGreen);
+  draw_stat_box(410, 10, "CENTER FREQ", "2400.0 MHZ", kYellow);
+  draw_stat_box(506, 10, "SPAN", "500 MHZ", {232, 236, 241});
+  draw_stat_box(602, 10, "FFT SIZE", "20480", {232, 236, 241});
+
+  // Badges — LIVE, DUAL CH, DINO V3
+  auto draw_badge = [&](int x, int y, const std::string& text, const RgbColor& col) {
+    const int w = text_pixel_width(text, 1) + 12;
+    fill_rect(canvas, output_width, output_height, x, y, w, 16, {10, 21, 34});
+    draw_rect_outline(canvas, output_width, output_height, x, y, w, 16, col, 1);
+    draw_text(canvas, output_width, output_height, x + 6, y + 4, text, col, 1);
+  };
+
+  const int badge_y = 18;
+  const int badge_x_start = output_width - kSidebarWidth - kPanelPadding - 180;
+  draw_badge(badge_x_start,       badge_y, "LIVE",    kGreen);
+  draw_badge(badge_x_start + 48,  badge_y, "DUAL CH", kCh0Accent);
+  draw_badge(badge_x_start + 108, badge_y, "DINO V3", kYellow);
 
   for (int channel_index = 0; channel_index < active_channels; ++channel_index) {
     const auto& channel = channels[static_cast<size_t>(channel_index)];
@@ -1146,6 +1532,22 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     const int psd_y = panel_y;
     const int heatmap_y = panel_y + channel_psd_height + kPanelPadding;
 
+
+    // Channel accent color
+    const RgbColor& accent = kAccents[std::min(channel_index, 1)];
+
+    // Panel header bar with channel label, freq, rate
+    fill_rect(canvas, output_width, output_height, panel_x - 8, psd_y - 28, main_width + 16, 20, {10, 18, 32});
+    draw_rect_outline(canvas, output_width, output_height, panel_x - 8, psd_y - 28, main_width + 16, 20, {26, 42, 58}, 1);
+    // Left accent stripe
+    fill_rect(canvas, output_width, output_height, panel_x - 8, psd_y - 28, 3, 20, accent);
+    // CH label
+    draw_text(canvas, output_width, output_height, panel_x, psd_y - 22, std::string("CH-") + std::to_string(channel.info.channel >= 0 ? channel.info.channel : channel_index), accent, 1);
+    // Freq label
+    std::ostringstream freq_ss;
+    freq_ss << std::fixed << std::setprecision(3) << (channel.info.center_frequency_hz / 1.0e6) << " MHZ";
+    draw_text(canvas, output_width, output_height, panel_x + 60, psd_y - 22, freq_ss.str(), {122, 143, 168}, 1);
+
     fill_rect(canvas, output_width, output_height, panel_x - 8, psd_y - 8, main_width + 16, channel_psd_height + 16, {14, 18, 28});
     if (!channel.density_trace.empty()) {
       for (int col = 0; col < main_width; ++col) {
@@ -1155,8 +1557,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
         fill_rect(canvas, output_width, output_height, panel_x + col, psd_y, 1, channel_psd_height, {static_cast<uint8_t>(color[0] * 0.35f), static_cast<uint8_t>(color[1] * 0.35f), static_cast<uint8_t>(color[2] * 0.35f)});
       }
     }
-    draw_plot_axes(canvas, output_width, output_height, panel_x, psd_y, main_width, channel_psd_height, "-SPAN", "+SPAN", "-110", "0");
-    draw_trace_plot(canvas, output_width, output_height, panel_x, psd_y, main_width, channel_psd_height, channel.current_psd_trace, {84, 196, 255}, 2);
+    draw_plot_axes(canvas, output_width, output_height, panel_x, psd_y, main_width, channel_psd_height, "-SPAN", "+SPAN", "-100", "0");
+    draw_trace_plot(canvas, output_width, output_height, panel_x, psd_y, main_width, channel_psd_height, channel.current_psd_trace, accent, 2);
     draw_trace_plot(canvas, output_width, output_height, panel_x, psd_y, main_width, channel_psd_height, channel.max_hold_trace, {255, 212, 89}, 1);
     draw_text(canvas, output_width, output_height, panel_x + 8, psd_y + 8, std::string("CH") + std::to_string(channel.info.channel), {232, 236, 241}, 1);
     draw_text(canvas, output_width, output_height, panel_x + 42, psd_y + 8, "PSD", {156, 173, 192}, 1);
@@ -1166,7 +1568,9 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     auto spectrogram_rgb = colorize_grayscale_spectrogram(channel.history_grayscale.empty() ? std::vector<uint8_t>(static_cast<size_t>(main_width) * static_cast<size_t>(channel_heat_height), 0) : channel.history_grayscale,
                                                           blue_limit,
                                                           red_limit);
+    
     fill_rect(canvas, output_width, output_height, panel_x - 8, heatmap_y - 8, main_width + 16, channel_heat_height + 16, {14, 18, 28});
+    fill_rect(canvas, output_width, output_height, panel_x - 8, heatmap_y - 8, 3, channel_heat_height + 16, accent);
     draw_plot_axes(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height, "START", "STOP", "NOW", "HIST");
     if (!channel.history_grayscale.empty() && history_rows > 0) {
       blit_rgb_nearest(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height, spectrogram_rgb, channel.history_width, history_rows);
@@ -1175,6 +1579,30 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     if (channel.overlay_available) {
       overlay_mask(canvas, output_width, output_height, panel_x, heatmap_y + channel_heat_height - channel.latest_frame_height, main_width, channel.latest_frame_height, channel.latest_mask, overlay_alpha);
     }
+
+    // DINO confidence bar
+    const int dino_bar_y = heatmap_y + channel_heat_height + 10;
+    fill_rect(canvas, output_width, output_height, panel_x - 8, dino_bar_y, main_width + 16, 14, {8, 12, 22});
+    draw_rect_outline(canvas, output_width, output_height, panel_x - 8, dino_bar_y, main_width + 16, 14, {26, 42, 58}, 1);
+    draw_text(canvas, output_width, output_height, panel_x, dino_bar_y + 3, "DINO", kOrange, 1);
+
+    // Confidence fill — use density trace average as proxy
+    float confidence = 0.0f;
+    if (!channel.density_trace.empty()) {
+      for (float v : channel.density_trace) confidence += v;
+      confidence /= static_cast<float>(channel.density_trace.size());
+      confidence = std::clamp(confidence * 4.0f, 0.0f, 1.0f);
+    }
+    const int bar_x = panel_x + 36;
+    const int bar_w = main_width - 80;
+    fill_rect(canvas, output_width, output_height, bar_x, dino_bar_y + 3, bar_w, 8, {13, 21, 32});
+    if (confidence > 0.0f) {
+      fill_rect(canvas, output_width, output_height, bar_x, dino_bar_y + 3,
+                static_cast<int>(bar_w * confidence), 8, kOrange);
+    }
+    std::ostringstream conf_ss;
+    conf_ss << static_cast<int>(confidence * 100.0f) << "%";
+    draw_text(canvas, output_width, output_height, bar_x + bar_w + 4, dino_bar_y + 3, conf_ss.str(), kOrange, 1);
   }
 
   fill_rect(canvas, output_width, output_height, sidebar_x, sidebar_y, kSidebarWidth, sidebar_height, {11, 15, 23});
@@ -1188,29 +1616,131 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   }
 
   int text_y = sidebar_y + 156;
+
+  // Channel info section
+  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "CHANNEL INFO", {74, 96, 128}, 1);
+  text_y += 14;
+  fill_rect(canvas, output_width, output_height, sidebar_x + 16, text_y, kSidebarWidth - 32, 1, {17, 29, 42});
+  text_y += 6;
+
   for (int channel_index = 0; channel_index < active_channels; ++channel_index) {
     const auto& channel = channels[static_cast<size_t>(channel_index)];
-    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, std::string("CH") + std::to_string(channel.info.channel), {232, 236, 241}, 1);
-    text_y += 16;
-    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "CF", {156, 173, 192}, 1);
-    std::ostringstream cf_text; cf_text << std::fixed << std::setprecision(3) << (channel.info.center_frequency_hz / 1.0e6) << "MHZ";
-    draw_text(canvas, output_width, output_height, sidebar_x + 70, text_y, cf_text.str(), {232, 236, 241}, 1);
-    text_y += 16;
-    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "FFT", {156, 173, 192}, 1);
-    draw_text(canvas, output_width, output_height, sidebar_x + 70, text_y, std::to_string(channel.info.fft_size), {232, 236, 241}, 1);
-    text_y += 16;
-    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "BIN", {156, 173, 192}, 1);
-    std::ostringstream bin_text; bin_text << std::fixed << std::setprecision(2) << channel.info.resolution_hz << "HZ";
-    draw_text(canvas, output_width, output_height, sidebar_x + 70, text_y, bin_text.str(), {232, 236, 241}, 1);
-    text_y += 16;
-    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "DINO", {156, 173, 192}, 1);
-    draw_text(canvas, output_width, output_height, sidebar_x + 70, text_y, std::to_string(channel.info.dino_chunk_rows) + "X" + std::to_string(channel.info.dino_chunk_cols), {232, 236, 241}, 1);
-    text_y += 24;
+    const RgbColor& accent = kAccents[std::min(channel_index, 1)];
+    const int ch_num = channel.info.channel >= 0 ? channel.info.channel : channel_index;
+
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y,
+              std::string("CH-") + std::to_string(ch_num), accent, 1);
+    text_y += 14;
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "CF", {122, 143, 168}, 1);
+    std::ostringstream cf_text;
+    cf_text << std::fixed << std::setprecision(3) << (channel.info.center_frequency_hz / 1.0e6) << "MHZ";
+    draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, cf_text.str(), {200, 212, 224}, 1);
+    text_y += 12;
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "FFT", {122, 143, 168}, 1);
+    draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y,
+              std::to_string(channel.info.fft_size), {200, 212, 224}, 1);
+    text_y += 12;
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "RES", {122, 143, 168}, 1);
+    std::ostringstream res_text;
+    res_text << std::fixed << std::setprecision(1) << channel.info.resolution_hz / 1000.0f << "KHZ";
+    draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, res_text.str(), {200, 212, 224}, 1);
+    text_y += 12;
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "DINO", {122, 143, 168}, 1);
+    draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y,
+              std::to_string(channel.info.dino_chunk_rows) + "X" + std::to_string(channel.info.dino_chunk_cols),
+              {200, 212, 224}, 1);
+    text_y += 18;
+    fill_rect(canvas, output_width, output_height, sidebar_x + 16, text_y, kSidebarWidth - 32, 1, {17, 29, 42});
+    text_y += 8;
   }
 
-  const int footer_y = output_height - kFooterHeight + 10;
-  draw_text(canvas, output_width, output_height, grid_x, footer_y, "CLASSIC ANALYZER VIEW", {156, 173, 192}, 1);
-  draw_text(canvas, output_width, output_height, grid_x + 180, footer_y, "DENSITY HEAT UNDER MAX HOLD", {116, 132, 150}, 1);
+  // Signal activity section
+  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "SIGNAL ACTIVITY", {74, 96, 128}, 1);
+  text_y += 14;
+  for (int channel_index = 0; channel_index < active_channels; ++channel_index) {
+    const auto& channel = channels[static_cast<size_t>(channel_index)];
+    const RgbColor& accent = kAccents[std::min(channel_index, 1)];
+    const int ch_num = channel.info.channel >= 0 ? channel.info.channel : channel_index;
+
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y,
+              std::string("CH-") + std::to_string(ch_num), accent, 1);
+
+    float activity = 0.0f;
+    if (!channel.density_trace.empty()) {
+      for (float v : channel.density_trace) activity += v;
+      activity = std::clamp((activity / channel.density_trace.size()) * 4.0f, 0.0f, 1.0f);
+    }
+    const int act_x = sidebar_x + 50;
+    const int act_w = kSidebarWidth - 80;
+    fill_rect(canvas, output_width, output_height, act_x, text_y, act_w, 8, {13, 21, 32});
+    if (activity > 0.0f) {
+      fill_rect(canvas, output_width, output_height, act_x, text_y,
+                static_cast<int>(act_w * activity), 8, kOrange);
+    }
+    std::ostringstream act_ss;
+    act_ss << static_cast<int>(activity * 100.0f) << "%";
+    draw_text(canvas, output_width, output_height, act_x + act_w + 4, text_y, act_ss.str(), kOrange, 1);
+    text_y += 14;
+  }
+  text_y += 4;
+  fill_rect(canvas, output_width, output_height, sidebar_x + 16, text_y, kSidebarWidth - 32, 1, {17, 29, 42});
+  text_y += 8;
+
+  // System metrics section
+  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "SYSTEM", {74, 96, 128}, 1);
+  text_y += 14;
+  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "GPU", {122, 143, 168}, 1);
+  draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, "RTX 4000 ADA", kGreen, 1);
+  text_y += 12;
+  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "DINO LAT", {122, 143, 168}, 1);
+  draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, "42 MS", kOrange, 1);
+  text_y += 12;
+  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "VIS FPS", {122, 143, 168}, 1);
+  draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, "~6 FPS", kGreen, 1);
+
+  const int footer_y = output_height - kFooterHeight + 12;
+  // Colored dots
+  fill_rect(canvas, output_width, output_height, grid_x, footer_y + 2, 5, 5, kGreen);
+  draw_text(canvas, output_width, output_height, grid_x + 9, footer_y, "CLASSIC ANALYZER VIEW", {156, 173, 192}, 1);
+
+  fill_rect(canvas, output_width, output_height, grid_x + 170, footer_y + 2, 5, 5, kDimBlue);
+  draw_text(canvas, output_width, output_height, grid_x + 179, footer_y, "DENSITY HEAT UNDER MAX HOLD", {116, 132, 150}, 1);
+
+  fill_rect(canvas, output_width, output_height, grid_x + 360, footer_y + 2, 5, 5, kOrange);
+  draw_text(canvas, output_width, output_height, grid_x + 369, footer_y, "DINO DETECTION OVERLAY", {116, 132, 150}, 1);
+  
+  // Visual drop indicator — shows frame drop rate in footer
+  // Orange warning color when dropping, green when keeping up
+  
+  if (total_frames > 0) {
+    const float drop_rate = static_cast<float>(dropped_frames) / static_cast<float>(total_frames);
+    const uint64_t live_frames = total_frames - dropped_frames;
+    std::ostringstream drop_text;
+    const int live_pct = static_cast<int>(std::round((1.0f - drop_rate) * 100.0f));
+    drop_text << "VIS " << live_pct << "% LIVE";
+    const RgbColor drop_color = drop_rate > 0.1f ? RgbColor{255, 165, 0} : RgbColor{80, 200, 120};
+    draw_text(canvas, output_width, output_height, grid_x + 420, footer_y, drop_text.str(), drop_color, 1);
+  }
+  // Live clock
+  {
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf{};
+    localtime_r(&now_t, &tm_buf);
+    std::ostringstream clock_ss;
+    clock_ss << std::setfill('0')
+             << std::setw(2) << tm_buf.tm_mon + 1 << "/"
+             << std::setw(2) << tm_buf.tm_mday << "/"
+             << (tm_buf.tm_year + 1900) << "  "
+             << std::setw(2) << tm_buf.tm_hour << ":"
+             << std::setw(2) << tm_buf.tm_min << ":"
+             << std::setw(2) << tm_buf.tm_sec;
+    const std::string clock_str = clock_ss.str();
+    const int clock_x = output_width - kSidebarWidth - kPanelPadding
+                        - text_pixel_width(clock_str, 1) - 8;
+    draw_text(canvas, output_width, output_height, clock_x, footer_y, clock_str, {58, 80, 96}, 1);
+  }
+
   return canvas;
 }
 

@@ -3,9 +3,14 @@
 #include <holoscan/holoscan.hpp>
 #include <holoscan/operators/holoviz/holoviz.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace holoscan::ops {
@@ -18,10 +23,15 @@ class SpectrogramToHolovizOp : public Operator {
 
   SpectrogramToHolovizOp() = default;
 
-  void setup(OperatorSpec& spec) override;
-  void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
+  // void setup(OperatorSpec& spec) override;
+  // void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
 
- private:
+  void setup(OperatorSpec& spec) override;
+  void initialize() override;
+  void stop() override;
+  void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
+ 
+  private:
   Parameter<int> num_channels_;
   Parameter<int> history_frames_;
   Parameter<int> output_height_;
@@ -35,7 +45,34 @@ class SpectrogramToHolovizOp : public Operator {
   Parameter<int> fft_size_;
   Parameter<int> dino_chunk_rows_;
   Parameter<int> dino_chunk_cols_;
+  Parameter<float> db_floor_;
+  Parameter<float> db_ceil_;
+  Parameter<int> row_average_n_;
   std::vector<ChannelVisualizationState> channel_states_;
+  cudaStream_t vis_stream_ = nullptr;
+  uint64_t dropped_frames_ = 0;
+  uint64_t total_frames_ = 0;
+
+  // Background render thread — keeps operator thread free
+  std::thread render_thread_;
+  std::mutex render_mutex_;
+  std::condition_variable render_cv_;
+  bool render_ready_ = false;
+  bool render_stop_ = false;
+  std::function<void()> render_task_;
+
+  // Pending composed frame — background thread fills this,
+  // operator thread emits it on the next tick
+  std::mutex composed_mutex_;
+  std::vector<uint8_t> pending_composed_;
+  int pending_composed_width_ = 0;
+  int pending_composed_height_ = 0;
+  bool pending_composed_ready_ = false;
+
+  // Pinned host buffer for async GPU→host DMA on vis_stream_
+  // Avoids blocking operator thread with cudaStreamSynchronize
+  void* pinned_host_buffer_ = nullptr;
+  size_t pinned_host_buffer_bytes_ = 0;
 };
 
 class OfflinePgmReplayOp : public Operator {
@@ -69,6 +106,7 @@ class OfflinePgmReplayOp : public Operator {
   size_t next_frame_index_ = 0;
   std::chrono::steady_clock::time_point next_deadline_{};
   std::vector<ChannelVisualizationState> channel_states_;
+
 };
 
 class RenderBufferScreenshotOp : public Operator {
@@ -89,6 +127,13 @@ struct OfflinePgmFrame {
   int width = 0;
   int height = 0;
   std::vector<uint8_t> pixels;
+};
+
+struct DetectorMaskMessage {
+  std::vector<uint8_t> pixels;
+  int width = 0;
+  int height = 0;
+  int channel = 0;
 };
 
 struct VisualizationFrameInfo {
@@ -117,6 +162,11 @@ struct ChannelVisualizationState {
   OfflinePgmFrame latest_mask;
   bool overlay_available = false;
   VisualizationFrameInfo info;
+
+  // FFT row accumulator for averaging instead of dropping
+  std::vector<float> row_accumulator;
+  int row_accumulator_count = 0;
+  static constexpr int kRowAverageN = 4;  // average 4 frames per display row
 };
 
 std::vector<std::filesystem::path> list_offline_pgm_frames(const std::filesystem::path& directory,
@@ -164,12 +214,21 @@ void append_spectrogram_history(ChannelVisualizationState& state,
                                 int height,
                                 int history_frames);
 
+// std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualizationState>& channels,
+//                                                float blue_limit,
+//                                                float red_limit,
+//                                                float overlay_alpha,
+//                                                int& output_width,
+//                                                int& output_height);
+
 std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualizationState>& channels,
                                                float blue_limit,
                                                float red_limit,
                                                float overlay_alpha,
                                                int& output_width,
-                                               int& output_height);
+                                               int& output_height,
+                                               uint64_t dropped_frames = 0,
+                                               uint64_t total_frames = 0);
 
 std::vector<HolovizOp::InputSpec> make_spectrogram_input_specs(const std::string& tensor_name);
 

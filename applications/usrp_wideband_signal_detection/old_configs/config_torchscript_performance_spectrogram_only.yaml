@@ -105,14 +105,14 @@ chdr_converter:
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
   num_ffts_per_batch: 128
-  num_simul_batches: 4
+  num_simul_batches: 2 #4
   num_channels: 2
   log_packets: false
   log_data: false
 
 fft:
   burst_size: 20480
-  num_bursts: 128
+  num_bursts: 64 #128
   num_channels: 2
   spectrum_type: 1
   averaging_type: 1
@@ -137,12 +137,12 @@ logger:
   log_interval: 5
 
 visualization:
-  enable: false
+  enable: true
   renderer:
     num_channels: 2
-    history_frames: 5
-    output_height: 256
-    output_width: 512
+    history_frames: 2 #5
+    output_height: 128 #256
+    output_width: 256 #512
     channel_filter: -1
     tensor_name: "spectrogram"
     blue_limit: 0.10
@@ -163,8 +163,8 @@ spectrogram:
   enable_save: false
   save_every_n_frames: 100
   max_images_per_channel: 0
-  output_height: 256
-  output_width: 512
+  output_height: 128 #256
+  output_width: 256 #512
   output_dir: "/workspace/spectrograms"
 
 dinov3_signal_detector:

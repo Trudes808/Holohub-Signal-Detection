@@ -453,7 +453,8 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         detector_source = spectrogramOp;
 
         if (enable_visualization) {
-          add_flow(spectrogramOp, spectrogramVisualizerOp);
+          //add_flow(spectrogramOp, spectrogramVisualizerOp);
+          add_flow(spectrogramOp, spectrogramVisualizerOp, {{"out", "in"}});
         }
       }
 
@@ -484,6 +485,13 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     if (enable_visualization) {
       add_flow(spectrogramVisualizerOp, holovizOp, {{"outputs", "receivers"}});
+    }
+    if (enable_visualization && enable_detector && detector_type == "coherent_power") {
+      for (int ch = 0; ch < pipeline_channels; ++ch) {
+        add_flow(coherentDetectorOps[static_cast<size_t>(ch)],
+                 spectrogramVisualizerOp,
+                 {{"mask_out", "mask_in"}});
+      }
     }
   }
 };

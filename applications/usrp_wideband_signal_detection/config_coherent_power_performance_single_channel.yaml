@@ -107,7 +107,29 @@ logger:
   log_interval: 5
 
 visualization:
-  enable: false
+  enable: true
+  renderer:
+    num_channels: 1
+    history_frames: 5
+    output_height: 256
+    output_width: 512
+    channel_filter: 0
+    tensor_name: "spectrogram"
+    blue_limit: 0.10
+    red_limit: 0.92
+    overlay_alpha: 0.38
+    center_frequency_hz: 0.0
+    fft_size: 20480
+    dino_chunk_rows: 256
+    dino_chunk_cols: 512
+    db_floor: -22.0
+    db_ceil: 35.0
+    row_average_n: 4
+  holoviz:
+    width: 1280
+    height: 720
+    window_title: "USRP Wideband Spectrogram"
+    fullscreen: false
 
 spectrogram:
   num_channels: 1
@@ -178,11 +200,11 @@ dinov3_signal_detector:
 coherent_power_signal_detector:
   num_channels: 1
   input_height: 250
-  input_width: 20480
+  input_width: 512 #20480
   # Full-rate aggressive profile matching the active two-channel fast path,
   # restricted to channel 0 only.
   emit_stride: 1
-  log_detections: false
+  log_detections: true
   fast_performance: true
   save_performance_path_artifacts: false
   enable_mask_save: false
@@ -217,6 +239,7 @@ coherent_power_signal_detector:
   grouping_min_time_span_px: 1
   grouping_min_density: 0.0
   grouping_time_continuity_ratio: 0.85
-  timing_summary_enable: false
+  timing_summary_enable: true
   timing_summary_every_n: 64
   timing_summary_window: 64
+
