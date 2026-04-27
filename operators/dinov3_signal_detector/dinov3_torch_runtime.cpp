@@ -1014,9 +1014,13 @@ class DinoTorchRuntime::Impl {
         result.patch_rows = trt_result.patch_rows;
         result.patch_cols = trt_result.patch_cols;
         result.feature_dim = trt_result.feature_dim;
+        result.timing.dino_score_ms = trt_result.timing.dino_score_ms;
+        result.timing.torch_forward_ms = std::max(0.0, result.timing.torch_forward_ms - result.timing.dino_score_ms);
         result.patch_features_batch = std::move(trt_result.patch_features_batch);
         result.patch_features_batch_device = trt_result.patch_features_batch_device;
         result.patch_features_batch_device_owner = std::move(trt_result.patch_features_batch_device_owner);
+        result.raw_score_maps_device = trt_result.raw_score_maps_device;
+        result.raw_score_maps_device_owner = std::move(trt_result.raw_score_maps_device_owner);
         result.backend_used = trt_result.backend_used;
         result.success = true;
         return result;
@@ -1594,6 +1598,30 @@ class DinoTorchRuntime::Impl {
     result.patch_cols = patch_cols;
     result.feature_dim = feature_dim;
     result.backend_used = "tensorrt";
+
+    DinoCudaScoreBatch raw_score_batch;
+    std::string raw_score_error;
+    result.timing.dino_score_ms = measure_ms([&] {
+      if (!project_tensorrt_raw_score_batch_cuda(output_device,
+                                                 input.batch_size,
+                                                 patch_rows,
+                                                 patch_cols,
+                                                 feature_dim,
+                                                 aligned_rows,
+                                                 aligned_cols,
+                                                 patch_rows,
+                                                 patch_cols,
+                                                 config.raw_dino_positional_deweight,
+                                                 true,
+                                                 execution_stream,
+                                                 input.raw_score_output_batch_device,
+                                                 &raw_score_batch,
+                                                 &raw_score_error)) {
+        throw std::runtime_error(raw_score_error.empty() ? "TensorRT raw score projection failed" : raw_score_error);
+      }
+    });
+    result.raw_score_maps_device = raw_score_batch.data;
+    result.raw_score_maps_device_owner = std::move(raw_score_batch.owner);
 
     if (config.return_patch_features) {
       result.patch_features_batch.resize(static_cast<size_t>(input.batch_size) * patch_elements_per_sample);

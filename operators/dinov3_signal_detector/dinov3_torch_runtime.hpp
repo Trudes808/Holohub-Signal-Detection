@@ -40,6 +40,7 @@ struct DinoTorchRuntimeConfig {
   double frontend_correction_edge_taper_sigma = 6.0;
   double frontend_correction_edge_target_drop_db = 2.5;
   double power_q = 0.90;
+  float raw_dino_positional_deweight = 0.75f;
   int dino_group_k = 8;
   double dino_group_spatial_weight = 0.35;
   double dino_group_score_q = 0.60;
@@ -76,6 +77,7 @@ struct DinoTorchRuntimeBatchInput {
   double resolution_hz = 0.0;
   double span_hz = 0.0;
   const float* corrected_db_batch_device = nullptr;
+  float* raw_score_output_batch_device = nullptr;
 };
 
 struct DinoTorchRuntimeTiming {
@@ -139,6 +141,8 @@ struct DinoTorchRuntimeBatchResult {
   std::vector<float> score_maps;
   const float* score_maps_device = nullptr;
   std::shared_ptr<void> score_maps_device_owner;
+  const float* raw_score_maps_device = nullptr;
+  std::shared_ptr<void> raw_score_maps_device_owner;
   std::vector<double> dino_thresholds;
   std::vector<double> final_thresholds;
 };

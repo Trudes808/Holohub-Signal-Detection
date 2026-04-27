@@ -4591,6 +4591,11 @@ bool project_runtime_score_batch_to_device(const float* score_maps_batch_device,
 }
 
 bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_batch_device,
+                                                      int dino_rows,
+                                                      int dino_cols,
+                                                      int dino_aligned_rows,
+                                                      int dino_aligned_cols,
+                                                      bool dino_resized_full_chunk,
                                                       const float* coherence_batch_device,
                                                       int batch_size,
                                                       int rows,
@@ -4605,7 +4610,8 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                       cudaStream_t cuda_stream,
                                                       CudaHybridStageTiming* stage_timing) {
   (void)use_fp16;
-  if (batch_size <= 0 || rows <= 0 || cols <= 0 || dino_score_batch_device == nullptr || coherence_batch_device == nullptr ||
+  if (batch_size <= 0 || rows <= 0 || cols <= 0 || dino_rows <= 0 || dino_cols <= 0 || dino_aligned_rows <= 0 || dino_aligned_cols <= 0 ||
+      dino_score_batch_device == nullptr || coherence_batch_device == nullptr ||
       output_combined_score_device == nullptr || output_final_mask_device == nullptr ||
       valid_row_mask_batch.size() != static_cast<size_t>(batch_size) * static_cast<size_t>(rows)) {
     return false;
@@ -4643,6 +4649,23 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
   auto sync_if_timed = [&]() {
     return stage_timing == nullptr || cudaStreamSynchronize(stream) == cudaSuccess;
   };
+  const float* dino_score_for_hybrid = dino_score_batch_device;
+  if (dino_rows != rows || dino_cols != cols || !dino_resized_full_chunk || dino_aligned_rows != rows || dino_aligned_cols != cols) {
+    if (!project_runtime_score_batch_to_device(dino_score_batch_device,
+                                               batch_size,
+                                               dino_rows,
+                                               dino_cols,
+                                               dino_aligned_rows,
+                                               dino_aligned_cols,
+                                               rows,
+                                               cols,
+                                               dino_resized_full_chunk,
+                                               scratch.work7,
+                                               stream)) {
+      return false;
+    }
+    dino_score_for_hybrid = scratch.work7;
+  }
   auto masked_normalize = [&](const float* input, float* output) -> bool {
     masked_minmax_reduce_kernel<<<batch_size, threads, 0, stream>>>(input,
                                                                     scratch.valid_mask,
@@ -4719,7 +4742,7 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
   }
 
   const auto normalization_start = std::chrono::steady_clock::now();
-  if (!extract_masked_quantile_thresholds_cuda_batch_to_device(dino_score_batch_device,
+  if (!extract_masked_quantile_thresholds_cuda_batch_to_device(dino_score_for_hybrid,
                                                                coherence_batch_device,
                                                                coherence_batch_device,
                                                                scratch.full_mask,
@@ -4735,7 +4758,7 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                                scratch.thresh1,
                                                                scratch.thresh2,
                                                                stream) ||
-      !extract_masked_quantile_thresholds_cuda_batch_to_device(dino_score_batch_device,
+      !extract_masked_quantile_thresholds_cuda_batch_to_device(dino_score_for_hybrid,
                                                                coherence_batch_device,
                                                                coherence_batch_device,
                                                                scratch.full_mask,
@@ -4753,7 +4776,7 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                                stream)) {
     return false;
   }
-  threshold_normalize_batch_kernel<<<blocks, threads, 0, stream>>>(dino_score_batch_device,
+  threshold_normalize_batch_kernel<<<blocks, threads, 0, stream>>>(dino_score_for_hybrid,
                                                                     total,
                                                                     plane,
                                                                     scratch.thresh0,
@@ -5754,6 +5777,13 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
 
     bool raw_score_ready = false;
     std::string raw_score_source = "none";
+    const float* hybrid_raw_score_batch_device = nullptr;
+    std::shared_ptr<void> hybrid_raw_score_batch_device_owner;
+    int hybrid_raw_score_rows = uniform_chunk_rows;
+    int hybrid_raw_score_cols = src_cols;
+    int hybrid_raw_score_aligned_rows = uniform_chunk_rows;
+    int hybrid_raw_score_aligned_cols = src_cols;
+    bool hybrid_raw_score_resized_full_chunk = true;
     const float* debug_patch_features_batch_device = nullptr;
     std::shared_ptr<void> debug_patch_features_batch_device_owner;
     int debug_patch_rows = 0;
@@ -5780,6 +5810,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       runtime_config.return_final_mask_device = true;
       runtime_config.compute_power_score = false;
       runtime_config.frontend_correction_enable = false;
+      runtime_config.raw_dino_positional_deweight = raw_dino_positional_deweight_.get();
 
       DinoTorchRuntimeBatchInput runtime_input;
       runtime_input.batch_size = chunk_count;
@@ -5792,6 +5823,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       runtime_input.resolution_hz = resolution_hz;
       runtime_input.span_hz = span_hz;
       runtime_input.corrected_db_batch_device = buffers.corrected_batch_device;
+      runtime_input.raw_score_output_batch_device = nullptr;
 
       if (!runtime_) {
         runtime_ = std::make_shared<DinoTorchRuntime>();
@@ -5814,8 +5846,24 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         debug_aligned_rows = runtime_result.aligned_rows;
         debug_aligned_cols = runtime_result.aligned_cols;
         debug_resized_full_chunk = resized_full_chunk;
-        if (runtime_result.patch_features_batch_device != nullptr && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 &&
-            runtime_result.feature_dim > 0) {
+        if (runtime_result.raw_score_maps_device != nullptr) {
+          const auto raw_score_start_time = std::chrono::steady_clock::now();
+          hybrid_raw_score_batch_device = runtime_result.raw_score_maps_device;
+          hybrid_raw_score_batch_device_owner = runtime_result.raw_score_maps_device_owner;
+          hybrid_raw_score_rows = std::max(1, runtime_result.patch_rows);
+          hybrid_raw_score_cols = std::max(1, runtime_result.patch_cols);
+          hybrid_raw_score_aligned_rows = std::max(1, runtime_result.aligned_rows);
+          hybrid_raw_score_aligned_cols = std::max(1, runtime_result.aligned_cols);
+          hybrid_raw_score_resized_full_chunk = resized_full_chunk;
+          raw_score_ready = true;
+          if (capture_operator_timing) {
+            throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                                "cuda_dino_detector raw score timing synchronization failed");
+            timing_profile.raw_score_projection_ms = elapsed_ms_since(raw_score_start_time);
+          }
+          raw_score_source = "runtime_raw_score_patch";
+        } else if (runtime_result.patch_features_batch_device != nullptr && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 &&
+                   runtime_result.feature_dim > 0) {
           const auto raw_score_start_time = std::chrono::steady_clock::now();
           raw_score_ready = compute_deweighted_raw_dino_score_gpu_batch_to_device(runtime_result.patch_features_batch_device,
                                                                                   chunk_count,
@@ -5830,6 +5878,12 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                   resized_full_chunk,
                                                                                   buffers.raw_dino_score_batch_device,
                                                                                   buffers.processing_stream);
+          hybrid_raw_score_batch_device = buffers.raw_dino_score_batch_device;
+          hybrid_raw_score_rows = uniform_chunk_rows;
+          hybrid_raw_score_cols = src_cols;
+          hybrid_raw_score_aligned_rows = uniform_chunk_rows;
+          hybrid_raw_score_aligned_cols = src_cols;
+          hybrid_raw_score_resized_full_chunk = true;
           if (capture_operator_timing) {
             throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
                                 "cuda_dino_detector raw score timing synchronization failed");
@@ -5849,6 +5903,12 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                   resized_full_chunk,
                                                                   buffers.raw_dino_score_batch_device,
                                                                   buffers.processing_stream);
+          hybrid_raw_score_batch_device = buffers.raw_dino_score_batch_device;
+          hybrid_raw_score_rows = uniform_chunk_rows;
+          hybrid_raw_score_cols = src_cols;
+          hybrid_raw_score_aligned_rows = uniform_chunk_rows;
+          hybrid_raw_score_aligned_cols = src_cols;
+          hybrid_raw_score_resized_full_chunk = true;
           if (capture_operator_timing) {
             throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
                                 "cuda_dino_detector raw score timing synchronization failed");
@@ -5884,7 +5944,12 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     if (coherence_ready && raw_score_ready) {
       const auto hybrid_start_time = std::chrono::steady_clock::now();
       CudaHybridStageTiming hybrid_stage_timing;
-      hybrid_ready = compute_residual_veto_hybrid_gpu_batch_to_device(buffers.raw_dino_score_batch_device,
+      hybrid_ready = compute_residual_veto_hybrid_gpu_batch_to_device(hybrid_raw_score_batch_device,
+                                                                      hybrid_raw_score_rows,
+                                                                      hybrid_raw_score_cols,
+                                                                      hybrid_raw_score_aligned_rows,
+                                                                      hybrid_raw_score_aligned_cols,
+                                                                      hybrid_raw_score_resized_full_chunk,
                                                                       buffers.coherence_gate_batch_device,
                                                                       chunk_count,
                                                                       uniform_chunk_rows,
@@ -5934,6 +5999,21 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       std::vector<uint8_t> hybrid_filled_mask_batch;
       std::vector<uint8_t> hybrid_component_filtered_mask_batch;
       if (write_operator_artifacts) {
+        if (hybrid_raw_score_batch_device != buffers.raw_dino_score_batch_device) {
+          if (!project_runtime_score_batch_to_device(hybrid_raw_score_batch_device,
+                                                     chunk_count,
+                                                     hybrid_raw_score_rows,
+                                                     hybrid_raw_score_cols,
+                                                     hybrid_raw_score_aligned_rows,
+                                                     hybrid_raw_score_aligned_cols,
+                                                     uniform_chunk_rows,
+                                                     src_cols,
+                                                     hybrid_raw_score_resized_full_chunk,
+                                                     buffers.raw_dino_score_batch_device,
+                                                     buffers.processing_stream)) {
+            throw std::runtime_error("cuda_dino_detector raw debug projection failed");
+          }
+        }
         corrected_batch.assign(batch_elements, 0.0f);
         coherence_gate_batch.assign(batch_elements, 0.0f);
         raw_score_batch.assign(batch_elements, 0.0f);

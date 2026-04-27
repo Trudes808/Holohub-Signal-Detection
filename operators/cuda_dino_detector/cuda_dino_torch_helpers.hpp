@@ -95,6 +95,11 @@ bool extract_masked_quantile_thresholds_cuda_batch_to_device(const float* input_
                                                              cudaStream_t cuda_stream);
 
 bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_batch_device,
+                                                      int dino_rows,
+                                                      int dino_cols,
+                                                      int dino_aligned_rows,
+                                                      int dino_aligned_cols,
+                                                      bool dino_resized_full_chunk,
                                                       const float* coherence_batch_device,
                                                       int batch_size,
                                                       int rows,
