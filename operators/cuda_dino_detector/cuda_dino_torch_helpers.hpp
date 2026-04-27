@@ -77,6 +77,23 @@ bool keep_large_components_cuda_batch_to_device(const uint8_t* mask_batch_device
                                                 uint8_t* output_mask_batch_device,
                                                 cudaStream_t cuda_stream);
 
+bool extract_masked_quantile_thresholds_cuda_batch_to_device(const float* input_a_batch_device,
+                                                             const float* input_b_batch_device,
+                                                             const float* input_c_batch_device,
+                                                             const bool* valid_mask_batch_device,
+                                                             int batch_size,
+                                                             int rows,
+                                                             int cols,
+                                                             int bin_count,
+                                                             float quantile_a,
+                                                             float quantile_b,
+                                                             float quantile_c,
+                                                             float fallback,
+                                                             float* output_threshold_a_device,
+                                                             float* output_threshold_b_device,
+                                                             float* output_threshold_c_device,
+                                                             cudaStream_t cuda_stream);
+
 bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_batch_device,
                                                       const float* coherence_batch_device,
                                                       int batch_size,

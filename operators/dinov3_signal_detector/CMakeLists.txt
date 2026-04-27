@@ -82,9 +82,21 @@ if(NOT Torch_FOUND)
   find_package(Torch QUIET)
 endif()
 
+find_library(DINOV3_TENSORRT_LIB
+  NAMES nvinfer
+  PATHS ${CUDA_LINK_DIRS} /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/local/lib /usr/local/TensorRT/lib
+)
+
+set(DINOV3_TENSORRT_FOUND FALSE)
+if(DINOV3_TENSORRT_LIB)
+  set(DINOV3_TENSORRT_FOUND TRUE)
+endif()
+
 set(DINOV3_SIGNAL_DETECTOR_SOURCES
   dinov3_signal_detector.cu
   dinov3_signal_detector.hpp
+  dinov3_runtime_cuda_preprocess.cu
+  dinov3_runtime_cuda_preprocess.hpp
 )
 
 if(Torch_FOUND)
@@ -99,6 +111,9 @@ if(Torch_FOUND)
   )
   if(TORCH_INCLUDE_DIRS)
     target_include_directories(dinov3_torch_runtime_obj PRIVATE ${TORCH_INCLUDE_DIRS})
+  endif()
+  if(DINOV3_TENSORRT_FOUND)
+    target_compile_definitions(dinov3_torch_runtime_obj PRIVATE HOLOHUB_HAS_TENSORRT=1)
   endif()
   if(TORCH_INCLUDE_HINTS)
     target_include_directories(dinov3_torch_runtime_obj PRIVATE ${TORCH_INCLUDE_HINTS})
@@ -127,6 +142,10 @@ target_link_libraries(dinov3_signal_detector
 
 if(Torch_FOUND)
   target_link_libraries(dinov3_signal_detector PRIVATE ${TORCH_LIBRARIES})
+  if(DINOV3_TENSORRT_FOUND)
+    target_link_libraries(dinov3_signal_detector PRIVATE ${DINOV3_TENSORRT_LIB})
+    target_compile_definitions(dinov3_signal_detector PRIVATE HOLOHUB_HAS_TENSORRT=1)
+  endif()
 
   set(OP_NVJITLINK_LINK_ITEM "")
   if(TARGET CUDA::nvJitLink)
@@ -191,6 +210,11 @@ if(Torch_FOUND)
   target_compile_features(dinov3_libtorch_sandbox PRIVATE cxx_std_17)
 
   message(STATUS "dinov3_signal_detector: Torch found, enabling PyTorch backend path")
+  if(DINOV3_TENSORRT_FOUND)
+    message(STATUS "dinov3_signal_detector: TensorRT found, enabling TensorRT engine backend path")
+  else()
+    message(STATUS "dinov3_signal_detector: TensorRT not found, TensorRT backend will be unavailable")
+  endif()
 else()
   message(STATUS "dinov3_signal_detector: Torch not found, building CUDA fallback path only")
 endif()

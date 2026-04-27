@@ -12,14 +12,23 @@ import numpy as np
 
 DEFAULT_STAGE_KEYS = [
     "corrected_resized_npy",
-    "runtime_input_gray_npy",
     "dino_score_raw_npy",
     "dino_score_raw_deweighted_npy",
     "coherence_gate_npy",
-    "hybrid_contrib_npy",
     "combined_score_npy",
     "hybrid_filled_mask_npy",
     "hybrid_component_filtered_mask_npy",
+    "grouped_mask_npy",
+    "final_mask_npy",
+    "final_mask_source_npy",
+    "final_mask_projected_npy",
+]
+
+
+SUMMARY_STAGE_KEYS = [
+    "projected_grouped_mask_npy",
+    "projected_grouped_score_npy",
+    "merged_box_mask_npy",
     "final_mask_npy",
 ]
 
@@ -126,11 +135,24 @@ def load_stage_array(summary: dict, key: str) -> np.ndarray:
     return np.load(path, allow_pickle=False).astype(np.float32)
 
 
+def load_stage_arrays(summary: dict, keys: Iterable[str]) -> list[tuple[str, np.ndarray]]:
+    return [(key, load_stage_array(summary, key)) for key in common_stage_keys(summary, keys)]
+
+
 def common_stage_keys(summary: dict, preferred: Iterable[str]) -> list[str]:
     keys = []
     for key in preferred:
         if key in summary and str(summary.get(key, "") or ""):
             keys.append(key)
+    return keys
+
+
+def require_stage_keys(summary: dict, preferred: Iterable[str], label: str) -> list[str]:
+    preferred_list = list(preferred)
+    keys = common_stage_keys(summary, preferred_list)
+    if keys != preferred_list:
+        missing = [key for key in preferred_list if key not in keys]
+        raise SystemExit(f"{label} is missing requested stages: {missing}")
     return keys
 
 
@@ -179,8 +201,9 @@ def summarize_stage_pair(reference_array: np.ndarray, cuda_array: np.ndarray) ->
 def print_stage_summary(cuda_summary: dict,
                         reference_summary: dict,
                         cuda_arrays: list[tuple[str, np.ndarray]],
-                        reference_arrays: list[tuple[str, np.ndarray]]) -> None:
-    print("Stage parity summary:")
+                        reference_arrays: list[tuple[str, np.ndarray]],
+                        heading: str = "Stage parity summary:") -> None:
+    print(heading)
     print(f"{'stage':<28} {'reference':>12} {'cuda':>12} {'mean_abs':>12} {'max_abs':>12} {'overlap':>24}")
     reference_map = dict(reference_arrays)
     cuda_map = dict(cuda_arrays)
@@ -194,7 +217,26 @@ def print_stage_summary(cuda_summary: dict,
 
     reference_boxes = int(reference_summary.get("grouped_box_count", 0) or 0)
     cuda_boxes = int(cuda_summary.get("grouped_box_count", 0) or 0)
-    print(f"Grouped boxes: reference={reference_boxes} cuda={cuda_boxes} delta={cuda_boxes - reference_boxes:+d}")
+    if reference_boxes or cuda_boxes:
+        print(f"Grouped boxes: reference={reference_boxes} cuda={cuda_boxes} delta={cuda_boxes - reference_boxes:+d}")
+
+
+def print_summary_stage_comparison(cuda_validation_summary: dict, reference_validation_summary: dict) -> None:
+    require_stage_keys(cuda_validation_summary, SUMMARY_STAGE_KEYS, "CUDA validation summary")
+    require_stage_keys(reference_validation_summary, SUMMARY_STAGE_KEYS, "Reference validation summary")
+    cuda_arrays = load_stage_arrays(cuda_validation_summary, SUMMARY_STAGE_KEYS)
+    reference_arrays = load_stage_arrays(reference_validation_summary, SUMMARY_STAGE_KEYS)
+    print_stage_summary(cuda_validation_summary,
+                        reference_validation_summary,
+                        cuda_arrays,
+                        reference_arrays,
+                        heading="Global merge parity summary:")
+    projected_reference = int(reference_validation_summary.get("projected_grouped_box_count", 0) or 0)
+    projected_cuda = int(cuda_validation_summary.get("projected_grouped_box_count", 0) or 0)
+    merged_reference = int(reference_validation_summary.get("merged_grouped_box_count", 0) or 0)
+    merged_cuda = int(cuda_validation_summary.get("merged_grouped_box_count", 0) or 0)
+    print(f"Projected boxes: reference={projected_reference} cuda={projected_cuda} delta={projected_cuda - projected_reference:+d}")
+    print(f"Merged boxes: reference={merged_reference} cuda={merged_cuda} delta={merged_cuda - merged_reference:+d}")
 
 
 def load_stage_profile_aggregates(path: Path | None) -> dict[str, float]:
@@ -389,9 +431,7 @@ def main() -> int:
 
     cuda_output_dir = Path(args.cuda_output_dir).expanduser().resolve()
     _, cuda_summary = resolve_debug_summary(cuda_output_dir)
-    selected_stages = common_stage_keys(cuda_summary, args.stages)
-    if not selected_stages:
-        raise SystemExit("No requested stages were found in the CUDA chunk debug summary")
+    selected_stages = require_stage_keys(cuda_summary, args.stages, "CUDA chunk debug summary")
 
     cuda_arrays = [(key, load_stage_array(cuda_summary, key)) for key in selected_stages]
     output_path = Path(args.output).expanduser().resolve() if args.output else (cuda_output_dir / "chunk_debug" / "cuda_artifact_compare.png")
@@ -401,14 +441,12 @@ def main() -> int:
         reference_output_dir = Path(args.reference_output_dir).expanduser().resolve()
         _, reference_summary = resolve_debug_summary(reference_output_dir)
         _, cuda_validation_summary = resolve_validation_summary(cuda_output_dir)
-        _, _ = resolve_validation_summary(reference_output_dir)
-        reference_stages = common_stage_keys(reference_summary, selected_stages)
-        if reference_stages != selected_stages:
-            missing = sorted(set(selected_stages) - set(reference_stages))
-            raise SystemExit(f"Reference bundle is missing requested stages: {missing}")
+        _, reference_validation_summary = resolve_validation_summary(reference_output_dir)
+        require_stage_keys(reference_summary, selected_stages, "Reference chunk debug summary")
         reference_arrays = [(key, load_stage_array(reference_summary, key)) for key in selected_stages]
         plot_comparison(cuda_arrays, reference_arrays, output_path)
         print_stage_summary(cuda_summary, reference_summary, cuda_arrays, reference_arrays)
+        print_summary_stage_comparison(cuda_validation_summary, reference_validation_summary)
         timing_rows = build_timing_rows(args.cuda_elapsed_ms,
                                         args.reference_elapsed_ms,
                                         resolve_stage_profile(reference_output_dir),

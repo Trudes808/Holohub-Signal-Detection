@@ -148,11 +148,12 @@ dinov3_signal_detector:
   max_masks_per_channel: 1
   output_dir: "/workspace/dino_masks"
   use_pytorch_backend: true
-  inference_backend: "torchscript"
+  inference_backend: "tensorrt"
   model_name: "dinov3_vitb16"
   model_repo_path: "/workspace/models/dinov3"
   weights_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
   model_script_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"
+  tensorrt_engine_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.single_channel.fp16.engine"
   torchscript_init_mode: "load_cuda_eval"
   torch_dtype: "fp32"
   hybrid_torch_dtype: "fp16"

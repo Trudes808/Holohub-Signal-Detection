@@ -75,7 +75,11 @@ struct ValidatorConfig {
   double pipeline_power_rescue_floor = 0.10;
   double pipeline_power_rescue_gain = 2.0;
   std::string inference_backend = "torchscript";
+  std::string model_name = "dinov3_vitb16";
+  std::string model_repo_path = "/workspace/models/dinov3";
+  std::string weights_path = "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth";
   std::string model_script_path = "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts";
+  std::string tensorrt_engine_path = "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.single_channel.fp16.engine";
   std::string torchscript_init_mode = "load_cuda_eval";
   std::string torch_dtype = "fp32";
 };
@@ -335,7 +339,11 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.pipeline_power_rescue_floor = extract_number<double>(text, "pipeline_power_rescue_floor").value_or(config.pipeline_power_rescue_floor);
   config.pipeline_power_rescue_gain = extract_number<double>(text, "pipeline_power_rescue_gain").value_or(config.pipeline_power_rescue_gain);
   config.inference_backend = extract_yaml_string(text, "inference_backend").value_or(config.inference_backend);
+  config.model_name = extract_yaml_string(text, "model_name").value_or(config.model_name);
+  config.model_repo_path = extract_yaml_string(text, "model_repo_path").value_or(config.model_repo_path);
+  config.weights_path = extract_yaml_string(text, "weights_path").value_or(config.weights_path);
   config.model_script_path = extract_yaml_string(text, "model_script_path").value_or(config.model_script_path);
+  config.tensorrt_engine_path = extract_yaml_string(text, "tensorrt_engine_path").value_or(config.tensorrt_engine_path);
   config.torchscript_init_mode = extract_yaml_string(text, "torchscript_init_mode").value_or(config.torchscript_init_mode);
   config.torch_dtype = extract_yaml_string(text, "torch_dtype").value_or(config.torch_dtype);
   return config;
@@ -3500,7 +3508,11 @@ int main(int argc, char** argv) {
     holoscan::ops::DinoTorchRuntime runtime;
     holoscan::ops::DinoTorchRuntimeConfig runtime_config;
     runtime_config.inference_backend = config.inference_backend;
+    runtime_config.model_name = config.model_name;
+    runtime_config.model_repo_path = config.model_repo_path;
+    runtime_config.weights_path = config.weights_path;
     runtime_config.model_script_path = config.model_script_path;
+    runtime_config.tensorrt_engine_path = config.tensorrt_engine_path;
     runtime_config.torchscript_init_mode = config.torchscript_init_mode;
     runtime_config.torch_dtype = config.torch_dtype;
     runtime_config.imagenet_mean = {0.485, 0.456, 0.406};

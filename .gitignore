@@ -58,3 +58,6 @@ rti_license.dat
 
 # Notebook-generated validator artifacts
 notebooks/validator_artifacts/
+
+# Local model artifacts
+dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.single_channel.onnx

@@ -2865,11 +2865,12 @@ void DinoV3SignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(max_masks_per_channel_, "max_masks_per_channel", "Max masks per channel", "Maximum number of detector masks to save per channel for a run.", 5);
   spec.param(output_dir_, "output_dir", "Output directory", "Directory where detector masks are written.", std::string("/workspace/dino_masks"));
   spec.param(use_pytorch_backend_, "use_pytorch_backend", "Use PyTorch backend", "If true, uses the LibTorch runtime for DINO score extraction when available.", true);
-  spec.param(inference_backend_, "inference_backend", "Inference backend", "Backend mode: torchscript, pytorch_placeholder, or cuda_threshold_fallback.", std::string("torchscript"));
+  spec.param(inference_backend_, "inference_backend", "Inference backend", "Backend mode: torchscript, tensorrt, pytorch_placeholder, or cuda_threshold_fallback.", std::string("torchscript"));
   spec.param(model_name_, "model_name", "Model name", "DINOv3 model name.", std::string("dinov3_vitb16"));
   spec.param(model_repo_path_, "model_repo_path", "Model repo path", "Path to local DINOv3 repository.", std::string("/workspace/models/dinov3"));
   spec.param(weights_path_, "weights_path", "Weights path", "Path to model weights.", std::string("/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"));
   spec.param(model_script_path_, "model_script_path", "Model script path", "Path to TorchScript model for model-forward backend.", std::string("/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"));
+  spec.param(tensorrt_engine_path_, "tensorrt_engine_path", "TensorRT engine path", "Path to TensorRT engine for the fused single-channel DINO runtime.", std::string(""));
   spec.param(torchscript_init_mode_, "torchscript_init_mode", "TorchScript init mode", "TorchScript initialization mode: load_only, load_cpu_eval, load_cuda_no_eval, or load_cuda_eval.", std::string("load_cuda_eval"));
   spec.param(torch_dtype_, "torch_dtype", "Torch dtype", "Torch inference precision: fp32 or fp16.", std::string("fp32"));
   spec.param(strict_model_forward_, "strict_model_forward", "Strict model forward", "If true, drop frames when the DINO runtime fails instead of falling back.", false);
@@ -2950,10 +2951,14 @@ void DinoV3SignalDetector::initialize() {
 #ifdef HOLOHUB_HAS_TORCH
   if (use_pytorch_backend_.get()) {
     pytorch_runtime_ready_ = true;
-    if (inference_backend_.get() == "torchscript") {
+    if (inference_backend_.get() == "torchscript" || inference_backend_.get() == "tensorrt" || inference_backend_.get() == "tensorrt_engine") {
       DinoTorchRuntimeConfig runtime_config;
       runtime_config.inference_backend = inference_backend_.get();
+      runtime_config.model_name = model_name_.get();
+      runtime_config.model_repo_path = model_repo_path_.get();
+      runtime_config.weights_path = weights_path_.get();
       runtime_config.model_script_path = model_script_path_.get();
+      runtime_config.tensorrt_engine_path = tensorrt_engine_path_.get();
       runtime_config.torchscript_init_mode = torchscript_init_mode_.get();
       runtime_config.torch_dtype = torch_dtype_.get();
       runtime_config.imagenet_mean = imagenet_mean_.get();

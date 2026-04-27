@@ -75,6 +75,11 @@ if(NOT Torch_FOUND)
   find_package(Torch QUIET)
 endif()
 
+find_library(CUDA_DINO_TENSORRT_LIB
+  NAMES nvinfer
+  PATHS ${CUDA_LINK_DIRS} /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/local/lib /usr/local/TensorRT/lib
+)
+
 add_library(cuda_dino_detector
   cuda_dino_detector.cu
   cuda_dino_torch_helpers.cpp
@@ -95,6 +100,9 @@ target_link_libraries(cuda_dino_detector
 
 if(Torch_FOUND)
   target_link_libraries(cuda_dino_detector PRIVATE ${TORCH_LIBRARIES})
+  if(CUDA_DINO_TENSORRT_LIB)
+    target_link_libraries(cuda_dino_detector PRIVATE ${CUDA_DINO_TENSORRT_LIB})
+  endif()
   if(TORCH_INCLUDE_DIRS)
     foreach(TORCH_INCLUDE_DIR IN LISTS TORCH_INCLUDE_DIRS)
       target_include_directories(cuda_dino_detector PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${TORCH_INCLUDE_DIR}>)

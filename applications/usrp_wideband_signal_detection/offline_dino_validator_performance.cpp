@@ -86,7 +86,11 @@ struct ValidatorConfig {
   double pipeline_power_rescue_floor = 0.10;
   double pipeline_power_rescue_gain = 2.0;
   std::string inference_backend = "torchscript";
+  std::string model_name = "dinov3_vitb16";
+  std::string model_repo_path = "/workspace/models/dinov3";
+  std::string weights_path = "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth";
   std::string model_script_path = "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts";
+  std::string tensorrt_engine_path = "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.single_channel.fp16.engine";
   std::string torchscript_init_mode = "load_cuda_eval";
   std::string torch_dtype = "fp32";
   std::string hybrid_torch_dtype = "fp32";
@@ -713,7 +717,11 @@ ValidatorConfig load_config(const std::filesystem::path& path) {
   config.pipeline_power_rescue_floor = extract_number<double>(text, "pipeline_power_rescue_floor").value_or(config.pipeline_power_rescue_floor);
   config.pipeline_power_rescue_gain = extract_number<double>(text, "pipeline_power_rescue_gain").value_or(config.pipeline_power_rescue_gain);
   config.inference_backend = extract_yaml_string(text, "inference_backend").value_or(config.inference_backend);
+  config.model_name = extract_yaml_string(text, "model_name").value_or(config.model_name);
+  config.model_repo_path = extract_yaml_string(text, "model_repo_path").value_or(config.model_repo_path);
+  config.weights_path = extract_yaml_string(text, "weights_path").value_or(config.weights_path);
   config.model_script_path = extract_yaml_string(text, "model_script_path").value_or(config.model_script_path);
+  config.tensorrt_engine_path = extract_yaml_string(text, "tensorrt_engine_path").value_or(config.tensorrt_engine_path);
   config.torchscript_init_mode = extract_yaml_string(text, "torchscript_init_mode").value_or(config.torchscript_init_mode);
   config.torch_dtype = extract_yaml_string(text, "torch_dtype").value_or(config.torch_dtype);
   config.hybrid_torch_dtype = extract_yaml_string(text, "hybrid_torch_dtype").value_or(config.hybrid_torch_dtype);
@@ -2740,6 +2748,9 @@ std::vector<float> project_patch_map_to_output(const std::vector<float>& patch_m
   if (patch_rows <= 0 || patch_cols <= 0 ||
       patch_map.size() != static_cast<size_t>(patch_rows) * static_cast<size_t>(patch_cols)) {
     return std::vector<float>(static_cast<size_t>(std::max(output_rows, 0)) * static_cast<size_t>(std::max(output_cols, 0)), 0.0f);
+  }
+  if (resized_full_chunk && output_rows > 0 && output_cols > 0) {
+    return resize_bilinear(patch_map, patch_rows, patch_cols, output_rows, output_cols);
   }
   const auto aligned_map = resize_bilinear(patch_map, patch_rows, patch_cols, aligned_rows, aligned_cols);
   return project_aligned_map_to_output(
@@ -5986,7 +5997,11 @@ int main(int argc, char** argv) {
     holoscan::ops::DinoTorchRuntime runtime;
     holoscan::ops::DinoTorchRuntimeConfig runtime_config;
     runtime_config.inference_backend = config.inference_backend;
+    runtime_config.model_name = config.model_name;
+    runtime_config.model_repo_path = config.model_repo_path;
+    runtime_config.weights_path = config.weights_path;
     runtime_config.model_script_path = config.model_script_path;
+    runtime_config.tensorrt_engine_path = config.tensorrt_engine_path;
     runtime_config.torchscript_init_mode = config.torchscript_init_mode;
     runtime_config.torch_dtype = config.torch_dtype;
     runtime_config.imagenet_mean = {0.485, 0.456, 0.406};
@@ -6714,8 +6729,6 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(chunk_debug_dir);
     if (debug_chunk_result.has_value()) {
       const auto& debug_chunk = *debug_chunk_result;
-      const ChunkRetryResult& stitched_debug_chunk =
-          (debug_chunk_index < chunk_results.size()) ? chunk_results[debug_chunk_index] : debug_chunk;
       const auto debug_corrected_path = chunk_debug_dir / "chunk_corrected_resized.npy";
       const auto debug_runtime_input_gray_path = chunk_debug_dir / "chunk_runtime_input_gray.npy";
       const auto debug_dino_score_path = chunk_debug_dir / "chunk_dino_score.npy";
@@ -6896,54 +6909,54 @@ int main(int argc, char** argv) {
                    debug_chunk.dst_rows,
                    debug_chunk.dst_cols,
                    "<f4");
-      std::vector<float> debug_grouped_mask_float(stitched_debug_chunk.grouped_mask.size(), 0.0f);
-      for (size_t index = 0; index < stitched_debug_chunk.grouped_mask.size(); ++index) {
-        debug_grouped_mask_float[index] = stitched_debug_chunk.grouped_mask[index] ? 1.0f : 0.0f;
+      std::vector<float> debug_grouped_mask_float(debug_chunk.grouped_mask.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.grouped_mask.size(); ++index) {
+        debug_grouped_mask_float[index] = debug_chunk.grouped_mask[index] ? 1.0f : 0.0f;
       }
       write_npy_2d(debug_grouped_mask_path,
                    debug_grouped_mask_float.data(),
                    debug_grouped_mask_float.size() * sizeof(float),
-                   stitched_debug_chunk.dst_rows,
-                   stitched_debug_chunk.dst_cols,
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
                    "<f4");
       write_pgm(debug_grouped_mask_pgm,
-                mask_to_u8(stitched_debug_chunk.grouped_mask),
-                stitched_debug_chunk.dst_cols,
-                stitched_debug_chunk.dst_rows);
-      std::vector<float> debug_hybrid_filled_mask_float(stitched_debug_chunk.hybrid_filled_mask.size(), 0.0f);
-      for (size_t index = 0; index < stitched_debug_chunk.hybrid_filled_mask.size(); ++index) {
-        debug_hybrid_filled_mask_float[index] = stitched_debug_chunk.hybrid_filled_mask[index] ? 1.0f : 0.0f;
+                mask_to_u8(debug_chunk.grouped_mask),
+                debug_chunk.dst_cols,
+                debug_chunk.dst_rows);
+      std::vector<float> debug_hybrid_filled_mask_float(debug_chunk.hybrid_filled_mask.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.hybrid_filled_mask.size(); ++index) {
+        debug_hybrid_filled_mask_float[index] = debug_chunk.hybrid_filled_mask[index] ? 1.0f : 0.0f;
       }
       write_npy_2d(debug_hybrid_filled_mask_path,
                    debug_hybrid_filled_mask_float.data(),
                    debug_hybrid_filled_mask_float.size() * sizeof(float),
-                   stitched_debug_chunk.dst_rows,
-                   stitched_debug_chunk.dst_cols,
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
                    "<f4");
-      std::vector<float> debug_hybrid_component_filtered_mask_float(stitched_debug_chunk.hybrid_component_filtered_mask.size(), 0.0f);
-      for (size_t index = 0; index < stitched_debug_chunk.hybrid_component_filtered_mask.size(); ++index) {
-        debug_hybrid_component_filtered_mask_float[index] = stitched_debug_chunk.hybrid_component_filtered_mask[index] ? 1.0f : 0.0f;
+      std::vector<float> debug_hybrid_component_filtered_mask_float(debug_chunk.hybrid_component_filtered_mask.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.hybrid_component_filtered_mask.size(); ++index) {
+        debug_hybrid_component_filtered_mask_float[index] = debug_chunk.hybrid_component_filtered_mask[index] ? 1.0f : 0.0f;
       }
       write_npy_2d(debug_hybrid_component_filtered_mask_path,
                    debug_hybrid_component_filtered_mask_float.data(),
                    debug_hybrid_component_filtered_mask_float.size() * sizeof(float),
-                   stitched_debug_chunk.dst_rows,
-                   stitched_debug_chunk.dst_cols,
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
                    "<f4");
-      std::vector<float> debug_final_mask_float(stitched_debug_chunk.final_mask.size(), 0.0f);
-      for (size_t index = 0; index < stitched_debug_chunk.final_mask.size(); ++index) {
-        debug_final_mask_float[index] = stitched_debug_chunk.final_mask[index] ? 1.0f : 0.0f;
+      std::vector<float> debug_final_mask_float(debug_chunk.final_mask.size(), 0.0f);
+      for (size_t index = 0; index < debug_chunk.final_mask.size(); ++index) {
+        debug_final_mask_float[index] = debug_chunk.final_mask[index] ? 1.0f : 0.0f;
       }
       write_npy_2d(debug_final_mask_path,
                    debug_final_mask_float.data(),
                    debug_final_mask_float.size() * sizeof(float),
-                   stitched_debug_chunk.dst_rows,
-                   stitched_debug_chunk.dst_cols,
+                   debug_chunk.dst_rows,
+                   debug_chunk.dst_cols,
                    "<f4");
       write_pgm(debug_final_mask_pgm,
-                mask_to_u8(stitched_debug_chunk.final_mask),
-                stitched_debug_chunk.dst_cols,
-                stitched_debug_chunk.dst_rows);
+                mask_to_u8(debug_chunk.final_mask),
+                debug_chunk.dst_cols,
+                debug_chunk.dst_rows);
       std::vector<float> debug_final_mask_source_float(debug_chunk.final_mask_source.size(), 0.0f);
       for (size_t index = 0; index < debug_chunk.final_mask_source.size(); ++index) {
         debug_final_mask_source_float[index] = debug_chunk.final_mask_source[index] ? 1.0f : 0.0f;
@@ -6959,15 +6972,15 @@ int main(int argc, char** argv) {
                 debug_chunk.src_cols,
                 debug_chunk.src_rows);
       std::vector<uint8_t> debug_final_mask_projected(static_cast<size_t>(debug_chunk.src_rows) * static_cast<size_t>(tensor.cols), 0);
-      if (!stitched_debug_chunk.final_mask.empty() && stitched_debug_chunk.dst_rows > 0 && stitched_debug_chunk.dst_cols > 0) {
-        const auto projected_row_nearest = build_nearest_resize_indices(stitched_debug_chunk.dst_rows, debug_chunk.src_rows);
-        const auto projected_col_nearest = build_nearest_resize_indices(stitched_debug_chunk.dst_cols, tensor.cols);
+      if (!debug_chunk.final_mask.empty() && debug_chunk.dst_rows > 0 && debug_chunk.dst_cols > 0) {
+        const auto projected_row_nearest = build_nearest_resize_indices(debug_chunk.dst_rows, debug_chunk.src_rows);
+        const auto projected_col_nearest = build_nearest_resize_indices(debug_chunk.dst_cols, tensor.cols);
         for (int projected_row = 0; projected_row < debug_chunk.src_rows; ++projected_row) {
           const int src_row_nearest = projected_row_nearest[static_cast<size_t>(projected_row)];
           for (int col = 0; col < tensor.cols; ++col) {
             const int src_col_nearest = projected_col_nearest[static_cast<size_t>(col)];
             debug_final_mask_projected[flat_index(tensor.cols, projected_row, col)] =
-                stitched_debug_chunk.final_mask[flat_index(stitched_debug_chunk.dst_cols, src_row_nearest, src_col_nearest)] ? 1 : 0;
+                debug_chunk.final_mask[flat_index(debug_chunk.dst_cols, src_row_nearest, src_col_nearest)] ? 1 : 0;
           }
         }
       }
@@ -6992,9 +7005,9 @@ int main(int argc, char** argv) {
           throw std::runtime_error("failed to open chunk grouped boxes output");
         }
         debug_grouped_boxes_out << std::fixed << std::setprecision(6);
-        debug_grouped_boxes_out << "{\n  \"box_count\": " << stitched_debug_chunk.grouped_boxes.size() << ",\n  \"boxes\": [\n";
-        for (size_t index = 0; index < stitched_debug_chunk.grouped_boxes.size(); ++index) {
-          const auto& box = stitched_debug_chunk.grouped_boxes[index];
+        debug_grouped_boxes_out << "{\n  \"box_count\": " << debug_chunk.grouped_boxes.size() << ",\n  \"boxes\": [\n";
+        for (size_t index = 0; index < debug_chunk.grouped_boxes.size(); ++index) {
+          const auto& box = debug_chunk.grouped_boxes[index];
           debug_grouped_boxes_out << "    {\"freq_start\": " << box.freq_start
                                   << ", \"freq_stop\": " << box.freq_stop
                                   << ", \"time_start\": " << box.time_start
@@ -7007,7 +7020,7 @@ int main(int argc, char** argv) {
                                   << ", \"split_applied\": " << (box.split_applied ? "true" : "false")
                                   << ", \"parent_component_id\": " << box.parent_component_id
                                   << "}";
-          if (index + 1 != stitched_debug_chunk.grouped_boxes.size()) {
+          if (index + 1 != debug_chunk.grouped_boxes.size()) {
             debug_grouped_boxes_out << ",";
           }
           debug_grouped_boxes_out << "\n";
@@ -7021,23 +7034,23 @@ int main(int argc, char** argv) {
       }
       debug_summary_out << std::fixed << std::setprecision(6);
       debug_summary_out << "{\n";
-      debug_summary_out << "  \"chunk_index\": " << stitched_debug_chunk.chunk_index << ",\n";
-      debug_summary_out << "  \"row_start\": " << stitched_debug_chunk.row_start << ",\n";
-      debug_summary_out << "  \"row_stop\": " << stitched_debug_chunk.row_stop << ",\n";
-      debug_summary_out << "  \"src_rows\": " << stitched_debug_chunk.src_rows << ",\n";
-      debug_summary_out << "  \"src_cols\": " << stitched_debug_chunk.src_cols << ",\n";
-      debug_summary_out << "  \"freq_start_hz\": " << stitched_debug_chunk.freq_start_hz << ",\n";
-      debug_summary_out << "  \"freq_stop_hz\": " << stitched_debug_chunk.freq_stop_hz << ",\n";
-      debug_summary_out << "  \"ignore_bins_per_side\": " << stitched_debug_chunk.ignore_bins_per_side << ",\n";
-      debug_summary_out << "  \"dino_threshold\": " << stitched_debug_chunk.dino_threshold << ",\n";
-      debug_summary_out << "  \"runtime_final_threshold\": " << stitched_debug_chunk.runtime_final_threshold << ",\n";
-      debug_summary_out << "  \"seed_freq_threshold\": " << stitched_debug_chunk.seed_freq_threshold << ",\n";
-      debug_summary_out << "  \"seed_res_threshold\": " << stitched_debug_chunk.seed_res_threshold << ",\n";
-      debug_summary_out << "  \"combined_threshold\": " << stitched_debug_chunk.combined_threshold << ",\n";
-      debug_summary_out << "  \"final_fraction\": " << stitched_debug_chunk.final_fraction << ",\n";
-      debug_summary_out << "  \"connected_fraction\": " << stitched_debug_chunk.connected_fraction << ",\n";
-      debug_summary_out << "  \"component_count\": " << stitched_debug_chunk.component_count << ",\n";
-      debug_summary_out << "  \"grouped_box_count\": " << stitched_debug_chunk.grouped_box_count << ",\n";
+      debug_summary_out << "  \"chunk_index\": " << debug_chunk.chunk_index << ",\n";
+      debug_summary_out << "  \"row_start\": " << debug_chunk.row_start << ",\n";
+      debug_summary_out << "  \"row_stop\": " << debug_chunk.row_stop << ",\n";
+      debug_summary_out << "  \"src_rows\": " << debug_chunk.src_rows << ",\n";
+      debug_summary_out << "  \"src_cols\": " << debug_chunk.src_cols << ",\n";
+      debug_summary_out << "  \"freq_start_hz\": " << debug_chunk.freq_start_hz << ",\n";
+      debug_summary_out << "  \"freq_stop_hz\": " << debug_chunk.freq_stop_hz << ",\n";
+      debug_summary_out << "  \"ignore_bins_per_side\": " << debug_chunk.ignore_bins_per_side << ",\n";
+      debug_summary_out << "  \"dino_threshold\": " << debug_chunk.dino_threshold << ",\n";
+      debug_summary_out << "  \"runtime_final_threshold\": " << debug_chunk.runtime_final_threshold << ",\n";
+      debug_summary_out << "  \"seed_freq_threshold\": " << debug_chunk.seed_freq_threshold << ",\n";
+      debug_summary_out << "  \"seed_res_threshold\": " << debug_chunk.seed_res_threshold << ",\n";
+      debug_summary_out << "  \"combined_threshold\": " << debug_chunk.combined_threshold << ",\n";
+      debug_summary_out << "  \"final_fraction\": " << debug_chunk.final_fraction << ",\n";
+      debug_summary_out << "  \"connected_fraction\": " << debug_chunk.connected_fraction << ",\n";
+      debug_summary_out << "  \"component_count\": " << debug_chunk.component_count << ",\n";
+      debug_summary_out << "  \"grouped_box_count\": " << debug_chunk.grouped_box_count << ",\n";
       debug_summary_out << "  \"runtime_input_gray_rows\": " << debug_chunk.runtime_input_gray_rows << ",\n";
       debug_summary_out << "  \"runtime_input_gray_cols\": " << debug_chunk.runtime_input_gray_cols << ",\n";
       debug_summary_out << "  \"patch_rows\": " << debug_chunk.patch_rows << ",\n";
@@ -7049,7 +7062,7 @@ int main(int argc, char** argv) {
       debug_summary_out << "  \"grouped_path_enabled\": false,\n";
       debug_summary_out << "  \"legacy_fast_gray_preprocess\": " << (config.legacy_fast_gray_preprocess ? "true" : "false") << ",\n";
       debug_summary_out << "  \"artifact_contract\": \"chunk_fixed_detector_grid_v1\",\n";
-      debug_summary_out << "  \"mask_source\": \"stitched_chunk_result\",\n";
+      debug_summary_out << "  \"mask_source\": \"debug_chunk_rerun\",\n";
       debug_summary_out << "  \"diagnostic_tensor_source\": \"debug_chunk_rerun\",\n";
       debug_summary_out << "  \"corrected_resized_npy\": \"" << json_escape(debug_corrected_path.string()) << "\",\n";
       debug_summary_out << "  \"runtime_input_gray_npy\": \"" << json_escape(debug_runtime_input_gray_path.string()) << "\",\n";
@@ -7132,6 +7145,7 @@ int main(int argc, char** argv) {
     summary << "  \"chunk_overlap_hz\": " << config.chunk_overlap_hz << ",\n";
     summary << "  \"frontend_reference_level\": " << frontend_reference_level << ",\n";
     summary << "  \"runtime_backend_used\": \"" << json_escape(runtime_config.inference_backend) << "\",\n";
+    summary << "  \"tensorrt_engine_path\": \"" << json_escape(runtime_config.tensorrt_engine_path) << "\",\n";
     summary << "  \"legacy_fast_gray_preprocess\": " << (config.legacy_fast_gray_preprocess ? "true" : "false") << ",\n";
     summary << "  \"debug_chunk_rerun_enabled\": true,\n";
     summary << "  \"debug_chunk_summary_json\": \"" << json_escape(debug_chunk_summary_path.string()) << "\",\n";

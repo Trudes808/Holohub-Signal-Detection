@@ -13,7 +13,11 @@ namespace holoscan::ops {
 
 struct DinoTorchRuntimeConfig {
   std::string inference_backend;
+  std::string model_name;
+  std::string model_repo_path;
+  std::string weights_path;
   std::string model_script_path;
+  std::string tensorrt_engine_path;
   std::string torchscript_init_mode;
   std::string torch_dtype = "fp32";
   bool legacy_fast_gray_preprocess = false;

@@ -3,12 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dinov3_torch_runtime.hpp"
+#include "dinov3_runtime_cuda_preprocess.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -16,6 +19,9 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#ifdef HOLOHUB_HAS_TENSORRT
+#include <NvInfer.h>
+#endif
 #include <torch/nn/functional.h>
 #include <torch/script.h>
 #include <torch/torch.h>
@@ -54,6 +60,55 @@ bool torchscript_init_runs_eval(const std::string& init_mode) {
 bool use_fp16_torch_dtype(const std::string& torch_dtype) {
   return torch_dtype == "fp16" || torch_dtype == "half";
 }
+
+void throw_runtime_if_cuda_error(cudaError_t status, const char* message) {
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string(message) + ": " + cudaGetErrorString(status));
+  }
+}
+
+bool is_tensorrt_backend(const std::string& backend) {
+  return backend == "tensorrt" || backend == "tensorrt_engine";
+}
+
+#ifdef HOLOHUB_HAS_TENSORRT
+class TensorRtLogger : public nvinfer1::ILogger {
+ public:
+  void log(Severity severity, const char* message) noexcept override {
+    if (severity > Severity::kWARNING || message == nullptr) {
+      return;
+    }
+    std::fprintf(stderr, "[dinov3_tensorrt] %s\n", message);
+  }
+};
+
+template <typename T>
+struct TensorRtDestroy {
+  void operator()(T* ptr) const {
+    if (ptr != nullptr) {
+#if NV_TENSORRT_MAJOR >= 10
+      delete ptr;
+#else
+      ptr->destroy();
+#endif
+    }
+  }
+};
+
+template <typename T>
+using TensorRtHandle = std::unique_ptr<T, TensorRtDestroy<T>>;
+
+size_t volume_from_dims(const nvinfer1::Dims& dims) {
+  size_t volume = 1;
+  for (int dim_index = 0; dim_index < dims.nbDims; ++dim_index) {
+    if (dims.d[dim_index] < 0) {
+      throw std::runtime_error("TensorRT tensor shape is still dynamic after binding input shape");
+    }
+    volume *= static_cast<size_t>(dims.d[dim_index]);
+  }
+  return volume;
+}
+#endif
 
 torch::Tensor select_quantile_along_dim(const torch::Tensor& input, double q, int64_t dim) {
   const auto size = input.size(dim);
@@ -116,9 +171,45 @@ torch::Tensor gaussian_filter1d_nearest(const torch::Tensor& input, double sigma
   return filtered.view({-1});
 }
 
+torch::Tensor gaussian_filter1d_nearest_batch_lastdim(const torch::Tensor& input, double sigma) {
+  if (sigma <= 0.0) {
+    return input.clone();
+  }
+
+  const auto radius = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(3.0 * sigma)));
+  const auto kernel_size = 2 * radius + 1;
+  auto options = torch::TensorOptions().dtype(input.dtype()).device(input.device());
+  auto x = torch::arange(-radius, radius + 1, options);
+  auto kernel = torch::exp(-(x * x) / (2.0 * sigma * sigma));
+  kernel = kernel / kernel.sum();
+
+  auto padded = torch::replication_pad1d(input.unsqueeze(1), {radius, radius});
+  auto filtered = torch::conv1d(padded, kernel.view({1, 1, kernel_size}));
+  return filtered.squeeze(1).contiguous();
+}
+
 torch::Tensor normalize_map01(const torch::Tensor& input, double low_q, double high_q) {
   auto lo = scalar_quantile_tensor(input, low_q);
   auto hi = scalar_quantile_tensor(input, high_q);
+  auto scale = torch::clamp_min(hi - lo, 1e-6);
+  return torch::clamp((input - lo) / scale, 0.0, 1.0);
+}
+
+torch::Tensor scalar_quantile_tensor_per_sample(const torch::Tensor& input, double q) {
+  auto flat = input.flatten(1);
+  const auto size = flat.size(1);
+  if (size <= 1) {
+    return flat.select(1, 0);
+  }
+
+  const double clamped = std::clamp(q, 0.0, 1.0);
+  const auto rank = static_cast<int64_t>(std::llround(clamped * static_cast<double>(size - 1)));
+  return std::get<0>(torch::kthvalue(flat, rank + 1, 1, false));
+}
+
+torch::Tensor normalize_map01_per_sample(const torch::Tensor& input, double low_q, double high_q) {
+  auto lo = scalar_quantile_tensor_per_sample(input, low_q).view({-1, 1, 1});
+  auto hi = scalar_quantile_tensor_per_sample(input, high_q).view({-1, 1, 1});
   auto scale = torch::clamp_min(hi - lo, 1e-6);
   return torch::clamp((input - lo) / scale, 0.0, 1.0);
 }
@@ -194,6 +285,20 @@ torch::Tensor uniform_filter_2d_nearest(const torch::Tensor& input, int kernel_r
       .contiguous();
 }
 
+    torch::Tensor uniform_filter_2d_nearest_batch(const torch::Tensor& input, int kernel_rows, int kernel_cols) {
+      const int row_radius = std::max(0, kernel_rows / 2);
+      const int col_radius = std::max(0, kernel_cols / 2);
+      auto padded = torch::replication_pad2d(input.unsqueeze(1), {col_radius, col_radius, row_radius, row_radius});
+      return torch::avg_pool2d(padded,
+               {std::max(1, kernel_rows), std::max(1, kernel_cols)},
+               {1, 1},
+               {0, 0},
+               false,
+               true)
+      .squeeze(1)
+      .contiguous();
+    }
+
 torch::Tensor gaussian_second_derivative_rows_2d(const torch::Tensor& input, double sigma) {
   auto kernel = gaussian_second_derivative_kernel_tensor(sigma, input.device());
   return convolve_rows_2d(input, kernel).contiguous();
@@ -255,8 +360,41 @@ torch::Tensor signal_agnostic_dino_gray(const torch::Tensor& sxx_db_local) {
   return torch::round(torch::clamp(combined, 0.0, 1.0) * 255.0).div(255.0).contiguous();
 }
 
+torch::Tensor signal_agnostic_dino_gray_batch(const torch::Tensor& sxx_db_batch) {
+  auto x_db = sxx_db_batch.to(torch::kFloat32).contiguous();
+
+  const double row_sigma = std::max(1.0, static_cast<double>(x_db.size(1)) / 32.0);
+  const double col_sigma = std::max(1.0, static_cast<double>(x_db.size(2)) / 32.0);
+  auto row_trend = gaussian_filter1d_nearest_batch_lastdim(x_db.mean(2), row_sigma).unsqueeze(2);
+  auto col_trend = gaussian_filter1d_nearest_batch_lastdim(x_db.mean(1), col_sigma).unsqueeze(1);
+  auto trend = (row_trend + col_trend - x_db.mean({1, 2}, true)).contiguous();
+
+  auto detrended = (x_db - trend).contiguous();
+  auto local_mean = uniform_filter_2d_nearest_batch(detrended, 7, 7);
+  auto local_resid = (detrended - local_mean).contiguous();
+  auto local_scale = torch::sqrt(uniform_filter_2d_nearest_batch(local_resid * local_resid, 9, 9) + 1e-6);
+  auto local_z = (local_resid / torch::clamp_min(local_scale, 1e-4)).contiguous();
+
+  auto abs_detrended = normalize_map01_per_sample(detrended, 0.02, 0.98);
+  auto local_abs = torch::abs(local_z).flatten(1);
+  auto scale = torch::clamp_min(scalar_quantile_tensor_per_sample(local_abs, 0.95), 1e-6).view({-1, 1, 1});
+  auto local_resid_n = torch::clamp(0.5 + 0.5 * (local_z / scale), 0.0, 1.0);
+
+  auto combined = (0.70 * local_resid_n + 0.30 * abs_detrended).to(torch::kFloat32).contiguous();
+  auto combined_std = combined.flatten(1).std(1, false);
+  auto fallback_combined = normalize_map01_per_sample(detrended, 0.01, 0.99).to(torch::kFloat32).contiguous();
+  auto low_variance_mask = combined_std.lt(0.02).view({-1, 1, 1});
+  combined = torch::where(low_variance_mask, fallback_combined, combined);
+
+  return torch::round(torch::clamp(combined, 0.0, 1.0) * 255.0).div(255.0).contiguous();
+}
+
 torch::Tensor legacy_fast_dino_gray(const torch::Tensor& sxx_db_local) {
   return normalize_map01(sxx_db_local, 0.01, 0.99).to(torch::kFloat32).contiguous();
+}
+
+torch::Tensor legacy_fast_dino_gray_batch(const torch::Tensor& sxx_db_batch) {
+  return normalize_map01_per_sample(sxx_db_batch, 0.01, 0.99).to(torch::kFloat32).contiguous();
 }
 
 torch::Tensor derive_dino_score_map(torch::Tensor model_output,
@@ -402,7 +540,8 @@ class DinoTorchRuntime::Impl {
                        " patch=" + std::to_string(input.patch_size);
 
       const auto init_mode = normalize_torchscript_init_mode(config.torchscript_init_mode);
-      const bool use_cuda_torch = (config.inference_backend != "torchscript") || torchscript_init_moves_to_cuda(init_mode);
+      const bool trt_backend = is_tensorrt_backend(config.inference_backend);
+      const bool use_cuda_torch = trt_backend || (config.inference_backend != "torchscript") || torchscript_init_moves_to_cuda(init_mode);
       const bool use_fp16 = use_fp16_torch_dtype(config.torch_dtype) && use_cuda_torch;
       const bool needs_power_db = config.compute_power_score || (!use_cuda_torch) || (input.corrected_db_device == nullptr);
       c10::Device compute_device = use_cuda_torch ? c10::Device(torch::kCUDA, 0) : c10::Device(torch::kCPU);
@@ -552,18 +691,25 @@ class DinoTorchRuntime::Impl {
         }
       });
 
+      torch::Tensor grayscale_2d;
+      torch::Tensor grayscale_batch;
       torch::Tensor model_input;
       failure_stage = "model_prep";
       result.timing.model_prep_ms = measure_ms([&] {
-        auto grayscale_2d = (config.legacy_fast_gray_preprocess
-                                 ? legacy_fast_dino_gray(resized_db)
-                                 : signal_agnostic_dino_gray(resized_db))
-                                .contiguous();
+        grayscale_2d = (config.legacy_fast_gray_preprocess
+                            ? legacy_fast_dino_gray(resized_db)
+                            : signal_agnostic_dino_gray(resized_db))
+                           .contiguous();
+        if (trt_backend) {
+          grayscale_batch = grayscale_2d.unsqueeze(0).unsqueeze(0).to(torch::kFloat32).contiguous();
+        }
         const auto target_dtype = use_fp16 ? torch::kHalf : torch::kFloat32;
-        auto grayscale = grayscale_2d.unsqueeze(0).unsqueeze(0).to(target_dtype);
-        auto rgb = grayscale.expand({1, 3, grayscale.size(2), grayscale.size(3)});
-        const auto [mean, std] = get_normalization_tensors(config, compute_device, target_dtype);
-        model_input = ((rgb - mean) / std).contiguous();
+        if (!trt_backend) {
+          auto grayscale = grayscale_2d.unsqueeze(0).unsqueeze(0).to(target_dtype);
+          auto rgb = grayscale.expand({1, 3, grayscale.size(2), grayscale.size(3)});
+          const auto [mean, std] = get_normalization_tensors(config, compute_device, target_dtype);
+          model_input = ((rgb - mean) / std).contiguous();
+        }
 
         if (config.return_pre_model_gray) {
           auto pre_model_gray_cpu = grayscale_2d.device().is_cuda() ? grayscale_2d.to(torch::kCPU) : grayscale_2d;
@@ -573,7 +719,64 @@ class DinoTorchRuntime::Impl {
       });
 
       torch::Tensor dino_score;
-      if (backend == "torchscript") {
+      if (trt_backend) {
+#ifdef HOLOHUB_HAS_TENSORRT
+        DinoTorchRuntimeBatchResult trt_result;
+        failure_stage = "tensorrt_forward";
+        result.timing.torch_forward_ms = measure_ms([&] {
+          DinoTorchRuntimeBatchInput trt_input;
+          trt_input.batch_size = 1;
+          trt_input.src_rows = input.src_rows;
+          trt_input.src_cols = input.src_cols;
+          trt_input.dst_rows = input.dst_rows;
+          trt_input.dst_cols = input.dst_cols;
+          trt_input.patch_size = input.patch_size;
+          trt_input.cuda_stream = input.cuda_stream;
+          trt_input.resolution_hz = input.resolution_hz;
+          trt_input.span_hz = input.span_hz;
+
+          auto trt_config = config;
+          trt_config.return_patch_features = true;
+          trt_result = run_batch_tensorrt(trt_config,
+                                         trt_input,
+                                         grayscale_batch.data_ptr<float>(),
+                                         std::make_shared<torch::Tensor>(grayscale_batch),
+                                         input.cuda_stream,
+                                         result.aligned_rows,
+                                         result.aligned_cols);
+        });
+        if (!trt_result.success) {
+          throw std::runtime_error(trt_result.error_message.empty() ? "TensorRT single batch execution failed" : trt_result.error_message);
+        }
+
+        failure_stage = "dino_score";
+        result.timing.dino_score_ms = measure_ms([&] {
+          result.patch_rows = trt_result.patch_rows;
+          result.patch_cols = trt_result.patch_cols;
+          result.feature_dim = trt_result.feature_dim;
+          if (result.patch_rows <= 0 || result.patch_cols <= 0 || result.feature_dim <= 0 || trt_result.patch_features_batch.empty()) {
+            throw std::runtime_error("TensorRT single batch returned no patch features");
+          }
+          if (config.return_patch_features) {
+            result.patch_features = trt_result.patch_features_batch;
+          }
+          auto patch_features = torch::from_blob(trt_result.patch_features_batch.data(),
+                                                {static_cast<int64_t>(result.patch_rows) * static_cast<int64_t>(result.patch_cols),
+                                                 static_cast<int64_t>(result.feature_dim)},
+                                                torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                                    .clone();
+          dino_score = derive_dino_score_map(patch_features,
+                                             result.aligned_rows,
+                                             result.aligned_cols,
+                                             input.patch_size,
+                                             input.dst_rows,
+                                             input.dst_cols);
+        });
+        result.backend_used = trt_result.backend_used;
+#else
+        throw std::runtime_error("TensorRT backend requested but this build does not include TensorRT support");
+#endif
+      } else if (backend == "torchscript") {
         torch::Tensor model_output;
         torch::Tensor patch_features;
         failure_stage = "torch_forward";
@@ -706,7 +909,8 @@ class DinoTorchRuntime::Impl {
                        " patch=" + std::to_string(input.patch_size);
 
       const auto init_mode = normalize_torchscript_init_mode(config.torchscript_init_mode);
-      const bool use_cuda_torch = (config.inference_backend != "torchscript") || torchscript_init_moves_to_cuda(init_mode);
+      const bool trt_backend = is_tensorrt_backend(config.inference_backend);
+      const bool use_cuda_torch = trt_backend || (config.inference_backend != "torchscript") || torchscript_init_moves_to_cuda(init_mode);
       const bool use_fp16 = use_fp16_torch_dtype(config.torch_dtype) && use_cuda_torch;
       c10::Device compute_device = use_cuda_torch ? c10::Device(torch::kCUDA, 0) : c10::Device(torch::kCPU);
       std::unique_ptr<c10::cuda::CUDAStreamGuard> stream_guard;
@@ -760,25 +964,66 @@ class DinoTorchRuntime::Impl {
       }
 
       failure_stage = "model_prep";
+      torch::Tensor grayscale_batch;
       torch::Tensor model_input;
+      DinoCudaGrayBatch grayscale_batch_cuda;
       result.timing.model_prep_ms = measure_ms([&] {
-        std::vector<torch::Tensor> grayscale_samples;
-        grayscale_samples.reserve(static_cast<size_t>(input.batch_size));
-        for (int sample_index = 0; sample_index < input.batch_size; ++sample_index) {
-          grayscale_samples.push_back((config.legacy_fast_gray_preprocess
-                                           ? legacy_fast_dino_gray(resized_batch[sample_index])
-                                           : signal_agnostic_dino_gray(resized_batch[sample_index]))
-                                          .contiguous());
+        if (trt_backend) {
+          std::string preprocess_error;
+          if (!prepare_tensorrt_grayscale_batch_cuda(resized_batch.data_ptr<float>(),
+                                                     input.batch_size,
+                                                     result.aligned_rows,
+                                                     result.aligned_cols,
+                                                     config.legacy_fast_gray_preprocess,
+                                                     input.cuda_stream,
+                                                     &grayscale_batch_cuda,
+                                                     &preprocess_error)) {
+            throw std::runtime_error(preprocess_error.empty() ? "TensorRT CUDA grayscale preprocess failed" : preprocess_error);
+          }
+          return;
         }
+        auto grayscale_maps = (config.legacy_fast_gray_preprocess
+                                   ? legacy_fast_dino_gray_batch(resized_batch)
+                                   : signal_agnostic_dino_gray_batch(resized_batch))
+                                  .contiguous();
+        grayscale_batch = grayscale_maps.unsqueeze(1).to(torch::kFloat32).contiguous();
         const auto target_dtype = use_fp16 ? torch::kHalf : torch::kFloat32;
-        auto grayscale_batch = torch::stack(grayscale_samples, 0).unsqueeze(1).to(target_dtype);
-        auto rgb_batch = grayscale_batch.expand({static_cast<int64_t>(input.batch_size), 3, grayscale_batch.size(2), grayscale_batch.size(3)});
+        auto grayscale_batch_typed = grayscale_batch.to(target_dtype);
+        auto rgb_batch = grayscale_batch_typed.expand({static_cast<int64_t>(input.batch_size), 3, grayscale_batch_typed.size(2), grayscale_batch_typed.size(3)});
         const auto [mean, std] = get_normalization_tensors(config, compute_device, target_dtype);
         model_input = ((rgb_batch - mean) / std).contiguous();
       });
 
       torch::Tensor score_maps_batch;
-      if (backend == "torchscript") {
+      if (trt_backend) {
+#ifdef HOLOHUB_HAS_TENSORRT
+        failure_stage = "tensorrt_forward";
+        DinoTorchRuntimeBatchResult trt_result;
+        result.timing.torch_forward_ms = measure_ms([&] {
+          trt_result = run_batch_tensorrt(config,
+                                         input,
+                                         grayscale_batch_cuda.data,
+                                         grayscale_batch_cuda.owner,
+                                         input.cuda_stream,
+                                         result.aligned_rows,
+                                         result.aligned_cols);
+        });
+        if (!trt_result.success) {
+          throw std::runtime_error(trt_result.error_message.empty() ? "TensorRT batch execution failed" : trt_result.error_message);
+        }
+        result.patch_rows = trt_result.patch_rows;
+        result.patch_cols = trt_result.patch_cols;
+        result.feature_dim = trt_result.feature_dim;
+        result.patch_features_batch = std::move(trt_result.patch_features_batch);
+        result.patch_features_batch_device = trt_result.patch_features_batch_device;
+        result.patch_features_batch_device_owner = std::move(trt_result.patch_features_batch_device_owner);
+        result.backend_used = trt_result.backend_used;
+        result.success = true;
+        return result;
+#else
+        throw std::runtime_error("TensorRT backend requested but this build does not include TensorRT support");
+#endif
+      } else if (backend == "torchscript") {
         torch::Tensor model_output;
         std::vector<torch::Tensor> patch_features_per_sample;
         failure_stage = "torch_forward";
@@ -969,11 +1214,12 @@ class DinoTorchRuntime::Impl {
               int batch_size,
               cudaStream_t cuda_stream) {
     const auto init_mode = normalize_torchscript_init_mode(config.torchscript_init_mode);
-    if (config.inference_backend != "torchscript") {
+    const bool trt_backend = is_tensorrt_backend(config.inference_backend);
+    if (config.inference_backend != "torchscript" && !trt_backend) {
       return;
     }
 
-    const bool use_cuda_torch = torchscript_init_moves_to_cuda(init_mode);
+    const bool use_cuda_torch = trt_backend || torchscript_init_moves_to_cuda(init_mode);
     const bool use_fp16 = use_fp16_torch_dtype(config.torch_dtype) && use_cuda_torch;
     const c10::Device compute_device = use_cuda_torch ? c10::Device(torch::kCUDA, 0) : c10::Device(torch::kCPU);
 
@@ -986,9 +1232,11 @@ class DinoTorchRuntime::Impl {
       stream_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(torch_stream);
     }
 
-    ensure_loaded(config, compute_device);
-    if (!torchscript_forward_ready_ || !torchscript_module_) {
-      return;
+    if (!trt_backend) {
+      ensure_loaded(config, compute_device);
+      if (!torchscript_forward_ready_ || !torchscript_module_) {
+        return;
+      }
     }
 
     const auto warmup_dtype = use_fp16 ? torch::kHalf : torch::kFloat32;
@@ -1023,7 +1271,7 @@ class DinoTorchRuntime::Impl {
       throw std::runtime_error("TorchScript warmup batch failed at " + warmup_result.error_stage + ": " + warmup_result.error_message);
     }
 
-    if (safe_batch == 1) {
+    if (!trt_backend && safe_batch == 1) {
       DinoTorchRuntimeInput warmup_single_input;
       warmup_single_input.src_rows = safe_src_rows;
       warmup_single_input.src_cols = safe_src_cols;
@@ -1062,6 +1310,312 @@ class DinoTorchRuntime::Impl {
     torch::Tensor mean_tensor;
     torch::Tensor std_tensor;
   };
+
+#ifdef HOLOHUB_HAS_TENSORRT
+  struct TensorRtEngineCache {
+    std::string engine_path;
+    std::string input_name;
+    std::string output_name;
+    TensorRtHandle<nvinfer1::IRuntime> runtime;
+    TensorRtHandle<nvinfer1::ICudaEngine> engine;
+    TensorRtHandle<nvinfer1::IExecutionContext> context;
+    int input_index = -1;
+    int output_index = -1;
+    int max_batch_size = 0;
+    bool loaded = false;
+  };
+
+  void ensure_tensorrt_loaded(const DinoTorchRuntimeConfig& config) {
+    std::lock_guard<std::mutex> lock(tensorrt_mutex_);
+    if (tensorrt_cache_.loaded && tensorrt_cache_.engine_path == config.tensorrt_engine_path) {
+      return;
+    }
+
+    if (config.tensorrt_engine_path.empty()) {
+      throw std::runtime_error("TensorRT backend requested without tensorrt_engine_path");
+    }
+
+    std::ifstream stream(config.tensorrt_engine_path, std::ios::binary);
+    if (!stream) {
+      throw std::runtime_error("Failed to open TensorRT engine file: " + config.tensorrt_engine_path);
+    }
+    stream.seekg(0, std::ios::end);
+    const auto byte_count = static_cast<size_t>(stream.tellg());
+    stream.seekg(0, std::ios::beg);
+    if (byte_count == 0) {
+      throw std::runtime_error("TensorRT engine file is empty: " + config.tensorrt_engine_path);
+    }
+    std::vector<char> engine_bytes(byte_count);
+    stream.read(engine_bytes.data(), static_cast<std::streamsize>(engine_bytes.size()));
+    if (!stream) {
+      throw std::runtime_error("Failed to read TensorRT engine file: " + config.tensorrt_engine_path);
+    }
+
+    TensorRtEngineCache next_cache;
+    next_cache.engine_path = config.tensorrt_engine_path;
+    next_cache.input_name = "spectrogram";
+    next_cache.output_name = "patch_features";
+    next_cache.runtime.reset(nvinfer1::createInferRuntime(tensorrt_logger_));
+    if (!next_cache.runtime) {
+      throw std::runtime_error("Failed to create TensorRT runtime");
+    }
+    next_cache.engine.reset(next_cache.runtime->deserializeCudaEngine(engine_bytes.data(), engine_bytes.size()));
+    if (!next_cache.engine) {
+      throw std::runtime_error("Failed to deserialize TensorRT engine: " + config.tensorrt_engine_path);
+    }
+    next_cache.context.reset(next_cache.engine->createExecutionContext());
+    if (!next_cache.context) {
+      throw std::runtime_error("Failed to create TensorRT execution context");
+    }
+
+#if NV_TENSORRT_MAJOR < 8 || (NV_TENSORRT_MAJOR == 8 && NV_TENSORRT_MINOR < 5)
+    const int binding_count = next_cache.engine->getNbBindings();
+    for (int binding_index = 0; binding_index < binding_count; ++binding_index) {
+      const char* binding_name = next_cache.engine->getBindingName(binding_index);
+      if (next_cache.engine->bindingIsInput(binding_index)) {
+        if (binding_name != nullptr && next_cache.input_name == binding_name) {
+          next_cache.input_index = binding_index;
+        }
+      } else if (binding_name != nullptr && next_cache.output_name == binding_name) {
+        next_cache.output_index = binding_index;
+      }
+    }
+    if (next_cache.input_index < 0 || next_cache.output_index < 0) {
+      for (int binding_index = 0; binding_index < binding_count; ++binding_index) {
+        if (next_cache.input_index < 0 && next_cache.engine->bindingIsInput(binding_index)) {
+          next_cache.input_index = binding_index;
+        }
+        if (next_cache.output_index < 0 && !next_cache.engine->bindingIsInput(binding_index)) {
+          next_cache.output_index = binding_index;
+        }
+      }
+    }
+#else
+    const int tensor_count = next_cache.engine->getNbIOTensors();
+    for (int tensor_index = 0; tensor_index < tensor_count; ++tensor_index) {
+      const char* tensor_name = next_cache.engine->getIOTensorName(tensor_index);
+      if (tensor_name == nullptr) {
+        continue;
+      }
+      const auto mode = next_cache.engine->getTensorIOMode(tensor_name);
+      if (mode == nvinfer1::TensorIOMode::kINPUT && next_cache.input_name == tensor_name) {
+        next_cache.input_index = tensor_index;
+      } else if (mode == nvinfer1::TensorIOMode::kOUTPUT && next_cache.output_name == tensor_name) {
+        next_cache.output_index = tensor_index;
+      }
+    }
+    if (next_cache.input_index < 0 || next_cache.output_index < 0) {
+      for (int tensor_index = 0; tensor_index < tensor_count; ++tensor_index) {
+        const char* tensor_name = next_cache.engine->getIOTensorName(tensor_index);
+        if (tensor_name == nullptr) {
+          continue;
+        }
+        const auto mode = next_cache.engine->getTensorIOMode(tensor_name);
+        if (next_cache.input_index < 0 && mode == nvinfer1::TensorIOMode::kINPUT) {
+          next_cache.input_index = tensor_index;
+          next_cache.input_name = tensor_name;
+        }
+        if (next_cache.output_index < 0 && mode == nvinfer1::TensorIOMode::kOUTPUT) {
+          next_cache.output_index = tensor_index;
+          next_cache.output_name = tensor_name;
+        }
+      }
+    }
+#endif
+
+    if (next_cache.input_index < 0 || next_cache.output_index < 0) {
+      throw std::runtime_error("TensorRT engine does not expose the expected input/output tensors");
+    }
+
+#if NV_TENSORRT_MAJOR < 8 || (NV_TENSORRT_MAJOR == 8 && NV_TENSORRT_MINOR < 5)
+    const nvinfer1::Dims max_input_dims = next_cache.engine->getProfileDimensions(
+        next_cache.input_index, 0, nvinfer1::OptProfileSelector::kMAX);
+#else
+    const nvinfer1::Dims max_input_dims = next_cache.engine->getProfileShape(
+        next_cache.input_name.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+#endif
+    if (max_input_dims.nbDims > 0 && max_input_dims.d[0] > 0) {
+      next_cache.max_batch_size = max_input_dims.d[0];
+    }
+
+    next_cache.loaded = true;
+    tensorrt_cache_ = std::move(next_cache);
+    last_detail_ = std::string("loaded TensorRT engine=") + config.tensorrt_engine_path;
+  }
+
+  DinoTorchRuntimeBatchResult run_batch_tensorrt(const DinoTorchRuntimeConfig& config,
+                                                 const DinoTorchRuntimeBatchInput& input,
+                                                 const float* grayscale_batch_device,
+                                                 std::shared_ptr<void> grayscale_batch_device_owner,
+                                                 cudaStream_t cuda_stream,
+                                                 int aligned_rows,
+                                                 int aligned_cols) {
+    DinoTorchRuntimeBatchResult result;
+    result.aligned_rows = aligned_rows;
+    result.aligned_cols = aligned_cols;
+    result.input_resized_to_target = (aligned_rows != input.src_rows || aligned_cols != input.src_cols);
+    result.dino_thresholds.resize(static_cast<size_t>(input.batch_size), config.pipeline_final_threshold);
+    result.final_thresholds.resize(static_cast<size_t>(input.batch_size), config.pipeline_final_threshold);
+
+    ensure_tensorrt_loaded(config);
+
+    float* output_device = nullptr;
+    size_t output_elements = 0;
+    int patch_rows = 0;
+    int patch_cols = 0;
+    int feature_dim = 0;
+    size_t patch_elements_per_sample = 0;
+    cudaStream_t execution_stream = cuda_stream;
+    bool owns_execution_stream = false;
+    if (execution_stream == nullptr) {
+      throw_runtime_if_cuda_error(cudaStreamCreateWithFlags(&execution_stream, cudaStreamNonBlocking),
+                                  "TensorRT execution stream creation failed");
+      owns_execution_stream = true;
+    }
+
+    try {
+      std::lock_guard<std::mutex> lock(tensorrt_mutex_);
+      if (!tensorrt_cache_.loaded || !tensorrt_cache_.engine || !tensorrt_cache_.context) {
+        throw std::runtime_error("TensorRT engine is not loaded");
+      }
+
+      const size_t grayscale_elements_per_sample = static_cast<size_t>(aligned_rows) * static_cast<size_t>(aligned_cols);
+      const float* grayscale_base = grayscale_batch_device;
+      int processed_samples = 0;
+      int preferred_chunk = input.batch_size;
+
+      while (processed_samples < input.batch_size) {
+        const int remaining_samples = input.batch_size - processed_samples;
+        int chunk_batch = std::min(preferred_chunk, remaining_samples);
+        if (tensorrt_cache_.max_batch_size > 0) {
+          chunk_batch = std::min(chunk_batch, tensorrt_cache_.max_batch_size);
+        }
+        bool chunk_shape_ready = false;
+        nvinfer1::Dims output_dims {};
+
+        while (chunk_batch >= 1) {
+          const nvinfer1::Dims input_dims = nvinfer1::Dims4(chunk_batch, 1, aligned_rows, aligned_cols);
+#if NV_TENSORRT_MAJOR < 8 || (NV_TENSORRT_MAJOR == 8 && NV_TENSORRT_MINOR < 5)
+          if (tensorrt_cache_.context->setBindingDimensions(tensorrt_cache_.input_index, input_dims)) {
+            output_dims = tensorrt_cache_.context->getBindingDimensions(tensorrt_cache_.output_index);
+            chunk_shape_ready = true;
+            break;
+          }
+#else
+          if (tensorrt_cache_.context->setInputShape(tensorrt_cache_.input_name.c_str(), input_dims)) {
+            output_dims = tensorrt_cache_.context->getTensorShape(tensorrt_cache_.output_name.c_str());
+            chunk_shape_ready = true;
+            break;
+          }
+#endif
+          if (chunk_batch == 1) {
+            throw std::runtime_error("Failed to set TensorRT input shape even for batch_size=1");
+          }
+          chunk_batch = std::max(1, chunk_batch / 2);
+        }
+
+        if (!chunk_shape_ready) {
+          throw std::runtime_error("Failed to determine a valid TensorRT chunk batch size");
+        }
+        if (output_dims.nbDims != 4) {
+          throw std::runtime_error("TensorRT patch feature tensor must be rank-4 [B,H,W,C]");
+        }
+        if (patch_rows == 0) {
+          patch_rows = output_dims.d[1];
+          patch_cols = output_dims.d[2];
+          feature_dim = output_dims.d[3];
+          if (patch_rows <= 0 || patch_cols <= 0 || feature_dim <= 0) {
+            throw std::runtime_error("TensorRT patch feature tensor has invalid dimensions");
+          }
+          output_elements = volume_from_dims(output_dims);
+          patch_elements_per_sample = output_elements / static_cast<size_t>(chunk_batch);
+          throw_runtime_if_cuda_error(
+              cudaMalloc(reinterpret_cast<void**>(&output_device),
+                         static_cast<size_t>(input.batch_size) * patch_elements_per_sample * sizeof(float)),
+              "TensorRT patch feature allocation failed");
+        }
+
+        float* output_chunk_ptr = output_device + static_cast<size_t>(processed_samples) * patch_elements_per_sample;
+        float* input_chunk_ptr = const_cast<float*>(grayscale_base + static_cast<size_t>(processed_samples) * grayscale_elements_per_sample);
+
+#if NV_TENSORRT_MAJOR < 8 || (NV_TENSORRT_MAJOR == 8 && NV_TENSORRT_MINOR < 5)
+        std::vector<void*> bindings(static_cast<size_t>(tensorrt_cache_.engine->getNbBindings()), nullptr);
+        bindings[static_cast<size_t>(tensorrt_cache_.input_index)] = input_chunk_ptr;
+        bindings[static_cast<size_t>(tensorrt_cache_.output_index)] = output_chunk_ptr;
+        if (!tensorrt_cache_.context->enqueueV2(bindings.data(), execution_stream, nullptr)) {
+          cudaFree(output_device);
+          throw std::runtime_error("TensorRT enqueueV2 failed");
+        }
+#else
+        if (!tensorrt_cache_.context->setTensorAddress(tensorrt_cache_.input_name.c_str(), input_chunk_ptr)) {
+          cudaFree(output_device);
+          throw std::runtime_error("Failed to bind TensorRT input tensor address");
+        }
+        if (!tensorrt_cache_.context->setTensorAddress(tensorrt_cache_.output_name.c_str(), output_chunk_ptr)) {
+          cudaFree(output_device);
+          throw std::runtime_error("Failed to bind TensorRT output tensor address");
+        }
+        if (!tensorrt_cache_.context->enqueueV3(execution_stream)) {
+          cudaFree(output_device);
+          throw std::runtime_error("TensorRT enqueueV3 failed");
+        }
+#endif
+
+        preferred_chunk = chunk_batch;
+        processed_samples += chunk_batch;
+      }
+    } catch (...) {
+      if (owns_execution_stream) {
+        cudaStreamDestroy(execution_stream);
+      }
+      throw;
+    }
+
+    if (grayscale_batch_device_owner) {
+      auto* retained_input_owner = new std::shared_ptr<void>(std::move(grayscale_batch_device_owner));
+      throw_runtime_if_cuda_error(
+          cudaLaunchHostFunc(
+              execution_stream,
+              [](void* user_data) {
+                delete static_cast<std::shared_ptr<void>*>(user_data);
+              },
+              retained_input_owner),
+          "TensorRT input lifetime callback launch failed");
+    }
+
+    auto device_owner = std::shared_ptr<void>(output_device, [](void* ptr) {
+      if (ptr != nullptr) {
+        cudaFree(ptr);
+      }
+    });
+    result.patch_features_batch_device = output_device;
+    result.patch_features_batch_device_owner = device_owner;
+    result.patch_rows = patch_rows;
+    result.patch_cols = patch_cols;
+    result.feature_dim = feature_dim;
+    result.backend_used = "tensorrt";
+
+    if (config.return_patch_features) {
+      result.patch_features_batch.resize(static_cast<size_t>(input.batch_size) * patch_elements_per_sample);
+      throw_runtime_if_cuda_error(cudaMemcpyAsync(result.patch_features_batch.data(),
+                      output_device,
+                      result.patch_features_batch.size() * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      execution_stream),
+                  "TensorRT patch feature host copy failed");
+      throw_runtime_if_cuda_error(cudaStreamSynchronize(execution_stream),
+                  "TensorRT patch feature host copy synchronization failed");
+    }
+
+    if (owns_execution_stream) {
+      throw_runtime_if_cuda_error(cudaStreamDestroy(execution_stream),
+                                  "TensorRT execution stream destroy failed");
+    }
+
+    result.success = true;
+    return result;
+  }
+#endif
 
   std::pair<torch::Tensor, torch::Tensor> get_normalization_tensors(const DinoTorchRuntimeConfig& config,
                                                                     const c10::Device& device,
@@ -1137,6 +1691,11 @@ class DinoTorchRuntime::Impl {
 
   std::mutex torchscript_load_mutex_;
   std::mutex normalization_cache_mutex_;
+#ifdef HOLOHUB_HAS_TENSORRT
+  TensorRtLogger tensorrt_logger_;
+  std::mutex tensorrt_mutex_;
+  TensorRtEngineCache tensorrt_cache_;
+#endif
   NormalizationTensorCache normalization_cache_;
   std::unique_ptr<torch::jit::script::Module> torchscript_module_;
   bool torchscript_model_loaded_ = false;

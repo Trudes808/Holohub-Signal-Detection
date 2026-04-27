@@ -20,13 +20,18 @@
 #include <exception>
 #include <iomanip>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace holoscan::ops {
 
 namespace {
+
+constexpr float kPositiveInfinity = std::numeric_limits<float>::infinity();
 
 bool use_fp16_precision(const std::string& dtype_text) {
   std::string lowered = dtype_text;
@@ -112,6 +117,7 @@ struct DebugChunkResult {
 };
 
 struct OperatorTimingProfile {
+  std::string runtime_backend_used;
   double total_compute_ms = 0.0;
   double power_db_ms = 0.0;
   double frontend_ms = 0.0;
@@ -323,8 +329,215 @@ __host__ __device__ __forceinline__ size_t flat_index(int cols, int row, int col
 }
 
 template <typename T>
+__host__ __device__ __forceinline__
 T clamp_value(T value, T low, T high) {
   return value < low ? low : (value > high ? high : value);
+}
+
+constexpr int kRawPositionalBasisDim = 16;
+
+int next_power_of_two(int value) {
+  int result = 1;
+  while (result < value) {
+    result <<= 1;
+  }
+  return result;
+}
+
+std::vector<float> positional_design_matrix_host(int patch_rows, int patch_cols) {
+  constexpr float kPi = 3.14159265358979323846f;
+  const int patch_count = patch_rows * patch_cols;
+  std::vector<float> design(static_cast<size_t>(std::max(patch_count, 0)) * static_cast<size_t>(kRawPositionalBasisDim), 0.0f);
+  for (int row = 0; row < patch_rows; ++row) {
+    const float row_coord = patch_rows > 1 ? -1.0f + 2.0f * static_cast<float>(row) / static_cast<float>(patch_rows - 1) : 0.0f;
+    for (int col = 0; col < patch_cols; ++col) {
+      const float col_coord = patch_cols > 1 ? -1.0f + 2.0f * static_cast<float>(col) / static_cast<float>(patch_cols - 1) : 0.0f;
+      const size_t base = flat_index(kRawPositionalBasisDim, row * patch_cols + col, 0);
+      design[base + 0] = 1.0f;
+      design[base + 1] = row_coord;
+      design[base + 2] = col_coord;
+      design[base + 3] = row_coord * row_coord;
+      design[base + 4] = col_coord * col_coord;
+      design[base + 5] = row_coord * col_coord;
+      design[base + 6] = std::sin(kPi * row_coord);
+      design[base + 7] = std::sin(kPi * col_coord);
+      design[base + 8] = std::cos(kPi * row_coord);
+      design[base + 9] = std::cos(kPi * col_coord);
+      design[base + 10] = std::sin(2.0f * kPi * row_coord);
+      design[base + 11] = std::sin(2.0f * kPi * col_coord);
+      design[base + 12] = std::cos(2.0f * kPi * row_coord);
+      design[base + 13] = std::cos(2.0f * kPi * col_coord);
+      design[base + 14] = std::sin(kPi * row_coord) * std::cos(kPi * col_coord);
+      design[base + 15] = std::cos(kPi * row_coord) * std::sin(kPi * col_coord);
+    }
+  }
+  return design;
+}
+
+std::vector<float> gaussian_kernel_host(double sigma) {
+  if (sigma <= 0.0) {
+    return {1.0f};
+  }
+  const int radius = std::max(1, static_cast<int>(std::ceil(3.0 * sigma)));
+  std::vector<float> kernel(static_cast<size_t>(radius * 2 + 1), 0.0f);
+  double sum = 0.0;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const double value = std::exp(-(static_cast<double>(offset * offset)) / (2.0 * sigma * sigma));
+    kernel[static_cast<size_t>(offset + radius)] = static_cast<float>(value);
+    sum += value;
+  }
+  const float inv_sum = sum > 0.0 ? static_cast<float>(1.0 / sum) : 1.0f;
+  for (float& value : kernel) {
+    value *= inv_sum;
+  }
+  return kernel;
+}
+
+std::vector<float> gaussian_second_derivative_kernel_host(double sigma) {
+  if (sigma <= 0.0) {
+    return {0.0f};
+  }
+  const int radius = std::max(1, static_cast<int>(std::ceil(3.0 * sigma)));
+  std::vector<float> kernel(static_cast<size_t>(radius * 2 + 1), 0.0f);
+  const double sigma2 = sigma * sigma;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const double x = static_cast<double>(offset);
+    kernel[static_cast<size_t>(offset + radius)] =
+        static_cast<float>(((x * x - sigma2) / (sigma2 * sigma2)) * std::exp(-(x * x) / (2.0 * sigma2)));
+  }
+  return kernel;
+}
+
+bool invert_small_square_matrix_host(const std::vector<float>& input, int dim, std::vector<float>& inverse) {
+  if (dim <= 0 || input.size() != static_cast<size_t>(dim) * static_cast<size_t>(dim)) {
+    return false;
+  }
+
+  std::vector<float> augmented(static_cast<size_t>(dim) * static_cast<size_t>(dim * 2), 0.0f);
+  for (int row = 0; row < dim; ++row) {
+    for (int col = 0; col < dim; ++col) {
+      augmented[static_cast<size_t>(row) * static_cast<size_t>(dim * 2) + static_cast<size_t>(col)] =
+          input[static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(col)];
+    }
+    augmented[static_cast<size_t>(row) * static_cast<size_t>(dim * 2) + static_cast<size_t>(dim + row)] = 1.0f;
+  }
+
+  for (int pivot = 0; pivot < dim; ++pivot) {
+    int best_row = pivot;
+    float best_value = std::fabs(augmented[static_cast<size_t>(pivot) * static_cast<size_t>(dim * 2) + static_cast<size_t>(pivot)]);
+    for (int row = pivot + 1; row < dim; ++row) {
+      const float candidate = std::fabs(augmented[static_cast<size_t>(row) * static_cast<size_t>(dim * 2) + static_cast<size_t>(pivot)]);
+      if (candidate > best_value) {
+        best_value = candidate;
+        best_row = row;
+      }
+    }
+    if (best_value < 1.0e-8f) {
+      return false;
+    }
+    if (best_row != pivot) {
+      for (int col = 0; col < dim * 2; ++col) {
+        std::swap(augmented[static_cast<size_t>(pivot) * static_cast<size_t>(dim * 2) + static_cast<size_t>(col)],
+                  augmented[static_cast<size_t>(best_row) * static_cast<size_t>(dim * 2) + static_cast<size_t>(col)]);
+      }
+    }
+
+    const float pivot_value = augmented[static_cast<size_t>(pivot) * static_cast<size_t>(dim * 2) + static_cast<size_t>(pivot)];
+    for (int col = 0; col < dim * 2; ++col) {
+      augmented[static_cast<size_t>(pivot) * static_cast<size_t>(dim * 2) + static_cast<size_t>(col)] /= pivot_value;
+    }
+    for (int row = 0; row < dim; ++row) {
+      if (row == pivot) {
+        continue;
+      }
+      const float factor = augmented[static_cast<size_t>(row) * static_cast<size_t>(dim * 2) + static_cast<size_t>(pivot)];
+      if (std::fabs(factor) < 1.0e-12f) {
+        continue;
+      }
+      for (int col = 0; col < dim * 2; ++col) {
+        augmented[static_cast<size_t>(row) * static_cast<size_t>(dim * 2) + static_cast<size_t>(col)] -=
+            factor * augmented[static_cast<size_t>(pivot) * static_cast<size_t>(dim * 2) + static_cast<size_t>(col)];
+      }
+    }
+  }
+
+  inverse.assign(static_cast<size_t>(dim) * static_cast<size_t>(dim), 0.0f);
+  for (int row = 0; row < dim; ++row) {
+    for (int col = 0; col < dim; ++col) {
+      inverse[static_cast<size_t>(row) * static_cast<size_t>(dim) + static_cast<size_t>(col)] =
+          augmented[static_cast<size_t>(row) * static_cast<size_t>(dim * 2) + static_cast<size_t>(dim + col)];
+    }
+  }
+  return true;
+}
+
+struct PositionalSuppressionDeviceCache {
+  int patch_count = 0;
+  float* design_device = nullptr;
+  float* inverse_gram_device = nullptr;
+
+  ~PositionalSuppressionDeviceCache() {
+    if (design_device != nullptr) {
+      cudaFree(design_device);
+    }
+    if (inverse_gram_device != nullptr) {
+      cudaFree(inverse_gram_device);
+    }
+  }
+};
+
+std::shared_ptr<const PositionalSuppressionDeviceCache> get_positional_suppression_device_cache(int patch_rows, int patch_cols) {
+  const uint64_t cache_key = (static_cast<uint64_t>(static_cast<uint32_t>(patch_rows)) << 32U) |
+                             static_cast<uint64_t>(static_cast<uint32_t>(patch_cols));
+  static std::mutex cache_mutex;
+  static std::unordered_map<uint64_t, std::shared_ptr<const PositionalSuppressionDeviceCache>> cache_by_shape;
+
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    const auto found = cache_by_shape.find(cache_key);
+    if (found != cache_by_shape.end()) {
+      return found->second;
+    }
+  }
+
+  auto cache = std::make_shared<PositionalSuppressionDeviceCache>();
+  cache->patch_count = patch_rows * patch_cols;
+  const auto design = positional_design_matrix_host(patch_rows, patch_cols);
+  std::vector<float> gram(static_cast<size_t>(kRawPositionalBasisDim) * static_cast<size_t>(kRawPositionalBasisDim), 0.0f);
+  for (int patch_index = 0; patch_index < cache->patch_count; ++patch_index) {
+    const size_t design_base = static_cast<size_t>(patch_index) * static_cast<size_t>(kRawPositionalBasisDim);
+    for (int left = 0; left < kRawPositionalBasisDim; ++left) {
+      const float left_value = design[design_base + static_cast<size_t>(left)];
+      for (int right = 0; right < kRawPositionalBasisDim; ++right) {
+        gram[static_cast<size_t>(left) * static_cast<size_t>(kRawPositionalBasisDim) + static_cast<size_t>(right)] +=
+            left_value * design[design_base + static_cast<size_t>(right)];
+      }
+    }
+  }
+  for (int diag = 0; diag < kRawPositionalBasisDim; ++diag) {
+    gram[static_cast<size_t>(diag) * static_cast<size_t>(kRawPositionalBasisDim) + static_cast<size_t>(diag)] += 1.0e-3f;
+  }
+
+  std::vector<float> inverse_gram;
+  if (!invert_small_square_matrix_host(gram, kRawPositionalBasisDim, inverse_gram)) {
+    return nullptr;
+  }
+
+  if (cudaMalloc(reinterpret_cast<void**>(&cache->design_device), design.size() * sizeof(float)) != cudaSuccess ||
+      cudaMalloc(reinterpret_cast<void**>(&cache->inverse_gram_device), inverse_gram.size() * sizeof(float)) != cudaSuccess) {
+    return nullptr;
+  }
+  if (cudaMemcpy(cache->design_device, design.data(), design.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(cache->inverse_gram_device,
+                 inverse_gram.data(),
+                 inverse_gram.size() * sizeof(float),
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    return nullptr;
+  }
+
+  std::lock_guard<std::mutex> lock(cache_mutex);
+  const auto [iter, inserted] = cache_by_shape.emplace(cache_key, cache);
+  return inserted ? cache : iter->second;
 }
 
 struct DirectionalCoherenceCudaScratch {
@@ -419,55 +632,119 @@ DirectionalCoherenceCudaScratch& directional_coherence_cuda_scratch() {
 }
 
 struct FillHolesCudaScratch {
-  uint8_t* background = nullptr;
-  uint8_t* grown_a = nullptr;
-  uint8_t* grown_b = nullptr;
-  uint32_t* changed = nullptr;
-  size_t mask_capacity = 0;
+  int* labels = nullptr;
+  uint32_t* boundary_touch = nullptr;
+  size_t label_capacity = 0;
+  size_t boundary_capacity = 0;
 
   ~FillHolesCudaScratch() {
     release();
   }
 
   void release() {
-    if (background != nullptr) {
-      cudaFree(background);
-      background = nullptr;
+    if (labels != nullptr) {
+      cudaFree(labels);
+      labels = nullptr;
     }
-    if (grown_a != nullptr) {
-      cudaFree(grown_a);
-      grown_a = nullptr;
+    if (boundary_touch != nullptr) {
+      cudaFree(boundary_touch);
+      boundary_touch = nullptr;
     }
-    if (grown_b != nullptr) {
-      cudaFree(grown_b);
-      grown_b = nullptr;
-    }
-    if (changed != nullptr) {
-      cudaFree(changed);
-      changed = nullptr;
-    }
-    mask_capacity = 0;
+    label_capacity = 0;
+    boundary_capacity = 0;
   }
 
-  bool ensure_capacity(size_t requested_mask_capacity) {
-    if (requested_mask_capacity <= mask_capacity && background != nullptr && grown_a != nullptr && grown_b != nullptr && changed != nullptr) {
+  bool ensure_capacity(size_t requested_label_capacity, size_t requested_boundary_capacity) {
+    if (requested_label_capacity <= label_capacity && requested_boundary_capacity <= boundary_capacity && labels != nullptr &&
+        boundary_touch != nullptr) {
       return true;
     }
-    release();
-    if (cudaMalloc(reinterpret_cast<void**>(&background), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess ||
-        cudaMalloc(reinterpret_cast<void**>(&grown_a), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess ||
-        cudaMalloc(reinterpret_cast<void**>(&grown_b), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess ||
-        cudaMalloc(reinterpret_cast<void**>(&changed), sizeof(uint32_t)) != cudaSuccess) {
-      release();
-      return false;
+
+    if (requested_label_capacity > label_capacity) {
+      if (labels != nullptr) {
+        cudaFree(labels);
+        labels = nullptr;
+      }
+      if (cudaMalloc(reinterpret_cast<void**>(&labels), requested_label_capacity * sizeof(int)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      label_capacity = requested_label_capacity;
     }
-    mask_capacity = requested_mask_capacity;
+
+    if (requested_boundary_capacity > boundary_capacity) {
+      if (boundary_touch != nullptr) {
+        cudaFree(boundary_touch);
+        boundary_touch = nullptr;
+      }
+      if (cudaMalloc(reinterpret_cast<void**>(&boundary_touch), requested_boundary_capacity * sizeof(uint32_t)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      boundary_capacity = requested_boundary_capacity;
+    }
+
     return true;
   }
 };
 
 FillHolesCudaScratch& fill_holes_cuda_scratch() {
   static FillHolesCudaScratch scratch;
+  return scratch;
+}
+
+struct ThresholdHistogramCudaScratch {
+  uint32_t* histograms = nullptr;
+  uint32_t* valid_counts = nullptr;
+  size_t histogram_capacity = 0;
+  size_t count_capacity = 0;
+
+  ~ThresholdHistogramCudaScratch() {
+    release();
+  }
+
+  void release() {
+    if (histograms != nullptr) {
+      cudaFree(histograms);
+      histograms = nullptr;
+    }
+    if (valid_counts != nullptr) {
+      cudaFree(valid_counts);
+      valid_counts = nullptr;
+    }
+    histogram_capacity = 0;
+    count_capacity = 0;
+  }
+
+  bool ensure_capacity(size_t requested_histogram_capacity, size_t requested_count_capacity) {
+    if (requested_histogram_capacity > histogram_capacity) {
+      if (histograms != nullptr) {
+        cudaFree(histograms);
+        histograms = nullptr;
+      }
+      if (cudaMalloc(reinterpret_cast<void**>(&histograms), requested_histogram_capacity * sizeof(uint32_t)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      histogram_capacity = requested_histogram_capacity;
+    }
+    if (requested_count_capacity > count_capacity) {
+      if (valid_counts != nullptr) {
+        cudaFree(valid_counts);
+        valid_counts = nullptr;
+      }
+      if (cudaMalloc(reinterpret_cast<void**>(&valid_counts), requested_count_capacity * sizeof(uint32_t)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      count_capacity = requested_count_capacity;
+    }
+    return true;
+  }
+};
+
+ThresholdHistogramCudaScratch& threshold_histogram_cuda_scratch() {
+  static ThresholdHistogramCudaScratch scratch;
   return scratch;
 }
 
@@ -544,6 +821,265 @@ struct ComponentFilterCudaScratch {
 
 ComponentFilterCudaScratch& component_filter_cuda_scratch() {
   static ComponentFilterCudaScratch scratch;
+  return scratch;
+}
+
+struct RawScoreProjectionCudaScratch {
+  float* xty = nullptr;
+  float* beta = nullptr;
+  float* raw_patch = nullptr;
+  float* aligned_map = nullptr;
+  size_t xty_capacity = 0;
+  size_t raw_patch_capacity = 0;
+  size_t aligned_capacity = 0;
+
+  ~RawScoreProjectionCudaScratch() {
+    release();
+  }
+
+  void release() {
+    if (xty != nullptr) {
+      cudaFree(xty);
+      xty = nullptr;
+    }
+    if (beta != nullptr) {
+      cudaFree(beta);
+      beta = nullptr;
+    }
+    if (raw_patch != nullptr) {
+      cudaFree(raw_patch);
+      raw_patch = nullptr;
+    }
+    if (aligned_map != nullptr) {
+      cudaFree(aligned_map);
+      aligned_map = nullptr;
+    }
+    xty_capacity = 0;
+    raw_patch_capacity = 0;
+    aligned_capacity = 0;
+  }
+
+  bool ensure_capacity(size_t requested_xty_capacity,
+                       size_t requested_raw_patch_capacity,
+                       size_t requested_aligned_capacity) {
+    if (requested_xty_capacity > xty_capacity) {
+      if (xty != nullptr) {
+        cudaFree(xty);
+        xty = nullptr;
+      }
+      if (beta != nullptr) {
+        cudaFree(beta);
+        beta = nullptr;
+      }
+      if (requested_xty_capacity > 0 &&
+          (cudaMalloc(reinterpret_cast<void**>(&xty), requested_xty_capacity * sizeof(float)) != cudaSuccess ||
+           cudaMalloc(reinterpret_cast<void**>(&beta), requested_xty_capacity * sizeof(float)) != cudaSuccess)) {
+        release();
+        return false;
+      }
+      xty_capacity = requested_xty_capacity;
+    }
+    if (requested_raw_patch_capacity > raw_patch_capacity) {
+      if (raw_patch != nullptr) {
+        cudaFree(raw_patch);
+        raw_patch = nullptr;
+      }
+      if (requested_raw_patch_capacity > 0 &&
+          cudaMalloc(reinterpret_cast<void**>(&raw_patch), requested_raw_patch_capacity * sizeof(float)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      raw_patch_capacity = requested_raw_patch_capacity;
+    }
+    if (requested_aligned_capacity > aligned_capacity) {
+      if (aligned_map != nullptr) {
+        cudaFree(aligned_map);
+        aligned_map = nullptr;
+      }
+      if (requested_aligned_capacity > 0 &&
+          cudaMalloc(reinterpret_cast<void**>(&aligned_map), requested_aligned_capacity * sizeof(float)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      aligned_capacity = requested_aligned_capacity;
+    }
+    return true;
+  }
+};
+
+RawScoreProjectionCudaScratch& raw_score_projection_cuda_scratch() {
+  static RawScoreProjectionCudaScratch scratch;
+  return scratch;
+}
+
+struct HybridPipelineCudaScratch {
+  float* work0 = nullptr;
+  float* work1 = nullptr;
+  float* work2 = nullptr;
+  float* work3 = nullptr;
+  float* work4 = nullptr;
+  float* work5 = nullptr;
+  float* work6 = nullptr;
+  float* work7 = nullptr;
+  float* thresh0 = nullptr;
+  float* thresh1 = nullptr;
+  float* thresh2 = nullptr;
+  float* thresh3 = nullptr;
+  float* thresh4 = nullptr;
+  float* thresh5 = nullptr;
+  float* kernel_rows = nullptr;
+  float* kernel_cols = nullptr;
+  uint8_t* valid_row_mask = nullptr;
+  bool* valid_mask = nullptr;
+  bool* full_mask = nullptr;
+  uint8_t* mask_a = nullptr;
+  uint8_t* mask_b = nullptr;
+  size_t value_capacity = 0;
+  size_t batch_capacity = 0;
+  size_t kernel_capacity = 0;
+  size_t row_mask_capacity = 0;
+  size_t mask_capacity = 0;
+
+  ~HybridPipelineCudaScratch() {
+    release();
+  }
+
+  void release() {
+    auto free_ptr = [](auto*& ptr) {
+      if (ptr != nullptr) {
+        cudaFree(ptr);
+        ptr = nullptr;
+      }
+    };
+    free_ptr(work0);
+    free_ptr(work1);
+    free_ptr(work2);
+    free_ptr(work3);
+    free_ptr(work4);
+    free_ptr(work5);
+    free_ptr(work6);
+    free_ptr(work7);
+    free_ptr(thresh0);
+    free_ptr(thresh1);
+    free_ptr(thresh2);
+    free_ptr(thresh3);
+    free_ptr(thresh4);
+    free_ptr(thresh5);
+    free_ptr(kernel_rows);
+    free_ptr(kernel_cols);
+    free_ptr(valid_row_mask);
+    free_ptr(valid_mask);
+    free_ptr(full_mask);
+    free_ptr(mask_a);
+    free_ptr(mask_b);
+    value_capacity = 0;
+    batch_capacity = 0;
+    kernel_capacity = 0;
+    row_mask_capacity = 0;
+    mask_capacity = 0;
+  }
+
+  bool ensure_capacity(size_t requested_values,
+                       size_t requested_batch,
+                       size_t requested_kernel,
+                       size_t requested_row_mask,
+                       size_t requested_mask) {
+    auto alloc_float = [](float*& ptr, size_t count) {
+      if (count == 0) {
+        return true;
+      }
+      return cudaMalloc(reinterpret_cast<void**>(&ptr), count * sizeof(float)) == cudaSuccess;
+    };
+    if (requested_values > value_capacity) {
+      if (work0 != nullptr) {
+        release();
+      }
+      if (!alloc_float(work0, requested_values) || !alloc_float(work1, requested_values) || !alloc_float(work2, requested_values) ||
+          !alloc_float(work3, requested_values) || !alloc_float(work4, requested_values) || !alloc_float(work5, requested_values) ||
+          !alloc_float(work6, requested_values) || !alloc_float(work7, requested_values)) {
+        release();
+        return false;
+      }
+      value_capacity = requested_values;
+    }
+    if (requested_batch > batch_capacity) {
+      auto free_ptr = [](float*& ptr) {
+        if (ptr != nullptr) {
+          cudaFree(ptr);
+          ptr = nullptr;
+        }
+      };
+      free_ptr(thresh0);
+      free_ptr(thresh1);
+      free_ptr(thresh2);
+      free_ptr(thresh3);
+      free_ptr(thresh4);
+      free_ptr(thresh5);
+      if (!alloc_float(thresh0, requested_batch) || !alloc_float(thresh1, requested_batch) || !alloc_float(thresh2, requested_batch) ||
+          !alloc_float(thresh3, requested_batch) || !alloc_float(thresh4, requested_batch) || !alloc_float(thresh5, requested_batch)) {
+        release();
+        return false;
+      }
+      batch_capacity = requested_batch;
+    }
+    if (requested_kernel > kernel_capacity) {
+      if (kernel_rows != nullptr) {
+        cudaFree(kernel_rows);
+        kernel_rows = nullptr;
+      }
+      if (kernel_cols != nullptr) {
+        cudaFree(kernel_cols);
+        kernel_cols = nullptr;
+      }
+      if (!alloc_float(kernel_rows, requested_kernel) || !alloc_float(kernel_cols, requested_kernel)) {
+        release();
+        return false;
+      }
+      kernel_capacity = requested_kernel;
+    }
+    if (requested_row_mask > row_mask_capacity) {
+      if (valid_row_mask != nullptr) {
+        cudaFree(valid_row_mask);
+        valid_row_mask = nullptr;
+      }
+      if (cudaMalloc(reinterpret_cast<void**>(&valid_row_mask), requested_row_mask * sizeof(uint8_t)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      row_mask_capacity = requested_row_mask;
+    }
+    if (requested_mask > mask_capacity) {
+      auto free_u8 = [](uint8_t*& ptr) {
+        if (ptr != nullptr) {
+          cudaFree(ptr);
+          ptr = nullptr;
+        }
+      };
+      auto free_bool = [](bool*& ptr) {
+        if (ptr != nullptr) {
+          cudaFree(ptr);
+          ptr = nullptr;
+        }
+      };
+      free_bool(valid_mask);
+      free_bool(full_mask);
+      free_u8(mask_a);
+      free_u8(mask_b);
+      if (cudaMalloc(reinterpret_cast<void**>(&valid_mask), requested_mask * sizeof(bool)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&full_mask), requested_mask * sizeof(bool)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&mask_a), requested_mask * sizeof(uint8_t)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&mask_b), requested_mask * sizeof(uint8_t)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      mask_capacity = requested_mask;
+    }
+    return true;
+  }
+};
+
+HybridPipelineCudaScratch& hybrid_pipeline_cuda_scratch() {
+  static HybridPipelineCudaScratch scratch;
   return scratch;
 }
 
@@ -662,12 +1198,610 @@ __global__ void directional_apply_valid_rows_batch_kernel(float* values,
   }
 }
 
-__global__ void fill_holes_init_kernel(const uint8_t* mask,
-                                       int batch_size,
-                                       int rows,
-                                       int cols,
-                                       uint8_t* background,
-                                       uint8_t* exterior) {
+__global__ void raw_positional_xty_kernel(const float* patch_features,
+                                          const float* design,
+                                          int patch_count,
+                                          int feature_dim,
+                                          int basis_dim,
+                                          float* xty) {
+  const int feature_index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int basis_index = blockIdx.y;
+  const int batch_index = blockIdx.z;
+  if (feature_index >= feature_dim || basis_index >= basis_dim) {
+    return;
+  }
+
+  const size_t batch_feature_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim);
+  float sum = 0.0f;
+  for (int patch_index = 0; patch_index < patch_count; ++patch_index) {
+    sum += design[static_cast<size_t>(patch_index) * static_cast<size_t>(basis_dim) + static_cast<size_t>(basis_index)] *
+           patch_features[batch_feature_offset + static_cast<size_t>(patch_index) * static_cast<size_t>(feature_dim) + static_cast<size_t>(feature_index)];
+  }
+  xty[(static_cast<size_t>(batch_index) * static_cast<size_t>(basis_dim) + static_cast<size_t>(basis_index)) *
+          static_cast<size_t>(feature_dim) +
+      static_cast<size_t>(feature_index)] = sum;
+}
+
+__global__ void raw_positional_beta_kernel(const float* inverse_gram,
+                                           const float* xty,
+                                           int feature_dim,
+                                           int basis_dim,
+                                           float* beta) {
+  const int feature_index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int basis_row = blockIdx.y;
+  const int batch_index = blockIdx.z;
+  if (feature_index >= feature_dim || basis_row >= basis_dim) {
+    return;
+  }
+
+  float sum = 0.0f;
+  for (int basis_col = 0; basis_col < basis_dim; ++basis_col) {
+    sum += inverse_gram[static_cast<size_t>(basis_row) * static_cast<size_t>(basis_dim) + static_cast<size_t>(basis_col)] *
+           xty[(static_cast<size_t>(batch_index) * static_cast<size_t>(basis_dim) + static_cast<size_t>(basis_col)) *
+                   static_cast<size_t>(feature_dim) +
+               static_cast<size_t>(feature_index)];
+  }
+  beta[(static_cast<size_t>(batch_index) * static_cast<size_t>(basis_dim) + static_cast<size_t>(basis_row)) *
+           static_cast<size_t>(feature_dim) +
+       static_cast<size_t>(feature_index)] = sum;
+}
+
+__global__ void raw_patch_energy_kernel(const float* patch_features,
+                                        const float* design,
+                                        const float* beta,
+                                        int patch_count,
+                                        int feature_dim,
+                                        int basis_dim,
+                                        float suppression,
+                                        float* raw_patch) {
+  const int patch_index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int batch_index = blockIdx.y;
+  if (patch_index >= patch_count) {
+    return;
+  }
+
+  const size_t batch_feature_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim);
+  const size_t beta_batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(basis_dim) * static_cast<size_t>(feature_dim);
+  const size_t design_offset = static_cast<size_t>(patch_index) * static_cast<size_t>(basis_dim);
+  float sum_sq = 0.0f;
+  for (int feature_index = 0; feature_index < feature_dim; ++feature_index) {
+    float trend = 0.0f;
+    for (int basis_index = 0; basis_index < basis_dim; ++basis_index) {
+      trend += design[design_offset + static_cast<size_t>(basis_index)] *
+               beta[beta_batch_offset + static_cast<size_t>(basis_index) * static_cast<size_t>(feature_dim) + static_cast<size_t>(feature_index)];
+    }
+    const float value = patch_features[batch_feature_offset + static_cast<size_t>(patch_index) * static_cast<size_t>(feature_dim) +
+                                       static_cast<size_t>(feature_index)] -
+                        suppression * trend;
+    sum_sq += value * value;
+  }
+  raw_patch[static_cast<size_t>(batch_index) * static_cast<size_t>(patch_count) + static_cast<size_t>(patch_index)] =
+      sqrtf(fmaxf(sum_sq / static_cast<float>(feature_dim), 1.0e-6f));
+}
+
+__global__ void raw_patch_energy_plain_kernel(const float* patch_features,
+                                              int patch_count,
+                                              int feature_dim,
+                                              float* raw_patch) {
+  const int patch_index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int batch_index = blockIdx.y;
+  if (patch_index >= patch_count) {
+    return;
+  }
+
+  const size_t batch_feature_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(patch_count) * static_cast<size_t>(feature_dim);
+  float sum_sq = 0.0f;
+  for (int feature_index = 0; feature_index < feature_dim; ++feature_index) {
+    const float value = patch_features[batch_feature_offset + static_cast<size_t>(patch_index) * static_cast<size_t>(feature_dim) +
+                                       static_cast<size_t>(feature_index)];
+    sum_sq += value * value;
+  }
+  raw_patch[static_cast<size_t>(batch_index) * static_cast<size_t>(patch_count) + static_cast<size_t>(patch_index)] =
+      sqrtf(fmaxf(sum_sq / static_cast<float>(feature_dim), 1.0e-6f));
+}
+
+__global__ void raw_patch_quantile_thresholds_kernel(const float* raw_patch,
+                                                     int plane,
+                                                     int padded_plane,
+                                                     float low_q,
+                                                     float high_q,
+                                                     float* low_threshold,
+                                                     float* high_threshold) {
+  extern __shared__ float sorted_values[];
+  const int batch_index = blockIdx.x;
+  const int tid = threadIdx.x;
+  const float* batch_input = raw_patch + static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+
+  for (int index = tid; index < padded_plane; index += blockDim.x) {
+    sorted_values[index] = index < plane ? batch_input[index] : kPositiveInfinity;
+  }
+  __syncthreads();
+
+  for (int k = 2; k <= padded_plane; k <<= 1) {
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      for (int index = tid; index < padded_plane; index += blockDim.x) {
+        const int partner = index ^ j;
+        if (partner > index && partner < padded_plane) {
+          const bool ascending = (index & k) == 0;
+          const float lhs = sorted_values[index];
+          const float rhs = sorted_values[partner];
+          if ((lhs > rhs) == ascending) {
+            sorted_values[index] = rhs;
+            sorted_values[partner] = lhs;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  if (tid == 0) {
+    const int low_rank = clamp_value(static_cast<int>(llroundf(low_q * static_cast<float>(plane - 1))), 0, plane - 1);
+    const int high_rank = clamp_value(static_cast<int>(llroundf(high_q * static_cast<float>(plane - 1))), 0, plane - 1);
+    low_threshold[batch_index] = sorted_values[low_rank];
+    high_threshold[batch_index] = sorted_values[high_rank];
+  }
+}
+
+__global__ void raw_patch_normalize_quantile_kernel(float* raw_patch,
+                                                    int total,
+                                                    int plane,
+                                                    const float* low_threshold,
+                                                    const float* high_threshold) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= total) {
+    return;
+  }
+  const int batch_index = index / plane;
+  const float low = low_threshold[batch_index];
+  const float high = high_threshold[batch_index];
+  const float denom = fmaxf(high - low, 1.0e-6f);
+  raw_patch[index] = fminf(fmaxf((raw_patch[index] - low) / denom, 0.0f), 1.0f);
+}
+
+__device__ __forceinline__ void bilinear_align_corners_false_coordinate(int dst_index,
+                                                                        int src_size,
+                                                                        int dst_size,
+                                                                        int& src0,
+                                                                        int& src1,
+                                                                        float& t) {
+  if (dst_size <= 0 || src_size <= 0) {
+    src0 = 0;
+    src1 = 0;
+    t = 0.0f;
+    return;
+  }
+  const float src = ((static_cast<float>(dst_index) + 0.5f) * static_cast<float>(src_size) / static_cast<float>(dst_size)) - 0.5f;
+  src0 = static_cast<int>(floorf(src));
+  t = src - static_cast<float>(src0);
+  if (src0 < 0) {
+    src0 = 0;
+    src1 = 0;
+    t = 0.0f;
+    return;
+  }
+  src1 = src0 + 1;
+  if (src1 >= src_size) {
+    src1 = src_size - 1;
+    if (src0 >= src_size - 1) {
+      src0 = src_size - 1;
+      t = 0.0f;
+    }
+  }
+}
+
+__global__ void resize_bilinear_batch_kernel(const float* input,
+                                             int batch_size,
+                                             int src_rows,
+                                             int src_cols,
+                                             int dst_rows,
+                                             int dst_cols,
+                                             float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = dst_rows * dst_cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int dst_row = local_index / dst_cols;
+  const int dst_col = local_index % dst_cols;
+  int src_row0 = 0;
+  int src_row1 = 0;
+  int src_col0 = 0;
+  int src_col1 = 0;
+  float row_t = 0.0f;
+  float col_t = 0.0f;
+  bilinear_align_corners_false_coordinate(dst_row, src_rows, dst_rows, src_row0, src_row1, row_t);
+  bilinear_align_corners_false_coordinate(dst_col, src_cols, dst_cols, src_col0, src_col1, col_t);
+
+  const size_t input_batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols);
+  const float v00 = input[input_batch_offset + flat_index(src_cols, src_row0, src_col0)];
+  const float v01 = input[input_batch_offset + flat_index(src_cols, src_row0, src_col1)];
+  const float v10 = input[input_batch_offset + flat_index(src_cols, src_row1, src_col0)];
+  const float v11 = input[input_batch_offset + flat_index(src_cols, src_row1, src_col1)];
+  const float top = (1.0f - col_t) * v00 + col_t * v01;
+  const float bottom = (1.0f - col_t) * v10 + col_t * v11;
+  output[idx] = (1.0f - row_t) * top + row_t * bottom;
+}
+
+__global__ void project_aligned_maps_to_output_kernel(const float* aligned_maps,
+                                                      int batch_size,
+                                                      int aligned_rows,
+                                                      int aligned_cols,
+                                                      int output_rows,
+                                                      int output_cols,
+                                                      float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = output_rows * output_cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / output_cols;
+  const int col = local_index % output_cols;
+  float value = 0.0f;
+  if (row < aligned_rows && col < aligned_cols) {
+    const size_t aligned_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(aligned_rows) * static_cast<size_t>(aligned_cols);
+    value = aligned_maps[aligned_offset + flat_index(aligned_cols, row, col)];
+  }
+  output[idx] = value;
+}
+
+__global__ void expand_valid_row_mask_to_bool_kernel(const uint8_t* valid_row_mask,
+                                                     int batch_size,
+                                                     int rows,
+                                                     int cols,
+                                                     bool* valid_mask) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / cols;
+  valid_mask[idx] = valid_row_mask[static_cast<size_t>(batch_index) * static_cast<size_t>(rows) + static_cast<size_t>(row)] != 0;
+}
+
+__global__ void fill_bool_kernel(bool* values, int total, bool value) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < total) {
+    values[idx] = value;
+  }
+}
+
+__global__ void threshold_normalize_batch_kernel(const float* input,
+                                                 int total,
+                                                 int plane,
+                                                 const float* low_threshold,
+                                                 const float* high_threshold,
+                                                 float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  const int batch_index = idx / plane;
+  const float low = low_threshold[batch_index];
+  const float high = high_threshold[batch_index];
+  const float denom = fmaxf(high - low, 1.0e-6f);
+  output[idx] = fminf(fmaxf((input[idx] - low) / denom, 0.0f), 1.0f);
+}
+
+__global__ void masked_minmax_reduce_kernel(const float* input,
+                                            const bool* valid_mask,
+                                            int plane,
+                                            float* output_low,
+                                            float* output_high) {
+  __shared__ float shared_low[256];
+  __shared__ float shared_high[256];
+  const int batch_index = blockIdx.x;
+  const int tid = threadIdx.x;
+  float local_low = kPositiveInfinity;
+  float local_high = -kPositiveInfinity;
+  bool found = false;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  for (int index = tid; index < plane; index += blockDim.x) {
+    if (!valid_mask[batch_offset + static_cast<size_t>(index)]) {
+      continue;
+    }
+    const float value = input[batch_offset + static_cast<size_t>(index)];
+    local_low = fminf(local_low, value);
+    local_high = fmaxf(local_high, value);
+    found = true;
+  }
+  shared_low[tid] = found ? local_low : kPositiveInfinity;
+  shared_high[tid] = found ? local_high : -kPositiveInfinity;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared_low[tid] = fminf(shared_low[tid], shared_low[tid + stride]);
+      shared_high[tid] = fmaxf(shared_high[tid], shared_high[tid + stride]);
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    output_low[batch_index] = isfinite(shared_low[0]) ? shared_low[0] : 0.0f;
+    output_high[batch_index] = isfinite(shared_high[0]) ? shared_high[0] : 1.0f;
+  }
+}
+
+__global__ void masked_minmax_normalize_kernel(const float* input,
+                                               const bool* valid_mask,
+                                               int total,
+                                               int plane,
+                                               const float* low_threshold,
+                                               const float* high_threshold,
+                                               float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  if (!valid_mask[idx]) {
+    output[idx] = 0.0f;
+    return;
+  }
+  const int batch_index = idx / plane;
+  const float low = low_threshold[batch_index];
+  const float high = high_threshold[batch_index];
+  const float denom = fmaxf(high - low, 1.0e-6f);
+  output[idx] = fminf(fmaxf((input[idx] - low) / denom, 0.0f), 1.0f);
+}
+
+__global__ void elementwise_multiply_kernel(const float* lhs, const float* rhs, int total, float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < total) {
+    output[idx] = lhs[idx] * rhs[idx];
+  }
+}
+
+__global__ void elementwise_abs_diff_kernel(const float* lhs, const float* rhs, int total, float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < total) {
+    output[idx] = fabsf(lhs[idx] - rhs[idx]);
+  }
+}
+
+__global__ void elementwise_abs_kernel(float* values, int total) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < total) {
+    values[idx] = fabsf(values[idx]);
+  }
+}
+
+__global__ void elementwise_subtract_scaled_kernel(const float* lhs,
+                                                   const float* rhs,
+                                                   float rhs_scale,
+                                                   int total,
+                                                   float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < total) {
+    output[idx] = lhs[idx] - rhs_scale * rhs[idx];
+  }
+}
+
+__global__ void affine_clamp01_kernel(float* values, int total, float bias, float scale) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < total) {
+    values[idx] = fminf(fmaxf((values[idx] + bias) * scale, 0.0f), 1.0f);
+  }
+}
+
+__global__ void combine_gate_kernel(const float* keep_freq,
+                                    const float* residual_gate,
+                                    int total,
+                                    float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < total) {
+    output[idx] = keep_freq[idx] * (0.35f + 0.65f * residual_gate[idx]);
+  }
+}
+
+__global__ void convolve_rows_batch_kernel(const float* input,
+                                           int batch_size,
+                                           int rows,
+                                           int cols,
+                                           const float* kernel,
+                                           int kernel_len,
+                                           float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+  const int radius = kernel_len / 2;
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / cols;
+  const int col = local_index % cols;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  float sum = 0.0f;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const int src_row = clamp_value(row + offset, 0, rows - 1);
+    sum += input[batch_offset + flat_index(cols, src_row, col)] * kernel[static_cast<size_t>(offset + radius)];
+  }
+  output[idx] = sum;
+}
+
+__global__ void convolve_cols_batch_kernel(const float* input,
+                                           int batch_size,
+                                           int rows,
+                                           int cols,
+                                           const float* kernel,
+                                           int kernel_len,
+                                           float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+  const int radius = kernel_len / 2;
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / cols;
+  const int col = local_index % cols;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  float sum = 0.0f;
+  for (int offset = -radius; offset <= radius; ++offset) {
+    const int src_col = clamp_value(col + offset, 0, cols - 1);
+    sum += input[batch_offset + flat_index(cols, row, src_col)] * kernel[static_cast<size_t>(offset + radius)];
+  }
+  output[idx] = sum;
+}
+
+__global__ void threshold_mask_kernel(const float* keep_freq,
+                                      const float* keep_res,
+                                      const float* combined_score,
+                                      const bool* valid_mask,
+                                      int total,
+                                      int plane,
+                                      const float* seed_freq_threshold,
+                                      const float* seed_res_threshold,
+                                      const float* combined_threshold,
+                                      float combined_scale,
+                                      uint8_t* output_mask) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  const int batch_index = idx / plane;
+  const bool keep = valid_mask[idx] &&
+                    keep_freq[idx] >= seed_freq_threshold[batch_index] &&
+                    keep_res[idx] >= seed_res_threshold[batch_index] &&
+                    combined_score[idx] >= combined_threshold[batch_index] * combined_scale;
+  output_mask[idx] = keep ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+}
+
+__global__ void binary_dilate_rect_batch_kernel(const uint8_t* input,
+                                                int batch_size,
+                                                int rows,
+                                                int cols,
+                                                int kernel_rows,
+                                                int kernel_cols,
+                                                uint8_t* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+  const int row_radius = kernel_rows / 2;
+  const int col_radius = kernel_cols / 2;
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / cols;
+  const int col = local_index % cols;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  uint8_t value = 0;
+  for (int row_offset = -row_radius; row_offset <= row_radius && value == 0; ++row_offset) {
+    const int src_row = clamp_value(row + row_offset, 0, rows - 1);
+    for (int col_offset = -col_radius; col_offset <= col_radius; ++col_offset) {
+      const int src_col = clamp_value(col + col_offset, 0, cols - 1);
+      if (input[batch_offset + flat_index(cols, src_row, src_col)] != 0) {
+        value = 1;
+        break;
+      }
+    }
+  }
+  output[idx] = value;
+}
+
+__global__ void binary_erode_rect_batch_kernel(const uint8_t* input,
+                                               int batch_size,
+                                               int rows,
+                                               int cols,
+                                               int kernel_rows,
+                                               int kernel_cols,
+                                               uint8_t* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+  const int row_radius = kernel_rows / 2;
+  const int col_radius = kernel_cols / 2;
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / cols;
+  const int col = local_index % cols;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  uint8_t value = 1;
+  for (int row_offset = -row_radius; row_offset <= row_radius && value != 0; ++row_offset) {
+    const int src_row = clamp_value(row + row_offset, 0, rows - 1);
+    for (int col_offset = -col_radius; col_offset <= col_radius; ++col_offset) {
+      const int src_col = clamp_value(col + col_offset, 0, cols - 1);
+      if (input[batch_offset + flat_index(cols, src_row, src_col)] == 0) {
+        value = 0;
+        break;
+      }
+    }
+  }
+  output[idx] = value;
+}
+
+__global__ void apply_valid_mask_u8_kernel(const uint8_t* input,
+                                           const bool* valid_mask,
+                                           int total,
+                                           uint8_t* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < total) {
+    output[idx] = valid_mask[idx] ? input[idx] : static_cast<uint8_t>(0);
+  }
+}
+
+__global__ void u8_to_float_with_valid_mask_kernel(const uint8_t* input,
+                                                   const bool* valid_mask,
+                                                   int total,
+                                                   float* output) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < total) {
+    output[idx] = valid_mask[idx] ? static_cast<float>(input[idx]) : 0.0f;
+  }
+}
+
+__global__ void fill_holes_init_labels_kernel(const uint8_t* mask,
+                                              int batch_size,
+                                              int rows,
+                                              int cols,
+                                              int* labels) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+  const int local_index = idx % plane;
+  labels[idx] = mask[idx] == 0 ? (local_index + 1) : 0;
+}
+
+__device__ __forceinline__ int fill_holes_find_root_device(const int* parents,
+                                                           size_t batch_offset,
+                                                           int label) {
+  int current = label;
+  while (current > 0) {
+    const int parent = parents[batch_offset + static_cast<size_t>(current - 1)];
+    if (parent <= 0 || parent == current) {
+      return current;
+    }
+    current = parent;
+  }
+  return 0;
+}
+
+__global__ void fill_holes_hook_neighbors_kernel(const uint8_t* mask,
+                                                 int batch_size,
+                                                 int rows,
+                                                 int cols,
+                                                 int* parents) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int plane = rows * cols;
   const int total = batch_size * plane;
@@ -675,25 +1809,7 @@ __global__ void fill_holes_init_kernel(const uint8_t* mask,
     return;
   }
 
-  const int local_index = idx % plane;
-  const int row = local_index / cols;
-  const int col = local_index % cols;
-  const uint8_t bg = mask[idx] == 0 ? 1 : 0;
-  background[idx] = bg;
-  exterior[idx] = (bg != 0 && (row == 0 || row == rows - 1 || col == 0 || col == cols - 1)) ? 1 : 0;
-}
-
-__global__ void fill_holes_expand_kernel(const uint8_t* background,
-                                         const uint8_t* current,
-                                         int batch_size,
-                                         int rows,
-                                         int cols,
-                                         uint8_t* next,
-                                         uint32_t* changed) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int plane = rows * cols;
-  const int total = batch_size * plane;
-  if (idx >= total) {
+  if (mask[idx] != 0) {
     return;
   }
 
@@ -702,43 +1818,213 @@ __global__ void fill_holes_expand_kernel(const uint8_t* background,
   const int row = local_index / cols;
   const int col = local_index % cols;
   const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  int root = fill_holes_find_root_device(parents, batch_offset, local_index + 1);
 
-  uint8_t value = current[idx];
-  if (value == 0 && background[idx] != 0) {
-    for (int d_row = -1; d_row <= 1 && value == 0; ++d_row) {
-      const int src_row = row + d_row;
-      if (src_row < 0 || src_row >= rows) {
+  for (int d_row = -1; d_row <= 0; ++d_row) {
+    const int src_row = row + d_row;
+    if (src_row < 0 || src_row >= rows) {
+      continue;
+    }
+    const int d_col_begin = (d_row == 0) ? -1 : -1;
+    const int d_col_end = (d_row == 0) ? -1 : 1;
+    for (int d_col = d_col_begin; d_col <= d_col_end; ++d_col) {
+      const int src_col = col + d_col;
+      if (src_col < 0 || src_col >= cols) {
         continue;
       }
-      for (int d_col = -1; d_col <= 1; ++d_col) {
-        const int src_col = col + d_col;
-        if (src_col < 0 || src_col >= cols) {
-          continue;
-        }
-        if (current[batch_offset + flat_index(cols, src_row, src_col)] != 0) {
-          value = 1;
-          break;
+      const size_t neighbor = batch_offset + flat_index(cols, src_row, src_col);
+      if (mask[neighbor] == 0) {
+        const int neighbor_root = fill_holes_find_root_device(parents,
+                                                              batch_offset,
+                                                              flat_index(cols, src_row, src_col) + 1);
+        if (neighbor_root > 0 && neighbor_root != root) {
+          const int low = min(root, neighbor_root);
+          const int high = max(root, neighbor_root);
+          atomicMin(&parents[batch_offset + static_cast<size_t>(high - 1)], low);
+          root = low;
         }
       }
     }
   }
+}
 
-  next[idx] = value;
-  if (value != current[idx]) {
-    atomicExch(changed, 1U);
+__global__ void fill_holes_compress_labels_kernel(const uint8_t* mask,
+                                                  int batch_size,
+                                                  int rows,
+                                                  int cols,
+                                                  int* parents) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total || mask[idx] != 0) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  const int label = parents[idx];
+  if (label <= 0) {
+    return;
+  }
+  parents[idx] = fill_holes_find_root_device(parents, batch_offset, label);
+}
+
+__global__ void fill_holes_mark_boundary_kernel(const uint8_t* mask,
+                                                const int* labels,
+                                                int batch_size,
+                                                int rows,
+                                                int cols,
+                                                uint32_t* boundary_touch) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total || mask[idx] != 0) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / cols;
+  const int col = local_index % cols;
+  if (row != 0 && row != rows - 1 && col != 0 && col != cols - 1) {
+    return;
+  }
+
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  const int root = fill_holes_find_root_device(labels, batch_offset, labels[idx]);
+  if (root > 0) {
+    atomicExch(&boundary_touch[batch_offset + static_cast<size_t>(root - 1)], 1U);
   }
 }
 
 __global__ void fill_holes_finalize_kernel(const uint8_t* mask,
-                                           const uint8_t* background,
-                                           const uint8_t* exterior,
-                                           int total,
+                                           const int* labels,
+                                           const uint32_t* boundary_touch,
+                                           int batch_size,
+                                           int rows,
+                                           int cols,
                                            uint8_t* output) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
   if (idx >= total) {
     return;
   }
-  output[idx] = (mask[idx] != 0 || (background[idx] != 0 && exterior[idx] == 0)) ? 1 : 0;
+
+  if (mask[idx] != 0) {
+    output[idx] = 1;
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  const int root = fill_holes_find_root_device(labels, batch_offset, labels[idx]);
+  output[idx] = (root > 0 && boundary_touch[batch_offset + static_cast<size_t>(root - 1)] == 0U) ? 1 : 0;
+}
+
+__global__ void threshold_histogram_triplet_kernel(const float* input_a,
+                                                   const float* input_b,
+                                                   const float* input_c,
+                                                   const bool* valid_mask,
+                                                   int batch_size,
+                                                   int plane,
+                                                   int bin_count,
+                                                   uint32_t* histograms,
+                                                   uint32_t* valid_counts) {
+  const int batch_index = blockIdx.x;
+  if (batch_index >= batch_size) {
+    return;
+  }
+
+  extern __shared__ uint32_t shared_storage[];
+  uint32_t* shared_hist = shared_storage;
+  uint32_t* shared_valid_count = shared_hist + 3 * bin_count;
+  const int tid = threadIdx.x;
+  const int shared_hist_size = 3 * bin_count;
+  for (int index = tid; index < shared_hist_size; index += blockDim.x) {
+    shared_hist[index] = 0;
+  }
+  if (tid == 0) {
+    shared_valid_count[0] = 0;
+  }
+  __syncthreads();
+
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  const int tile_stride = gridDim.y * blockDim.x;
+  for (int local_index = blockIdx.y * blockDim.x + tid; local_index < plane; local_index += tile_stride) {
+    const size_t offset = batch_offset + static_cast<size_t>(local_index);
+    if (!valid_mask[offset]) {
+      continue;
+    }
+
+    atomicAdd(shared_valid_count, 1U);
+
+    const auto to_bin = [bin_count](float value) {
+      const float clamped = fminf(fmaxf(value, 0.0f), 1.0f);
+      const int bin = static_cast<int>(llroundf(clamped * static_cast<float>(bin_count - 1)));
+      return max(0, min(bin_count - 1, bin));
+    };
+
+    atomicAdd(&shared_hist[to_bin(input_a[offset])], 1U);
+    atomicAdd(&shared_hist[bin_count + to_bin(input_b[offset])], 1U);
+    atomicAdd(&shared_hist[2 * bin_count + to_bin(input_c[offset])], 1U);
+  }
+  __syncthreads();
+
+  const size_t histogram_batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(3 * bin_count);
+  for (int index = tid; index < shared_hist_size; index += blockDim.x) {
+    atomicAdd(&histograms[histogram_batch_offset + static_cast<size_t>(index)], shared_hist[index]);
+  }
+  if (tid == 0) {
+    atomicAdd(&valid_counts[batch_index], shared_valid_count[0]);
+  }
+}
+
+__global__ void threshold_histogram_finalize_kernel(const uint32_t* histograms,
+                                                    const uint32_t* valid_counts,
+                                                    int batch_size,
+                                                    int bin_count,
+                                                    float quantile_a,
+                                                    float quantile_b,
+                                                    float quantile_c,
+                                                    float fallback,
+                                                    float* output_a,
+                                                    float* output_b,
+                                                    float* output_c) {
+  const int batch_index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (batch_index >= batch_size) {
+    return;
+  }
+
+  const uint32_t count = valid_counts[batch_index];
+  if (count == 0) {
+    output_a[batch_index] = fallback;
+    output_b[batch_index] = fallback;
+    output_c[batch_index] = fallback;
+    return;
+  }
+
+  const uint32_t targets[3] = {
+      static_cast<uint32_t>(llroundf(static_cast<float>(count - 1) * fminf(fmaxf(quantile_a, 0.0f), 1.0f))) + 1U,
+      static_cast<uint32_t>(llroundf(static_cast<float>(count - 1) * fminf(fmaxf(quantile_b, 0.0f), 1.0f))) + 1U,
+      static_cast<uint32_t>(llroundf(static_cast<float>(count - 1) * fminf(fmaxf(quantile_c, 0.0f), 1.0f))) + 1U,
+  };
+
+  const size_t histogram_batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(3 * bin_count);
+  float* outputs[3] = {output_a, output_b, output_c};
+  for (int channel = 0; channel < 3; ++channel) {
+    uint32_t cumulative = 0;
+    int selected_bin = bin_count - 1;
+    const size_t channel_offset = histogram_batch_offset + static_cast<size_t>(channel * bin_count);
+    for (int bin = 0; bin < bin_count; ++bin) {
+      cumulative += histograms[channel_offset + static_cast<size_t>(bin)];
+      if (cumulative >= targets[channel]) {
+        selected_bin = bin;
+        break;
+      }
+    }
+    outputs[channel][batch_index] = static_cast<float>(selected_bin) / static_cast<float>(max(bin_count - 1, 1));
+  }
 }
 
 __global__ void component_filter_init_labels_kernel(const uint8_t* mask,
@@ -756,13 +2042,25 @@ __global__ void component_filter_init_labels_kernel(const uint8_t* mask,
   labels[idx] = mask[idx] != 0 ? (local_index + 1) : 0;
 }
 
-__global__ void component_filter_propagate_labels_kernel(const uint8_t* mask,
-                                                         const int* current,
-                                                         int batch_size,
-                                                         int rows,
-                                                         int cols,
-                                                         int* next,
-                                                         uint32_t* changed) {
+__device__ __forceinline__ int component_filter_find_root_device(const int* parents,
+                                                                 size_t batch_offset,
+                                                                 int label) {
+  int current = label;
+  while (current > 0) {
+    const int parent = parents[batch_offset + static_cast<size_t>(current - 1)];
+    if (parent <= 0 || parent == current) {
+      return current;
+    }
+    current = parent;
+  }
+  return 0;
+}
+
+__global__ void component_filter_hook_neighbors_kernel(const uint8_t* mask,
+                                                       int batch_size,
+                                                       int rows,
+                                                       int cols,
+                                                       int* parents) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int plane = rows * cols;
   const int total = batch_size * plane;
@@ -771,7 +2069,6 @@ __global__ void component_filter_propagate_labels_kernel(const uint8_t* mask,
   }
 
   if (mask[idx] == 0) {
-    next[idx] = 0;
     return;
   }
 
@@ -780,32 +2077,62 @@ __global__ void component_filter_propagate_labels_kernel(const uint8_t* mask,
   const int row = local_index / cols;
   const int col = local_index % cols;
   const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  int root = component_filter_find_root_device(parents, batch_offset, local_index + 1);
 
-  int best = current[idx];
-  for (int d_row = -1; d_row <= 1; ++d_row) {
+  for (int d_row = -1; d_row <= 0; ++d_row) {
     const int src_row = row + d_row;
     if (src_row < 0 || src_row >= rows) {
       continue;
     }
-    for (int d_col = -1; d_col <= 1; ++d_col) {
+    const int d_col_begin = (d_row == 0) ? -1 : -1;
+    const int d_col_end = (d_row == 0) ? -1 : 1;
+    for (int d_col = d_col_begin; d_col <= d_col_end; ++d_col) {
       const int src_col = col + d_col;
       if (src_col < 0 || src_col >= cols) {
         continue;
       }
+      if (d_row == 0 && d_col == 0) {
+        continue;
+      }
       const size_t neighbor = batch_offset + flat_index(cols, src_row, src_col);
       if (mask[neighbor] != 0) {
-        best = max(best, current[neighbor]);
+        const int neighbor_root = component_filter_find_root_device(parents,
+                                                                    batch_offset,
+                                                                    flat_index(cols, src_row, src_col) + 1);
+        if (neighbor_root > 0 && neighbor_root != root) {
+          const int low = min(root, neighbor_root);
+          const int high = max(root, neighbor_root);
+          atomicMin(&parents[batch_offset + static_cast<size_t>(high - 1)], low);
+          root = low;
+        }
       }
     }
   }
-
-  next[idx] = best;
-  if (best != current[idx]) {
-    atomicExch(changed, 1U);
-  }
 }
 
-__global__ void component_filter_count_labels_kernel(const int* labels,
+__global__ void component_filter_compress_labels_kernel(const uint8_t* mask,
+                                                        int batch_size,
+                                                        int rows,
+                                                        int cols,
+                                                        int* parents) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total || mask[idx] == 0) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  const int label = parents[idx];
+  if (label <= 0) {
+    return;
+  }
+  parents[idx] = component_filter_find_root_device(parents, batch_offset, label);
+}
+
+__global__ void component_filter_count_labels_kernel(const uint8_t* mask,
+                                                     const int* labels,
                                                      int batch_size,
                                                      int rows,
                                                      int cols,
@@ -816,11 +2143,15 @@ __global__ void component_filter_count_labels_kernel(const int* labels,
   if (idx >= total) {
     return;
   }
-  const int label = labels[idx];
-  if (label <= 0) {
+  if (mask[idx] == 0) {
     return;
   }
   const int batch_index = idx / plane;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  const int label = component_filter_find_root_device(labels, batch_offset, labels[idx]);
+  if (label <= 0) {
+    return;
+  }
   atomicAdd(&counts[batch_index * (plane + 1) + label], 1);
 }
 
@@ -843,7 +2174,8 @@ __global__ void component_filter_finalize_kernel(const uint8_t* mask,
     return;
   }
   const int batch_index = idx / plane;
-  const int label = labels[idx];
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  const int label = component_filter_find_root_device(labels, batch_offset, labels[idx]);
   output[idx] = (label > 0 && counts[batch_index * (plane + 1) + label] >= min_size) ? 1 : 0;
 }
 
@@ -1158,6 +2490,7 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   summary << "  \"selected_chunk_index\": " << selected_chunk_index << ",\n";
   summary << "  \"src_rows\": " << src_rows << ",\n";
   summary << "  \"src_cols\": " << src_cols << ",\n";
+  summary << "  \"runtime_backend_used\": \"" << json_escape(timing_profile.runtime_backend_used) << "\",\n";
   summary << "  \"operator_timing_ms\": {\n";
   summary << "    \"total_compute\": " << timing_profile.total_compute_ms << ",\n";
   summary << "    \"power_db\": " << timing_profile.power_db_ms << ",\n";
@@ -2858,7 +4191,7 @@ bool binary_fill_holes_cuda_batch_to_device(const uint8_t* mask_batch_device,
   const size_t plane = static_cast<size_t>(rows) * static_cast<size_t>(cols);
   const size_t total = static_cast<size_t>(batch_size) * plane;
   auto& scratch = fill_holes_cuda_scratch();
-  if (!scratch.ensure_capacity(total)) {
+  if (!scratch.ensure_capacity(total, total)) {
     return false;
   }
 
@@ -2866,51 +4199,128 @@ bool binary_fill_holes_cuda_batch_to_device(const uint8_t* mask_batch_device,
   const int threads = 256;
   const int blocks = static_cast<int>((total + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
 
-  fill_holes_init_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
-                                                          batch_size,
-                                                          rows,
-                                                          cols,
-                                                          scratch.background,
-                                                          scratch.grown_a);
+  fill_holes_init_labels_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
+                                                                 batch_size,
+                                                                 rows,
+                                                                 cols,
+                                                                 scratch.labels);
   if (cudaGetLastError() != cudaSuccess) {
     return false;
   }
 
-  uint8_t* current = scratch.grown_a;
-  uint8_t* next = scratch.grown_b;
-  const int max_iterations = std::max(1, rows + cols);
-  for (int iteration = 0; iteration < max_iterations; ++iteration) {
-    if (cudaMemsetAsync(scratch.changed, 0, sizeof(uint32_t), stream) != cudaSuccess) {
-      return false;
-    }
-    fill_holes_expand_kernel<<<blocks, threads, 0, stream>>>(scratch.background,
-                                                              current,
-                                                              batch_size,
-                                                              rows,
-                                                              cols,
-                                                              next,
-                                                              scratch.changed);
+  int union_rounds = 1;
+  for (int span = std::max(1, std::max(rows, cols)); span > 1; span = (span + 1) >> 1) {
+    ++union_rounds;
+  }
+  union_rounds += 2;
+
+  for (int round = 0; round < union_rounds; ++round) {
+    fill_holes_hook_neighbors_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
+                                                                      batch_size,
+                                                                      rows,
+                                                                      cols,
+                                                                      scratch.labels);
     if (cudaGetLastError() != cudaSuccess) {
       return false;
     }
-
-    uint32_t changed_host = 0;
-    if (cudaMemcpyAsync(&changed_host, scratch.changed, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
-        cudaStreamSynchronize(stream) != cudaSuccess) {
+    fill_holes_compress_labels_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
+                                                                       batch_size,
+                                                                       rows,
+                                                                       cols,
+                                                                       scratch.labels);
+    if (cudaGetLastError() != cudaSuccess) {
       return false;
-    }
-
-    std::swap(current, next);
-    if (changed_host == 0) {
-      break;
     }
   }
 
+  if (cudaMemsetAsync(scratch.boundary_touch, 0, total * sizeof(uint32_t), stream) != cudaSuccess) {
+    return false;
+  }
+  fill_holes_mark_boundary_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
+                                                                   scratch.labels,
+                                                                   batch_size,
+                                                                   rows,
+                                                                   cols,
+                                                                   scratch.boundary_touch);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
   fill_holes_finalize_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
-                                                              scratch.background,
-                                                              current,
-                                                              static_cast<int>(total),
+                                                              scratch.labels,
+                                                              scratch.boundary_touch,
+                                                              batch_size,
+                                                              rows,
+                                                              cols,
                                                               output_mask_batch_device);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool extract_masked_quantile_thresholds_cuda_batch_to_device(const float* input_a_batch_device,
+                                                             const float* input_b_batch_device,
+                                                             const float* input_c_batch_device,
+                                                             const bool* valid_mask_batch_device,
+                                                             int batch_size,
+                                                             int rows,
+                                                             int cols,
+                                                             int bin_count,
+                                                             float quantile_a,
+                                                             float quantile_b,
+                                                             float quantile_c,
+                                                             float fallback,
+                                                             float* output_threshold_a_device,
+                                                             float* output_threshold_b_device,
+                                                             float* output_threshold_c_device,
+                                                             cudaStream_t cuda_stream) {
+  if (input_a_batch_device == nullptr || input_b_batch_device == nullptr || input_c_batch_device == nullptr ||
+      valid_mask_batch_device == nullptr || output_threshold_a_device == nullptr || output_threshold_b_device == nullptr ||
+      output_threshold_c_device == nullptr || batch_size <= 0 || rows <= 0 || cols <= 0) {
+    return false;
+  }
+
+  bin_count = max(bin_count, 2);
+  const int plane = rows * cols;
+  const size_t histogram_count = static_cast<size_t>(batch_size) * static_cast<size_t>(3 * bin_count);
+  auto& scratch = threshold_histogram_cuda_scratch();
+  if (!scratch.ensure_capacity(histogram_count, static_cast<size_t>(batch_size))) {
+    return false;
+  }
+
+  cudaStream_t stream = cuda_stream != nullptr ? cuda_stream : cudaStreamPerThread;
+  if (cudaMemsetAsync(scratch.histograms, 0, histogram_count * sizeof(uint32_t), stream) != cudaSuccess ||
+      cudaMemsetAsync(scratch.valid_counts, 0, static_cast<size_t>(batch_size) * sizeof(uint32_t), stream) != cudaSuccess) {
+    return false;
+  }
+
+  const int threads = 256;
+  const int tile_blocks = max(1, min(16, (plane + threads - 1) / threads));
+  const dim3 grid(static_cast<unsigned int>(batch_size), static_cast<unsigned int>(tile_blocks), 1U);
+  const size_t shared_bytes = static_cast<size_t>(3 * bin_count + 1) * sizeof(uint32_t);
+  threshold_histogram_triplet_kernel<<<grid, threads, shared_bytes, stream>>>(input_a_batch_device,
+                                                                               input_b_batch_device,
+                                                                               input_c_batch_device,
+                                                                               valid_mask_batch_device,
+                                                                               batch_size,
+                                                                               plane,
+                                                                               bin_count,
+                                                                               scratch.histograms,
+                                                                               scratch.valid_counts);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  const int finalize_blocks = (batch_size + threads - 1) / threads;
+  threshold_histogram_finalize_kernel<<<finalize_blocks, threads, 0, stream>>>(scratch.histograms,
+                                                                                scratch.valid_counts,
+                                                                                batch_size,
+                                                                                bin_count,
+                                                                                quantile_a,
+                                                                                quantile_b,
+                                                                                quantile_c,
+                                                                                fallback,
+                                                                                output_threshold_a_device,
+                                                                                output_threshold_b_device,
+                                                                                output_threshold_c_device);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2953,33 +4363,28 @@ bool keep_large_components_cuda_batch_to_device(const uint8_t* mask_batch_device
     return false;
   }
 
-  int* current = scratch.labels_a;
-  int* next = scratch.labels_b;
-  const int max_iterations = std::max(1, rows + cols);
-  for (int iteration = 0; iteration < max_iterations; ++iteration) {
-    if (cudaMemsetAsync(scratch.changed, 0, sizeof(uint32_t), stream) != cudaSuccess) {
-      return false;
-    }
-    component_filter_propagate_labels_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
-                                                                              current,
-                                                                              batch_size,
-                                                                              rows,
-                                                                              cols,
-                                                                              next,
-                                                                              scratch.changed);
+  int union_rounds = 1;
+  for (int span = std::max(1, std::max(rows, cols)); span > 1; span = (span + 1) >> 1) {
+    ++union_rounds;
+  }
+  union_rounds += 2;
+
+  for (int round = 0; round < union_rounds; ++round) {
+    component_filter_hook_neighbors_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
+                                                                            batch_size,
+                                                                            rows,
+                                                                            cols,
+                                                                            scratch.labels_a);
     if (cudaGetLastError() != cudaSuccess) {
       return false;
     }
-
-    uint32_t changed_host = 0;
-    if (cudaMemcpyAsync(&changed_host, scratch.changed, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
-        cudaStreamSynchronize(stream) != cudaSuccess) {
+    component_filter_compress_labels_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
+                                                                             batch_size,
+                                                                             rows,
+                                                                             cols,
+                                                                             scratch.labels_a);
+    if (cudaGetLastError() != cudaSuccess) {
       return false;
-    }
-
-    std::swap(current, next);
-    if (changed_host == 0) {
-      break;
     }
   }
 
@@ -2987,7 +4392,8 @@ bool keep_large_components_cuda_batch_to_device(const uint8_t* mask_batch_device
   if (cudaMemsetAsync(scratch.component_counts, 0, count_total * sizeof(int), stream) != cudaSuccess) {
     return false;
   }
-  component_filter_count_labels_kernel<<<blocks, threads, 0, stream>>>(current,
+  component_filter_count_labels_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
+                                                                        scratch.labels_a,
                                                                         batch_size,
                                                                         rows,
                                                                         cols,
@@ -2997,7 +4403,7 @@ bool keep_large_components_cuda_batch_to_device(const uint8_t* mask_batch_device
   }
 
   component_filter_finalize_kernel<<<blocks, threads, 0, stream>>>(mask_batch_device,
-                                                                    current,
+                                                                    scratch.labels_a,
                                                                     batch_size,
                                                                     rows,
                                                                     cols,
@@ -3005,6 +4411,570 @@ bool keep_large_components_cuda_batch_to_device(const uint8_t* mask_batch_device
                                                                     scratch.component_counts,
                                                                     output_mask_batch_device);
   return cudaGetLastError() == cudaSuccess;
+}
+
+bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_features_batch_device,
+                                                           int batch_size,
+                                                           int patch_rows,
+                                                           int patch_cols,
+                                                           int feature_dim,
+                                                           int aligned_rows,
+                                                           int aligned_cols,
+                                                           int output_rows,
+                                                           int output_cols,
+                                                           float positional_suppression,
+                                                           bool resized_full_chunk,
+                                                           float* output_score_device,
+                                                           cudaStream_t cuda_stream) {
+  const int patch_count = patch_rows * patch_cols;
+  if (batch_size <= 0 || patch_rows <= 0 || patch_cols <= 0 || feature_dim <= 0 || aligned_rows <= 0 || aligned_cols <= 0 ||
+      output_rows <= 0 || output_cols <= 0 || patch_features_batch_device == nullptr || output_score_device == nullptr || patch_count <= 0) {
+    return false;
+  }
+
+  const float clamped_suppression = clamp_value(positional_suppression, 0.0f, 1.0f);
+  const size_t xty_capacity = clamped_suppression > 0.0f
+                                  ? static_cast<size_t>(batch_size) * static_cast<size_t>(kRawPositionalBasisDim) * static_cast<size_t>(feature_dim)
+                                  : 0;
+  const size_t raw_patch_capacity = static_cast<size_t>(batch_size) * static_cast<size_t>(patch_count);
+  const size_t aligned_capacity = resized_full_chunk ? 0 : static_cast<size_t>(batch_size) * static_cast<size_t>(aligned_rows) * static_cast<size_t>(aligned_cols);
+  auto& scratch = raw_score_projection_cuda_scratch();
+  if (!scratch.ensure_capacity(xty_capacity, raw_patch_capacity, aligned_capacity)) {
+    return false;
+  }
+
+  cudaStream_t stream = cuda_stream != nullptr ? cuda_stream : cudaStreamPerThread;
+  constexpr int threads = 256;
+  const dim3 patch_grid(static_cast<unsigned int>((patch_count + threads - 1) / threads), static_cast<unsigned int>(batch_size), 1U);
+
+  if (clamped_suppression > 0.0f) {
+    const auto cache = get_positional_suppression_device_cache(patch_rows, patch_cols);
+    if (!cache || cache->patch_count != patch_count) {
+      return false;
+    }
+    const dim3 feature_grid(static_cast<unsigned int>((feature_dim + threads - 1) / threads),
+                            static_cast<unsigned int>(kRawPositionalBasisDim),
+                            static_cast<unsigned int>(batch_size));
+    raw_positional_xty_kernel<<<feature_grid, threads, 0, stream>>>(patch_features_batch_device,
+                                                                     cache->design_device,
+                                                                     patch_count,
+                                                                     feature_dim,
+                                                                     kRawPositionalBasisDim,
+                                                                     scratch.xty);
+    if (cudaGetLastError() != cudaSuccess) {
+      return false;
+    }
+    raw_positional_beta_kernel<<<feature_grid, threads, 0, stream>>>(cache->inverse_gram_device,
+                                                                      scratch.xty,
+                                                                      feature_dim,
+                                                                      kRawPositionalBasisDim,
+                                                                      scratch.beta);
+    if (cudaGetLastError() != cudaSuccess) {
+      return false;
+    }
+    raw_patch_energy_kernel<<<patch_grid, threads, 0, stream>>>(patch_features_batch_device,
+                                                                 cache->design_device,
+                                                                 scratch.beta,
+                                                                 patch_count,
+                                                                 feature_dim,
+                                                                 kRawPositionalBasisDim,
+                                                                 clamped_suppression,
+                                                                 scratch.raw_patch);
+  } else {
+    raw_patch_energy_plain_kernel<<<patch_grid, threads, 0, stream>>>(patch_features_batch_device,
+                                                                       patch_count,
+                                                                       feature_dim,
+                                                                       scratch.raw_patch);
+  }
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  if (resized_full_chunk) {
+    const int output_total = batch_size * output_rows * output_cols;
+    const int output_blocks = (output_total + threads - 1) / threads;
+    resize_bilinear_batch_kernel<<<output_blocks, threads, 0, stream>>>(scratch.raw_patch,
+                                                                         batch_size,
+                                                                         patch_rows,
+                                                                         patch_cols,
+                                                                         output_rows,
+                                                                         output_cols,
+                                                                         output_score_device);
+    return cudaGetLastError() == cudaSuccess;
+  }
+
+  const int aligned_total = batch_size * aligned_rows * aligned_cols;
+  const int aligned_blocks = (aligned_total + threads - 1) / threads;
+  resize_bilinear_batch_kernel<<<aligned_blocks, threads, 0, stream>>>(scratch.raw_patch,
+                                                                        batch_size,
+                                                                        patch_rows,
+                                                                        patch_cols,
+                                                                        aligned_rows,
+                                                                        aligned_cols,
+                                                                        scratch.aligned_map);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  const int output_total = batch_size * output_rows * output_cols;
+  const int output_blocks = (output_total + threads - 1) / threads;
+  project_aligned_maps_to_output_kernel<<<output_blocks, threads, 0, stream>>>(scratch.aligned_map,
+                                                                                batch_size,
+                                                                                aligned_rows,
+                                                                                aligned_cols,
+                                                                                output_rows,
+                                                                                output_cols,
+                                                                                output_score_device);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool project_runtime_score_batch_to_device(const float* score_maps_batch_device,
+                                           int batch_size,
+                                           int runtime_rows,
+                                           int runtime_cols,
+                                           int aligned_rows,
+                                           int aligned_cols,
+                                           int output_rows,
+                                           int output_cols,
+                                           bool resized_full_chunk,
+                                           float* output_score_device,
+                                           cudaStream_t cuda_stream) {
+  if (batch_size <= 0 || runtime_rows <= 0 || runtime_cols <= 0 || aligned_rows <= 0 || aligned_cols <= 0 ||
+      output_rows <= 0 || output_cols <= 0 || score_maps_batch_device == nullptr || output_score_device == nullptr) {
+    return false;
+  }
+
+  const size_t aligned_capacity = resized_full_chunk ? 0 : static_cast<size_t>(batch_size) * static_cast<size_t>(aligned_rows) * static_cast<size_t>(aligned_cols);
+  auto& scratch = raw_score_projection_cuda_scratch();
+  if (!scratch.ensure_capacity(0, 0, aligned_capacity)) {
+    return false;
+  }
+
+  cudaStream_t stream = cuda_stream != nullptr ? cuda_stream : cudaStreamPerThread;
+  constexpr int threads = 256;
+  if (resized_full_chunk) {
+    const int output_total = batch_size * output_rows * output_cols;
+    const int output_blocks = (output_total + threads - 1) / threads;
+    resize_bilinear_batch_kernel<<<output_blocks, threads, 0, stream>>>(score_maps_batch_device,
+                                                                         batch_size,
+                                                                         runtime_rows,
+                                                                         runtime_cols,
+                                                                         output_rows,
+                                                                         output_cols,
+                                                                         output_score_device);
+    return cudaGetLastError() == cudaSuccess;
+  }
+
+  const int aligned_total = batch_size * aligned_rows * aligned_cols;
+  const int aligned_blocks = (aligned_total + threads - 1) / threads;
+  resize_bilinear_batch_kernel<<<aligned_blocks, threads, 0, stream>>>(score_maps_batch_device,
+                                                                        batch_size,
+                                                                        runtime_rows,
+                                                                        runtime_cols,
+                                                                        aligned_rows,
+                                                                        aligned_cols,
+                                                                        scratch.aligned_map);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  const int output_total = batch_size * output_rows * output_cols;
+  const int output_blocks = (output_total + threads - 1) / threads;
+  project_aligned_maps_to_output_kernel<<<output_blocks, threads, 0, stream>>>(scratch.aligned_map,
+                                                                                batch_size,
+                                                                                aligned_rows,
+                                                                                aligned_cols,
+                                                                                output_rows,
+                                                                                output_cols,
+                                                                                output_score_device);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_batch_device,
+                                                      const float* coherence_batch_device,
+                                                      int batch_size,
+                                                      int rows,
+                                                      int cols,
+                                                      const std::vector<uint8_t>& valid_row_mask_batch,
+                                                      bool use_fp16,
+                                                      int min_component_size,
+                                                      float* output_combined_score_device,
+                                                      float* output_final_mask_device,
+                                                      uint8_t* output_filled_mask_batch_device,
+                                                      uint8_t* output_component_filtered_mask_batch_device,
+                                                      cudaStream_t cuda_stream,
+                                                      CudaHybridStageTiming* stage_timing) {
+  (void)use_fp16;
+  if (batch_size <= 0 || rows <= 0 || cols <= 0 || dino_score_batch_device == nullptr || coherence_batch_device == nullptr ||
+      output_combined_score_device == nullptr || output_final_mask_device == nullptr ||
+      valid_row_mask_batch.size() != static_cast<size_t>(batch_size) * static_cast<size_t>(rows)) {
+    return false;
+  }
+
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  const size_t total_values = static_cast<size_t>(total);
+  const size_t total_row_mask = static_cast<size_t>(batch_size) * static_cast<size_t>(rows);
+  const auto envelope_row_kernel = gaussian_kernel_host(6.0);
+  const auto envelope_col_kernel = gaussian_kernel_host(1.4);
+  const auto base_row_kernel = gaussian_kernel_host(4.0);
+  const auto base_col_kernel = gaussian_kernel_host(1.0);
+  const auto residual_row_kernel = gaussian_kernel_host(2.0);
+  const auto residual_col_kernel = gaussian_kernel_host(0.8);
+  const auto curvature_row_kernel = gaussian_second_derivative_kernel_host(0.8);
+  const size_t kernel_capacity = std::max({envelope_row_kernel.size(),
+                                           envelope_col_kernel.size(),
+                                           base_row_kernel.size(),
+                                           base_col_kernel.size(),
+                                           residual_row_kernel.size(),
+                                           residual_col_kernel.size(),
+                                           curvature_row_kernel.size()});
+  auto& scratch = hybrid_pipeline_cuda_scratch();
+  if (!scratch.ensure_capacity(total_values, static_cast<size_t>(batch_size), kernel_capacity, total_row_mask, total_values)) {
+    return false;
+  }
+
+  cudaStream_t stream = cuda_stream != nullptr ? cuda_stream : cudaStreamPerThread;
+  constexpr int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  auto check_launch = [&]() {
+    return cudaGetLastError() == cudaSuccess;
+  };
+  auto sync_if_timed = [&]() {
+    return stage_timing == nullptr || cudaStreamSynchronize(stream) == cudaSuccess;
+  };
+  auto masked_normalize = [&](const float* input, float* output) -> bool {
+    masked_minmax_reduce_kernel<<<batch_size, threads, 0, stream>>>(input,
+                                                                    scratch.valid_mask,
+                                                                    plane,
+                                                                    scratch.thresh0,
+                                                                    scratch.thresh1);
+    if (!check_launch()) {
+      return false;
+    }
+    masked_minmax_normalize_kernel<<<blocks, threads, 0, stream>>>(input,
+                                    scratch.valid_mask,
+                                    total,
+                                    plane,
+                                    scratch.thresh0,
+                                    scratch.thresh1,
+                                    output);
+    return check_launch();
+  };
+  auto blur_2d = [&](const float* input,
+                     float* temp,
+                     float* output,
+                     const std::vector<float>& row_kernel,
+                     const std::vector<float>& col_kernel) -> bool {
+    if (cudaMemcpyAsync(scratch.kernel_rows,
+                        row_kernel.data(),
+                        row_kernel.size() * sizeof(float),
+                        cudaMemcpyHostToDevice,
+                        stream) != cudaSuccess ||
+        cudaMemcpyAsync(scratch.kernel_cols,
+                        col_kernel.data(),
+                        col_kernel.size() * sizeof(float),
+                        cudaMemcpyHostToDevice,
+                        stream) != cudaSuccess) {
+      return false;
+    }
+    convolve_rows_batch_kernel<<<blocks, threads, 0, stream>>>(input,
+                                                                batch_size,
+                                                                rows,
+                                                                cols,
+                                                                scratch.kernel_rows,
+                                                                static_cast<int>(row_kernel.size()),
+                                                                temp);
+    if (!check_launch()) {
+      return false;
+    }
+    convolve_cols_batch_kernel<<<blocks, threads, 0, stream>>>(temp,
+                                                                batch_size,
+                                                                rows,
+                                                                cols,
+                                                                scratch.kernel_cols,
+                                                                static_cast<int>(col_kernel.size()),
+                                                                output);
+    return check_launch();
+  };
+
+  if (cudaMemcpyAsync(scratch.valid_row_mask,
+                      valid_row_mask_batch.data(),
+                      total_row_mask * sizeof(uint8_t),
+                      cudaMemcpyHostToDevice,
+                      stream) != cudaSuccess) {
+    return false;
+  }
+  expand_valid_row_mask_to_bool_kernel<<<blocks, threads, 0, stream>>>(scratch.valid_row_mask,
+                                                                        batch_size,
+                                                                        rows,
+                                                                        cols,
+                                                                        scratch.valid_mask);
+  if (!check_launch()) {
+    return false;
+  }
+  fill_bool_kernel<<<blocks, threads, 0, stream>>>(scratch.full_mask, total, true);
+  if (!check_launch()) {
+    return false;
+  }
+
+  const auto normalization_start = std::chrono::steady_clock::now();
+  if (!extract_masked_quantile_thresholds_cuda_batch_to_device(dino_score_batch_device,
+                                                               coherence_batch_device,
+                                                               coherence_batch_device,
+                                                               scratch.full_mask,
+                                                               batch_size,
+                                                               rows,
+                                                               cols,
+                                                               256,
+                                                               0.05f,
+                                                               0.05f,
+                                                               0.05f,
+                                                               0.0f,
+                                                               scratch.thresh0,
+                                                               scratch.thresh1,
+                                                               scratch.thresh2,
+                                                               stream) ||
+      !extract_masked_quantile_thresholds_cuda_batch_to_device(dino_score_batch_device,
+                                                               coherence_batch_device,
+                                                               coherence_batch_device,
+                                                               scratch.full_mask,
+                                                               batch_size,
+                                                               rows,
+                                                               cols,
+                                                               256,
+                                                               0.95f,
+                                                               0.99f,
+                                                               0.99f,
+                                                               1.0f,
+                                                               scratch.thresh3,
+                                                               scratch.thresh4,
+                                                               scratch.thresh5,
+                                                               stream)) {
+    return false;
+  }
+  threshold_normalize_batch_kernel<<<blocks, threads, 0, stream>>>(dino_score_batch_device,
+                                                                    total,
+                                                                    plane,
+                                                                    scratch.thresh0,
+                                                                    scratch.thresh3,
+                                                                    scratch.work0);
+  if (!check_launch()) {
+    return false;
+  }
+  threshold_normalize_batch_kernel<<<blocks, threads, 0, stream>>>(coherence_batch_device,
+                                                                    total,
+                                                                    plane,
+                                                                    scratch.thresh1,
+                                                                    scratch.thresh4,
+                                                                    scratch.work1);
+  if (!check_launch()) {
+    return false;
+  }
+  elementwise_multiply_kernel<<<blocks, threads, 0, stream>>>(scratch.work0, scratch.work1, total, scratch.work2);
+  if (!check_launch() || !masked_normalize(scratch.work2, scratch.work2) || !sync_if_timed()) {
+    return false;
+  }
+  if (stage_timing != nullptr) {
+    stage_timing->normalization_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - normalization_start).count();
+  }
+
+  const auto residual_stack_start = std::chrono::steady_clock::now();
+  if (!blur_2d(scratch.work2, scratch.work3, scratch.work4, envelope_row_kernel, envelope_col_kernel) ||
+      !masked_normalize(scratch.work4, scratch.work4) ||
+      !blur_2d(scratch.work2, scratch.work3, scratch.work0, base_row_kernel, base_col_kernel)) {
+    return false;
+  }
+  elementwise_abs_diff_kernel<<<blocks, threads, 0, stream>>>(scratch.work2, scratch.work0, total, scratch.work3);
+  if (!check_launch() ||
+      !blur_2d(scratch.work3, scratch.work0, scratch.work1, residual_row_kernel, residual_col_kernel) ||
+      !masked_normalize(scratch.work1, scratch.work1)) {
+    return false;
+  }
+  if (cudaMemcpyAsync(scratch.kernel_rows,
+                      curvature_row_kernel.data(),
+                      curvature_row_kernel.size() * sizeof(float),
+                      cudaMemcpyHostToDevice,
+                      stream) != cudaSuccess) {
+    return false;
+  }
+  convolve_rows_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.work2,
+                                                              batch_size,
+                                                              rows,
+                                                              cols,
+                                                              scratch.kernel_rows,
+                                                              static_cast<int>(curvature_row_kernel.size()),
+                                                              scratch.work3);
+  if (!check_launch()) {
+    return false;
+  }
+  elementwise_abs_kernel<<<blocks, threads, 0, stream>>>(scratch.work3, total);
+  if (!check_launch() || !masked_normalize(scratch.work3, scratch.work3)) {
+    return false;
+  }
+  elementwise_subtract_scaled_kernel<<<blocks, threads, 0, stream>>>(scratch.work4, scratch.work3, 0.90f, total, scratch.work5);
+  if (!check_launch() || !masked_normalize(scratch.work5, scratch.work5)) {
+    return false;
+  }
+  elementwise_subtract_scaled_kernel<<<blocks, threads, 0, stream>>>(scratch.work4, scratch.work1, 1.0f, total, scratch.work6);
+  if (!check_launch() || !masked_normalize(scratch.work6, scratch.work6)) {
+    return false;
+  }
+  affine_clamp01_kernel<<<blocks, threads, 0, stream>>>(scratch.work6, total, -0.30f, 1.0f / 0.70f);
+  if (!check_launch()) {
+    return false;
+  }
+  combine_gate_kernel<<<blocks, threads, 0, stream>>>(scratch.work5, scratch.work6, total, scratch.work7);
+  if (!check_launch() || !masked_normalize(scratch.work7, scratch.work7) || !sync_if_timed()) {
+    return false;
+  }
+  if (stage_timing != nullptr) {
+    stage_timing->residual_stack_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - residual_stack_start).count();
+  }
+
+  const auto threshold_extract_start = std::chrono::steady_clock::now();
+  if (!extract_masked_quantile_thresholds_cuda_batch_to_device(scratch.work5,
+                                                               scratch.work6,
+                                                               scratch.work7,
+                                                               scratch.valid_mask,
+                                                               batch_size,
+                                                               rows,
+                                                               cols,
+                                                               256,
+                                                               0.90f,
+                                                               0.82f,
+                                                               0.78f,
+                                                               1.0f,
+                                                               scratch.thresh0,
+                                                               scratch.thresh1,
+                                                               scratch.thresh2,
+                                                               stream) ||
+      !sync_if_timed()) {
+    return false;
+  }
+  if (stage_timing != nullptr) {
+    stage_timing->threshold_extract_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - threshold_extract_start).count();
+  }
+
+  threshold_mask_kernel<<<blocks, threads, 0, stream>>>(scratch.work5,
+                                                         scratch.work6,
+                                                         scratch.work7,
+                                                         scratch.valid_mask,
+                                                         total,
+                                                         plane,
+                                                         scratch.thresh0,
+                                                         scratch.thresh1,
+                                                         scratch.thresh2,
+                                                         0.85f,
+                                                         scratch.mask_a);
+  if (!check_launch()) {
+    return false;
+  }
+
+  const auto closing_start = std::chrono::steady_clock::now();
+  binary_dilate_rect_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_a,
+                                                                   batch_size,
+                                                                   rows,
+                                                                   cols,
+                                                                   7,
+                                                                   3,
+                                                                   scratch.mask_b);
+  if (!check_launch()) {
+    return false;
+  }
+  binary_erode_rect_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_b,
+                                                                  batch_size,
+                                                                  rows,
+                                                                  cols,
+                                                                  7,
+                                                                  3,
+                                                                  scratch.mask_a);
+  if (!check_launch() || !sync_if_timed()) {
+    return false;
+  }
+  if (stage_timing != nullptr) {
+    stage_timing->closing_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - closing_start).count();
+  }
+
+  const auto fill_holes_start = std::chrono::steady_clock::now();
+  if (!binary_fill_holes_cuda_batch_to_device(scratch.mask_a,
+                                              batch_size,
+                                              rows,
+                                              cols,
+                                              scratch.mask_b,
+                                              stream) ||
+      !sync_if_timed()) {
+    return false;
+  }
+  if (stage_timing != nullptr) {
+    stage_timing->fill_holes_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fill_holes_start).count();
+  }
+  if (output_filled_mask_batch_device != nullptr &&
+      cudaMemcpyAsync(output_filled_mask_batch_device,
+                      scratch.mask_b,
+                      total_values * sizeof(uint8_t),
+                      cudaMemcpyDeviceToDevice,
+                      stream) != cudaSuccess) {
+    return false;
+  }
+
+  apply_valid_mask_u8_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_b,
+                                                              scratch.valid_mask,
+                                                              total,
+                                                              scratch.mask_a);
+  if (!check_launch()) {
+    return false;
+  }
+
+  const auto component_filter_start = std::chrono::steady_clock::now();
+  if (!keep_large_components_cuda_batch_to_device(scratch.mask_a,
+                                                  batch_size,
+                                                  rows,
+                                                  cols,
+                                                  min_component_size,
+                                                  scratch.mask_b,
+                                                  stream) ||
+      !sync_if_timed()) {
+    return false;
+  }
+  if (stage_timing != nullptr) {
+    stage_timing->component_filter_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - component_filter_start).count();
+  }
+  if (output_component_filtered_mask_batch_device != nullptr &&
+      cudaMemcpyAsync(output_component_filtered_mask_batch_device,
+                      scratch.mask_b,
+                      total_values * sizeof(uint8_t),
+                      cudaMemcpyDeviceToDevice,
+                      stream) != cudaSuccess) {
+    return false;
+  }
+
+  const auto output_copy_start = std::chrono::steady_clock::now();
+  if (cudaMemcpyAsync(output_combined_score_device,
+                      scratch.work7,
+                      total_values * sizeof(float),
+                      cudaMemcpyDeviceToDevice,
+                      stream) != cudaSuccess) {
+    return false;
+  }
+  u8_to_float_with_valid_mask_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_b,
+                                                                      scratch.valid_mask,
+                                                                      total,
+                                                                      output_final_mask_device);
+  if (!check_launch() || !sync_if_timed()) {
+    return false;
+  }
+  if (stage_timing != nullptr) {
+    stage_timing->output_copy_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - output_copy_start).count();
+  }
+  return true;
 }
 
 bool compute_fast_directional_coherence_gate_gpu_batch_to_device(const float* corrected_batch_device,
@@ -3332,6 +5302,11 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Model script path",
              "TorchScript model path for the CUDA DINO runtime path.",
              std::string(""));
+  spec.param(tensorrt_engine_path_,
+             "tensorrt_engine_path",
+             "TensorRT engine path",
+             "TensorRT engine path for the CUDA DINO runtime path.",
+             std::string(""));
   spec.param(torchscript_init_mode_,
              "torchscript_init_mode",
              "TorchScript init mode",
@@ -3377,15 +5352,21 @@ void CudaDinoDetector::initialize() {
   if (!runtime_) {
     runtime_ = std::make_shared<DinoTorchRuntime>();
   }
-  if (is_truthy_backend_mode(backend_mode_.get()) && inference_backend_.get() == "torchscript" && !model_script_path_.get().empty()) {
+  const bool has_runtime_artifact =
+      (inference_backend_.get() == "torchscript" && !model_script_path_.get().empty()) ||
+      ((inference_backend_.get() == "tensorrt" || inference_backend_.get() == "tensorrt_engine") && !tensorrt_engine_path_.get().empty());
+  if (is_truthy_backend_mode(backend_mode_.get()) && has_runtime_artifact) {
     DinoTorchRuntimeConfig runtime_config;
+    const bool tensorrt_runtime =
+        (inference_backend_.get() == "tensorrt" || inference_backend_.get() == "tensorrt_engine");
     runtime_config.inference_backend = inference_backend_.get();
     runtime_config.model_script_path = model_script_path_.get();
+    runtime_config.tensorrt_engine_path = tensorrt_engine_path_.get();
     runtime_config.torchscript_init_mode = torchscript_init_mode_.get();
     runtime_config.torch_dtype = torch_dtype_.get();
     runtime_config.imagenet_mean = imagenet_mean_.get();
     runtime_config.imagenet_std = imagenet_std_.get();
-    runtime_config.return_patch_features = true;
+    runtime_config.return_patch_features = !tensorrt_runtime;
     runtime_config.return_final_mask_device = true;
     runtime_config.compute_power_score = false;
     runtime_config.frontend_correction_enable = false;
@@ -3774,21 +5755,28 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     bool raw_score_ready = false;
     std::string raw_score_source = "none";
     const float* debug_patch_features_batch_device = nullptr;
+    std::shared_ptr<void> debug_patch_features_batch_device_owner;
     int debug_patch_rows = 0;
     int debug_patch_cols = 0;
     int debug_feature_dim = 0;
     int debug_aligned_rows = 0;
     int debug_aligned_cols = 0;
     bool debug_resized_full_chunk = false;
-    if (is_truthy_backend_mode(backend_mode_.get()) && !model_script_path_.get().empty()) {
+    const bool runtime_artifact_ready =
+        (inference_backend_.get() == "torchscript" && !model_script_path_.get().empty()) ||
+        ((inference_backend_.get() == "tensorrt" || inference_backend_.get() == "tensorrt_engine") && !tensorrt_engine_path_.get().empty());
+    if (is_truthy_backend_mode(backend_mode_.get()) && runtime_artifact_ready) {
       DinoTorchRuntimeConfig runtime_config;
+      const bool tensorrt_runtime =
+          (inference_backend_.get() == "tensorrt" || inference_backend_.get() == "tensorrt_engine");
       runtime_config.inference_backend = inference_backend_.get();
       runtime_config.model_script_path = model_script_path_.get();
+      runtime_config.tensorrt_engine_path = tensorrt_engine_path_.get();
       runtime_config.torchscript_init_mode = torchscript_init_mode_.get();
       runtime_config.torch_dtype = torch_dtype_.get();
       runtime_config.imagenet_mean = imagenet_mean_.get();
       runtime_config.imagenet_std = imagenet_std_.get();
-      runtime_config.return_patch_features = true;
+      runtime_config.return_patch_features = !tensorrt_runtime;
       runtime_config.return_final_mask_device = true;
       runtime_config.compute_power_score = false;
       runtime_config.frontend_correction_enable = false;
@@ -3819,6 +5807,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         timing_profile.runtime_dino_score_ms = runtime_result.timing.dino_score_ms;
         const bool resized_full_chunk = runtime_result.input_resized_to_target;
         debug_patch_features_batch_device = runtime_result.patch_features_batch_device;
+        debug_patch_features_batch_device_owner = runtime_result.patch_features_batch_device_owner;
         debug_patch_rows = runtime_result.patch_rows;
         debug_patch_cols = runtime_result.patch_cols;
         debug_feature_dim = runtime_result.feature_dim;
@@ -3873,6 +5862,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
           meta->set("cuda_dino_patch_cols", static_cast<uint32_t>(std::max(0, runtime_result.patch_cols)));
           meta->set("cuda_dino_feature_dim", static_cast<uint32_t>(std::max(0, runtime_result.feature_dim)));
         }
+        timing_profile.runtime_backend_used = runtime_result.backend_used;
       } else {
         std::fprintf(stderr,
                      "[cuda_dino_detector] WARN: DINO runtime batch failed at stage='%s': %s\n",
@@ -3929,10 +5919,11 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                 hybrid_ready ? std::string("residual_veto_post_component_filter") : std::string("none"));
     }
 
-    const bool debug_projection_merge_enabled =
-        hybrid_ready && debug_mode_.get() && enable_debug_artifact_host_copy_.get();
-    if (debug_projection_merge_enabled) {
-      const bool write_operator_artifacts = !debug_artifact_output_dir_.get().empty();
+    const bool group_merge_enabled = hybrid_ready;
+    const bool write_operator_artifacts =
+      group_merge_enabled && debug_mode_.get() && enable_debug_artifact_host_copy_.get() &&
+      !debug_artifact_output_dir_.get().empty();
+    if (group_merge_enabled) {
       const auto debug_device_to_host_start_time = std::chrono::steady_clock::now();
       std::vector<float> corrected_batch;
       std::vector<float> coherence_gate_batch;
@@ -3988,6 +5979,8 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                               raw_score_debug_device,
                                                                                               buffers.processing_stream);
           if (raw_debug_ready) {
+            throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                                "cuda_dino_detector raw non-deweighted DINO debug compute failed");
             throw_if_cuda_error(cudaMemcpyAsync(raw_score_batch.data(),
                                                 raw_score_debug_device,
                                                 batch_elements * sizeof(float),

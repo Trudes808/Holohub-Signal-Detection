@@ -246,12 +246,31 @@ if not summary_path.exists():
     summary = {}
 else:
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if summary.get("artifact_contract") != "operator_live_cuda_dino_v1":
+        failures.append(
+            f"unexpected summary artifact_contract: {summary.get('artifact_contract')!r}"
+        )
+    runtime_backend_used = str(summary.get("runtime_backend_used", "") or "").strip()
+    if not runtime_backend_used:
+        failures.append("summary missing runtime_backend_used")
+    chunk_count = int(summary.get("chunk_count", 0) or 0)
+    if chunk_count <= 0:
+        failures.append(f"invalid chunk_count in summary: {chunk_count}")
+    selected_chunk_index = int(summary.get("selected_chunk_index", -1) or -1)
+    if selected_chunk_index < 0 or (chunk_count > 0 and selected_chunk_index >= chunk_count):
+        failures.append(
+            f"invalid selected_chunk_index in summary: {selected_chunk_index} for chunk_count={chunk_count}"
+        )
 
 if not chunk_debug_summary_path.exists():
     failures.append(f"missing chunk debug summary: {chunk_debug_summary_path}")
     debug_summary = {}
 else:
     debug_summary = json.loads(chunk_debug_summary_path.read_text(encoding="utf-8"))
+    if debug_summary.get("artifact_contract") != "operator_live_cuda_dino_v1":
+        failures.append(
+            f"unexpected chunk debug artifact_contract: {debug_summary.get('artifact_contract')!r}"
+        )
 
 required_summary_artifacts = [
     "projected_grouped_mask_npy",
@@ -290,6 +309,9 @@ manifest = {
     "output_dir": str(output_dir),
     "summary_json": str(summary_path),
     "chunk_debug_summary_json": str(chunk_debug_summary_path),
+    "runtime_backend_used": str(summary.get("runtime_backend_used", "") or ""),
+    "chunk_count": int(summary.get("chunk_count", 0) or 0),
+    "selected_chunk_index": int(summary.get("selected_chunk_index", -1) or -1),
     "summary_artifacts": {key: str(to_host_path(str(summary.get(key, "") or ""))) for key in required_summary_artifacts},
     "debug_artifacts": {key: str(to_host_path(str(debug_summary.get(key, "") or ""))) for key in required_debug_artifacts},
 }

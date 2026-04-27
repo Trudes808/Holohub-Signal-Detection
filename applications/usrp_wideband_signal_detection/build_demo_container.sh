@@ -20,12 +20,18 @@ CONTAINER_DINOV3_ROOT=${CONTAINER_DINOV3_ROOT:-/workspace/models/dinov3}
 CONTAINER_WEIGHT_PATH=${CONTAINER_WEIGHT_PATH:-${CONTAINER_DINOV3_ROOT}/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth}
 CONTAINER_TORCHSCRIPT_PATH=${CONTAINER_TORCHSCRIPT_PATH:-${CONTAINER_DINOV3_ROOT}/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts}
 CONTAINER_EXPORT_SCRIPT=${CONTAINER_EXPORT_SCRIPT:-/workspace/holohub/applications/usrp_wideband_signal_detection/export_dinov3_torchscript.py}
+CONTAINER_TRT_EXPORT_SCRIPT=${CONTAINER_TRT_EXPORT_SCRIPT:-/workspace/holohub/applications/usrp_wideband_signal_detection/export_dinov3_single_channel_trt.py}
+CONTAINER_TRT_ONNX_PATH=${CONTAINER_TRT_ONNX_PATH:-${CONTAINER_DINOV3_ROOT}/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.single_channel.onnx}
+CONTAINER_TRT_ENGINE_PATH=${CONTAINER_TRT_ENGINE_PATH:-${CONTAINER_DINOV3_ROOT}/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.single_channel.fp16.engine}
+EXPORT_TENSORRT_ENGINE_IN_CONTAINER=${EXPORT_TENSORRT_ENGINE_IN_CONTAINER:-1}
 PYTORCH_INDEX_URL=${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu126}
 PYTORCH_VERSION=${PYTORCH_VERSION:-2.10.0}
 TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.25.0}
 MATX_VERSION=${MATX_VERSION:-0.9.2}
 BUILD_APP_IN_CONTAINER=${BUILD_APP_IN_CONTAINER:-1}
 INSTALL_PYTHON_DEPS=${INSTALL_PYTHON_DEPS:-1}
+INSTALL_TENSORRT_IN_CONTAINER=${INSTALL_TENSORRT_IN_CONTAINER:-1}
+TENSORRT_APT_VERSION=${TENSORRT_APT_VERSION:-}
 SKIP_IMAGE_BUILD=${SKIP_IMAGE_BUILD:-0}
 ENSURE_VULKAN_RUNTIME=${ENSURE_VULKAN_RUNTIME:-1}
 DISPLAY_VALUE=${DISPLAY:-}
@@ -72,6 +78,35 @@ for libdir in \
 		ln -s libnvJitLink.so.12 "$libdir/libnvJitLink.so"
 	fi
 done'
+}
+
+ensure_tensorrt_tooling() {
+	run_in_container "set -euo pipefail
+if command -v trtexec >/dev/null 2>&1; then
+	exit 0
+fi
+apt-get update
+if [[ -n \"${TENSORRT_APT_VERSION}\" ]]; then
+	apt-get install -y --allow-downgrades --no-install-recommends \
+		libnvinfer-bin=${TENSORRT_APT_VERSION} \
+		libnvinfer-lean10=${TENSORRT_APT_VERSION} \
+		libnvinfer-dispatch10=${TENSORRT_APT_VERSION} \
+		libnvinfer-vc-plugin10=${TENSORRT_APT_VERSION} \
+		libnvinfer10=${TENSORRT_APT_VERSION} \
+		libnvinfer-headers-dev=${TENSORRT_APT_VERSION} \
+		libnvinfer-dev=${TENSORRT_APT_VERSION} \
+		libnvinfer-headers-plugin-dev=${TENSORRT_APT_VERSION} \
+		libnvinfer-plugin10=${TENSORRT_APT_VERSION} \
+		libnvinfer-plugin-dev=${TENSORRT_APT_VERSION} \
+		libnvinfer-lean-dev=${TENSORRT_APT_VERSION} \
+		libnvinfer-dispatch-dev=${TENSORRT_APT_VERSION} \
+		libnvinfer-vc-plugin-dev=${TENSORRT_APT_VERSION} \
+		libnvonnxparsers10=${TENSORRT_APT_VERSION} \
+		libnvonnxparsers-dev=${TENSORRT_APT_VERSION}
+else
+	apt-get install -y --no-install-recommends libnvinfer-bin libnvinfer-lean10 libnvinfer-dispatch10 libnvinfer-vc-plugin10 libnvinfer10 libnvinfer-headers-dev libnvinfer-dev libnvinfer-headers-plugin-dev libnvinfer-plugin10 libnvinfer-plugin-dev libnvinfer-lean-dev libnvinfer-dispatch-dev libnvinfer-vc-plugin-dev libnvonnxparsers10 libnvonnxparsers-dev
+fi
+"
 }
 
 require_network_build_deps() {
@@ -160,11 +195,13 @@ echo "Host coherent mask output: ${COHERENT_MASK_HOST_DIR}"
 
 sudo docker exec "${CONTAINER_NAME}" rm -rf "${CONTAINER_DINOV3_ROOT}"
 sudo docker exec "${CONTAINER_NAME}" mkdir -p "${CONTAINER_DINOV3_ROOT}/weights"
+sudo docker exec "${CONTAINER_NAME}" rm -rf /workspace/dinov3
 
 tar --exclude='./weights' -C "${HOST_DINOV3_ROOT}" -cf - . \
 	| sudo docker exec -i "${CONTAINER_NAME}" tar -xf - -C "${CONTAINER_DINOV3_ROOT}"
 
 sudo docker cp "${HOST_WEIGHT_PATH}" "${CONTAINER_NAME}:${CONTAINER_WEIGHT_PATH}"
+sudo docker exec "${CONTAINER_NAME}" ln -s "${CONTAINER_DINOV3_ROOT}" /workspace/dinov3
 
 echo "Verifying NVIDIA runtime inside ${CONTAINER_NAME}."
 run_in_container 'nvidia-smi'
@@ -172,8 +209,13 @@ run_in_container 'nvidia-smi'
 if [[ "${INSTALL_PYTHON_DEPS}" == "1" ]]; then
 	if ! run_in_container 'python3 -c "import torch, torchvision, ftfy, omegaconf, regex, submitit, termcolor, torchmetrics"' >/dev/null 2>&1; then
 		echo "Installing DINOv3 Python requirements into ${CONTAINER_NAME}."
-		run_in_container 'export PIP_BREAK_SYSTEM_PACKAGES=1 && python3 -m pip install --no-cache-dir ftfy omegaconf regex scikit-learn submitit termcolor torchmetrics'
+		run_in_container 'export PIP_BREAK_SYSTEM_PACKAGES=1 && python3 -m pip install --no-cache-dir ftfy omegaconf onnx onnxscript regex scikit-learn submitit termcolor torchmetrics'
 		install_pytorch_cuda_stack
+	fi
+
+	if ! run_in_container 'python3 -c "import onnx, onnxscript"' >/dev/null 2>&1; then
+		echo "Installing ONNX export dependencies into ${CONTAINER_NAME}."
+		run_in_container 'export PIP_BREAK_SYSTEM_PACKAGES=1 && python3 -m pip install --no-cache-dir onnx onnxscript'
 	fi
 
 	if ! sudo docker exec "${CONTAINER_NAME}" python3 - <<'PY'
@@ -222,6 +264,13 @@ else
 	echo "Skipping Vulkan runtime installation check because ENSURE_VULKAN_RUNTIME=${ENSURE_VULKAN_RUNTIME}."
 fi
 
+if [[ "${INSTALL_TENSORRT_IN_CONTAINER}" == "1" ]]; then
+	ensure_tensorrt_tooling
+	run_in_container 'command -v trtexec >/dev/null 2>&1'
+else
+	echo "Skipping TensorRT tooling installation because INSTALL_TENSORRT_IN_CONTAINER=${INSTALL_TENSORRT_IN_CONTAINER}."
+fi
+
 if ! run_in_container 'test -f /usr/local/lib/cmake/matx/matx-config.cmake'; then
 	install_matx
 fi
@@ -237,6 +286,19 @@ sudo docker exec "${CONTAINER_NAME}" python3 "${CONTAINER_EXPORT_SCRIPT}" \
 	--height 256 \
 	--width 512 \
 	--device cuda
+
+if [[ "${EXPORT_TENSORRT_ENGINE_IN_CONTAINER}" == "1" ]]; then
+	run_in_container "command -v trtexec >/dev/null 2>&1"
+	sudo docker exec "${CONTAINER_NAME}" python3 "${CONTAINER_TRT_EXPORT_SCRIPT}" \
+		--model-repo "${CONTAINER_DINOV3_ROOT}" \
+		--model-name dinov3_vitb16 \
+		--weights-path "${CONTAINER_WEIGHT_PATH}" \
+		--output-onnx "${CONTAINER_TRT_ONNX_PATH}" \
+		--output-engine "${CONTAINER_TRT_ENGINE_PATH}" \
+		--input-height 256 \
+		--input-width 512 \
+		--build-engine
+fi
 
 run_in_container "ls -lah ${CONTAINER_DINOV3_ROOT}/weights"
 
