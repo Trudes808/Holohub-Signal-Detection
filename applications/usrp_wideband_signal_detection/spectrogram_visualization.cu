@@ -827,6 +827,7 @@ void SpectrogramToHolovizOp::initialize() {
   Operator::initialize();
   // Create a dedicated CUDA stream for visualization rendering
   // so it never blocks the pipeline's CUDA stream
+  metadata_policy(holoscan::MetadataPolicy::kUpdate);  // ← add this
   auto result = cudaStreamCreateWithFlags(&vis_stream_, cudaStreamNonBlocking);
   if (result != cudaSuccess) {
     throw std::runtime_error(std::string("Failed to create vis_stream_: ") + cudaGetErrorString(result));
@@ -886,7 +887,8 @@ void SpectrogramToHolovizOp::stop() {
 
 void SpectrogramToHolovizOp::compute(InputContext& op_input,
                                      OutputContext& op_output,
-                                     ExecutionContext& context) {
+                                     ExecutionContext& context) { 
+
   auto input = op_input.receive<SpectrogramMessage>("in").value();
   const auto& tensor = std::get<0>(input);
   const auto stream = std::get<1>(input);
@@ -900,6 +902,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
   // Receive mask from coherent power detector if available
   auto mask_msg = op_input.receive<DetectorMaskMessage>("mask_in");
   if (mask_msg) {
+    printf("MASK RECEIVED: w=%d h=%d pixels=%zu\n", mask_msg->width, mask_msg->height, mask_msg->pixels.size());
     if (channel_states_.size() <= static_cast<size_t>(mask_msg->channel)) {
       channel_states_.resize(static_cast<size_t>(mask_msg->channel + 1));
     }
@@ -1030,17 +1033,21 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
     int snap_history_frames = history_frames_.get();
 
     render_task_ = [this,
-                    snapshot_channel_number,
-                    snapshot_dropped,
-                    snapshot_total,
-                    blue, red, alpha, red_lim,
-                    snap_db_floor, snap_db_ceil,
-                    snap_row_average_n,
-                    snap_width, snap_height,
-                    snap_tensor_rows, snap_tensor_cols,
-                    snap_history_frames]() mutable {
+                snapshot_channel_number,
+                snapshot_dropped,
+                snapshot_total,
+                blue, red, alpha, red_lim,
+                snap_db_floor, snap_db_ceil,
+                snap_row_average_n,
+                snap_width, snap_height,
+                snap_tensor_rows, snap_tensor_cols,
+                snap_history_frames]() mutable {
+
       // Sync vis_stream_ HERE — blocks background thread, NOT operator thread
       cudaStreamSynchronize(vis_stream_);
+
+      auto snapshot_overlay_available = channel_states_[static_cast<size_t>(snapshot_channel_number)].overlay_available;
+      auto snapshot_mask = channel_states_[static_cast<size_t>(snapshot_channel_number)].latest_mask;
 
       // pinned_host_buffer_ now has complete GPU data — run reduction on CPU
       auto grayscale = reduce_from_pinned_buffer(pinned_host_buffer_,
@@ -1055,6 +1062,8 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
       auto& state = channel_states_[static_cast<size_t>(snapshot_channel_number)];
       state.active = true;
       state.info.channel = snapshot_channel_number;
+      state.overlay_available = snapshot_overlay_available;
+      state.latest_mask = snapshot_mask;
 
       // Accumulate grayscale rows — average N frames before appending to history
       // This makes waterfall scroll slower but smoothly, no jumping
@@ -1079,7 +1088,6 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
         // Reset accumulator
         std::fill(state.row_accumulator.begin(), state.row_accumulator.end(), 0.0f);
         state.row_accumulator_count = 0;
-        // Append averaged row to history
         append_spectrogram_history(state, averaged, snap_width, snap_height, snap_history_frames);
         state.current_psd_trace = compute_psd_trace(averaged, snap_width, snap_height);
       } else {
@@ -1095,6 +1103,9 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
 
       int composite_width = 0;
       int composite_height = 0;
+      printf("RENDER: overlay_available=%d mask_pixels=%zu\n",
+             (int)channel_states_[static_cast<size_t>(snapshot_channel_number)].overlay_available,
+             channel_states_[static_cast<size_t>(snapshot_channel_number)].latest_mask.pixels.size());
       auto composed = compose_visualization_rgb(channel_states_,
                                                 blue,
                                                 red,
@@ -1576,9 +1587,16 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
       blit_rgb_nearest(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height, spectrogram_rgb, channel.history_width, history_rows);
     }
     draw_grid(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height);
-    if (channel.overlay_available) {
-      overlay_mask(canvas, output_width, output_height, panel_x, heatmap_y + channel_heat_height - channel.latest_frame_height, main_width, channel.latest_frame_height, channel.latest_mask, overlay_alpha);
-    }
+    // if (channel.overlay_available) {
+    //   overlay_mask(canvas, output_width, output_height, panel_x, heatmap_y + channel_heat_height - channel.latest_frame_height, main_width, channel.latest_frame_height, channel.latest_mask, overlay_alpha);
+    // }
+
+    if (channel.overlay_available && channel.latest_mask.width > 0 && channel.latest_mask.height > 0) {
+      overlay_mask(canvas, output_width, output_height,
+               panel_x, heatmap_y,
+               main_width, channel_heat_height,
+               channel.latest_mask, overlay_alpha);
+}
 
     // DINO confidence bar
     const int dino_bar_y = heatmap_y + channel_heat_height + 10;

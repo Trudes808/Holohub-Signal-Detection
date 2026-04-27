@@ -7787,7 +7787,49 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       : 0U;
   meta->set("coherent_final_mask_nonzero_pixels", coherent_final_mask_nonzero_pixels);
 
-  if (!timing_enabled) {
+  if (use_reference_backend) {
+    if (!pipeline_summary.final_mask.empty()) {
+      holoscan::ops::DetectorMaskMessage mask_msg;
+      mask_msg.pixels = binary_float_mask_to_u8(pipeline_summary.final_mask);
+      mask_msg.width = output_cols;
+      mask_msg.height = output_rows;
+      mask_msg.channel = channel_number;
+      // count nonzero pixels
+      int nonzero = 0;
+      for (auto p : mask_msg.pixels) nonzero += (p > 0 ? 1 : 0);
+      printf("MASK EMIT: width=%d height=%d nonzero=%d\n", mask_msg.width, mask_msg.height, nonzero);
+      op_output.emit(mask_msg, "mask_out");
+    }
+
+  } else {
+    auto& buffers = channel_buffers_[static_cast<size_t>(channel_number)];
+    if (buffers.scratch_mask_device != nullptr && buffers.mask_elements > 0) {
+      std::vector<uint8_t> raw(buffers.mask_elements);
+      cudaMemcpy(raw.data(), buffers.scratch_mask_device,
+                 buffers.mask_elements, cudaMemcpyDeviceToHost);
+      const int src_rows = 20480;
+      const int src_cols = 512;
+      const int dst_rows = 256;
+      const int dst_cols = 512;
+      holoscan::ops::DetectorMaskMessage mask_msg;
+      mask_msg.pixels.resize(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols));
+      for (int t = 0; t < dst_rows; ++t) {
+        for (int f = 0; f < dst_cols; ++f) {
+          const int src_f = (f * src_rows) / dst_cols;
+          const int src_t = (t * src_cols) / dst_rows;
+          const auto val = raw[static_cast<size_t>(src_f) * src_cols + src_t];
+          mask_msg.pixels[static_cast<size_t>(t) * dst_cols + f] = val ? 255 : 0;
+        }
+      }
+      int nz = 0; for (auto p : mask_msg.pixels) nz += (p > 0); printf("FAST MASK NZ=%d\n", nz);
+      mask_msg.width = dst_cols;
+      mask_msg.height = dst_rows;
+      mask_msg.channel = channel_number;
+      op_output.emit(mask_msg, "mask_out");
+    }
+  }
+
+    if (!timing_enabled) {
     return;
   }
 
@@ -7881,15 +7923,18 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   HOLOSCAN_LOG_INFO("{}", oss.str());
   stats = ChannelTimingStats {};
 
-  // Emit mask to visualization if available
-  if (!pipeline_summary.final_mask.empty()) {
-    holoscan::ops::DetectorMaskMessage mask_msg;
-    mask_msg.pixels = binary_float_mask_to_u8(pipeline_summary.final_mask);
-    mask_msg.width = output_cols;
-    mask_msg.height = output_rows;
-    mask_msg.channel = channel_number;
-    op_output.emit(mask_msg, "mask_out");
-  }
+  // // Emit mask to visualization if available
+  // if (!pipeline_summary.final_mask.empty()) {
+  //   holoscan::ops::DetectorMaskMessage mask_msg;
+  //   mask_msg.pixels = binary_float_mask_to_u8(pipeline_summary.final_mask);
+  //   mask_msg.width = output_cols;
+  //   mask_msg.height = output_rows;
+  //   mask_msg.channel = channel_number;
+  //   op_output.emit(mask_msg, "mask_out");
+  // }
+
+  // count nonzero pixel
+
 }
 
 }   // namespace holoscan::ops

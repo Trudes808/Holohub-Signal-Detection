@@ -386,6 +386,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       spectrogramVisualizerOp = make_operator<ops::SpectrogramToHolovizOp>(
         "spectrogramVisualizerOp",
         from_config("visualization.renderer"));
+        
       holovizOp = make_operator<ops::HolovizOp>(
         "holovizOp",
         from_config("visualization.holoviz"),

@@ -137,7 +137,29 @@ logger:
   log_interval: 5
 
 visualization:
-  enable: false
+  enable: true
+  renderer:
+    num_channels: 1
+    history_frames: 5
+    output_height: 256
+    output_width: 512
+    channel_filter: 0
+    tensor_name: "spectrogram"
+    blue_limit: 0.10
+    red_limit: 0.92
+    overlay_alpha: 0.9 #0.38
+    center_frequency_hz: 0.0
+    fft_size: 20480
+    dino_chunk_rows: 256
+    dino_chunk_cols: 512
+    db_floor: -22.0
+    db_ceil: 35.0
+    row_average_n: 4
+  holoviz:
+    width: 1280
+    height: 720
+    window_title: "USRP Wideband Spectrogram"
+    fullscreen: false
 
 spectrogram:
   num_channels: 2

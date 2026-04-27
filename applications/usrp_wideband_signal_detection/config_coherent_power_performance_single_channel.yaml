@@ -117,7 +117,7 @@ visualization:
     tensor_name: "spectrogram"
     blue_limit: 0.10
     red_limit: 0.92
-    overlay_alpha: 0.38
+    overlay_alpha: 0.7 #0.38
     center_frequency_hz: 0.0
     fft_size: 20480
     dino_chunk_rows: 256
@@ -199,10 +199,13 @@ dinov3_signal_detector:
 
 coherent_power_signal_detector:
   num_channels: 1
-  input_height: 250
-  input_width: 512 #20480
+  input_height: 250 #256
+  input_width: 20480 #512
   # Full-rate aggressive profile matching the active two-channel fast path,
   # restricted to channel 0 only.
+  fast_power_floor_db: 0.5
+  fast_power_span_db: 3.0
+  fast_score_threshold: 0.4
   emit_stride: 1
   log_detections: true
   fast_performance: true
@@ -230,7 +233,7 @@ coherent_power_signal_detector:
   coherence_power_support_q: 0.82
   coherence_power_q: 0.92
   min_component_size: 1
-  filter_detection_mask: false
+  filter_detection_mask: true
   grouping_seed_score_q: 0.72
   grouping_bridge_freq_px: 33
   grouping_bridge_time_px: 5
