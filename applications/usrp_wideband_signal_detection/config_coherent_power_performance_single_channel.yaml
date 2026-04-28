@@ -117,7 +117,11 @@ visualization:
     tensor_name: "spectrogram"
     blue_limit: 0.10
     red_limit: 0.92
+<<<<<<< Updated upstream
     overlay_alpha: 0.7 #0.38
+=======
+    overlay_alpha: 0.38
+>>>>>>> Stashed changes
     center_frequency_hz: 0.0
     fft_size: 20480
     dino_chunk_rows: 256
@@ -199,8 +203,13 @@ dinov3_signal_detector:
 
 coherent_power_signal_detector:
   num_channels: 1
+<<<<<<< Updated upstream
   input_height: 250 #256
   input_width: 20480 #512
+=======
+  input_height: 250
+  input_width: 512 #20480
+>>>>>>> Stashed changes
   # Full-rate aggressive profile matching the active two-channel fast path,
   # restricted to channel 0 only.
   fast_power_floor_db: 0.5
