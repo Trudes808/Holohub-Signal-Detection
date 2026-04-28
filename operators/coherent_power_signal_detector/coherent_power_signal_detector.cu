@@ -7923,7 +7923,6 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   HOLOSCAN_LOG_INFO("{}", oss.str());
   stats = ChannelTimingStats {};
 
-<<<<<<< Updated upstream
   // // Emit mask to visualization if available
   // if (!pipeline_summary.final_mask.empty()) {
   //   holoscan::ops::DetectorMaskMessage mask_msg;
@@ -7936,17 +7935,6 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
   // count nonzero pixel
 
-=======
-  // Emit mask to visualization if available
-  if (!pipeline_summary.final_mask.empty()) {
-    holoscan::ops::DetectorMaskMessage mask_msg;
-    mask_msg.pixels = binary_float_mask_to_u8(pipeline_summary.final_mask);
-    mask_msg.width = output_cols;
-    mask_msg.height = output_rows;
-    mask_msg.channel = channel_number;
-    op_output.emit(mask_msg, "mask_out");
-  }
->>>>>>> Stashed changes
 }
 
 }   // namespace holoscan::ops
