@@ -202,6 +202,51 @@ struct VisualizationFrameInfo {
   std::string detector_label = "Dinov3";
 };
 
+struct VisualizationRect {
+  float x = 0.0f;
+  float y = 0.0f;
+  float width = 0.0f;
+  float height = 0.0f;
+};
+
+struct VisualizationChannelUiState {
+  bool active = false;
+  int channel = -1;
+  VisualizationRect header_rect;
+  VisualizationRect psd_rect;
+  VisualizationRect waterfall_rect;
+  VisualizationRect mask_rect;
+  VisualizationRect confidence_rect;
+  double center_frequency_hz = 0.0;
+  double span_hz = 0.0;
+  double resolution_hz = 0.0;
+  double seconds_per_time_bin = 0.0;
+  int fft_size = 0;
+  int history_rows = 0;
+  int dino_chunk_rows = 0;
+  int dino_chunk_cols = 0;
+  float confidence = 0.0f;
+  bool overlay_available = false;
+  std::string detector_label = "Dinov3";
+};
+
+struct VisualizationUiState {
+  int canvas_width = 0;
+  int canvas_height = 0;
+  bool overlay_enabled = true;
+  float blue_limit = 0.0f;
+  float red_limit = 0.0f;
+  uint64_t dropped_frames = 0;
+  uint64_t total_frames = 0;
+  std::string title = "USRP WIDEBAND";
+  std::string subtitle = "REAL TIME SIGNAL DETECTION";
+  std::string detector_label = "Dinov3";
+  VisualizationRect header_rect;
+  VisualizationRect content_rect;
+  VisualizationRect sidebar_rect;
+  std::vector<VisualizationChannelUiState> channels;
+};
+
 struct ChannelVisualizationState {
   bool active = false;
   int history_width = 0;
@@ -309,5 +354,15 @@ void initialize_visualization_overlay_state(bool enabled);
 void set_visualization_overlay_enabled(bool enabled);
 
 bool visualization_overlay_enabled();
+
+void set_visualization_full_ui_enabled(bool enabled);
+
+bool visualization_full_ui_enabled();
+
+void update_visualization_ui_state(const VisualizationUiState& state);
+
+VisualizationUiState visualization_ui_state_snapshot();
+
+void render_visualization_ui_overlay();
 
 }  // namespace holoscan::ops

@@ -233,18 +233,14 @@ class OfflineSpectrogramReplayApp : public holoscan::Application {
 
   void layer_callback(const std::vector<holoscan::gxf::Entity>&) {
     holoscan::viz::BeginImGuiLayer();
-    ImGui::SetNextWindowBgAlpha(0.70f);
-    ImGui::Begin("Display Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-    bool overlay_enabled = holoscan::ops::visualization_overlay_enabled();
-    if (ImGui::Checkbox("Detection Overlay", &overlay_enabled)) {
-      holoscan::ops::set_visualization_overlay_enabled(overlay_enabled);
-    }
-    ImGui::End();
+    holoscan::ops::render_visualization_ui_overlay();
     holoscan::viz::EndLayer();
   }
 
   void compose() override {
     using namespace holoscan;
+
+    ops::set_visualization_full_ui_enabled(true);
 
     const auto tensor_name = from_config("offline_replay.tensor_name").as<std::string>();
     const auto directory = overrides_.offline_dir.empty() ? from_config("offline_replay.directory").as<std::string>()
@@ -252,6 +248,7 @@ class OfflineSpectrogramReplayApp : public holoscan::Application {
     const auto frame_rate = overrides_.frame_rate > 0.0 ? overrides_.frame_rate
                                                         : from_config("offline_replay.frame_rate").as<double>();
     const auto fft_span_hz = from_config("fft.span").as<double>();
+    const auto center_frequency_hz = from_config("visualization.renderer.center_frequency_hz").as<double>();
     const auto detector_type = from_config("pipeline.detector_type").as<std::string>();
     const std::string detector_label = detector_type == "coherent_power" ? "Coherent Power" : "Dinov3";
 
@@ -262,6 +259,7 @@ class OfflineSpectrogramReplayApp : public holoscan::Application {
                                                          Arg("mask_directory") = overrides_.mask_dir,
                                                          Arg("repeat") = overrides_.repeat,
                                Arg("frame_rate") = frame_rate,
+                               Arg("center_frequency_hz") = center_frequency_hz,
                                Arg("span_hz") = fft_span_hz,
                                Arg("detector_label") = detector_label);
 

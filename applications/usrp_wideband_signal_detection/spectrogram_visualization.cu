@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 #include <matx.h>
 #include <gxf/std/tensor.hpp>
+#include <holoviz/holoviz.hpp>
+#include <imgui.h>
 
 #include <algorithm>
 #include <array>
@@ -248,6 +250,43 @@ constexpr size_t kBytesPerMegabyte = 1024 * 1024;
 std::atomic<bool>& global_overlay_enabled() {
   static std::atomic<bool> enabled{true};
   return enabled;
+}
+
+std::atomic<bool>& global_full_ui_enabled() {
+  static std::atomic<bool> enabled{false};
+  return enabled;
+}
+
+std::mutex& visualization_ui_state_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+holoscan::ops::VisualizationUiState& visualization_ui_state_storage() {
+  static holoscan::ops::VisualizationUiState state;
+  return state;
+}
+
+holoscan::ops::VisualizationRect normalized_rect(int x,
+                                                 int y,
+                                                 int width,
+                                                 int height,
+                                                 int canvas_width,
+                                                 int canvas_height) {
+  const float safe_width = static_cast<float>(std::max(1, canvas_width));
+  const float safe_height = static_cast<float>(std::max(1, canvas_height));
+  return {static_cast<float>(x) / safe_width,
+          static_cast<float>(y) / safe_height,
+          static_cast<float>(width) / safe_width,
+          static_cast<float>(height) / safe_height};
+}
+
+ImVec2 denormalize_point(float x, float y, const ImVec2& display_size) {
+  return ImVec2(x * display_size.x, y * display_size.y);
+}
+
+ImVec2 denormalize_size(float width, float height, const ImVec2& display_size) {
+  return ImVec2(width * display_size.x, height * display_size.y);
 }
 
 int clamp_history_rows_to_budget(int width, int requested_rows, int budget_mb) {
@@ -971,6 +1010,9 @@ void draw_plot_axes(std::vector<uint8_t>& canvas,
     const int gx = x + (plot_width * step) / 6;
     fill_rect(canvas, width, height, gx, y, 1, plot_height, {40, 48, 64});
   }
+  if (label_scale <= 0) {
+    return;
+  }
   const int label_y = y + plot_height + 8;
   draw_text(canvas, width, height, x, label_y, x0, {164, 179, 196}, label_scale);
   draw_text(canvas,
@@ -1359,6 +1401,225 @@ bool visualization_overlay_enabled() {
   return global_overlay_enabled().load(std::memory_order_relaxed);
 }
 
+void set_visualization_full_ui_enabled(bool enabled) {
+  global_full_ui_enabled().store(enabled, std::memory_order_relaxed);
+}
+
+bool visualization_full_ui_enabled() {
+  return global_full_ui_enabled().load(std::memory_order_relaxed);
+}
+
+void update_visualization_ui_state(const VisualizationUiState& state) {
+  std::lock_guard<std::mutex> lock(visualization_ui_state_mutex());
+  visualization_ui_state_storage() = state;
+}
+
+VisualizationUiState visualization_ui_state_snapshot() {
+  std::lock_guard<std::mutex> lock(visualization_ui_state_mutex());
+  return visualization_ui_state_storage();
+}
+
+void render_visualization_ui_overlay() {
+  const auto state = visualization_ui_state_snapshot();
+  if (!visualization_full_ui_enabled() || state.canvas_width <= 0 || state.canvas_height <= 0) {
+    return;
+  }
+
+  const ImVec2 display_size = ImGui::GetIO().DisplaySize;
+  if (display_size.x <= 0.0f || display_size.y <= 0.0f) {
+    return;
+  }
+
+  auto* draw_list = ImGui::GetBackgroundDrawList();
+  const ImU32 panel_bg = IM_COL32(11, 15, 23, 210);
+  const ImU32 panel_border = IM_COL32(62, 74, 92, 255);
+  const ImU32 panel_muted = IM_COL32(122, 143, 168, 255);
+  const ImU32 panel_text = IM_COL32(232, 236, 241, 255);
+  const ImU32 accent_orange = IM_COL32(255, 130, 48, 255);
+  const ImU32 accent_green = IM_COL32(80, 200, 120, 255);
+  const ImU32 accent_blue = IM_COL32(84, 196, 255, 255);
+
+  auto rect_min = [&](const VisualizationRect& rect) {
+    return denormalize_point(rect.x, rect.y, display_size);
+  };
+  auto rect_max = [&](const VisualizationRect& rect) {
+    return ImVec2((rect.x + rect.width) * display_size.x, (rect.y + rect.height) * display_size.y);
+  };
+  auto resolved_span_hz = [](const VisualizationChannelUiState& channel) {
+    if (std::isfinite(channel.span_hz) && channel.span_hz > 0.0) {
+      return channel.span_hz;
+    }
+    if (std::isfinite(channel.resolution_hz) && channel.resolution_hz > 0.0) {
+      return channel.resolution_hz * static_cast<double>(std::max(1, channel.fft_size));
+    }
+    return 0.0;
+  };
+  auto draw_panel = [&](const VisualizationRect& rect, float rounding = 12.0f) {
+    draw_list->AddRectFilled(rect_min(rect), rect_max(rect), panel_bg, rounding);
+    draw_list->AddRect(rect_min(rect), rect_max(rect), panel_border, rounding, 0, 1.0f);
+  };
+
+  draw_panel(state.header_rect, 14.0f);
+  draw_panel(state.sidebar_rect, 14.0f);
+
+  const ImVec2 header_min = rect_min(state.header_rect);
+  const ImVec2 header_max = rect_max(state.header_rect);
+  draw_list->AddText(ImVec2(header_min.x + 18.0f, header_min.y + 10.0f), panel_text, state.title.c_str());
+  draw_list->AddText(ImVec2(header_min.x + 18.0f, header_min.y + 30.0f), accent_blue, state.subtitle.c_str());
+
+  ImGui::SetNextWindowBgAlpha(0.82f);
+  ImGui::SetNextWindowPos(ImVec2(header_max.x - 16.0f, header_min.y + 12.0f),
+                          ImGuiCond_Always,
+                          ImVec2(1.0f, 0.0f));
+  ImGui::Begin("Display Controls",
+               nullptr,
+               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
+                   ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                   ImGuiWindowFlags_NoSavedSettings);
+  bool overlay_enabled = visualization_overlay_enabled();
+  if (ImGui::Checkbox("Detect", &overlay_enabled)) {
+    set_visualization_overlay_enabled(overlay_enabled);
+  }
+  ImGui::Separator();
+  ImGui::TextColored(ImVec4(0.48f, 0.78f, 1.0f, 1.0f), "%s", state.detector_label.c_str());
+  ImGui::End();
+
+  const ImVec2 sidebar_min = rect_min(state.sidebar_rect);
+  draw_list->AddText(ImVec2(sidebar_min.x + 16.0f, sidebar_min.y + 16.0f), panel_text, "Channel Info");
+
+  float sidebar_text_y = sidebar_min.y + 42.0f;
+  for (const auto& channel : state.channels) {
+    if (!channel.active) {
+      continue;
+    }
+    const std::string channel_name = std::string("CH-") + std::to_string(channel.channel);
+    draw_list->AddText(ImVec2(sidebar_min.x + 16.0f, sidebar_text_y), panel_text, channel_name.c_str());
+    sidebar_text_y += 18.0f;
+
+    auto draw_kv = [&](const char* key, const std::string& value) {
+      draw_list->AddText(ImVec2(sidebar_min.x + 16.0f, sidebar_text_y), panel_muted, key);
+      draw_list->AddText(ImVec2(sidebar_min.x + 92.0f, sidebar_text_y), panel_text, value.c_str());
+      sidebar_text_y += 16.0f;
+    };
+
+    draw_kv("Center", format_frequency_label(channel.center_frequency_hz));
+    draw_kv("Span", format_frequency_label(channel.span_hz));
+    draw_kv("Freq Bin", format_frequency_label(channel.resolution_hz));
+    draw_kv("Time Bin", format_time_bin_label(channel.seconds_per_time_bin));
+    draw_kv("FFT", std::to_string(channel.fft_size));
+    draw_kv("History", std::to_string(channel.history_rows) + " bins");
+    draw_kv(channel.detector_label.c_str(),
+            std::to_string(channel.dino_chunk_rows) + " x " + std::to_string(channel.dino_chunk_cols));
+
+    const float bar_width = std::max(60.0f, rect_max(state.sidebar_rect).x - sidebar_min.x - 120.0f);
+    const ImVec2 bar_min(sidebar_min.x + 16.0f, sidebar_text_y + 4.0f);
+    const ImVec2 bar_max(bar_min.x + bar_width, bar_min.y + 8.0f);
+    draw_list->AddRectFilled(bar_min, bar_max, IM_COL32(13, 21, 32, 255), 4.0f);
+    draw_list->AddRectFilled(bar_min,
+                             ImVec2(bar_min.x + bar_width * std::clamp(channel.confidence, 0.0f, 1.0f), bar_max.y),
+                             accent_orange,
+                             4.0f);
+    std::ostringstream confidence_text;
+    confidence_text << channel.detector_label << " " << static_cast<int>(channel.confidence * 100.0f) << "%";
+    draw_list->AddText(ImVec2(bar_min.x, bar_min.y - 18.0f), panel_muted, confidence_text.str().c_str());
+    sidebar_text_y += 28.0f;
+
+    draw_list->AddLine(ImVec2(sidebar_min.x + 16.0f, sidebar_text_y),
+                       ImVec2(rect_max(state.sidebar_rect).x - 16.0f, sidebar_text_y),
+                       IM_COL32(17, 29, 42, 255),
+                       1.0f);
+    sidebar_text_y += 12.0f;
+  }
+
+  for (const auto& channel : state.channels) {
+    if (!channel.active) {
+      continue;
+    }
+
+    draw_panel(channel.header_rect, 12.0f);
+    const ImVec2 header_pos = rect_min(channel.header_rect);
+    const std::string channel_title = std::string("CH-") + std::to_string(channel.channel) + "  " + format_frequency_label(channel.center_frequency_hz);
+    draw_list->AddText(ImVec2(header_pos.x + 12.0f, header_pos.y + 10.0f), panel_text, channel_title.c_str());
+    draw_list->AddText(ImVec2(header_pos.x + 12.0f, header_pos.y + 28.0f), panel_muted, channel.detector_label.c_str());
+
+    auto draw_frequency_grid_labels = [&](const VisualizationRect& rect) {
+      constexpr int kGridDivisions = 8;
+      const ImVec2 min = rect_min(rect);
+      const ImVec2 max = rect_max(rect);
+      const double span_hz = resolved_span_hz(channel);
+      if (!std::isfinite(channel.center_frequency_hz) || span_hz <= 0.0) {
+        return;
+      }
+
+      const double start_hz = channel.center_frequency_hz - (span_hz * 0.5);
+      const float axis_y = max.y + 6.0f;
+      for (int step = 0; step <= kGridDivisions; ++step) {
+        const float t = static_cast<float>(step) / static_cast<float>(kGridDivisions);
+        const double frequency_hz = start_hz + span_hz * static_cast<double>(t);
+        const std::string label = format_frequency_label(frequency_hz);
+        const ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
+        const float tick_x = min.x + (max.x - min.x) * t;
+        const float label_x = std::clamp(tick_x - text_size.x * 0.5f, min.x, max.x - text_size.x);
+        draw_list->AddText(ImVec2(label_x, axis_y), panel_muted, label.c_str());
+      }
+    };
+
+    auto annotate_plot = [&](const VisualizationRect& rect,
+                             const char* title,
+                             const std::string& y0,
+                             const std::string& y1) {
+      const ImVec2 min = rect_min(rect);
+      const ImVec2 max = rect_max(rect);
+      draw_list->AddText(ImVec2(min.x + 10.0f, min.y + 8.0f), panel_text, title);
+      draw_frequency_grid_labels(rect);
+      draw_list->AddText(ImVec2(min.x - 36.0f, min.y - 2.0f), panel_muted, y1.c_str());
+      draw_list->AddText(ImVec2(min.x - 28.0f, max.y - 14.0f), panel_muted, y0.c_str());
+    };
+
+    annotate_plot(channel.psd_rect,
+                  "PSD / Max Hold",
+                  "-100 dB",
+                  "0 dB");
+    annotate_plot(channel.waterfall_rect,
+                  "Spectrogram",
+                  "0",
+                  std::to_string(channel.history_rows));
+    annotate_plot(channel.mask_rect,
+                  "Mask",
+                  "0",
+                  std::to_string(channel.history_rows));
+
+    const ImVec2 conf_min = rect_min(channel.confidence_rect);
+    const ImVec2 conf_max = rect_max(channel.confidence_rect);
+    draw_list->AddRectFilled(conf_min, conf_max, IM_COL32(8, 12, 22, 220), 6.0f);
+    draw_list->AddRect(conf_min, conf_max, panel_border, 6.0f, 0, 1.0f);
+    draw_list->AddText(ImVec2(conf_min.x + 10.0f, conf_min.y + 4.0f), accent_orange, channel.detector_label.c_str());
+    const float label_width = std::max(90.0f, ImGui::CalcTextSize(channel.detector_label.c_str()).x + 24.0f);
+    const float bar_start = conf_min.x + label_width;
+    const float bar_width = std::max(40.0f, conf_max.x - bar_start - 56.0f);
+    draw_list->AddRectFilled(ImVec2(bar_start, conf_min.y + 6.0f),
+                             ImVec2(bar_start + bar_width, conf_min.y + 14.0f),
+                             IM_COL32(13, 21, 32, 255),
+                             4.0f);
+    draw_list->AddRectFilled(ImVec2(bar_start, conf_min.y + 6.0f),
+                             ImVec2(bar_start + bar_width * std::clamp(channel.confidence, 0.0f, 1.0f), conf_min.y + 14.0f),
+                             accent_orange,
+                             4.0f);
+    std::ostringstream pct;
+    pct << static_cast<int>(channel.confidence * 100.0f) << "%";
+    draw_list->AddText(ImVec2(conf_max.x - 44.0f, conf_min.y + 4.0f), panel_text, pct.str().c_str());
+  }
+
+  if (state.total_frames > 0) {
+    const float live_ratio = 1.0f - static_cast<float>(state.dropped_frames) / static_cast<float>(state.total_frames);
+    std::ostringstream footer_text;
+    footer_text << "VIS " << static_cast<int>(std::round(live_ratio * 100.0f)) << "% LIVE";
+    draw_list->AddText(ImVec2(display_size.x - 140.0f, display_size.y - 28.0f),
+                       live_ratio < 0.9f ? accent_orange : accent_green,
+                       footer_text.str().c_str());
+  }
+}
+
 std::vector<uint8_t> cleanup_live_mask_for_display(const std::vector<uint8_t>& reduced_mask,
                                                    int width,
                                                    int height);
@@ -1575,6 +1836,10 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
   const auto meta = metadata();
   const int channel_number = meta ? static_cast<int>(meta->get<uint16_t>("channel_number", 0)) : 0;
   const uint64_t spectrogram_frame_number = meta ? meta->get<uint64_t>("fft_emitted_frame_number", 0) : 0;
+  const double metadata_center_frequency_hz =
+      meta ? std::max(meta->get<double>("center_frequency_hz", 0.0),
+                      meta->get<double>("center_frequency", 0.0))
+           : 0.0;
   const double metadata_sample_rate_hz = meta ? meta->get<double>("sample_rate_hz", 0.0) : 0.0;
   const double metadata_span_hz = meta ? static_cast<double>(meta->get<uint64_t>("span", 0)) : 0.0;
   const double metadata_resolution_hz = meta ? static_cast<double>(meta->get<uint64_t>("resolution", 0)) : 0.0;
@@ -1829,6 +2094,8 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
     int snap_display_time_rows = clamp_history_rows_to_budget(width,
                                   snap_display_time_rows_requested,
                                   history_memory_budget_mb_.get());
+    const double snap_center_frequency_hz = metadata_center_frequency_hz > 0.0 ? metadata_center_frequency_hz
+                                          : center_frequency_hz_.get();
     const double snap_span_hz = metadata_span_hz > 0.0 ? metadata_span_hz
                   : (metadata_sample_rate_hz > 0.0 ? metadata_sample_rate_hz : span_hz_.get());
     const double snap_resolution_hz = metadata_resolution_hz > 0.0 ? metadata_resolution_hz
@@ -1855,6 +2122,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
             blue, red, alpha, overlay_enabled, red_lim,
                 snap_width, snap_height,
           snap_display_time_rows,
+            snap_center_frequency_hz,
             snap_span_hz,
             snap_resolution_hz,
           snap_render_every_n_frames,
@@ -1882,7 +2150,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
         state.active = true;
         state.info.channel = snapshot_channel_number;
         state.info.frame_number = static_cast<int64_t>(snap_spectrogram_frame_number);
-        state.info.center_frequency_hz = center_frequency_hz_.get();
+        state.info.center_frequency_hz = snap_center_frequency_hz;
         state.info.span_hz = snap_span_hz;
         state.info.resolution_hz = snap_resolution_hz;
         state.info.fft_size = fft_size_.get();
@@ -2551,6 +2819,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   const RgbColor kOrange{255, 130, 48};
   const RgbColor kYellow{255, 212, 89};
   const RgbColor kDimBlue{74, 96, 128};
+  const bool render_canvas_chrome = !visualization_full_ui_enabled();
 
   const int active_channels = std::max(1, static_cast<int>(channels.size()));
   const int requested_panel_width = std::max(128, panel_width);
@@ -2577,13 +2846,37 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   output_width = grid_width + kSidebarWidth + kPanelPadding * 3;
   output_height = kHeaderHeight + rows * channel_block_height + kFooterHeight + kPanelPadding * 2;
 
-  std::vector<uint8_t> canvas(static_cast<size_t>(output_width) * static_cast<size_t>(output_height) * 3, 0);
-  fill_vertical_gradient(canvas, output_width, output_height, {7, 10, 18}, {14, 19, 29});
-
   const int grid_x = kPanelPadding;
   const int sidebar_x = grid_x + grid_width + kPanelPadding;
   const int sidebar_y = kHeaderHeight + kPanelPadding;
   const int sidebar_height = output_height - sidebar_y - kFooterHeight - kPanelPadding;
+
+  VisualizationUiState ui_state;
+  ui_state.canvas_width = output_width;
+  ui_state.canvas_height = output_height;
+  ui_state.overlay_enabled = overlay_enabled;
+  ui_state.blue_limit = blue_limit;
+  ui_state.red_limit = red_limit;
+  ui_state.dropped_frames = dropped_frames;
+  ui_state.total_frames = total_frames;
+  ui_state.title = "USRP WIDEBAND";
+  ui_state.subtitle = "REAL TIME SIGNAL DETECTION";
+  ui_state.header_rect = normalized_rect(0, 0, output_width, kHeaderHeight, output_width, output_height);
+  ui_state.content_rect = normalized_rect(grid_x,
+                                          kHeaderHeight + kPanelPadding,
+                                          grid_width,
+                                          rows * channel_block_height,
+                                          output_width,
+                                          output_height);
+  ui_state.sidebar_rect = normalized_rect(sidebar_x,
+                                          sidebar_y,
+                                          kSidebarWidth,
+                                          sidebar_height,
+                                          output_width,
+                                          output_height);
+
+  std::vector<uint8_t> canvas(static_cast<size_t>(output_width) * static_cast<size_t>(output_height) * 3, 0);
+  fill_vertical_gradient(canvas, output_width, output_height, {7, 10, 18}, {14, 19, 29});
 
   // fill_rect(canvas, output_width, output_height, 0, 0, output_width, kHeaderHeight, {8, 12, 18});
   // fill_rect(canvas, output_width, output_height, 0, kHeaderHeight - 2, output_width, 2, {124, 198, 255});
@@ -2595,8 +2888,10 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   fill_rect(canvas, output_width, output_height, 0, kHeaderHeight - 2, output_width, 2, {124, 198, 255});
 
   // Title + subtitle
-  draw_text(canvas, output_width, output_height, 18, 8, "USRP WIDEBAND", {232, 236, 241}, 2);
-  draw_text(canvas, output_width, output_height, 18, 26, "REAL TIME SIGNAL DETECTION", {124, 198, 255}, 1);
+  if (render_canvas_chrome) {
+    draw_text(canvas, output_width, output_height, 18, 8, "USRP WIDEBAND", {232, 236, 241}, 2);
+    draw_text(canvas, output_width, output_height, 18, 26, "REAL TIME SIGNAL DETECTION", {124, 198, 255}, 1);
+  }
 
   // Divider after title
   fill_rect(canvas, output_width, output_height, 210, 10, 1, 30, {30, 45, 62});
@@ -2613,11 +2908,13 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   std::string ch0_rate = "500.0 MSps";
   std::string ch1_rate = "500.0 MSps";
 
-  draw_stat_box(218, 10, "CH-0 RATE", ch0_rate, kGreen);
-  draw_stat_box(314, 10, "CH-1 RATE", ch1_rate, kGreen);
-  draw_stat_box(410, 10, "CENTER FREQ", "2400.0 MHZ", kYellow);
-  draw_stat_box(506, 10, "SPAN", "500 MHZ", {232, 236, 241});
-  draw_stat_box(602, 10, "FFT SIZE", "20480", {232, 236, 241});
+  if (render_canvas_chrome) {
+    draw_stat_box(218, 10, "CH-0 RATE", ch0_rate, kGreen);
+    draw_stat_box(314, 10, "CH-1 RATE", ch1_rate, kGreen);
+    draw_stat_box(410, 10, "CENTER FREQ", "2400.0 MHZ", kYellow);
+    draw_stat_box(506, 10, "SPAN", "500 MHZ", {232, 236, 241});
+    draw_stat_box(602, 10, "FFT SIZE", "20480", {232, 236, 241});
+  }
 
   std::string active_detector_label = "Dinov3";
   for (const auto& channel : channels) {
@@ -2637,9 +2934,12 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
 
   const int badge_y = 18;
   const int badge_x_start = output_width - kSidebarWidth - kPanelPadding - 180;
-  draw_badge(badge_x_start,       badge_y, "LIVE",    kGreen);
-  draw_badge(badge_x_start + 48,  badge_y, "DUAL CH", kCh0Accent);
-  draw_badge(badge_x_start + 108, badge_y, active_detector_label, kYellow);
+  if (render_canvas_chrome) {
+    draw_badge(badge_x_start,       badge_y, "LIVE",    kGreen);
+    draw_badge(badge_x_start + 48,  badge_y, "DUAL CH", kCh0Accent);
+    draw_badge(badge_x_start + 108, badge_y, active_detector_label, kYellow);
+  }
+  ui_state.detector_label = active_detector_label;
 
   for (int channel_index = 0; channel_index < active_channels; ++channel_index) {
     const auto& channel = channels[static_cast<size_t>(channel_index)];
@@ -2661,11 +2961,15 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     // Left accent stripe
     fill_rect(canvas, output_width, output_height, panel_x - 8, psd_y - 28, 3, 20, accent);
     // CH label
-    draw_text(canvas, output_width, output_height, panel_x, psd_y - 22, std::string("CH-") + std::to_string(channel.info.channel >= 0 ? channel.info.channel : channel_index), accent, 1);
+    if (render_canvas_chrome) {
+      draw_text(canvas, output_width, output_height, panel_x, psd_y - 22, std::string("CH-") + std::to_string(channel.info.channel >= 0 ? channel.info.channel : channel_index), accent, 1);
+    }
     // Freq label
     std::ostringstream freq_ss;
     freq_ss << std::fixed << std::setprecision(3) << (channel.info.center_frequency_hz / 1.0e6) << " MHZ";
-    draw_text(canvas, output_width, output_height, panel_x + 60, psd_y - 22, freq_ss.str(), {122, 143, 168}, 1);
+    if (render_canvas_chrome) {
+      draw_text(canvas, output_width, output_height, panel_x + 60, psd_y - 22, freq_ss.str(), {122, 143, 168}, 1);
+    }
 
     const double span_hz = resolved_display_span_hz(channel, main_width);
     const std::string freq_min_label = span_hz > 0.0
@@ -2680,6 +2984,25 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                        : channel.history_valid_rows);
     const std::string oldest_time_label = std::to_string(history_rows);
     const std::string newest_time_label = "0";
+
+    VisualizationChannelUiState channel_ui;
+    channel_ui.active = channel.active;
+    channel_ui.channel = channel.info.channel >= 0 ? channel.info.channel : channel_index;
+    channel_ui.header_rect = normalized_rect(panel_x - 8, psd_y - 28, main_width + 16, 20, output_width, output_height);
+    channel_ui.psd_rect = normalized_rect(panel_x, psd_y, main_width, channel_psd_height, output_width, output_height);
+    channel_ui.waterfall_rect = normalized_rect(panel_x, heatmap_y, main_width, channel_heat_height, output_width, output_height);
+    channel_ui.mask_rect = normalized_rect(panel_x, mask_y, main_width, channel_mask_height, output_width, output_height);
+    channel_ui.confidence_rect = normalized_rect(panel_x - 8, mask_y + channel_mask_height + 10, main_width + 16, 14, output_width, output_height);
+    channel_ui.center_frequency_hz = channel.info.center_frequency_hz;
+    channel_ui.span_hz = span_hz;
+    channel_ui.resolution_hz = channel.info.resolution_hz;
+    channel_ui.seconds_per_time_bin = span_hz > 0.0 ? static_cast<double>(std::max(1, channel.info.fft_size)) / span_hz : 0.0;
+    channel_ui.fft_size = channel.info.fft_size;
+    channel_ui.history_rows = history_rows;
+    channel_ui.dino_chunk_rows = channel.info.dino_chunk_rows;
+    channel_ui.dino_chunk_cols = channel.info.dino_chunk_cols;
+    channel_ui.overlay_available = channel.overlay_available;
+    channel_ui.detector_label = channel.info.detector_label;
 
     fill_rect(canvas, output_width, output_height, panel_x - 8, psd_y - 8, main_width + 16, channel_psd_height + 16, {14, 18, 28});
     if (!channel.density_trace.empty()) {
@@ -2701,14 +3024,16 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
              freq_max_label,
              "-100",
              "0",
-                   1,
+                   render_canvas_chrome ? 1 : 0,
              "FREQ",
              "POWER");
     draw_trace_plot(canvas, output_width, output_height, panel_x, psd_y, main_width, channel_psd_height, channel.current_psd_trace, accent, 2);
     draw_trace_plot(canvas, output_width, output_height, panel_x, psd_y, main_width, channel_psd_height, channel.max_hold_trace, {255, 212, 89}, 1);
-    draw_text(canvas, output_width, output_height, panel_x + 8, psd_y + 8, std::string("CH") + std::to_string(channel.info.channel), {232, 236, 241}, 1);
-    draw_text(canvas, output_width, output_height, panel_x + 42, psd_y + 8, "PSD", {156, 173, 192}, 1);
-    draw_text(canvas, output_width, output_height, panel_x + 72, psd_y + 8, "MAX HOLD", {255, 212, 89}, 1);
+    if (render_canvas_chrome) {
+      draw_text(canvas, output_width, output_height, panel_x + 8, psd_y + 8, std::string("CH") + std::to_string(channel.info.channel), {232, 236, 241}, 1);
+      draw_text(canvas, output_width, output_height, panel_x + 42, psd_y + 8, "PSD", {156, 173, 192}, 1);
+      draw_text(canvas, output_width, output_height, panel_x + 72, psd_y + 8, "MAX HOLD", {255, 212, 89}, 1);
+    }
 
     fill_rect(canvas, output_width, output_height, panel_x - 8, heatmap_y - 8, main_width + 16, channel_heat_height + 16, {14, 18, 28});
     fill_rect(canvas, output_width, output_height, panel_x - 8, heatmap_y - 8, 3, channel_heat_height + 16, accent);
@@ -2723,7 +3048,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
              freq_max_label,
              newest_time_label,
              oldest_time_label,
-                   1,
+                   render_canvas_chrome ? 1 : 0,
                  "FREQ",
                  "TIME BIN");
     blit_grayscale_ring_to_canvas(canvas,
@@ -2789,44 +3114,48 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                              freq_max_label,
                              newest_time_label,
                              oldest_time_label,
-                             1,
+                             render_canvas_chrome ? 1 : 0,
                              "FREQ",
                              "TIME BIN");
               bool showing_latest_fallback = false;
-              if (mask_nonzero > 0) {
-                blit_mask_ring_to_canvas(canvas,
-                                         output_width,
-                                         output_height,
-                                         panel_x,
-                                         mask_y,
-                                         main_width,
-                                         channel_mask_height,
-                                         channel.history_mask,
-                                         history_width,
-                                         history_rows,
-                                         channel.history_valid_rows,
-                                         channel.history_write_row);
-              } else if (!channel.latest_mask.pixels.empty() && channel.latest_mask.width > 0 && channel.latest_mask.height > 0) {
-                blit_mask_frame_to_canvas(canvas,
-                                          output_width,
-                                          output_height,
-                                          panel_x,
-                                          mask_y,
-                                          main_width,
-                                          channel_mask_height,
-                                          channel.latest_mask);
-                showing_latest_fallback = true;
-                draw_rect_outline(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {255, 212, 89}, 1);
+              if (overlay_enabled) {
+                if (mask_nonzero > 0) {
+                  blit_mask_ring_to_canvas(canvas,
+                                           output_width,
+                                           output_height,
+                                           panel_x,
+                                           mask_y,
+                                           main_width,
+                                           channel_mask_height,
+                                           channel.history_mask,
+                                           history_width,
+                                           history_rows,
+                                           channel.history_valid_rows,
+                                           channel.history_write_row);
+                } else if (!channel.latest_mask.pixels.empty() && channel.latest_mask.width > 0 && channel.latest_mask.height > 0) {
+                  blit_mask_frame_to_canvas(canvas,
+                                            output_width,
+                                            output_height,
+                                            panel_x,
+                                            mask_y,
+                                            main_width,
+                                            channel_mask_height,
+                                            channel.latest_mask);
+                  showing_latest_fallback = true;
+                  draw_rect_outline(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {255, 212, 89}, 1);
+                }
+                draw_grid(canvas, output_width, output_height, panel_x, mask_y, main_width, channel_mask_height);
               }
-              draw_grid(canvas, output_width, output_height, panel_x, mask_y, main_width, channel_mask_height);
-              draw_text(canvas,
-                        output_width,
-                        output_height,
-                        panel_x + 8,
-                        mask_y + 8,
-                        showing_latest_fallback ? "MASK LATEST" : "MASK",
-                        {232, 236, 241},
-                        1);
+              if (render_canvas_chrome) {
+                draw_text(canvas,
+                          output_width,
+                          output_height,
+                          panel_x + 8,
+                          mask_y + 8,
+                          overlay_enabled ? (showing_latest_fallback ? "MASK LATEST" : "MASK") : "MASK OFF",
+                          {232, 236, 241},
+                          1);
+              }
           static uint64_t mask_debug_counter = 0;
           if ((++mask_debug_counter % 64) == 0) {
             HOLOSCAN_LOG_INFO(
@@ -2842,16 +3171,18 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
 
     // Detector confidence bar
               const int dino_bar_y = mask_y + channel_mask_height + 10;
-    fill_rect(canvas, output_width, output_height, panel_x - 8, dino_bar_y, main_width + 16, 14, {8, 12, 22});
-    draw_rect_outline(canvas, output_width, output_height, panel_x - 8, dino_bar_y, main_width + 16, 14, {26, 42, 58}, 1);
-    draw_text(canvas,
-          output_width,
-          output_height,
-          panel_x,
-          dino_bar_y + 3,
-          channel.info.detector_label,
-          kOrange,
-          1);
+        if (render_canvas_chrome) {
+      fill_rect(canvas, output_width, output_height, panel_x - 8, dino_bar_y, main_width + 16, 14, {8, 12, 22});
+      draw_rect_outline(canvas, output_width, output_height, panel_x - 8, dino_bar_y, main_width + 16, 14, {26, 42, 58}, 1);
+      draw_text(canvas,
+        output_width,
+        output_height,
+        panel_x,
+        dino_bar_y + 3,
+        channel.info.detector_label,
+        kOrange,
+        1);
+        }
 
     // Confidence fill — use density trace average as proxy
     float confidence = 0.0f;
@@ -2860,50 +3191,61 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
       confidence /= static_cast<float>(channel.density_trace.size());
       confidence = std::clamp(confidence * 4.0f, 0.0f, 1.0f);
     }
+    channel_ui.confidence = confidence;
     const int bar_x = panel_x + text_pixel_width(channel.info.detector_label, 1) + 12;
     const int bar_w = main_width - 80;
-    fill_rect(canvas, output_width, output_height, bar_x, dino_bar_y + 3, bar_w, 8, {13, 21, 32});
-    if (confidence > 0.0f) {
-      fill_rect(canvas, output_width, output_height, bar_x, dino_bar_y + 3,
-                static_cast<int>(bar_w * confidence), 8, kOrange);
+    if (render_canvas_chrome) {
+      fill_rect(canvas, output_width, output_height, bar_x, dino_bar_y + 3, bar_w, 8, {13, 21, 32});
+      if (confidence > 0.0f) {
+        fill_rect(canvas, output_width, output_height, bar_x, dino_bar_y + 3,
+                  static_cast<int>(bar_w * confidence), 8, kOrange);
+      }
+      std::ostringstream conf_ss;
+      conf_ss << static_cast<int>(confidence * 100.0f) << "%";
+      draw_text(canvas, output_width, output_height, bar_x + bar_w + 4, dino_bar_y + 3, conf_ss.str(), kOrange, 1);
     }
-    std::ostringstream conf_ss;
-    conf_ss << static_cast<int>(confidence * 100.0f) << "%";
-    draw_text(canvas, output_width, output_height, bar_x + bar_w + 4, dino_bar_y + 3, conf_ss.str(), kOrange, 1);
+    ui_state.channels.push_back(channel_ui);
   }
 
   fill_rect(canvas, output_width, output_height, sidebar_x, sidebar_y, kSidebarWidth, sidebar_height, {11, 15, 23});
   draw_rect_outline(canvas, output_width, output_height, sidebar_x, sidebar_y, kSidebarWidth, sidebar_height, {62, 74, 92}, 1);
-  draw_text(canvas, output_width, output_height, sidebar_x + 16, sidebar_y + 12, "DISPLAY", {232, 236, 241}, 2);
-  draw_vertical_slider(canvas, output_width, output_height, sidebar_x + 24, sidebar_y + 34, 104, blue_limit, {90, 148, 255}, "BLUE");
-  draw_vertical_slider(canvas, output_width, output_height, sidebar_x + 74, sidebar_y + 34, 104, red_limit, {255, 98, 62}, "RED");
-  for (int i = 0; i < 64; ++i) {
-    const auto color = heatmap_color(static_cast<float>(63 - i) / 63.0f);
-    fill_rect(canvas, output_width, output_height, sidebar_x + 122, sidebar_y + 34 + i * 2, 20, 2, {color[0], color[1], color[2]});
+  if (render_canvas_chrome) {
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, sidebar_y + 12, "DISPLAY", {232, 236, 241}, 2);
+    draw_vertical_slider(canvas, output_width, output_height, sidebar_x + 24, sidebar_y + 34, 104, blue_limit, {90, 148, 255}, "BLUE");
+    draw_vertical_slider(canvas, output_width, output_height, sidebar_x + 74, sidebar_y + 34, 104, red_limit, {255, 98, 62}, "RED");
+    for (int i = 0; i < 64; ++i) {
+      const auto color = heatmap_color(static_cast<float>(63 - i) / 63.0f);
+      fill_rect(canvas, output_width, output_height, sidebar_x + 122, sidebar_y + 34 + i * 2, 20, 2, {color[0], color[1], color[2]});
+    }
+    draw_toggle_button(canvas,
+                       output_width,
+                       output_height,
+                       sidebar_x + 152,
+                       sidebar_y + 34,
+                       kSidebarWidth - 168,
+                       "OVERLAY",
+                       overlay_enabled,
+                       kOrange);
   }
-  draw_toggle_button(canvas,
-                     output_width,
-                     output_height,
-                     sidebar_x + 152,
-                     sidebar_y + 34,
-                     kSidebarWidth - 168,
-                     "OVERLAY",
-                     overlay_enabled,
-                     kOrange);
 
   int text_y = sidebar_y + 156;
 
   // Channel info section
-  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "CHANNEL INFO", {74, 96, 128}, 2);
-  text_y += 18;
-  fill_rect(canvas, output_width, output_height, sidebar_x + 16, text_y, kSidebarWidth - 32, 1, {17, 29, 42});
-  text_y += 6;
+  if (render_canvas_chrome) {
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "CHANNEL INFO", {74, 96, 128}, 2);
+    text_y += 18;
+    fill_rect(canvas, output_width, output_height, sidebar_x + 16, text_y, kSidebarWidth - 32, 1, {17, 29, 42});
+    text_y += 6;
+  }
 
   for (int channel_index = 0; channel_index < active_channels; ++channel_index) {
     const auto& channel = channels[static_cast<size_t>(channel_index)];
     const RgbColor& accent = kAccents[std::min(channel_index, 1)];
     const int ch_num = channel.info.channel >= 0 ? channel.info.channel : channel_index;
 
+    if (!render_canvas_chrome) {
+      continue;
+    }
     draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y,
               std::string("CH-") + std::to_string(ch_num), accent, 1);
     text_y += 14;
@@ -2945,9 +3287,14 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   }
 
   // Signal activity section
-  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "SIGNAL ACTIVITY", {74, 96, 128}, 2);
-  text_y += 18;
+  if (render_canvas_chrome) {
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "SIGNAL ACTIVITY", {74, 96, 128}, 2);
+    text_y += 18;
+  }
   for (int channel_index = 0; channel_index < active_channels; ++channel_index) {
+    if (!render_canvas_chrome) {
+      break;
+    }
     const auto& channel = channels[static_cast<size_t>(channel_index)];
     const RgbColor& accent = kAccents[std::min(channel_index, 1)];
     const int ch_num = channel.info.channel >= 0 ? channel.info.channel : channel_index;
@@ -2972,52 +3319,58 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     draw_text(canvas, output_width, output_height, act_x + act_w + 4, text_y, act_ss.str(), kOrange, 1);
     text_y += 14;
   }
-  text_y += 4;
-  fill_rect(canvas, output_width, output_height, sidebar_x + 16, text_y, kSidebarWidth - 32, 1, {17, 29, 42});
-  text_y += 8;
+  if (render_canvas_chrome) {
+    text_y += 4;
+    fill_rect(canvas, output_width, output_height, sidebar_x + 16, text_y, kSidebarWidth - 32, 1, {17, 29, 42});
+    text_y += 8;
+  }
 
   // System metrics section
-  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "SYSTEM", {74, 96, 128}, 2);
-  text_y += 18;
-  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "GPU", {122, 143, 168}, 1);
-  draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, "RTX 4000 ADA", kGreen, 1);
-  text_y += 12;
-  draw_text(canvas,
-            output_width,
-            output_height,
-            sidebar_x + 16,
-            text_y,
-            active_detector_label + " LAT",
-            {122, 143, 168},
-            1);
-  draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, "42 MS", kOrange, 1);
-  text_y += 12;
-  draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "VIS FPS", {122, 143, 168}, 1);
-  draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, "~6 FPS", kGreen, 1);
+  if (render_canvas_chrome) {
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "SYSTEM", {74, 96, 128}, 2);
+    text_y += 18;
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "GPU", {122, 143, 168}, 1);
+    draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, "RTX 4000 ADA", kGreen, 1);
+    text_y += 12;
+    draw_text(canvas,
+              output_width,
+              output_height,
+              sidebar_x + 16,
+              text_y,
+              active_detector_label + " LAT",
+              {122, 143, 168},
+              1);
+    draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, "42 MS", kOrange, 1);
+    text_y += 12;
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "VIS FPS", {122, 143, 168}, 1);
+    draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, "~6 FPS", kGreen, 1);
+  }
 
   const int footer_y = output_height - kFooterHeight + 12;
   // Colored dots
-  fill_rect(canvas, output_width, output_height, grid_x, footer_y + 2, 5, 5, kGreen);
-  draw_text(canvas, output_width, output_height, grid_x + 9, footer_y, "CLASSIC ANALYZER VIEW", {156, 173, 192}, 1);
+  if (render_canvas_chrome) {
+    fill_rect(canvas, output_width, output_height, grid_x, footer_y + 2, 5, 5, kGreen);
+    draw_text(canvas, output_width, output_height, grid_x + 9, footer_y, "CLASSIC ANALYZER VIEW", {156, 173, 192}, 1);
 
-  fill_rect(canvas, output_width, output_height, grid_x + 170, footer_y + 2, 5, 5, kDimBlue);
-  draw_text(canvas, output_width, output_height, grid_x + 179, footer_y, "DENSITY HEAT UNDER MAX HOLD", {116, 132, 150}, 1);
+    fill_rect(canvas, output_width, output_height, grid_x + 170, footer_y + 2, 5, 5, kDimBlue);
+    draw_text(canvas, output_width, output_height, grid_x + 179, footer_y, "DENSITY HEAT UNDER MAX HOLD", {116, 132, 150}, 1);
 
-  fill_rect(canvas, output_width, output_height, grid_x + 360, footer_y + 2, 5, 5, kOrange);
-  draw_text(canvas,
-            output_width,
-            output_height,
-            grid_x + 369,
-            footer_y,
-            overlay_enabled ? (active_detector_label + " DETECTION OVERLAY")
-                            : (active_detector_label + " DETECTION OVERLAY OFF"),
-            overlay_enabled ? RgbColor{116, 132, 150} : RgbColor{90, 104, 128},
-            1);
+    fill_rect(canvas, output_width, output_height, grid_x + 360, footer_y + 2, 5, 5, kOrange);
+    draw_text(canvas,
+              output_width,
+              output_height,
+              grid_x + 369,
+              footer_y,
+              overlay_enabled ? (active_detector_label + " DETECTION OVERLAY")
+                              : (active_detector_label + " DETECTION OVERLAY OFF"),
+              overlay_enabled ? RgbColor{116, 132, 150} : RgbColor{90, 104, 128},
+              1);
+  }
   
   // Visual drop indicator — shows frame drop rate in footer
   // Orange warning color when dropping, green when keeping up
   
-  if (total_frames > 0) {
+  if (render_canvas_chrome && total_frames > 0) {
     const float drop_rate = static_cast<float>(dropped_frames) / static_cast<float>(total_frames);
     const uint64_t live_frames = total_frames - dropped_frames;
     std::ostringstream drop_text;
@@ -3027,7 +3380,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     draw_text(canvas, output_width, output_height, grid_x + 420, footer_y, drop_text.str(), drop_color, 1);
   }
   // Live clock
-  {
+  if (render_canvas_chrome) {
     auto now = std::chrono::system_clock::now();
     std::time_t now_t = std::chrono::system_clock::to_time_t(now);
     std::tm tm_buf{};
@@ -3045,6 +3398,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                         - text_pixel_width(clock_str, 1) - 8;
     draw_text(canvas, output_width, output_height, clock_x, footer_y, clock_str, {58, 80, 96}, 1);
   }
+
+  update_visualization_ui_state(ui_state);
 
   return canvas;
 }

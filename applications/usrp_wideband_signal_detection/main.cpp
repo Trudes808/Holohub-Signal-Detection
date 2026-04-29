@@ -241,13 +241,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
  public:
   void layer_callback(const std::vector<holoscan::gxf::Entity>&) {
     holoscan::viz::BeginImGuiLayer();
-    ImGui::SetNextWindowBgAlpha(0.70f);
-    ImGui::Begin("Display Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-    bool overlay_enabled = holoscan::ops::visualization_overlay_enabled();
-    if (ImGui::Checkbox("Detection Overlay", &overlay_enabled)) {
-      holoscan::ops::set_visualization_overlay_enabled(overlay_enabled);
-    }
-    ImGui::End();
+    holoscan::ops::render_visualization_ui_overlay();
     holoscan::viz::EndLayer();
   }
 
@@ -411,8 +405,10 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     std::shared_ptr<holoscan::Operator> spectrogramVisualizerOp;
     std::shared_ptr<holoscan::Operator> holovizOp;
     if (enable_visualization) {
+      ops::set_visualization_full_ui_enabled(true);
       const auto tensor_name = from_config("visualization.renderer.tensor_name").as<std::string>();
       const auto fft_span_hz = from_config("fft.span").as<double>();
+      const auto center_frequency_hz = from_config("visualization.renderer.center_frequency_hz").as<double>();
       const std::string detector_label =
           (!enable_detector || detector_type == "dinov3" || detector_type == "cuda_dino")
               ? std::string("Dinov3")
@@ -420,6 +416,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       spectrogramVisualizerOp = make_operator<ops::SpectrogramToHolovizOp>(
         "spectrogramVisualizerOp",
         from_config("visualization.renderer"),
+        Arg("center_frequency_hz") = center_frequency_hz,
         Arg("span_hz") = fft_span_hz,
         Arg("detector_label") = detector_label);
         
