@@ -43,7 +43,10 @@ class SpectrogramToHolovizOp : public Operator {
   Parameter<float> blue_limit_;
   Parameter<float> red_limit_;
   Parameter<float> overlay_alpha_;
+  Parameter<bool> overlay_enable_;
+  Parameter<std::string> detector_label_;
   Parameter<double> center_frequency_hz_;
+  Parameter<double> span_hz_;
   Parameter<int> fft_size_;
   Parameter<int> dino_chunk_rows_;
   Parameter<int> dino_chunk_cols_;
@@ -140,7 +143,10 @@ class OfflinePgmReplayOp : public Operator {
   Parameter<float> blue_limit_;
   Parameter<float> red_limit_;
   Parameter<float> overlay_alpha_;
+  Parameter<bool> overlay_enable_;
+  Parameter<std::string> detector_label_;
   Parameter<double> center_frequency_hz_;
+  Parameter<double> span_hz_;
   Parameter<int> fft_size_;
   Parameter<int> dino_chunk_rows_;
   Parameter<int> dino_chunk_cols_;
@@ -193,6 +199,7 @@ struct VisualizationFrameInfo {
   bool overlay_available = false;
   std::string title = "USRP WIDEBAND";
   std::string subtitle = "SPECTROGRAM";
+  std::string detector_label = "Dinov3";
 };
 
 struct ChannelVisualizationState {
@@ -287,6 +294,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                                float blue_limit,
                                                float red_limit,
                                                float overlay_alpha,
+                                               bool overlay_enabled,
                                                int panel_width,
                                                int panel_height,
                                                int& output_width,
@@ -295,5 +303,11 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                                uint64_t total_frames = 0);
 
 std::vector<HolovizOp::InputSpec> make_spectrogram_input_specs(const std::string& tensor_name);
+
+void initialize_visualization_overlay_state(bool enabled);
+
+void set_visualization_overlay_enabled(bool enabled);
+
+bool visualization_overlay_enabled();
 
 }  // namespace holoscan::ops

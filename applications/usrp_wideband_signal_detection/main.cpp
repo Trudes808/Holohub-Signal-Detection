@@ -11,6 +11,8 @@
 #include <dinov3_signal_detector.hpp>
 #include <fft.hpp>
 #include <holoscan/operators/holoviz/holoviz.hpp>
+#include <holoviz/holoviz.hpp>
+#include <holoviz/imgui/imgui.h>
 #include <spectrogram.hpp>
 
 #ifdef USRP_WIDEBAND_HAS_NVML
@@ -237,6 +239,18 @@ class DropOp: public holoscan::Operator {
 
 class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
  public:
+  void layer_callback(const std::vector<holoscan::gxf::Entity>&) {
+    holoscan::viz::BeginImGuiLayer();
+    ImGui::SetNextWindowBgAlpha(0.70f);
+    ImGui::Begin("Display Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    bool overlay_enabled = holoscan::ops::visualization_overlay_enabled();
+    if (ImGui::Checkbox("Detection Overlay", &overlay_enabled)) {
+      holoscan::ops::set_visualization_overlay_enabled(overlay_enabled);
+    }
+    ImGui::End();
+    holoscan::viz::EndLayer();
+  }
+
   void compose() override {
     using namespace holoscan;
 
@@ -398,13 +412,25 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     std::shared_ptr<holoscan::Operator> holovizOp;
     if (enable_visualization) {
       const auto tensor_name = from_config("visualization.renderer.tensor_name").as<std::string>();
+      const auto fft_span_hz = from_config("fft.span").as<double>();
+      const std::string detector_label =
+          (!enable_detector || detector_type == "dinov3" || detector_type == "cuda_dino")
+              ? std::string("Dinov3")
+              : std::string("Coherent Power");
       spectrogramVisualizerOp = make_operator<ops::SpectrogramToHolovizOp>(
         "spectrogramVisualizerOp",
-        from_config("visualization.renderer"));
+        from_config("visualization.renderer"),
+        Arg("span_hz") = fft_span_hz,
+        Arg("detector_label") = detector_label);
         
       holovizOp = make_operator<ops::HolovizOp>(
         "holovizOp",
         from_config("visualization.holoviz"),
+        Arg("layer_callback",
+          ops::HolovizOp::LayerCallbackFunction(
+            std::bind(&UsrpWidebandSignalDetectionPipeline::layer_callback,
+                  this,
+                  std::placeholders::_1))),
         holoscan::Arg("tensors") = ops::make_spectrogram_input_specs(tensor_name));
     }
     std::vector<std::shared_ptr<holoscan::Operator>> logOps;

@@ -164,6 +164,7 @@ target_link_libraries(usrp_wideband_signal_detection
   holoscan::advanced_network
   holoscan::ops::fft
   holoscan::ops::holoviz
+  holoscan::viz::imgui
   holoscan::ops::spectrogram
   holoscan::ops::dinov3_signal_detector
   CHDR_converter_wideband
@@ -210,6 +211,7 @@ target_link_libraries(offline_spectrogram_visualizer
   matx::matx
   holoscan::core
   holoscan::ops::holoviz
+  holoscan::viz::imgui
 )
 
 target_link_libraries(offline_coherent_power_validator
