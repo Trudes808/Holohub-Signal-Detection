@@ -1940,7 +1940,7 @@ def _resolve_artifact_path(path_value: str | Path) -> Path:
     container_prefixes = {
         "/workspace/spectrograms": Path("/tmp/usrp_spectrograms"),
         "/workspace/dino_masks": Path("/tmp/usrp_dino_masks"),
-        "/workspace/coherent_power_snapshots": Path("/home/dm57767/coherent_power_snapshots"),
+        "/workspace/coherent_power_snapshots": Path("/tmp/coherent_power_snapshots"),
         "/workspace/coherent_power_masks": Path("/tmp/coherent_power_masks"),
     }
     for prefix, host_root in container_prefixes.items():
@@ -2132,10 +2132,33 @@ def _resolve_latest_validator_summary_path() -> Path | None:
     return candidates[0] if candidates else None
 
 
+def _coherent_snapshot_search_roots() -> list[Path]:
+    roots = [
+        Path("/tmp/coherent_power_snapshots/performance_path_debug"),
+        Path("/tmp/coherent_power_snapshots"),
+        Path.home() / "coherent_power_snapshots" / "performance_path_debug",
+        Path.home() / "coherent_power_snapshots",
+        Path("/home/dm57767/coherent_power_snapshots/performance_path_debug"),
+        Path("/home/dm57767/coherent_power_snapshots"),
+    ]
+    seen: set[Path] = set()
+    unique_roots: list[Path] = []
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        unique_roots.append(root)
+    return unique_roots
+
+
 def _resolve_latest_live_artifact_metadata_path() -> Path | None:
-    snapshot_root = Path("/home/dm57767/coherent_power_snapshots/performance_path_debug")
+    candidates: list[Path] = []
+    for snapshot_root in _coherent_snapshot_search_roots():
+        if not snapshot_root.exists():
+            continue
+        candidates.extend(snapshot_root.glob("**/coherent_power_snapshot_*.json"))
     candidates = sorted(
-        snapshot_root.glob("**/coherent_power_snapshot_*.json"),
+        {path.resolve() for path in candidates},
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )

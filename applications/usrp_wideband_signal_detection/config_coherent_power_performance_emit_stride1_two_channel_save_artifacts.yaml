@@ -212,9 +212,11 @@ coherent_power_signal_detector:
   # Full-rate aggressive profile for two-channel performance validation.
   emit_stride: 1
   log_detections: false
-  fast_performance: true
   save_performance_path_artifacts: true
-  enable_mask_save: true
+  # Save the exact full-resolution mask emitted to the visualizer plus a reduced
+  # artifact reconstructed with the live visualizer history rule, then exit.
+  live_emit_mask_rows: 16
+  live_emit_mask_cols: 20480
   save_every_n_frames: 100
   max_masks_per_channel: 0
   output_dir: "/workspace/coherent_power_snapshots"
@@ -230,8 +232,6 @@ coherent_power_signal_detector:
   frontend_max_boost_db: 12.0
   coherence_weight: 0.55
   power_weight: 0.45
-  power_assist_mode: "absolute_direct"
-  coherence_source_mode: "power_assist"
   score_threshold_mode: "fixed"
   fixed_score_threshold: 0.4
   coherence_power_support_q: 0.82

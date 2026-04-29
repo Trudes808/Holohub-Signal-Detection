@@ -143,6 +143,14 @@ visualization:
     history_frames: 5
     output_height: 256
     output_width: 512
+    display_time_rows: 2048
+    display_freq_bins: 20480
+    history_memory_budget_mb: 1024
+    rows_per_frame: 16
+    mask_frame_offset: 0
+    render_every_n_frames: 4
+    timing_summary_enable: true
+    timing_summary_every_n: 128
     channel_filter: 0
     tensor_name: "spectrogram"
     blue_limit: 0.10
@@ -154,7 +162,7 @@ visualization:
     dino_chunk_cols: 512
     db_floor: -22.0
     db_ceil: 35.0
-    row_average_n: 4
+    row_average_n: 1
   holoviz:
     width: 1280
     height: 720
@@ -252,8 +260,6 @@ coherent_power_signal_detector:
   frontend_max_boost_db: 12.0
   coherence_weight: 0.55
   power_weight: 0.45
-  power_assist_mode: "absolute_direct"
-  coherence_source_mode: "power_assist"
   score_threshold_mode: "fixed"
   fixed_score_threshold: 0.4
   coherence_power_support_q: 0.82

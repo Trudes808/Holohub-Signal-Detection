@@ -28,12 +28,45 @@ BUILD_APP_IN_CONTAINER=${BUILD_APP_IN_CONTAINER:-1}
 INSTALL_PYTHON_DEPS=${INSTALL_PYTHON_DEPS:-1}
 SKIP_IMAGE_BUILD=${SKIP_IMAGE_BUILD:-0}
 ENSURE_VULKAN_RUNTIME=${ENSURE_VULKAN_RUNTIME:-1}
+ENSURE_WINDOWING_RUNTIME=${ENSURE_WINDOWING_RUNTIME:-1}
 DISPLAY_VALUE=${DISPLAY:-}
 XAUTHORITY_VALUE=${XAUTHORITY:-}
 X11_SOCKET_DIR=/tmp/.X11-unix
+CONTAINER_WORKSPACE_DIR=${CONTAINER_WORKSPACE_DIR:-/workspace/holohub}
+CONTAINER_APP_BUILD_DIR=${CONTAINER_APP_BUILD_DIR:-${CONTAINER_WORKSPACE_DIR}/build/${APP_NAME}}
 
 run_in_container() {
 	sudo docker exec "${CONTAINER_NAME}" bash -lc "$1"
+}
+
+clear_incompatible_app_build_tree() {
+	local cache_file="${CONTAINER_APP_BUILD_DIR}/CMakeCache.txt"
+	if ! run_in_container "test -f ${cache_file}"; then
+		return
+	fi
+
+	if run_in_container "python3 - <<'PY'
+from pathlib import Path
+
+cache_path = Path('${cache_file}')
+expected_build_dir = '${CONTAINER_APP_BUILD_DIR}'
+expected_source_dir = '${CONTAINER_WORKSPACE_DIR}'
+
+build_dir = None
+source_dir = None
+for line in cache_path.read_text(errors='ignore').splitlines():
+    if line.startswith('# For build in directory:'):
+        build_dir = line.split(':', 1)[1].strip()
+    elif line.startswith('CMAKE_HOME_DIRECTORY:') and '=' in line:
+        source_dir = line.split('=', 1)[1].strip()
+
+raise SystemExit(0 if build_dir == expected_build_dir and source_dir == expected_source_dir else 1)
+PY"; then
+		return
+	fi
+
+	echo "Clearing stale build tree at ${CONTAINER_APP_BUILD_DIR} before configuring inside the container."
+	run_in_container "rm -rf ${CONTAINER_APP_BUILD_DIR}"
 }
 
 install_pytorch_cuda_stack() {
@@ -59,6 +92,48 @@ if ! ldconfig -p | grep -q "libvulkan.so.1"; then
 	apt-get update
 	apt-get install -y --no-install-recommends libvulkan1
 fi'
+}
+
+ensure_windowing_runtime() {
+	run_in_container 'set -euo pipefail
+missing=0
+for lib in \
+	libX11.so.6 \
+	libXrandr.so.2 \
+	libXinerama.so.1 \
+	libXcursor.so.1 \
+	libXi.so.6 \
+	libxkbcommon.so.0 \
+	libwayland-client.so.0 \
+	libEGL.so.1 \
+	libGL.so.1; do
+	if ! ldconfig -p | grep -q "$lib"; then
+		missing=1
+		break
+	fi
+	done
+	if [[ "$missing" -eq 1 ]]; then
+		apt-get update
+		apt-get install -y --no-install-recommends \
+			libx11-6 \
+			libxrandr2 \
+			libxinerama1 \
+			libxcursor1 \
+			libxi6 \
+			libxext6 \
+			libxfixes3 \
+			libxrender1 \
+			libxkbcommon0 \
+			libxkbcommon-x11-0 \
+			libwayland-client0 \
+			libwayland-egl1 \
+			libegl1 \
+			libgl1 \
+			libxcb1 \
+			libxcb-randr0 \
+			libxcb-xinerama0 \
+			libxcb-cursor0
+	fi'
 }
 
 ensure_nvjitlink_symlink() {
@@ -127,17 +202,24 @@ DOCKER_RUN_CMD=(
 	--ipc=host \
 )
 
-if [[ -n "${DISPLAY_VALUE}" && -d "${X11_SOCKET_DIR}" ]]; then
-	DOCKER_RUN_CMD+=(
-		-e DISPLAY="${DISPLAY_VALUE}" \
-		-v "${X11_SOCKET_DIR}:${X11_SOCKET_DIR}:rw"
-	)
+if [[ -n "${DISPLAY_VALUE}" ]]; then
+	DOCKER_RUN_CMD+=(-e DISPLAY="${DISPLAY_VALUE}")
 
-	if [[ -n "${XAUTHORITY_VALUE}" && -f "${XAUTHORITY_VALUE}" ]]; then
-		DOCKER_RUN_CMD+=(
-			-e XAUTHORITY="${XAUTHORITY_VALUE}" \
-			-v "${XAUTHORITY_VALUE}:${XAUTHORITY_VALUE}:ro"
-		)
+	if [[ -d "${X11_SOCKET_DIR}" ]]; then
+		DOCKER_RUN_CMD+=(-v "${X11_SOCKET_DIR}:${X11_SOCKET_DIR}:rw")
+	else
+		echo "Warning: ${X11_SOCKET_DIR} is not present on the host; relying on DISPLAY=${DISPLAY_VALUE} being reachable from the container." >&2
+	fi
+
+	if [[ -n "${XAUTHORITY_VALUE}" ]]; then
+		if [[ -f "${XAUTHORITY_VALUE}" ]]; then
+			DOCKER_RUN_CMD+=(
+				-e XAUTHORITY="${XAUTHORITY_VALUE}" \
+				-v "${XAUTHORITY_VALUE}:${XAUTHORITY_VALUE}:ro"
+			)
+		else
+			echo "Warning: XAUTHORITY is set to ${XAUTHORITY_VALUE}, but that file does not exist on the host." >&2
+		fi
 	fi
 fi
 
@@ -222,6 +304,12 @@ else
 	echo "Skipping Vulkan runtime installation check because ENSURE_VULKAN_RUNTIME=${ENSURE_VULKAN_RUNTIME}."
 fi
 
+if [[ "${ENSURE_WINDOWING_RUNTIME}" == "1" ]]; then
+	ensure_windowing_runtime
+else
+	echo "Skipping windowing runtime installation check because ENSURE_WINDOWING_RUNTIME=${ENSURE_WINDOWING_RUNTIME}."
+fi
+
 if ! run_in_container 'test -f /usr/local/lib/cmake/matx/matx-config.cmake'; then
 	install_matx
 fi
@@ -241,8 +329,9 @@ sudo docker exec "${CONTAINER_NAME}" python3 "${CONTAINER_EXPORT_SCRIPT}" \
 run_in_container "ls -lah ${CONTAINER_DINOV3_ROOT}/weights"
 
 if [[ "${BUILD_APP_IN_CONTAINER}" == "1" ]]; then
-	run_in_container "cd /workspace/holohub && export HOLOHUB_BUILD_LOCAL=1 && ./holohub build ${APP_NAME} --local --configure-args=-Dmatx_DIR=/usr/local/lib/cmake/matx"
-	run_in_container "ls -lah /workspace/holohub/build/${APP_NAME}/applications/${APP_NAME}"
+	clear_incompatible_app_build_tree
+	run_in_container "cd ${CONTAINER_WORKSPACE_DIR} && export HOLOHUB_BUILD_LOCAL=1 && ./holohub build ${APP_NAME} --local --configure-args=-Dmatx_DIR=/usr/local/lib/cmake/matx"
+	run_in_container "ls -lah ${CONTAINER_APP_BUILD_DIR}/applications/${APP_NAME}"
 fi
 
 echo "Initial container setup is complete."

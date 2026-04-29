@@ -111,8 +111,16 @@ visualization:
   renderer:
     num_channels: 1
     history_frames: 1
-    output_height: 256
-    output_width: 512
+    output_height: 512
+    output_width: 1024
+    display_time_rows: 2048
+    display_freq_bins: 20480
+    history_memory_budget_mb: 1024
+    rows_per_frame: 16
+    mask_frame_offset: 0
+    render_every_n_frames: 4
+    timing_summary_enable: true
+    timing_summary_every_n: 128
     channel_filter: 0
     tensor_name: "spectrogram"
     blue_limit: 0.10
@@ -124,7 +132,7 @@ visualization:
     dino_chunk_cols: 512
     db_floor: -22.0
     db_ceil: 35.0
-    row_average_n: 4
+    row_average_n: 1
   holoviz:
     width: 1280
     height: 720
@@ -206,6 +214,9 @@ coherent_power_signal_detector:
   fast_power_floor_db: 0.5
   fast_power_span_db: 3.0
   fast_score_threshold: 0.4
+  live_emit_mask_rows: 16
+  live_emit_mask_cols: 20480
+  live_emit_mask_min_coverage: 0.35
   emit_stride: 1
   log_detections: true
   fast_performance: true
@@ -223,11 +234,10 @@ coherent_power_signal_detector:
   frontend_row_q: 25.0
   frontend_reference_q: 75.0
   frontend_smooth_sigma: 12.0
-  frontend_max_boost_db: 12.0
+  frontend_max_boost_db: 0.0
+  frontend_signal_cap_db: 0.0
   coherence_weight: 0.55
   power_weight: 0.45
-  power_assist_mode: "absolute_direct"
-  coherence_source_mode: "power_assist"
   score_threshold_mode: "fixed"
   fixed_score_threshold: 0.4
   coherence_power_support_q: 0.82
@@ -243,6 +253,6 @@ coherent_power_signal_detector:
   grouping_min_density: 0.0
   grouping_time_continuity_ratio: 0.85
   timing_summary_enable: true
-  timing_summary_every_n: 64
-  timing_summary_window: 64
+  timing_summary_every_n: 512
+  timing_summary_window: 512
 

@@ -61,6 +61,63 @@ fi
 
 ensure_container_repo_mount_matches "${CONTAINER_NAME}" "${EXPECTED_REPO_ROOT}"
 
+container_has_env_value() {
+  local key=$1
+  local value=$2
+  sudo docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${CONTAINER_NAME}" | grep -Fx "${key}=${value}" >/dev/null
+}
+
+container_has_mount_destination() {
+  local destination=$1
+  sudo docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "${CONTAINER_NAME}" | grep -Fx "${destination}" >/dev/null
+}
+
+container_has_mount_source() {
+  local source=$1
+  sudo docker inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "${CONTAINER_NAME}" | grep -Fx "${source}" >/dev/null
+}
+
+require_current_display_forwarding() {
+  local requested_display=${DISPLAY:-}
+  local requested_xauthority=${XAUTHORITY:-}
+  local x11_socket_dir=/tmp/.X11-unix
+
+  if [[ -z "${requested_display}" ]]; then
+    return
+  fi
+
+  if ! container_has_env_value DISPLAY "${requested_display}"; then
+    echo "Container ${CONTAINER_NAME} was not created with DISPLAY=${requested_display}." >&2
+    echo "docker start cannot add display forwarding to an existing container." >&2
+    echo "Recreate it from this desktop session with:" >&2
+    echo "  SKIP_IMAGE_BUILD=1 sudo -E ./build_demo_container.sh" >&2
+    exit 1
+  fi
+
+  if [[ -d "${x11_socket_dir}" ]] && ! container_has_mount_destination "${x11_socket_dir}"; then
+    echo "Container ${CONTAINER_NAME} is missing the ${x11_socket_dir} mount required by the current session." >&2
+    echo "Recreate it from this desktop session with:" >&2
+    echo "  SKIP_IMAGE_BUILD=1 sudo -E ./build_demo_container.sh" >&2
+    exit 1
+  fi
+
+  if [[ -n "${requested_xauthority}" ]]; then
+    if [[ ! -f "${requested_xauthority}" ]]; then
+      echo "Warning: XAUTHORITY is set to ${requested_xauthority}, but that file does not exist on the host." >&2
+      return
+    fi
+
+    if ! container_has_env_value XAUTHORITY "${requested_xauthority}" || ! container_has_mount_source "${requested_xauthority}"; then
+      echo "Container ${CONTAINER_NAME} was not created with the current XAUTHORITY file." >&2
+      echo "Recreate it from this desktop session with:" >&2
+      echo "  SKIP_IMAGE_BUILD=1 sudo -E ./build_demo_container.sh" >&2
+      exit 1
+    fi
+  fi
+}
+
+require_current_display_forwarding
+
 if [[ "$(sudo docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}")" == "true" ]]; then
   echo "Container ${CONTAINER_NAME} is already running."
 else

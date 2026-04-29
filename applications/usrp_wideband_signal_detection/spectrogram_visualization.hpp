@@ -8,9 +8,11 @@
 #include <condition_variable>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace holoscan::ops {
@@ -45,13 +47,57 @@ class SpectrogramToHolovizOp : public Operator {
   Parameter<int> fft_size_;
   Parameter<int> dino_chunk_rows_;
   Parameter<int> dino_chunk_cols_;
+  Parameter<int> display_time_rows_;
+  Parameter<int> display_freq_bins_;
+  Parameter<int> history_memory_budget_mb_;
+  Parameter<int> rows_per_frame_;
+  Parameter<int> mask_frame_offset_;
+  Parameter<int> render_every_n_frames_;
+  Parameter<bool> timing_summary_enable_;
+  Parameter<int> timing_summary_every_n_;
   Parameter<float> db_floor_;
   Parameter<float> db_ceil_;
   Parameter<int> row_average_n_;
+
+  struct VisualChannelResources {
+    cudaStream_t stream = nullptr;
+    uint8_t* device_grayscale_buffer = nullptr;
+    void* pinned_grayscale_buffer = nullptr;
+    uint8_t* device_mask_buffer = nullptr;
+    void* pinned_mask_buffer = nullptr;
+    size_t grayscale_buffer_bytes = 0;
+  };
+
+  struct VisualTimingStats {
+    uint64_t frames_seen = 0;
+    uint64_t frames_processed = 0;
+    uint64_t frames_rendered = 0;
+    uint64_t dropped_vis_stream_busy = 0;
+    uint64_t dropped_render_queue_busy = 0;
+    uint64_t render_skipped_by_cadence = 0;
+    uint64_t masks_received = 0;
+    uint64_t masks_backfilled = 0;
+    uint64_t masks_deferred = 0;
+    uint64_t masks_pending_peak = 0;
+    double sync_total_ms = 0.0;
+    double sync_max_ms = 0.0;
+    double reduce_total_ms = 0.0;
+    double reduce_max_ms = 0.0;
+    double history_total_ms = 0.0;
+    double history_max_ms = 0.0;
+    double compose_total_ms = 0.0;
+    double compose_max_ms = 0.0;
+    double render_total_ms = 0.0;
+    double render_max_ms = 0.0;
+  };
+
   std::vector<ChannelVisualizationState> channel_states_;
-  cudaStream_t vis_stream_ = nullptr;
+  std::mutex channel_states_mutex_;
+  std::vector<VisualChannelResources> channel_resources_;
   uint64_t dropped_frames_ = 0;
   uint64_t total_frames_ = 0;
+  std::mutex timing_mutex_;
+  VisualTimingStats timing_stats_;
 
   // Background render thread — keeps operator thread free
   std::thread render_thread_;
@@ -68,11 +114,8 @@ class SpectrogramToHolovizOp : public Operator {
   int pending_composed_width_ = 0;
   int pending_composed_height_ = 0;
   bool pending_composed_ready_ = false;
+  std::atomic<bool> history_budget_warning_emitted_{false};
 
-  // Pinned host buffer for async GPU→host DMA on vis_stream_
-  // Avoids blocking operator thread with cudaStreamSynchronize
-  void* pinned_host_buffer_ = nullptr;
-  size_t pinned_host_buffer_bytes_ = 0;
 };
 
 class OfflinePgmReplayOp : public Operator {
@@ -131,9 +174,11 @@ struct OfflinePgmFrame {
 
 struct DetectorMaskMessage {
   std::vector<uint8_t> pixels;
+  std::shared_ptr<uint8_t> device_pixels;
   int width = 0;
   int height = 0;
   int channel = 0;
+  uint64_t frame_number = 0;
 };
 
 struct VisualizationFrameInfo {
@@ -154,14 +199,22 @@ struct ChannelVisualizationState {
   bool active = false;
   int history_width = 0;
   int latest_frame_height = 0;
+  int history_capacity_rows = 0;
+  int history_valid_rows = 0;
+  int history_write_row = 0;
   std::vector<uint8_t> history_grayscale;
+  std::vector<uint8_t> history_mask;
+  std::vector<int64_t> history_row_frame_numbers;
+  std::vector<int> history_row_indices_within_frame;
   std::vector<float> current_psd_trace;
   std::vector<float> max_hold_trace;
   std::vector<float> density_trace;
   size_t density_frames_seen = 0;
   OfflinePgmFrame latest_mask;
+  int64_t latest_mask_frame_number = -1;
   bool overlay_available = false;
   VisualizationFrameInfo info;
+  std::unordered_map<int64_t, DetectorMaskMessage> pending_masks;
 
   // FFT row accumulator for averaging instead of dropping
   std::vector<float> row_accumulator;
@@ -208,11 +261,20 @@ void update_density_history(const std::vector<float>& current_density,
                             std::vector<float>& density_history,
                             size_t& density_frames_seen);
 
+std::vector<uint8_t> reduce_mask_to_history_rows(const OfflinePgmFrame& mask_frame,
+                                                 int dst_width,
+                                                 int dst_rows);
+
+bool patch_history_mask_for_frame(ChannelVisualizationState& state,
+                                  int64_t frame_number,
+                                  const std::vector<uint8_t>& mask_rows,
+                                  int width);
+
 void append_spectrogram_history(ChannelVisualizationState& state,
                                 const std::vector<uint8_t>& grayscale,
                                 int width,
                                 int height,
-                                int history_frames);
+                                int max_rows);
 
 // std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualizationState>& channels,
 //                                                float blue_limit,
@@ -225,6 +287,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                                float blue_limit,
                                                float red_limit,
                                                float overlay_alpha,
+                                               int panel_width,
+                                               int panel_height,
                                                int& output_width,
                                                int& output_height,
                                                uint64_t dropped_frames = 0,

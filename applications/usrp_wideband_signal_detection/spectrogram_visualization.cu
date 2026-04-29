@@ -19,6 +19,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -33,6 +34,55 @@ namespace {
 using SpectrogramComplex = cuda::std::complex<float>;
 using SpectrogramTensor = matx::tensor_t<SpectrogramComplex, 2>;
 using SpectrogramMessage = std::tuple<SpectrogramTensor, cudaStream_t>;
+
+constexpr int kLiveMaskGroupingMinComponentSize = 24;
+constexpr int kLiveMaskGroupingMinFreqSpan = 18;
+constexpr int kLiveMaskGroupingMinTimeSpan = 2;
+constexpr float kLiveMaskGroupingMinDensity = 0.06f;
+
+__global__ void reduce_binary_mask_to_alpha_kernel(const uint8_t* input,
+                                                   int src_rows,
+                                                   int src_cols,
+                                                   uint8_t* output,
+                                                   int dst_rows,
+                                                   int dst_cols) {
+  const int out_col = blockIdx.x * blockDim.x + threadIdx.x;
+  const int out_row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (out_col >= dst_cols || out_row >= dst_rows) {
+    return;
+  }
+
+  const int row_start = (out_row * src_rows) / dst_rows;
+  const int row_end = max(row_start + 1, ((out_row + 1) * src_rows) / dst_rows);
+  const int col_start = (out_col * src_cols) / dst_cols;
+  const int col_end = max(col_start + 1, ((out_col + 1) * src_cols) / dst_cols);
+
+  int active = 0;
+  int count = 0;
+  for (int src_row = row_start; src_row < row_end; ++src_row) {
+    const size_t row_offset = static_cast<size_t>(src_row) * static_cast<size_t>(src_cols);
+    for (int src_col = col_start; src_col < col_end; ++src_col) {
+      active += input[row_offset + static_cast<size_t>(src_col)] > 0 ? 1 : 0;
+      ++count;
+    }
+  }
+
+  const float occupancy = count > 0 ? static_cast<float>(active) / static_cast<float>(count) : 0.0f;
+  output[static_cast<size_t>(out_row) * static_cast<size_t>(dst_cols) + static_cast<size_t>(out_col)] =
+      static_cast<uint8_t>(std::lround(std::clamp(occupancy, 0.0f, 1.0f) * 255.0f));
+}
+
+__global__ void count_nonzero_u8_kernel(const uint8_t* input,
+                                        int total,
+                                        unsigned int* output_count) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= total) {
+    return;
+  }
+  if (input[index] != 0) {
+    atomicAdd(output_count, 1U);
+  }
+}
 
 std::string trim(std::string value) {
   const auto first = value.find_first_not_of(" \t\r\n");
@@ -130,14 +180,38 @@ bool load_pgm_file(const std::filesystem::path& path,
 std::array<uint8_t, 3> heatmap_color(float normalized) {
   normalized = std::clamp(normalized, 0.0f, 1.0f);
 
-  const float four_x = normalized * 4.0f;
-  const float red = std::clamp(std::min(four_x - 1.5f, -four_x + 4.5f), 0.0f, 1.0f);
-  const float green = std::clamp(std::min(four_x - 0.5f, -four_x + 3.5f), 0.0f, 1.0f);
-  const float blue = std::clamp(std::min(four_x + 0.5f, -four_x + 2.5f), 0.0f, 1.0f);
+  // Piecewise interpolation across representative plasma colormap stops.
+    static constexpr std::array<std::array<float, 4>, 10> kPlasmaStops{{
+      {0.00f, 0.050f, 0.030f, 0.528f},
+      {0.11f, 0.215f, 0.017f, 0.599f},
+      {0.22f, 0.379f, 0.002f, 0.653f},
+      {0.33f, 0.523f, 0.025f, 0.653f},
+      {0.44f, 0.651f, 0.125f, 0.596f},
+      {0.56f, 0.752f, 0.227f, 0.513f},
+      {0.67f, 0.836f, 0.329f, 0.431f},
+      {0.78f, 0.907f, 0.435f, 0.353f},
+      {0.89f, 0.967f, 0.564f, 0.265f},
+      {1.00f, 0.940f, 0.975f, 0.131f},
+  }};
 
-  return {static_cast<uint8_t>(red * 255.0f),
-          static_cast<uint8_t>(green * 255.0f),
-          static_cast<uint8_t>(blue * 255.0f)};
+  for (size_t index = 1; index < kPlasmaStops.size(); ++index) {
+    if (normalized <= kPlasmaStops[index][0]) {
+      const auto& lower = kPlasmaStops[index - 1];
+      const auto& upper = kPlasmaStops[index];
+      const float span = std::max(0.0001f, upper[0] - lower[0]);
+      const float t = (normalized - lower[0]) / span;
+      return {
+          static_cast<uint8_t>((lower[1] + (upper[1] - lower[1]) * t) * 255.0f),
+          static_cast<uint8_t>((lower[2] + (upper[2] - lower[2]) * t) * 255.0f),
+          static_cast<uint8_t>((lower[3] + (upper[3] - lower[3]) * t) * 255.0f),
+      };
+    }
+  }
+
+  const auto& last = kPlasmaStops.back();
+  return {static_cast<uint8_t>(last[1] * 255.0f),
+          static_cast<uint8_t>(last[2] * 255.0f),
+          static_cast<uint8_t>(last[3] * 255.0f)};
 }
 
 std::vector<uint8_t> grayscale_to_rgb(const std::vector<uint8_t>& grayscale,
@@ -168,6 +242,20 @@ constexpr int kFooterHeight = 40;
 constexpr int kSidebarWidth = 260;
 constexpr int kPsdHeight = 142;
 constexpr int kPanelPadding = 18;
+constexpr size_t kBytesPerMegabyte = 1024 * 1024;
+
+int clamp_history_rows_to_budget(int width, int requested_rows, int budget_mb) {
+  const int safe_width = std::max(1, width);
+  const int safe_rows = std::max(1, requested_rows);
+  const size_t budget_bytes = static_cast<size_t>(std::max(1, budget_mb)) * kBytesPerMegabyte;
+  const size_t bytes_per_row = static_cast<size_t>(safe_width) * (sizeof(uint8_t) + sizeof(uint8_t)) +
+                               sizeof(int64_t) + sizeof(int);
+  if (bytes_per_row == 0 || budget_bytes <= bytes_per_row) {
+    return 1;
+  }
+  const size_t max_rows_by_budget = std::max<size_t>(1, budget_bytes / bytes_per_row);
+  return std::min(safe_rows, static_cast<int>(std::min<size_t>(static_cast<size_t>(safe_rows), max_rows_by_budget)));
+}
 
 RgbColor mix(const RgbColor& a, const RgbColor& b, float t) {
   const float clamped = std::clamp(t, 0.0f, 1.0f);
@@ -459,6 +547,19 @@ void blit_rgb_nearest(std::vector<uint8_t>& canvas,
   }
 }
 
+RgbColor mask_overlay_color(float normalized_value) {
+  const float t = std::clamp(std::sqrt(std::max(0.0f, normalized_value)), 0.0f, 1.0f);
+  const auto blend_channel = [t](uint8_t low, uint8_t high) {
+    return static_cast<uint8_t>(std::lround((1.0f - t) * static_cast<float>(low) +
+                                            t * static_cast<float>(high)));
+  };
+  return {
+      blend_channel(72, 255),
+      blend_channel(208, 246),
+      blend_channel(255, 168),
+  };
+}
+
 void overlay_mask(std::vector<uint8_t>& canvas,
                   int canvas_width,
                   int canvas_height,
@@ -468,16 +569,173 @@ void overlay_mask(std::vector<uint8_t>& canvas,
                   int dst_height,
                   const holoscan::ops::OfflinePgmFrame& mask_frame,
                   float overlay_alpha) {
-  const RgbColor overlay_color{255, 130, 48};
   for (int row = 0; row < dst_height; ++row) {
     const int src_row = std::min(mask_frame.height - 1, (row * mask_frame.height) / std::max(1, dst_height));
     for (int col = 0; col < dst_width; ++col) {
       const int src_col = std::min(mask_frame.width - 1, (col * mask_frame.width) / std::max(1, dst_width));
       const auto value = mask_frame.pixels[static_cast<size_t>(src_row) * static_cast<size_t>(mask_frame.width) + static_cast<size_t>(src_col)];
-      if (value < 128) {
+      if (value == 0) {
         continue;
       }
-      blend_pixel(canvas, canvas_width, canvas_height, dst_x + col, dst_y + row, overlay_color, overlay_alpha);
+      const float normalized_value = static_cast<float>(value) / 255.0f;
+      const float scaled_alpha = overlay_alpha * (0.18f + 0.82f * std::sqrt(normalized_value));
+      blend_pixel(canvas,
+                  canvas_width,
+                  canvas_height,
+                  dst_x + col,
+                  dst_y + row,
+                  mask_overlay_color(normalized_value),
+                  scaled_alpha);
+    }
+  }
+}
+
+void blit_grayscale_ring_to_canvas(std::vector<uint8_t>& canvas,
+                                   int canvas_width,
+                                   int canvas_height,
+                                   int dst_x,
+                                   int dst_y,
+                                   int dst_width,
+                                   int dst_height,
+                                   const std::vector<uint8_t>& ring,
+                                   int src_width,
+                                   int capacity_rows,
+                                   int valid_rows,
+                                   int write_row,
+                                   float blue_limit,
+                                   float red_limit) {
+  if (ring.empty() || src_width <= 0 || capacity_rows <= 0) {
+    return;
+  }
+  const int oldest_row = valid_rows == capacity_rows ? write_row : 0;
+  const int leading_blank_rows = capacity_rows - valid_rows;
+  const float blue = std::clamp(blue_limit, 0.0f, 1.0f);
+  const float red = std::clamp(red_limit, blue + 0.01f, 1.0f);
+  for (int row = 0; row < dst_height; ++row) {
+    const int src_canvas_row = std::min(capacity_rows - 1, (row * capacity_rows) / std::max(1, dst_height));
+    if (src_canvas_row < leading_blank_rows) {
+      continue;
+    }
+    const int logical_row = src_canvas_row - leading_blank_rows;
+    const int ring_row = (oldest_row + logical_row) % capacity_rows;
+    for (int col = 0; col < dst_width; ++col) {
+      const int src_col = std::min(src_width - 1, (col * src_width) / std::max(1, dst_width));
+      const uint8_t gray = ring[static_cast<size_t>(ring_row) * static_cast<size_t>(src_width) + static_cast<size_t>(src_col)];
+      const float normalized = static_cast<float>(gray) / 255.0f;
+      const float remapped = std::clamp((normalized - blue) / std::max(0.01f, red - blue), 0.0f, 1.0f);
+      const auto color = heatmap_color(remapped);
+      set_pixel(canvas, canvas_width, canvas_height, dst_x + col, dst_y + row, {color[0], color[1], color[2]});
+    }
+  }
+}
+
+void overlay_mask_ring(std::vector<uint8_t>& canvas,
+                       int canvas_width,
+                       int canvas_height,
+                       int dst_x,
+                       int dst_y,
+                       int dst_width,
+                       int dst_height,
+                       const std::vector<uint8_t>& ring,
+                       int src_width,
+                       int capacity_rows,
+                       int valid_rows,
+                       int write_row,
+                       float overlay_alpha) {
+  if (ring.empty() || src_width <= 0 || capacity_rows <= 0) {
+    return;
+  }
+  const int oldest_row = valid_rows == capacity_rows ? write_row : 0;
+  const int leading_blank_rows = capacity_rows - valid_rows;
+  for (int row = 0; row < dst_height; ++row) {
+    const int src_canvas_row = std::min(capacity_rows - 1, (row * capacity_rows) / std::max(1, dst_height));
+    if (src_canvas_row < leading_blank_rows) {
+      continue;
+    }
+    const int logical_row = src_canvas_row - leading_blank_rows;
+    const int ring_row = (oldest_row + logical_row) % capacity_rows;
+    for (int col = 0; col < dst_width; ++col) {
+      const int src_col = std::min(src_width - 1, (col * src_width) / std::max(1, dst_width));
+      const uint8_t value = ring[static_cast<size_t>(ring_row) * static_cast<size_t>(src_width) + static_cast<size_t>(src_col)];
+      if (value > 0) {
+        const float normalized_value = static_cast<float>(value) / 255.0f;
+        const float boosted_visibility = std::pow(normalized_value, 0.65f);
+        const float scaled_alpha = overlay_alpha * (0.16f + 0.84f * boosted_visibility);
+        blend_pixel(canvas,
+                    canvas_width,
+                    canvas_height,
+                    dst_x + col,
+                    dst_y + row,
+                    mask_overlay_color(normalized_value),
+                    scaled_alpha);
+      }
+    }
+  }
+}
+
+void blit_mask_ring_to_canvas(std::vector<uint8_t>& canvas,
+                              int canvas_width,
+                              int canvas_height,
+                              int dst_x,
+                              int dst_y,
+                              int dst_width,
+                              int dst_height,
+                              const std::vector<uint8_t>& ring,
+                              int src_width,
+                              int capacity_rows,
+                              int valid_rows,
+                              int write_row) {
+  if (ring.empty() || src_width <= 0 || capacity_rows <= 0) {
+    return;
+  }
+  const int oldest_row = valid_rows == capacity_rows ? write_row : 0;
+  const int leading_blank_rows = capacity_rows - valid_rows;
+  for (int row = 0; row < dst_height; ++row) {
+    const int src_canvas_row = std::min(capacity_rows - 1, (row * capacity_rows) / std::max(1, dst_height));
+    if (src_canvas_row < leading_blank_rows) {
+      continue;
+    }
+    const int logical_row = src_canvas_row - leading_blank_rows;
+    const int ring_row = (oldest_row + logical_row) % capacity_rows;
+    for (int col = 0; col < dst_width; ++col) {
+      const int src_col = std::min(src_width - 1, (col * src_width) / std::max(1, dst_width));
+      const uint8_t value = ring[static_cast<size_t>(ring_row) * static_cast<size_t>(src_width) +
+                                 static_cast<size_t>(src_col)];
+      if (value == 0) {
+        continue;
+      }
+      const float normalized_value = static_cast<float>(value) / 255.0f;
+      const float boosted = std::pow(normalized_value, 0.35f);
+      const uint8_t gray = static_cast<uint8_t>(std::clamp(boosted, 0.0f, 1.0f) * 255.0f);
+      set_pixel(canvas, canvas_width, canvas_height, dst_x + col, dst_y + row, {gray, gray, gray});
+    }
+  }
+}
+
+void blit_mask_frame_to_canvas(std::vector<uint8_t>& canvas,
+                               int canvas_width,
+                               int canvas_height,
+                               int dst_x,
+                               int dst_y,
+                               int dst_width,
+                               int dst_height,
+                               const holoscan::ops::OfflinePgmFrame& mask_frame) {
+  if (mask_frame.pixels.empty() || mask_frame.width <= 0 || mask_frame.height <= 0) {
+    return;
+  }
+  for (int row = 0; row < dst_height; ++row) {
+    const int src_row = std::min(mask_frame.height - 1, (row * mask_frame.height) / std::max(1, dst_height));
+    for (int col = 0; col < dst_width; ++col) {
+      const int src_col = std::min(mask_frame.width - 1, (col * mask_frame.width) / std::max(1, dst_width));
+      const uint8_t value = mask_frame.pixels[static_cast<size_t>(src_row) * static_cast<size_t>(mask_frame.width) +
+                                             static_cast<size_t>(src_col)];
+      if (value == 0) {
+        continue;
+      }
+      const float normalized_value = static_cast<float>(value) / 255.0f;
+      const float boosted = std::pow(normalized_value, 0.35f);
+      const uint8_t gray = static_cast<uint8_t>(std::clamp(boosted, 0.0f, 1.0f) * 255.0f);
+      set_pixel(canvas, canvas_width, canvas_height, dst_x + col, dst_y + row, {gray, gray, gray});
     }
   }
 }
@@ -666,35 +924,174 @@ std::vector<uint8_t> reduce_spectrogram_to_grayscale(const SpectrogramTensor& te
 
 }
 
+struct DeviceBufferLease {
+  void* ptr = nullptr;
+  size_t bytes = 0;
+};
+
+std::mutex& output_buffer_pool_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<size_t, std::vector<void*>>& output_buffer_pool() {
+  static std::unordered_map<size_t, std::vector<void*>> pool;
+  return pool;
+}
+
+void* acquire_output_buffer(size_t bytes) {
+  std::lock_guard<std::mutex> lock(output_buffer_pool_mutex());
+  auto& pool = output_buffer_pool();
+  auto it = pool.find(bytes);
+  if (it != pool.end() && !it->second.empty()) {
+    void* ptr = it->second.back();
+    it->second.pop_back();
+    return ptr;
+  }
+  void* ptr = nullptr;
+  auto result = cudaMalloc(&ptr, bytes);
+  if (result != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMalloc failed: ") + cudaGetErrorString(result));
+  }
+  return ptr;
+}
+
+void recycle_output_buffer(void* ptr, size_t bytes) {
+  if (ptr == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(output_buffer_pool_mutex());
+  output_buffer_pool()[bytes].push_back(ptr);
+}
+
+__global__ void reduce_complex_to_grayscale_kernel(const SpectrogramComplex* input,
+                                                   int src_rows,
+                                                   int src_cols,
+                                                   uint8_t* output,
+                                                   int dst_rows,
+                                                   int dst_cols,
+                                                   float db_floor,
+                                                   float db_ceil) {
+  const int out_col = blockIdx.x * blockDim.x + threadIdx.x;
+  const int out_row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (out_col >= dst_cols || out_row >= dst_rows) {
+    return;
+  }
+
+  const int row_start = (out_row * src_rows) / dst_rows;
+  const int row_end = max(row_start + 1, ((out_row + 1) * src_rows) / dst_rows);
+  const int col_start = (out_col * src_cols) / dst_cols;
+  const int col_end = max(col_start + 1, ((out_col + 1) * src_cols) / dst_cols);
+
+  double accumulation = 0.0;
+  int count = 0;
+  for (int src_row = row_start; src_row < row_end; ++src_row) {
+    for (int src_col = col_start; src_col < col_end; ++src_col) {
+      const auto value = input[static_cast<size_t>(src_row) * static_cast<size_t>(src_cols) + static_cast<size_t>(src_col)];
+      const float real = value.real();
+      const float imag = value.imag();
+      accumulation += 10.0 * log10(real * real + imag * imag + 1e-12f);
+      ++count;
+    }
+  }
+
+  const float reduced = static_cast<float>(accumulation / static_cast<double>(max(1, count)));
+  const float db_range = max(1.0f, db_ceil - db_floor);
+  const float normalized = (reduced - db_floor) / db_range;
+  output[static_cast<size_t>(out_row) * static_cast<size_t>(dst_cols) + static_cast<size_t>(out_col)] =
+      static_cast<uint8_t>(max(0.0f, min(normalized * 255.0f, 255.0f)));
+}
+
+void reduce_spectrogram_to_grayscale_row_gpu(const SpectrogramTensor& tensor,
+                                             cudaStream_t stream,
+                                             uint8_t* device_output,
+                                             int output_height,
+                                             int output_width,
+                                             float db_floor,
+                                             float db_ceil) {
+  const int src_rows = static_cast<int>(tensor.Size(0));
+  const int src_cols = static_cast<int>(tensor.Size(1));
+  const int dst_rows = std::max(1, std::min(output_height, src_rows));
+  const int dst_cols = std::max(1, std::min(output_width, src_cols));
+  const dim3 block(32, 4);
+  const dim3 grid((dst_cols + block.x - 1) / block.x, (dst_rows + block.y - 1) / block.y);
+  reduce_complex_to_grayscale_kernel<<<grid, block, 0, stream>>>(tensor.Data(),
+                                                                 src_rows,
+                                                                 src_cols,
+                                                                 device_output,
+                                                                 dst_rows,
+                                                                 dst_cols,
+                                                                 db_floor,
+                                                                 db_ceil);
+}
+
+std::vector<uint8_t> reduce_mask_to_history_rows_gpu(const uint8_t* device_input,
+                                                     int src_height,
+                                                     int src_width,
+                                                     int dst_width,
+                                                     int dst_rows,
+                                                     cudaStream_t stream,
+                                                     uint8_t* device_output,
+                                                     void* pinned_output,
+                                                     size_t available_bytes) {
+  if (device_input == nullptr || src_width <= 0 || src_height <= 0 || dst_width <= 0 || dst_rows <= 0) {
+    return {};
+  }
+
+  const size_t reduced_bytes = static_cast<size_t>(dst_width) * static_cast<size_t>(dst_rows) * sizeof(uint8_t);
+  if (reduced_bytes > available_bytes || device_output == nullptr || pinned_output == nullptr) {
+    throw std::runtime_error("visualizer mask reduction buffers are not initialized for the requested live mask size");
+  }
+
+  const dim3 block(32, 4);
+  const dim3 grid((dst_width + block.x - 1) / block.x, (dst_rows + block.y - 1) / block.y);
+  reduce_binary_mask_to_alpha_kernel<<<grid, block, 0, stream>>>(device_input,
+                                                                  src_height,
+                                                                  src_width,
+                                                                  device_output,
+                                                                  dst_rows,
+                                                                  dst_width);
+  auto kernel_result = cudaGetLastError();
+  if (kernel_result != cudaSuccess) {
+    throw std::runtime_error(std::string("visualizer mask reduction kernel launch failed: ") +
+                             cudaGetErrorString(kernel_result));
+  }
+
+  auto copy_result = cudaMemcpyAsync(pinned_output,
+                                     device_output,
+                                     reduced_bytes,
+                                     cudaMemcpyDeviceToHost,
+                                     stream);
+  if (copy_result != cudaSuccess) {
+    throw std::runtime_error(std::string("visualizer reduced mask copy failed: ") + cudaGetErrorString(copy_result));
+  }
+
+  auto sync_result = cudaStreamSynchronize(stream);
+  if (sync_result != cudaSuccess) {
+    throw std::runtime_error(std::string("visualizer reduced mask sync failed: ") + cudaGetErrorString(sync_result));
+  }
+
+  std::vector<uint8_t> reduced(static_cast<size_t>(dst_width) * static_cast<size_t>(dst_rows), 0);
+  std::memcpy(reduced.data(), pinned_output, reduced_bytes);
+  return reduced;
+}
+
 
 holoscan::gxf::Entity create_rgb_entity(holoscan::ExecutionContext& context,
                                         const std::vector<uint8_t>& rgb,
                                         int width,
                                         int height,
                                         const std::string& tensor_name) {
-  auto device_buffer = std::shared_ptr<void*>(new void*, [](void** pointer) {
-    if (pointer != nullptr) {
-      if (*pointer != nullptr) {
-        cudaFree(*pointer);
-      }
-      delete pointer;
-    }
-  });
-
   const size_t bytes = rgb.size() * sizeof(uint8_t);
-  auto alloc_result = cudaMalloc(device_buffer.get(), bytes);
-  if (alloc_result != cudaSuccess) {
-    throw std::runtime_error(std::string("cudaMalloc failed: ") + cudaGetErrorString(alloc_result));
-  }
+  auto lease = std::shared_ptr<DeviceBufferLease>(new DeviceBufferLease{acquire_output_buffer(bytes), bytes},
+                                                  [](DeviceBufferLease* buffer) {
+                                                    if (buffer != nullptr) {
+                                                      recycle_output_buffer(buffer->ptr, buffer->bytes);
+                                                      delete buffer;
+                                                    }
+                                                  });
 
-  // auto copy_result = cudaMemcpy(*device_buffer, rgb.data(), bytes, cudaMemcpyHostToDevice);
-  // if (copy_result != cudaSuccess) {
-  //   throw std::runtime_error(std::string("cudaMemcpy failed: ") + cudaGetErrorString(copy_result));
-  // }
-
-  // Use async copy to avoid blocking — caller is responsible for
-  // synchronizing vis_stream before this buffer is consumed
-  auto copy_result = cudaMemcpyAsync(*device_buffer, rgb.data(), bytes, cudaMemcpyHostToDevice, 0);
+  auto copy_result = cudaMemcpyAsync(lease->ptr, rgb.data(), bytes, cudaMemcpyHostToDevice, 0);
   if (copy_result != cudaSuccess) {
     throw std::runtime_error(std::string("cudaMemcpy failed: ") + cudaGetErrorString(copy_result));
   }
@@ -718,8 +1115,8 @@ holoscan::gxf::Entity create_rgb_entity(holoscan::ExecutionContext& context,
                              element_size,
                              nvidia::gxf::ComputeTrivialStrides(shape, element_size),
                              nvidia::gxf::MemoryStorageType::kDevice,
-                             *device_buffer,
-                             [buffer = device_buffer](void*) mutable {
+                             lease->ptr,
+                             [buffer = lease](void*) mutable {
                                buffer.reset();
                                return nvidia::gxf::Success;
                              });
@@ -787,9 +1184,23 @@ std::vector<uint8_t> reduce_from_pinned_buffer(const void* pinned_buffer,
 
 namespace holoscan::ops {
 
+std::vector<uint8_t> cleanup_live_mask_for_display(const std::vector<uint8_t>& reduced_mask,
+                                                   int width,
+                                                   int height);
+
+namespace {
+
+void update_timing_accumulator(double value_ms, double& total_ms, double& max_ms) {
+  total_ms += value_ms;
+  max_ms = std::max(max_ms, value_ms);
+}
+
+}  // namespace
+
 void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
   spec.input<SpectrogramMessage>("in");
-  spec.input<DetectorMaskMessage>("mask_in").condition(holoscan::ConditionType::kNone);
+  auto& mask_input_port = spec.input<DetectorMaskMessage>("mask_in", holoscan::IOSpec::IOSize{8});
+  mask_input_port.condition(holoscan::ConditionType::kNone);
   spec.output<gxf::Entity>("outputs");
   spec.param(num_channels_, "num_channels", "Num Channels", "Number of channels shown in the analyzer view.", 2);
   spec.param(history_frames_, "history_frames", "History Frames", "Number of consecutive spectrogram frames retained in the display history.", 5);
@@ -817,6 +1228,22 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
   spec.param(dino_chunk_rows_, "dino_chunk_rows", "DINO Chunk Rows", "DINO chunk height shown in readouts.", 256);
   //spec.param(dino_chunk_cols_, "dino_chunk_cols", "DINO Chunk Cols", "DINO chunk width shown in readouts.", 512);
   spec.param(dino_chunk_cols_, "dino_chunk_cols", "DINO Chunk Cols", "DINO chunk width shown in readouts.", 512);
+  spec.param(display_time_rows_, "display_time_rows", "Display Time Rows", "Number of waterfall rows retained in the live ring buffer.", 1024);
+  spec.param(display_freq_bins_, "display_freq_bins", "Display Freq Bins", "Number of frequency bins retained in the live waterfall.", 2048);
+  spec.param(history_memory_budget_mb_,
+             "history_memory_budget_mb",
+             "History Memory Budget MB",
+             "Maximum host memory budget in MiB for the live waterfall history ring buffers.",
+             512);
+  spec.param(rows_per_frame_, "rows_per_frame", "Rows Per Frame", "Number of display rows emitted for each incoming spectrogram frame.", 1);
+  spec.param(mask_frame_offset_,
+             "mask_frame_offset",
+             "Mask Frame Offset",
+             "Shift detector masks by this many whole spectrogram frames before patching them into history.",
+             0);
+  spec.param(render_every_n_frames_, "render_every_n_frames", "Render Every N Frames", "Compose a UI frame every N processed spectrogram frames while still updating history on every frame.", 4);
+  spec.param(timing_summary_enable_, "timing_summary_enable", "Timing Summary Enable", "Enable live visualizer timing summaries.", false);
+  spec.param(timing_summary_every_n_, "timing_summary_every_n", "Timing Summary Every N", "Emit a live visualizer timing summary every N seen frames.", 128);
   spec.param(db_floor_, "db_floor", "dB Floor", "Fixed dB floor for spectrogram normalization.", -100.0f);
   spec.param(db_ceil_,  "db_ceil",  "dB Ceiling", "Fixed dB ceiling for spectrogram normalization.", 0.0f);
   spec.param(row_average_n_, "row_average_n", "Row Average N", "Frames averaged per waterfall row.", 4);
@@ -825,23 +1252,35 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
 
 void SpectrogramToHolovizOp::initialize() {
   Operator::initialize();
-  // Create a dedicated CUDA stream for visualization rendering
-  // so it never blocks the pipeline's CUDA stream
   metadata_policy(holoscan::MetadataPolicy::kUpdate);  // ← add this
-  auto result = cudaStreamCreateWithFlags(&vis_stream_, cudaStreamNonBlocking);
-  if (result != cudaSuccess) {
-    throw std::runtime_error(std::string("Failed to create vis_stream_: ") + cudaGetErrorString(result));
+  const size_t channel_count = static_cast<size_t>(std::max(1, num_channels_.get()));
+  const size_t grayscale_bytes = static_cast<size_t>(std::max(1, display_freq_bins_.get())) *
+                                 static_cast<size_t>(std::max(1, rows_per_frame_.get())) *
+                                 sizeof(uint8_t);
+  channel_resources_.assign(channel_count, {});
+  for (auto& resources : channel_resources_) {
+    auto result = cudaStreamCreateWithFlags(&resources.stream, cudaStreamNonBlocking);
+    if (result != cudaSuccess) {
+      throw std::runtime_error(std::string("Failed to create channel vis stream: ") + cudaGetErrorString(result));
+    }
+    auto device_result = cudaMalloc(reinterpret_cast<void**>(&resources.device_grayscale_buffer), grayscale_bytes);
+    if (device_result != cudaSuccess) {
+      throw std::runtime_error(std::string("Failed to allocate device grayscale buffer: ") + cudaGetErrorString(device_result));
+    }
+    auto pinned_result = cudaMallocHost(&resources.pinned_grayscale_buffer, grayscale_bytes);
+    if (pinned_result != cudaSuccess) {
+      throw std::runtime_error(std::string("Failed to allocate pinned grayscale buffer: ") + cudaGetErrorString(pinned_result));
+    }
+    auto mask_device_result = cudaMalloc(reinterpret_cast<void**>(&resources.device_mask_buffer), grayscale_bytes);
+    if (mask_device_result != cudaSuccess) {
+      throw std::runtime_error(std::string("Failed to allocate device mask buffer: ") + cudaGetErrorString(mask_device_result));
+    }
+    auto mask_pinned_result = cudaMallocHost(&resources.pinned_mask_buffer, grayscale_bytes);
+    if (mask_pinned_result != cudaSuccess) {
+      throw std::runtime_error(std::string("Failed to allocate pinned mask buffer: ") + cudaGetErrorString(mask_pinned_result));
+    }
+    resources.grayscale_buffer_bytes = grayscale_bytes;
   }
-
-  // Allocate pinned host buffer for async GPU→host DMA
-  // Sized for largest possible tensor: num_bursts * fft_size * complex<float>
-  // 1024 bursts * 20480 FFT points * 8 bytes = 167,772,160 bytes
-  const size_t max_bytes = 1024ULL * 20480ULL * sizeof(float) * 2;
-  auto pinned_result = cudaMallocHost(&pinned_host_buffer_, max_bytes);
-  if (pinned_result != cudaSuccess) {
-    throw std::runtime_error(std::string("Failed to allocate pinned host buffer: ") + cudaGetErrorString(pinned_result));
-  }
-  pinned_host_buffer_bytes_ = max_bytes;
 
   // Start background render thread — operator thread hands off work here
   // and returns immediately, never blocking the pipeline
@@ -868,17 +1307,31 @@ void SpectrogramToHolovizOp::stop() {
   if (render_thread_.joinable()) {
     render_thread_.join();
   }
-  // Clean up the dedicated visualization stream
-  if (vis_stream_ != nullptr) {
-    cudaStreamSynchronize(vis_stream_);
-    cudaStreamDestroy(vis_stream_);
-    vis_stream_ = nullptr;
+  for (auto& resources : channel_resources_) {
+    if (resources.stream != nullptr) {
+      cudaStreamSynchronize(resources.stream);
+      cudaStreamDestroy(resources.stream);
+      resources.stream = nullptr;
+    }
+    if (resources.device_grayscale_buffer != nullptr) {
+      cudaFree(resources.device_grayscale_buffer);
+      resources.device_grayscale_buffer = nullptr;
+    }
+    if (resources.pinned_grayscale_buffer != nullptr) {
+      cudaFreeHost(resources.pinned_grayscale_buffer);
+      resources.pinned_grayscale_buffer = nullptr;
+    }
+    if (resources.device_mask_buffer != nullptr) {
+      cudaFree(resources.device_mask_buffer);
+      resources.device_mask_buffer = nullptr;
+    }
+    if (resources.pinned_mask_buffer != nullptr) {
+      cudaFreeHost(resources.pinned_mask_buffer);
+      resources.pinned_mask_buffer = nullptr;
+    }
+    resources.grayscale_buffer_bytes = 0;
   }
-  // Free pinned host buffer
-  if (pinned_host_buffer_ != nullptr) {
-    cudaFreeHost(pinned_host_buffer_);
-    pinned_host_buffer_ = nullptr;
-  }
+  channel_resources_.clear();
   Operator::stop();
 }
 
@@ -888,6 +1341,45 @@ void SpectrogramToHolovizOp::stop() {
 void SpectrogramToHolovizOp::compute(InputContext& op_input,
                                      OutputContext& op_output,
                                      ExecutionContext& context) { 
+  auto maybe_emit_timing_summary = [this]() {
+    if (!timing_summary_enable_.get()) {
+      return;
+    }
+    const uint64_t summary_every = static_cast<uint64_t>(std::max(1, timing_summary_every_n_.get()));
+    std::lock_guard<std::mutex> lock(timing_mutex_);
+    if (timing_stats_.frames_seen == 0 || (timing_stats_.frames_seen % summary_every) != 0) {
+      return;
+    }
+
+     const double seen = static_cast<double>(std::max<uint64_t>(1, timing_stats_.frames_seen));
+     const double processed = static_cast<double>(std::max<uint64_t>(1, timing_stats_.frames_processed));
+     const double rendered = static_cast<double>(std::max<uint64_t>(1, timing_stats_.frames_rendered));
+    std::ostringstream os;
+    os << "Visualizer timing: frames_seen=" << timing_stats_.frames_seen
+       << " processed=" << timing_stats_.frames_processed
+       << " rendered=" << timing_stats_.frames_rendered
+       << " drop_vis_busy=" << timing_stats_.dropped_vis_stream_busy
+       << " drop_render_busy=" << timing_stats_.dropped_render_queue_busy
+       << " cadence_skips=" << timing_stats_.render_skipped_by_cadence
+       << " masks(received/backfilled/deferred/peak)="
+       << timing_stats_.masks_received << "/"
+       << timing_stats_.masks_backfilled << "/"
+       << timing_stats_.masks_deferred << "/"
+       << timing_stats_.masks_pending_peak
+       << " sync_ms(avg/max)=" << std::fixed << std::setprecision(2)
+      << (timing_stats_.sync_total_ms / processed) << "/" << timing_stats_.sync_max_ms
+      << " reduce_ms(avg/max)=" << (timing_stats_.reduce_total_ms / processed) << "/" << timing_stats_.reduce_max_ms
+      << " history_ms(avg/max)=" << (timing_stats_.history_total_ms / processed) << "/" << timing_stats_.history_max_ms
+       << " compose_ms(avg/max)=" << (timing_stats_.compose_total_ms / rendered) << "/" << timing_stats_.compose_max_ms
+      << " render_ms(avg/max)=" << (timing_stats_.render_total_ms / processed) << "/" << timing_stats_.render_max_ms
+       << " drop_rate=" << ((timing_stats_.dropped_vis_stream_busy + timing_stats_.dropped_render_queue_busy) / seen);
+    HOLOSCAN_LOG_INFO("{}", os.str());
+  };
+
+  {
+    std::lock_guard<std::mutex> lock(timing_mutex_);
+    ++timing_stats_.frames_seen;
+  }
 
   auto input = op_input.receive<SpectrogramMessage>("in").value();
   const auto& tensor = std::get<0>(input);
@@ -895,26 +1387,18 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
 
   const auto meta = metadata();
   const int channel_number = meta ? static_cast<int>(meta->get<uint16_t>("channel_number", 0)) : 0;
+  const uint64_t spectrogram_frame_number = meta ? meta->get<uint64_t>("fft_emitted_frame_number", 0) : 0;
   if (channel_filter_.get() >= 0 && channel_number != channel_filter_.get()) {
     return;
   }
 
-  // Receive mask from coherent power detector if available
   auto mask_msg = op_input.receive<DetectorMaskMessage>("mask_in");
-  if (mask_msg) {
-    printf("MASK RECEIVED: w=%d h=%d pixels=%zu\n", mask_msg->width, mask_msg->height, mask_msg->pixels.size());
-    if (channel_states_.size() <= static_cast<size_t>(mask_msg->channel)) {
-      channel_states_.resize(static_cast<size_t>(mask_msg->channel + 1));
-    }
-    auto& mask_state = channel_states_[static_cast<size_t>(mask_msg->channel)];
-    mask_state.latest_mask.pixels = mask_msg->pixels;
-    mask_state.latest_mask.width = mask_msg->width;
-    mask_state.latest_mask.height = mask_msg->height;
-    mask_state.overlay_available = true;
-  }
 
-  if (channel_states_.size() < static_cast<size_t>(std::max(num_channels_.get(), channel_number + 1))) {
-    channel_states_.resize(static_cast<size_t>(std::max(num_channels_.get(), channel_number + 1)));
+  {
+    std::lock_guard<std::mutex> state_lock(channel_states_mutex_);
+    if (channel_states_.size() < static_cast<size_t>(std::max(num_channels_.get(), channel_number + 1))) {
+      channel_states_.resize(static_cast<size_t>(std::max(num_channels_.get(), channel_number + 1)));
+    }
   }
 
   // const int width = std::max(1, std::min(output_width_.get(), static_cast<int>(tensor.Size(1))));
@@ -935,8 +1419,128 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
   // auto grayscale = reduce_spectrogram_to_grayscale(tensor, vis_stream_, height, width);
   
 
-  const int width = std::max(1, std::min(output_width_.get(), static_cast<int>(tensor.Size(1))));
-  const int height = std::max(1, std::min(output_height_.get(), static_cast<int>(tensor.Size(0))));
+  const int width = std::max(1, display_freq_bins_.get());
+  const int height = std::max(1, rows_per_frame_.get());
+  if (channel_resources_.size() <= static_cast<size_t>(channel_number)) {
+    channel_resources_.resize(static_cast<size_t>(channel_number + 1));
+  }
+  auto& channel_resources = channel_resources_[static_cast<size_t>(channel_number)];
+
+  if (mask_msg) {
+    std::lock_guard<std::mutex> state_lock(channel_states_mutex_);
+    if (channel_states_.size() <= static_cast<size_t>(mask_msg->channel)) {
+      channel_states_.resize(static_cast<size_t>(mask_msg->channel + 1));
+    }
+    auto& mask_state = channel_states_[static_cast<size_t>(mask_msg->channel)];
+    {
+      std::lock_guard<std::mutex> lock(timing_mutex_);
+      ++timing_stats_.masks_received;
+    }
+
+    const int target_width = std::max(1, display_freq_bins_.get());
+    const int rows_per_frame = std::max(1, rows_per_frame_.get());
+    std::vector<uint8_t> reduced_mask;
+    unsigned int incoming_device_nonzero = 0;
+    if (mask_msg->width == target_width && mask_msg->height == rows_per_frame) {
+      reduced_mask = mask_msg->pixels;
+      if (reduced_mask.empty() && mask_msg->device_pixels) {
+        reduced_mask.resize(static_cast<size_t>(mask_msg->width) * static_cast<size_t>(mask_msg->height));
+        const auto copy_result = cudaMemcpy(reduced_mask.data(),
+                                            mask_msg->device_pixels.get(),
+                                            reduced_mask.size() * sizeof(uint8_t),
+                                            cudaMemcpyDeviceToHost);
+        if (copy_result != cudaSuccess) {
+          throw std::runtime_error(std::string("cudaMemcpy failed while reading reduced detector mask: ") +
+                                   cudaGetErrorString(copy_result));
+        }
+      }
+    } else if (!mask_msg->pixels.empty()) {
+      OfflinePgmFrame host_mask;
+      host_mask.pixels = mask_msg->pixels;
+      host_mask.width = mask_msg->width;
+      host_mask.height = mask_msg->height;
+      reduced_mask = reduce_mask_to_history_rows(host_mask, target_width, rows_per_frame);
+    } else if (mask_msg->device_pixels) {
+      if ((mask_msg->frame_number % 128) == 0 && channel_resources.device_grayscale_buffer != nullptr) {
+        auto* device_counter = reinterpret_cast<unsigned int*>(channel_resources.device_grayscale_buffer);
+        const int total = mask_msg->width * mask_msg->height;
+        if (cudaMemsetAsync(device_counter, 0, sizeof(unsigned int), channel_resources.stream) == cudaSuccess) {
+          constexpr int count_threads = 256;
+          const int count_blocks = (total + count_threads - 1) / count_threads;
+          count_nonzero_u8_kernel<<<count_blocks, count_threads, 0, channel_resources.stream>>>(
+              mask_msg->device_pixels.get(), total, device_counter);
+          if (cudaGetLastError() == cudaSuccess &&
+              cudaMemcpyAsync(&incoming_device_nonzero,
+                              device_counter,
+                              sizeof(unsigned int),
+                              cudaMemcpyDeviceToHost,
+                              channel_resources.stream) == cudaSuccess) {
+            cudaStreamSynchronize(channel_resources.stream);
+          }
+        }
+      }
+      reduced_mask = reduce_mask_to_history_rows_gpu(mask_msg->device_pixels.get(),
+                                                     mask_msg->height,
+                                                     mask_msg->width,
+                                                     target_width,
+                                                     rows_per_frame,
+                                                     channel_resources.stream,
+                                                     channel_resources.device_mask_buffer,
+                                                     channel_resources.pinned_mask_buffer,
+                                                     channel_resources.grayscale_buffer_bytes);
+    } else {
+      mask_state.latest_mask.pixels = mask_msg->pixels;
+      mask_state.latest_mask.width = mask_msg->width;
+      mask_state.latest_mask.height = mask_msg->height;
+      reduced_mask = reduce_mask_to_history_rows(mask_state.latest_mask, target_width, rows_per_frame);
+    }
+
+    reduced_mask = cleanup_live_mask_for_display(reduced_mask, target_width, rows_per_frame);
+
+    mask_state.latest_mask.pixels = reduced_mask;
+    mask_state.latest_mask.width = target_width;
+    mask_state.latest_mask.height = rows_per_frame;
+    mask_state.latest_mask_frame_number = static_cast<int64_t>(mask_msg->frame_number);
+    if ((mask_msg->frame_number % 128) == 0) {
+      const auto reduced_nonzero = std::count_if(reduced_mask.begin(), reduced_mask.end(), [](uint8_t value) {
+        return value != 0;
+      });
+      HOLOSCAN_LOG_INFO(
+          "Mask receive audit ch={} frame={} src={}x{} host_pixels={} device_ptr={} raw_device_nonzero={} reduced_nonzero={}",
+          mask_msg->channel,
+          mask_msg->frame_number,
+          mask_msg->width,
+          mask_msg->height,
+          mask_msg->pixels.size(),
+          mask_msg->device_pixels ? "yes" : "no",
+          incoming_device_nonzero,
+          reduced_nonzero);
+    }
+    const int64_t target_frame_number = static_cast<int64_t>(mask_msg->frame_number) +
+                                        static_cast<int64_t>(mask_frame_offset_.get());
+
+    DetectorMaskMessage reduced_mask_msg;
+    reduced_mask_msg.pixels = reduced_mask;
+    reduced_mask_msg.width = target_width;
+    reduced_mask_msg.height = rows_per_frame;
+    reduced_mask_msg.channel = mask_msg->channel;
+    reduced_mask_msg.frame_number = mask_msg->frame_number;
+    if (!patch_history_mask_for_frame(mask_state,
+                                      target_frame_number,
+                                      reduced_mask,
+                                      target_width)) {
+      mask_state.pending_masks[target_frame_number] = std::move(reduced_mask_msg);
+      {
+        std::lock_guard<std::mutex> lock(timing_mutex_);
+        ++timing_stats_.masks_deferred;
+        timing_stats_.masks_pending_peak = std::max<uint64_t>(timing_stats_.masks_pending_peak,
+                                                              static_cast<uint64_t>(mask_state.pending_masks.size()));
+      }
+    } else {
+      std::lock_guard<std::mutex> lock(timing_mutex_);
+      ++timing_stats_.masks_backfilled;
+    }
+  }
 
   // Count every frame received
   // Emit any previously composed frame from the background thread
@@ -959,8 +1563,13 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
 
   // Check if vis_stream_ is still busy rendering the previous frame.
   // If busy → drop this frame immediately, pipeline continues without blocking.
-  if (cudaStreamQuery(vis_stream_) == cudaErrorNotReady) {
+  if (cudaStreamQuery(channel_resources.stream) == cudaErrorNotReady) {
     dropped_frames_++;
+    {
+      std::lock_guard<std::mutex> lock(timing_mutex_);
+      ++timing_stats_.dropped_vis_stream_busy;
+    }
+    maybe_emit_timing_summary();
     return;  // pipeline is NEVER blocked 
   }
 
@@ -973,38 +1582,31 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
   cudaEvent_t pipeline_done;
   cudaEventCreateWithFlags(&pipeline_done, cudaEventDisableTiming);
   cudaEventRecord(pipeline_done, stream);
-  cudaStreamWaitEvent(vis_stream_, pipeline_done, 0);
+  cudaStreamWaitEvent(channel_resources.stream, pipeline_done, 0);
   cudaEventDestroy(pipeline_done);
 
-  // Kick off async GPU→host DMA on vis_stream_ into pinned buffer.
-  // Operator thread does NOT synchronize — returns immediately after this.
-  const int tensor_rows = static_cast<int>(tensor.Size(0));
-  const int tensor_cols = static_cast<int>(tensor.Size(1));
-  const size_t tensor_bytes = static_cast<size_t>(tensor_rows)
-                            * static_cast<size_t>(tensor_cols)
-                            * sizeof(cuda::std::complex<float>);
-  if (tensor_bytes > pinned_host_buffer_bytes_) {
-    // Buffer too small — skip this frame rather than overflow
+  const size_t grayscale_bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(uint8_t);
+  if (grayscale_bytes > channel_resources.grayscale_buffer_bytes) {
     dropped_frames_++;
+    {
+      std::lock_guard<std::mutex> lock(timing_mutex_);
+      ++timing_stats_.dropped_vis_stream_busy;
+    }
+    maybe_emit_timing_summary();
     return;
   }
-  cudaMemcpyAsync(pinned_host_buffer_, tensor.Data(),
-                  tensor_bytes, cudaMemcpyDeviceToHost, vis_stream_);
-
-  // Check if background render thread is free.
-  // If busy → drop this frame, operator thread returns immediately.
-  // Throttle rendering to every 8th frame — matches background thread capacity
-  // of ~6 fps at 500 MSps. Signal history still updates every tick.
-  // Per-channel throttle counter — ensures both channels get render turns
-  if (channel_states_.size() <= static_cast<size_t>(channel_number)) {
-    channel_states_.resize(static_cast<size_t>(channel_number + 1));
-  }
-  static std::array<uint64_t, 2> compose_ticks = {0, 0};
-  const int tick_index = channel_number % 2;
-  compose_ticks[tick_index]++;
-  if (compose_ticks[tick_index] % 8 != 0) {
-    return;
-  }
+  reduce_spectrogram_to_grayscale_row_gpu(tensor,
+                                          channel_resources.stream,
+                                          channel_resources.device_grayscale_buffer,
+                                          height,
+                                          width,
+                                          db_floor_.get(),
+                                          db_ceil_.get());
+  cudaMemcpyAsync(channel_resources.pinned_grayscale_buffer,
+                  channel_resources.device_grayscale_buffer,
+                  grayscale_bytes,
+                  cudaMemcpyDeviceToHost,
+                  channel_resources.stream);
 
   // Check if background render thread is free.
   // If busy → drop this frame, operator thread returns immediately.
@@ -1012,6 +1614,11 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
     std::unique_lock<std::mutex> lock(render_mutex_);
     if (render_ready_) {
       dropped_frames_++;
+      {
+        std::lock_guard<std::mutex> stats_lock(timing_mutex_);
+        ++timing_stats_.dropped_render_queue_busy;
+      }
+      maybe_emit_timing_summary();
       return;
     }
 
@@ -1025,95 +1632,127 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
     float red_lim = red_limit_.get();
     float snap_db_floor = db_floor_.get();
     float snap_db_ceil  = db_ceil_.get();
-    int snap_row_average_n = row_average_n_.get();
     int snap_width = width;
     int snap_height = height;
-    int snap_tensor_rows = tensor_rows;
-    int snap_tensor_cols = tensor_cols;
-    int snap_history_frames = history_frames_.get();
+    int snap_display_time_rows_requested = std::max(1, display_time_rows_.get());
+    int snap_display_time_rows = clamp_history_rows_to_budget(width,
+                                  snap_display_time_rows_requested,
+                                  history_memory_budget_mb_.get());
+    int snap_render_every_n_frames = std::max(1, render_every_n_frames_.get());
+    uint64_t snap_spectrogram_frame_number = spectrogram_frame_number;
+        auto snap_stream = channel_resources.stream;
+        auto snap_pinned_grayscale_buffer = channel_resources.pinned_grayscale_buffer;
+
+    if (snap_display_time_rows < snap_display_time_rows_requested &&
+      !history_budget_warning_emitted_.exchange(true)) {
+      HOLOSCAN_LOG_WARN(
+        "Visualizer requested display_time_rows={} at display_freq_bins={} but history_memory_budget_mb={} allows {} rows; clamping live history.",
+        snap_display_time_rows_requested,
+        width,
+        history_memory_budget_mb_.get(),
+        snap_display_time_rows);
+    }
 
     render_task_ = [this,
                 snapshot_channel_number,
                 snapshot_dropped,
                 snapshot_total,
                 blue, red, alpha, red_lim,
-                snap_db_floor, snap_db_ceil,
-                snap_row_average_n,
                 snap_width, snap_height,
-                snap_tensor_rows, snap_tensor_cols,
-                snap_history_frames]() mutable {
+          snap_display_time_rows,
+          snap_render_every_n_frames,
+                snap_spectrogram_frame_number,
+          snap_stream,
+          snap_pinned_grayscale_buffer]() mutable {
+      const auto render_start = std::chrono::steady_clock::now();
 
-      // Sync vis_stream_ HERE — blocks background thread, NOT operator thread
-      cudaStreamSynchronize(vis_stream_);
+      // Sync the per-channel visualization stream here — blocks background thread, not operator thread.
+      const auto sync_start = std::chrono::steady_clock::now();
+      cudaStreamSynchronize(snap_stream);
+      const auto sync_end = std::chrono::steady_clock::now();
 
-      auto snapshot_overlay_available = channel_states_[static_cast<size_t>(snapshot_channel_number)].overlay_available;
-      auto snapshot_mask = channel_states_[static_cast<size_t>(snapshot_channel_number)].latest_mask;
-
-      // pinned_host_buffer_ now has complete GPU data — run reduction on CPU
-      auto grayscale = reduce_from_pinned_buffer(pinned_host_buffer_,
-                                                 snap_tensor_rows,
-                                                 snap_tensor_cols,
-                                                 snap_height,
-                                                 snap_width,
-                                                 snap_db_floor,
-                                                 snap_db_ceil);
+      // Small grayscale row buffer is now ready in pinned host memory.
+      const auto reduce_start = sync_end;
+      std::vector<uint8_t> grayscale(static_cast<size_t>(snap_width) * static_cast<size_t>(snap_height));
+      std::memcpy(grayscale.data(), snap_pinned_grayscale_buffer, grayscale.size());
+      const auto reduce_end = std::chrono::steady_clock::now();
 
       // Update channel state
-      auto& state = channel_states_[static_cast<size_t>(snapshot_channel_number)];
-      state.active = true;
-      state.info.channel = snapshot_channel_number;
-      state.overlay_available = snapshot_overlay_available;
-      state.latest_mask = snapshot_mask;
-
-      // Accumulate grayscale rows — average N frames before appending to history
-      // This makes waterfall scroll slower but smoothly, no jumping
-      const size_t gray_size = static_cast<size_t>(snap_width) * static_cast<size_t>(snap_height);
-      if (state.row_accumulator.size() != gray_size) {
-        state.row_accumulator.assign(gray_size, 0.0f);
-        state.row_accumulator_count = 0;
-      }
-      for (size_t i = 0; i < gray_size; ++i) {
-        state.row_accumulator[i] += static_cast<float>(grayscale[i]);
-      }
-      state.row_accumulator_count++;
-
-      if (state.row_accumulator_count >= snap_row_average_n) {
-        // Produce averaged grayscale
-        std::vector<uint8_t> averaged(gray_size);
-        for (size_t i = 0; i < gray_size; ++i) {
-          averaged[i] = static_cast<uint8_t>(std::clamp(
-              state.row_accumulator[i] / static_cast<float>(state.row_accumulator_count),
-              0.0f, 255.0f));
-        }
-        // Reset accumulator
-        std::fill(state.row_accumulator.begin(), state.row_accumulator.end(), 0.0f);
-        state.row_accumulator_count = 0;
-        append_spectrogram_history(state, averaged, snap_width, snap_height, snap_history_frames);
-        state.current_psd_trace = compute_psd_trace(averaged, snap_width, snap_height);
-      } else {
-        // Not enough frames yet — still update PSD from latest raw frame
+      const auto history_start = reduce_end;
+      {
+        std::lock_guard<std::mutex> state_lock(channel_states_mutex_);
+        auto& state = channel_states_[static_cast<size_t>(snapshot_channel_number)];
+        state.active = true;
+        state.info.channel = snapshot_channel_number;
+        state.info.frame_number = static_cast<int64_t>(snap_spectrogram_frame_number);
+        append_spectrogram_history(state, grayscale, snap_width, snap_height, snap_display_time_rows);
         state.current_psd_trace = compute_psd_trace(grayscale, snap_width, snap_height);
-      }
 
-      update_max_hold_trace(state.current_psd_trace, state.max_hold_trace);
-      update_density_history(
-          compute_density_trace_from_grayscale(grayscale, snap_width, snap_height, red_lim),
-          state.density_trace,
-          state.density_frames_seen);
+        auto pending_it = state.pending_masks.find(static_cast<int64_t>(snap_spectrogram_frame_number));
+        if (pending_it != state.pending_masks.end()) {
+          const OfflinePgmFrame pending_frame{pending_it->second.width, pending_it->second.height, pending_it->second.pixels};
+          const auto reduced_mask =
+              (pending_frame.width == snap_width && pending_frame.height == snap_height)
+                  ? pending_frame.pixels
+                  : reduce_mask_to_history_rows(pending_frame, snap_width, snap_height);
+          patch_history_mask_for_frame(state,
+                                       static_cast<int64_t>(snap_spectrogram_frame_number),
+                                       reduced_mask,
+                                       snap_width);
+          state.pending_masks.erase(pending_it);
+          {
+            std::lock_guard<std::mutex> lock(timing_mutex_);
+            ++timing_stats_.masks_backfilled;
+          }
+        }
+        state.overlay_available = state.latest_mask_frame_number == static_cast<int64_t>(snap_spectrogram_frame_number) &&
+                                  !state.latest_mask.pixels.empty();
+
+        update_max_hold_trace(state.current_psd_trace, state.max_hold_trace);
+        update_density_history(
+            compute_density_trace_from_grayscale(grayscale, snap_width, snap_height, red_lim),
+            state.density_trace,
+            state.density_frames_seen);
+      }
+      const auto history_end = std::chrono::steady_clock::now();
+
+      if ((snap_spectrogram_frame_number % static_cast<uint64_t>(snap_render_every_n_frames)) != 0) {
+        std::lock_guard<std::mutex> lock(timing_mutex_);
+        update_timing_accumulator(std::chrono::duration<double, std::milli>(sync_end - sync_start).count(),
+                                  timing_stats_.sync_total_ms,
+                                  timing_stats_.sync_max_ms);
+        update_timing_accumulator(std::chrono::duration<double, std::milli>(reduce_end - reduce_start).count(),
+                                  timing_stats_.reduce_total_ms,
+                                  timing_stats_.reduce_max_ms);
+        update_timing_accumulator(std::chrono::duration<double, std::milli>(history_end - history_start).count(),
+                                  timing_stats_.history_total_ms,
+                                  timing_stats_.history_max_ms);
+        update_timing_accumulator(std::chrono::duration<double, std::milli>(history_end - render_start).count(),
+                                  timing_stats_.render_total_ms,
+                                  timing_stats_.render_max_ms);
+        ++timing_stats_.frames_processed;
+        ++timing_stats_.render_skipped_by_cadence;
+        return;
+      }
 
       int composite_width = 0;
       int composite_height = 0;
-      printf("RENDER: overlay_available=%d mask_pixels=%zu\n",
-             (int)channel_states_[static_cast<size_t>(snapshot_channel_number)].overlay_available,
-             channel_states_[static_cast<size_t>(snapshot_channel_number)].latest_mask.pixels.size());
-      auto composed = compose_visualization_rgb(channel_states_,
-                                                blue,
-                                                red,
-                                                alpha,
-                                                composite_width,
-                                                composite_height,
-                                                snapshot_dropped,
-                                                snapshot_total);
+      const auto compose_start = std::chrono::steady_clock::now();
+      std::vector<uint8_t> composed;
+      {
+        std::lock_guard<std::mutex> state_lock(channel_states_mutex_);
+        composed = compose_visualization_rgb(channel_states_,
+                                             blue,
+                                             red,
+                                             alpha,
+                                             output_width_.get(),
+                                             output_height_.get(),
+                                             composite_width,
+                                             composite_height,
+                                             snapshot_dropped,
+                                             snapshot_total);
+      }
+      const auto compose_end = std::chrono::steady_clock::now();
       {
         std::unique_lock<std::mutex> composed_lock(composed_mutex_);
         pending_composed_ = std::move(composed);
@@ -1121,10 +1760,31 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
         pending_composed_height_ = composite_height;
         pending_composed_ready_ = true;
       }
+      {
+        std::lock_guard<std::mutex> lock(timing_mutex_);
+        update_timing_accumulator(std::chrono::duration<double, std::milli>(sync_end - sync_start).count(),
+                                  timing_stats_.sync_total_ms,
+                                  timing_stats_.sync_max_ms);
+        update_timing_accumulator(std::chrono::duration<double, std::milli>(reduce_end - reduce_start).count(),
+                                  timing_stats_.reduce_total_ms,
+                                  timing_stats_.reduce_max_ms);
+        update_timing_accumulator(std::chrono::duration<double, std::milli>(history_end - history_start).count(),
+                                  timing_stats_.history_total_ms,
+                                  timing_stats_.history_max_ms);
+        update_timing_accumulator(std::chrono::duration<double, std::milli>(compose_end - compose_start).count(),
+                                  timing_stats_.compose_total_ms,
+                                  timing_stats_.compose_max_ms);
+        update_timing_accumulator(std::chrono::duration<double, std::milli>(compose_end - render_start).count(),
+                                  timing_stats_.render_total_ms,
+                                  timing_stats_.render_max_ms);
+        ++timing_stats_.frames_processed;
+        ++timing_stats_.frames_rendered;
+      }
     };
     render_ready_ = true;
     render_cv_.notify_one();
   }
+  maybe_emit_timing_summary();
   // Operator thread returns immediately here
   // cudaMemcpyAsync is still running on vis_stream_ — background thread will sync it
   // Pipeline stream is completely free
@@ -1219,7 +1879,8 @@ void OfflinePgmReplayOp::compute(InputContext&, OutputContext& op_output, Execut
   }
   const size_t state_index = static_cast<size_t>(std::max(0, channel));
   auto& state = channel_states_[state_index];
-  append_spectrogram_history(state, grayscale, width, height, history_frames_.get());
+  state.info.frame_number = static_cast<int64_t>(frame_number);
+  append_spectrogram_history(state, grayscale, width, height, history_frames_.get() * height);
   state.current_psd_trace = compute_psd_trace(grayscale, width, height);
   update_max_hold_trace(state.current_psd_trace, state.max_hold_trace);
   const auto current_density = has_mask ? compute_density_trace(&mask_frame)
@@ -1227,9 +1888,13 @@ void OfflinePgmReplayOp::compute(InputContext&, OutputContext& op_output, Execut
   update_density_history(current_density, state.density_trace, state.density_frames_seen);
   state.overlay_available = has_mask;
   state.latest_mask = has_mask ? mask_frame : OfflinePgmFrame{};
+  state.latest_mask_frame_number = has_mask ? static_cast<int64_t>(frame_number) : -1;
+  if (has_mask) {
+    const auto reduced_mask = reduce_mask_to_history_rows(mask_frame, width, height);
+    patch_history_mask_for_frame(state, static_cast<int64_t>(frame_number), reduced_mask, width);
+  }
   state.active = true;
   state.info.channel = channel;
-  state.info.frame_number = static_cast<int64_t>(frame_number);
   state.info.center_frequency_hz = center_frequency_hz_.get();
   state.info.fft_size = fft_size_.get();
   state.info.dino_chunk_rows = dino_chunk_rows_.get();
@@ -1251,6 +1916,8 @@ void OfflinePgmReplayOp::compute(InputContext&, OutputContext& op_output, Execut
                                             blue_limit_.get(),
                                             red_limit_.get(),
                                             overlay_alpha_.get(),
+                                            width,
+                                            std::max(256, height * history_frames_.get()),
                                             composite_width,
                                             composite_height,
                                             0,
@@ -1366,7 +2033,7 @@ std::vector<float> compute_density_trace(const OfflinePgmFrame* mask_frame) {
   for (int col = 0; col < mask_frame->width; ++col) {
     int active = 0;
     for (int row = 0; row < mask_frame->height; ++row) {
-      active += mask_frame->pixels[static_cast<size_t>(row) * static_cast<size_t>(mask_frame->width) + static_cast<size_t>(col)] >= 128 ? 1 : 0;
+      active += mask_frame->pixels[static_cast<size_t>(row) * static_cast<size_t>(mask_frame->width) + static_cast<size_t>(col)] > 0 ? 1 : 0;
     }
     density[static_cast<size_t>(col)] = static_cast<float>(active) / static_cast<float>(mask_frame->height);
   }
@@ -1415,36 +2082,237 @@ void update_density_history(const std::vector<float>& current_density,
   ++density_frames_seen;
 }
 
+void ensure_history_capacity(ChannelVisualizationState& state, int width, int max_rows) {
+  const int clamped_rows = std::max(1, max_rows);
+  if (state.history_width == width && state.history_capacity_rows == clamped_rows) {
+    return;
+  }
+
+  state.history_width = width;
+  state.history_capacity_rows = clamped_rows;
+  state.history_valid_rows = 0;
+  state.history_write_row = 0;
+  state.history_grayscale.assign(static_cast<size_t>(width) * static_cast<size_t>(clamped_rows), 0);
+  state.history_mask.assign(static_cast<size_t>(width) * static_cast<size_t>(clamped_rows), 0);
+  state.history_row_frame_numbers.assign(static_cast<size_t>(clamped_rows), -1);
+  state.history_row_indices_within_frame.assign(static_cast<size_t>(clamped_rows), -1);
+}
+
+void write_history_rows(ChannelVisualizationState& state,
+                        const std::vector<uint8_t>& rows,
+                        int width,
+                        int row_count,
+                        int64_t frame_number) {
+  if (row_count <= 0 || width <= 0) {
+    return;
+  }
+
+  ensure_history_capacity(state, width, state.history_capacity_rows > 0 ? state.history_capacity_rows : row_count);
+  const size_t row_bytes = static_cast<size_t>(width);
+  for (int row = 0; row < row_count; ++row) {
+    const int dst_row = state.history_write_row;
+    const size_t dst_offset = static_cast<size_t>(dst_row) * row_bytes;
+    const size_t src_offset = static_cast<size_t>(row) * row_bytes;
+    std::copy(rows.begin() + static_cast<std::ptrdiff_t>(src_offset),
+              rows.begin() + static_cast<std::ptrdiff_t>(src_offset + row_bytes),
+              state.history_grayscale.begin() + static_cast<std::ptrdiff_t>(dst_offset));
+    std::fill(state.history_mask.begin() + static_cast<std::ptrdiff_t>(dst_offset),
+              state.history_mask.begin() + static_cast<std::ptrdiff_t>(dst_offset + row_bytes),
+              0);
+    state.history_row_frame_numbers[static_cast<size_t>(dst_row)] = frame_number;
+    state.history_row_indices_within_frame[static_cast<size_t>(dst_row)] = row;
+    state.history_write_row = (state.history_write_row + 1) % state.history_capacity_rows;
+    state.history_valid_rows = std::min(state.history_valid_rows + 1, state.history_capacity_rows);
+  }
+}
+
+std::vector<uint8_t> materialize_history_rows(const std::vector<uint8_t>& ring,
+                                              int width,
+                                              int capacity_rows,
+                                              int valid_rows,
+                                              int write_row) {
+  const int output_rows = std::max(1, capacity_rows);
+  std::vector<uint8_t> materialized(static_cast<size_t>(width) * static_cast<size_t>(output_rows), 0);
+  if (width <= 0 || capacity_rows <= 0 || valid_rows <= 0) {
+    return materialized;
+  }
+
+  const size_t row_bytes = static_cast<size_t>(width);
+  const int leading_blank_rows = output_rows - valid_rows;
+  const int oldest_row = valid_rows == capacity_rows ? write_row : 0;
+  for (int row = 0; row < valid_rows; ++row) {
+    const int src_row = (oldest_row + row) % capacity_rows;
+    const size_t src_offset = static_cast<size_t>(src_row) * row_bytes;
+    const size_t dst_offset = static_cast<size_t>(leading_blank_rows + row) * row_bytes;
+    std::copy(ring.begin() + static_cast<std::ptrdiff_t>(src_offset),
+              ring.begin() + static_cast<std::ptrdiff_t>(src_offset + row_bytes),
+              materialized.begin() + static_cast<std::ptrdiff_t>(dst_offset));
+  }
+  return materialized;
+}
+
+std::vector<uint8_t> reduce_mask_to_history_rows(const holoscan::ops::OfflinePgmFrame& mask_frame,
+                                                 int dst_width,
+                                                 int dst_rows) {
+  if (mask_frame.width <= 0 || mask_frame.height <= 0 || mask_frame.pixels.empty() ||
+      dst_width <= 0 || dst_rows <= 0) {
+    return {};
+  }
+
+  std::vector<uint8_t> reduced(static_cast<size_t>(dst_width) * static_cast<size_t>(dst_rows), 0);
+  for (int row = 0; row < dst_rows; ++row) {
+    const int src_row_start = (row * mask_frame.height) / dst_rows;
+    const int src_row_end = std::max(src_row_start + 1, ((row + 1) * mask_frame.height) / dst_rows);
+    for (int col = 0; col < dst_width; ++col) {
+      const int src_col_start = (col * mask_frame.width) / dst_width;
+      const int src_col_end = std::max(src_col_start + 1, ((col + 1) * mask_frame.width) / dst_width);
+      int active = 0;
+      int count = 0;
+      for (int src_row = src_row_start; src_row < src_row_end; ++src_row) {
+        for (int src_col = src_col_start; src_col < src_col_end; ++src_col) {
+          active += mask_frame.pixels[static_cast<size_t>(src_row) * static_cast<size_t>(mask_frame.width) +
+                                      static_cast<size_t>(src_col)] > 0
+                        ? 1
+                        : 0;
+          ++count;
+        }
+      }
+      const float occupancy = count > 0 ? static_cast<float>(active) / static_cast<float>(count) : 0.0f;
+      reduced[static_cast<size_t>(row) * static_cast<size_t>(dst_width) + static_cast<size_t>(col)] =
+          static_cast<uint8_t>(std::lround(std::clamp(occupancy, 0.0f, 1.0f) * 255.0f));
+    }
+  }
+  return reduced;
+}
+
+std::vector<uint8_t> cleanup_live_mask_for_display(const std::vector<uint8_t>& reduced_mask,
+                                                   int width,
+                                                   int height) {
+  if (width <= 0 || height <= 0 || reduced_mask.size() != static_cast<size_t>(width) * static_cast<size_t>(height)) {
+    return reduced_mask;
+  }
+
+  struct ComponentStats {
+    int min_row;
+    int max_row;
+    int min_col;
+    int max_col;
+    int filled = 0;
+    uint8_t peak_value = 0;
+  };
+
+  std::vector<uint8_t> visited(reduced_mask.size(), 0);
+  std::vector<uint8_t> cleaned(reduced_mask.size(), 0);
+  const std::array<std::pair<int, int>, 4> neighbors{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
+
+  for (int row = 0; row < height; ++row) {
+    for (int col = 0; col < width; ++col) {
+      const size_t seed_index = static_cast<size_t>(row) * static_cast<size_t>(width) + static_cast<size_t>(col);
+      if (visited[seed_index] || reduced_mask[seed_index] == 0) {
+        continue;
+      }
+
+      ComponentStats stats{row, row, col, col, 0, 0};
+      std::queue<std::pair<int, int>> pending;
+      pending.push({row, col});
+      visited[seed_index] = 1;
+
+      while (!pending.empty()) {
+        const auto [current_row, current_col] = pending.front();
+        pending.pop();
+        const size_t current_index = static_cast<size_t>(current_row) * static_cast<size_t>(width) +
+                                     static_cast<size_t>(current_col);
+        stats.min_row = std::min(stats.min_row, current_row);
+        stats.max_row = std::max(stats.max_row, current_row);
+        stats.min_col = std::min(stats.min_col, current_col);
+        stats.max_col = std::max(stats.max_col, current_col);
+        stats.peak_value = std::max(stats.peak_value, reduced_mask[current_index]);
+        ++stats.filled;
+
+        for (const auto& [delta_row, delta_col] : neighbors) {
+          const int next_row = current_row + delta_row;
+          const int next_col = current_col + delta_col;
+          if (next_row < 0 || next_row >= height || next_col < 0 || next_col >= width) {
+            continue;
+          }
+          const size_t next_index = static_cast<size_t>(next_row) * static_cast<size_t>(width) +
+                                    static_cast<size_t>(next_col);
+          if (visited[next_index] || reduced_mask[next_index] == 0) {
+            continue;
+          }
+          visited[next_index] = 1;
+          pending.push({next_row, next_col});
+        }
+      }
+
+      const int freq_span = stats.max_col - stats.min_col + 1;
+      const int time_span = stats.max_row - stats.min_row + 1;
+      const int bbox_area = freq_span * time_span;
+      const float density = bbox_area > 0 ? static_cast<float>(stats.filled) / static_cast<float>(bbox_area) : 0.0f;
+      if (stats.filled < kLiveMaskGroupingMinComponentSize ||
+          freq_span < kLiveMaskGroupingMinFreqSpan ||
+          time_span < kLiveMaskGroupingMinTimeSpan ||
+          density < kLiveMaskGroupingMinDensity) {
+        continue;
+      }
+
+      for (int fill_row = stats.min_row; fill_row <= stats.max_row; ++fill_row) {
+        for (int fill_col = stats.min_col; fill_col <= stats.max_col; ++fill_col) {
+          cleaned[static_cast<size_t>(fill_row) * static_cast<size_t>(width) + static_cast<size_t>(fill_col)] =
+              stats.peak_value;
+        }
+      }
+    }
+  }
+
+  return cleaned;
+}
+
+bool patch_history_mask_for_frame(ChannelVisualizationState& state,
+                                  int64_t frame_number,
+                                  const std::vector<uint8_t>& mask_rows,
+                                  int width) {
+  if (frame_number < 0 || width <= 0 || state.history_width != width || mask_rows.size() < static_cast<size_t>(width)) {
+    return false;
+  }
+
+  const size_t row_bytes = static_cast<size_t>(width);
+  const int mask_row_count = static_cast<int>(mask_rows.size() / row_bytes);
+  bool patched_any_row = false;
+  for (int row = 0; row < state.history_capacity_rows; ++row) {
+    if (state.history_row_frame_numbers[static_cast<size_t>(row)] != frame_number) {
+      continue;
+    }
+    const int frame_row_index = state.history_row_indices_within_frame[static_cast<size_t>(row)];
+    if (frame_row_index < 0 || frame_row_index >= mask_row_count) {
+      continue;
+    }
+    const size_t src_offset = static_cast<size_t>(frame_row_index) * row_bytes;
+    const size_t dst_offset = static_cast<size_t>(row) * row_bytes;
+    std::copy(mask_rows.begin() + static_cast<std::ptrdiff_t>(src_offset),
+              mask_rows.begin() + static_cast<std::ptrdiff_t>(src_offset + row_bytes),
+              state.history_mask.begin() + static_cast<std::ptrdiff_t>(dst_offset));
+    patched_any_row = true;
+  }
+  return patched_any_row;
+}
+
 void append_spectrogram_history(ChannelVisualizationState& state,
                                 const std::vector<uint8_t>& grayscale,
                                 int width,
                                 int height,
-                                int history_frames) {
-  if (state.history_width != width) {
-    state.history_grayscale.clear();
-    state.history_width = width;
-    state.latest_frame_height = height;
-  }
+                                int max_rows) {
   state.latest_frame_height = height;
-  const int max_rows = std::max(1, history_frames) * height;
-  const int existing_rows = state.history_width > 0 ? static_cast<int>(state.history_grayscale.size() / static_cast<size_t>(state.history_width)) : 0;
-  const int kept_rows = std::min(existing_rows, std::max(0, max_rows - height));
-
-  std::vector<uint8_t> combined(static_cast<size_t>(std::min(max_rows, kept_rows + height)) * static_cast<size_t>(width));
-  if (kept_rows > 0) {
-    const size_t src_offset = static_cast<size_t>(existing_rows - kept_rows) * static_cast<size_t>(width);
-    std::copy(state.history_grayscale.begin() + static_cast<std::ptrdiff_t>(src_offset),
-              state.history_grayscale.end(),
-              combined.begin());
-  }
-  std::copy(grayscale.begin(), grayscale.end(), combined.begin() + static_cast<std::ptrdiff_t>(kept_rows * width));
-  state.history_grayscale = std::move(combined);
+  ensure_history_capacity(state, width, max_rows);
+  write_history_rows(state, grayscale, width, height, state.info.frame_number);
 }
 
 std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualizationState>& channels,
                                                float blue_limit,
                                                float red_limit,
                                                float overlay_alpha,
+                                               int panel_width,
+                                               int panel_height,
                                                int& output_width,
                                                int& output_height,
                                                uint64_t dropped_frames,
@@ -1462,15 +2330,23 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   const RgbColor kDimBlue{74, 96, 128};
 
   const int active_channels = std::max(1, static_cast<int>(channels.size()));
-  int main_width = 512;
+  const int requested_panel_width = std::max(128, panel_width);
+  const int requested_panel_height = std::max(128, panel_height);
+  int main_width = requested_panel_width;
+  int history_panel_height = requested_panel_height;
   for (const auto& channel : channels) {
     if (channel.active && channel.history_width > 0) {
-      main_width = std::max(main_width, channel.history_width);
+      main_width = std::min(main_width, std::max(1, channel.history_width));
+      history_panel_height = std::min(history_panel_height,
+                                      std::max(1,
+                                               channel.history_capacity_rows > 0 ? channel.history_capacity_rows
+                                                                                : channel.history_valid_rows));
     }
   }
   const int channel_psd_height = 92;
-  const int channel_heat_height = 220;
-  const int channel_block_height = channel_psd_height + channel_heat_height + kPanelPadding * 2 + 36;
+  const int channel_heat_height = history_panel_height;
+  const int channel_mask_height = std::max(40, history_panel_height / 4);
+  const int channel_block_height = channel_psd_height + channel_heat_height + channel_mask_height + kPanelPadding * 3 + 56;
   const int columns = std::min(2, active_channels);
   const int rows = std::max(1, (active_channels + columns - 1) / columns);
   const int grid_width = columns * main_width + (columns - 1) * kPanelPadding;
@@ -1542,6 +2418,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     const int panel_y = kHeaderHeight + kPanelPadding + row_index * channel_block_height;
     const int psd_y = panel_y;
     const int heatmap_y = panel_y + channel_psd_height + kPanelPadding;
+    const int mask_y = heatmap_y + channel_heat_height + kPanelPadding;
 
 
     // Channel accent color
@@ -1575,31 +2452,128 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     draw_text(canvas, output_width, output_height, panel_x + 42, psd_y + 8, "PSD", {156, 173, 192}, 1);
     draw_text(canvas, output_width, output_height, panel_x + 72, psd_y + 8, "MAX HOLD", {255, 212, 89}, 1);
 
-    const int history_rows = channel.history_width > 0 ? static_cast<int>(channel.history_grayscale.size() / static_cast<size_t>(channel.history_width)) : 0;
-    auto spectrogram_rgb = colorize_grayscale_spectrogram(channel.history_grayscale.empty() ? std::vector<uint8_t>(static_cast<size_t>(main_width) * static_cast<size_t>(channel_heat_height), 0) : channel.history_grayscale,
-                                                          blue_limit,
-                                                          red_limit);
+    const int history_width = channel.history_width > 0 ? channel.history_width : main_width;
+    const int history_rows = std::max(1,
+                      channel.history_capacity_rows > 0 ? channel.history_capacity_rows
+                                       : channel.history_valid_rows);
     
     fill_rect(canvas, output_width, output_height, panel_x - 8, heatmap_y - 8, main_width + 16, channel_heat_height + 16, {14, 18, 28});
     fill_rect(canvas, output_width, output_height, panel_x - 8, heatmap_y - 8, 3, channel_heat_height + 16, accent);
     draw_plot_axes(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height, "START", "STOP", "NOW", "HIST");
-    if (!channel.history_grayscale.empty() && history_rows > 0) {
-      blit_rgb_nearest(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height, spectrogram_rgb, channel.history_width, history_rows);
-    }
+    blit_grayscale_ring_to_canvas(canvas,
+                                  output_width,
+                                  output_height,
+                                  panel_x,
+                                  heatmap_y,
+                                  main_width,
+                                  channel_heat_height,
+                                  channel.history_grayscale,
+                                  history_width,
+                                  history_rows,
+                                  channel.history_valid_rows,
+                                  channel.history_write_row,
+                                  blue_limit,
+                                  red_limit);
     draw_grid(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height);
-    // if (channel.overlay_available) {
-    //   overlay_mask(canvas, output_width, output_height, panel_x, heatmap_y + channel_heat_height - channel.latest_frame_height, main_width, channel.latest_frame_height, channel.latest_mask, overlay_alpha);
-    // }
+    overlay_mask_ring(canvas,
+                      output_width,
+                      output_height,
+                      panel_x,
+                      heatmap_y,
+                      main_width,
+                      channel_heat_height,
+                      channel.history_mask,
+                      history_width,
+                      history_rows,
+                      channel.history_valid_rows,
+                      channel.history_write_row,
+                      overlay_alpha);
 
-    if (channel.overlay_available && channel.latest_mask.width > 0 && channel.latest_mask.height > 0) {
-      overlay_mask(canvas, output_width, output_height,
-               panel_x, heatmap_y,
-               main_width, channel_heat_height,
-               channel.latest_mask, overlay_alpha);
-}
+              fill_rect(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {14, 18, 28});
+              fill_rect(canvas, output_width, output_height, panel_x - 8, mask_y - 8, 3, channel_mask_height + 16, {232, 236, 241});
+              size_t mask_nonzero = 0;
+              uint8_t mask_max = 0;
+              for (uint8_t value : channel.history_mask) {
+                if (value > 0) {
+                  ++mask_nonzero;
+                  mask_max = std::max(mask_max, value);
+                }
+              }
+              size_t latest_mask_nonzero = 0;
+              uint8_t latest_mask_max = 0;
+              for (uint8_t value : channel.latest_mask.pixels) {
+                if (value > 0) {
+                  ++latest_mask_nonzero;
+                  latest_mask_max = std::max(latest_mask_max, value);
+                }
+              }
+              if (mask_nonzero > 0) {
+                draw_rect_outline(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {80, 200, 120}, 1);
+              }
+              draw_plot_axes(canvas, output_width, output_height, panel_x, mask_y, main_width, channel_mask_height, "START", "STOP", "NOW", "MASK");
+              bool showing_latest_fallback = false;
+              if (mask_nonzero > 0) {
+                blit_mask_ring_to_canvas(canvas,
+                                         output_width,
+                                         output_height,
+                                         panel_x,
+                                         mask_y,
+                                         main_width,
+                                         channel_mask_height,
+                                         channel.history_mask,
+                                         history_width,
+                                         history_rows,
+                                         channel.history_valid_rows,
+                                         channel.history_write_row);
+              } else if (!channel.latest_mask.pixels.empty() && channel.latest_mask.width > 0 && channel.latest_mask.height > 0) {
+                blit_mask_frame_to_canvas(canvas,
+                                          output_width,
+                                          output_height,
+                                          panel_x,
+                                          mask_y,
+                                          main_width,
+                                          channel_mask_height,
+                                          channel.latest_mask);
+                showing_latest_fallback = true;
+                draw_rect_outline(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {255, 212, 89}, 1);
+              }
+              draw_grid(canvas, output_width, output_height, panel_x, mask_y, main_width, channel_mask_height);
+              draw_text(canvas,
+                        output_width,
+                        output_height,
+                        panel_x + 8,
+                        mask_y + 8,
+                        showing_latest_fallback ? "MASK LATEST" : "MASK",
+                        {232, 236, 241},
+                        1);
+              std::ostringstream mask_stats_ss;
+              mask_stats_ss << "NZ " << mask_nonzero
+                      << " MAX " << static_cast<int>(mask_max)
+                      << " LNZ " << latest_mask_nonzero
+                      << " LMAX " << static_cast<int>(latest_mask_max);
+              draw_text(canvas,
+                    output_width,
+                    output_height,
+                    panel_x + 56,
+                    mask_y + 8,
+                    mask_stats_ss.str(),
+                    mask_nonzero > 0 ? RgbColor{80, 200, 120} : RgbColor{156, 173, 192},
+                    1);
+          static uint64_t mask_debug_counter = 0;
+          if ((++mask_debug_counter % 64) == 0) {
+            HOLOSCAN_LOG_INFO(
+                "Mask panel state ch={} history_nonzero={} history_max={} latest_nonzero={} latest_max={} latest_frame={} pending_masks={}",
+                channel.info.channel,
+                mask_nonzero,
+                static_cast<int>(mask_max),
+                latest_mask_nonzero,
+                static_cast<int>(latest_mask_max),
+                channel.latest_mask_frame_number,
+                channel.pending_masks.size());
+          }
 
     // DINO confidence bar
-    const int dino_bar_y = heatmap_y + channel_heat_height + 10;
+              const int dino_bar_y = mask_y + channel_mask_height + 10;
     fill_rect(canvas, output_width, output_height, panel_x - 8, dino_bar_y, main_width + 16, 14, {8, 12, 22});
     draw_rect_outline(canvas, output_width, output_height, panel_x - 8, dino_bar_y, main_width + 16, 14, {26, 42, 58}, 1);
     draw_text(canvas, output_width, output_height, panel_x, dino_bar_y + 3, "DINO", kOrange, 1);

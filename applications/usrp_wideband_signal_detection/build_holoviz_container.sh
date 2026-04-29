@@ -27,6 +27,8 @@ MATX_VERSION=${MATX_VERSION:-0.9.2}
 BUILD_APP_IN_CONTAINER=${BUILD_APP_IN_CONTAINER:-1}
 INSTALL_PYTHON_DEPS=${INSTALL_PYTHON_DEPS:-1}
 SKIP_IMAGE_BUILD=${SKIP_IMAGE_BUILD:-1}
+ENSURE_VULKAN_RUNTIME=${ENSURE_VULKAN_RUNTIME:-1}
+ENSURE_WINDOWING_RUNTIME=${ENSURE_WINDOWING_RUNTIME:-1}
 DISPLAY_VALUE=${DISPLAY:-}
 XAUTHORITY_VALUE=${XAUTHORITY:-}
 X11_SOCKET_DIR=/tmp/.X11-unix
@@ -58,6 +60,48 @@ if ! ldconfig -p | grep -q "libvulkan.so.1"; then
 	apt-get update
 	apt-get install -y --no-install-recommends libvulkan1
 fi'
+}
+
+ensure_windowing_runtime() {
+	run_in_container 'set -euo pipefail
+missing=0
+	for lib in \
+		libX11.so.6 \
+		libXrandr.so.2 \
+		libXinerama.so.1 \
+		libXcursor.so.1 \
+		libXi.so.6 \
+		libxkbcommon.so.0 \
+		libwayland-client.so.0 \
+		libEGL.so.1 \
+		libGL.so.1; do
+		if ! ldconfig -p | grep -q "$lib"; then
+			missing=1
+			break
+		fi
+		done
+	if [[ "$missing" -eq 1 ]]; then
+		apt-get update
+		apt-get install -y --no-install-recommends \
+			libx11-6 \
+			libxrandr2 \
+			libxinerama1 \
+			libxcursor1 \
+			libxi6 \
+			libxext6 \
+			libxfixes3 \
+			libxrender1 \
+			libxkbcommon0 \
+			libxkbcommon-x11-0 \
+			libwayland-client0 \
+			libwayland-egl1 \
+			libegl1 \
+			libgl1 \
+			libxcb1 \
+			libxcb-randr0 \
+			libxcb-xinerama0 \
+			libxcb-cursor0
+	fi'
 }
 
 ensure_nvjitlink_symlink() {
@@ -207,7 +251,17 @@ print(f"cuda_device_name={torch.cuda.get_device_name(0)}")
 PY
 
 ensure_nvjitlink_symlink
-ensure_vulkan_runtime
+if [[ "${ENSURE_VULKAN_RUNTIME}" == "1" ]]; then
+	ensure_vulkan_runtime
+else
+	echo "Skipping Vulkan runtime installation check because ENSURE_VULKAN_RUNTIME=${ENSURE_VULKAN_RUNTIME}."
+fi
+
+if [[ "${ENSURE_WINDOWING_RUNTIME}" == "1" ]]; then
+	ensure_windowing_runtime
+else
+	echo "Skipping windowing runtime installation check because ENSURE_WINDOWING_RUNTIME=${ENSURE_WINDOWING_RUNTIME}."
+fi
 
 if ! run_in_container 'test -f /usr/local/lib/cmake/matx/matx-config.cmake'; then
 	install_matx

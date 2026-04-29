@@ -44,20 +44,6 @@ advanced_network:
           - local
         num_bufs: 131072
         buf_size: 4096
-      - name: "CH2_CHDR_Headers_RX_CPU"
-        kind: "huge"
-        affinity: 0
-        access:
-          - local
-        num_bufs: 131072
-        buf_size: 64
-      - name: "CH2_Data_RX_GPU"
-        kind: "device"
-        affinity: 0
-        access:
-          - local
-        num_bufs: 131072
-        buf_size: 4096
 
     interfaces:
       - name: sdr_data
@@ -73,14 +59,6 @@ advanced_network:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
                 - "CH1_Data_RX_GPU"
-            - name: "Channel 2 data"
-              id: 1
-              cpu_core: 11
-              batch_size: 1024
-              memory_regions:
-                - "Headers_RX_CPU"
-                - "CH2_CHDR_Headers_RX_CPU"
-                - "CH2_Data_RX_GPU"
 
           flows:
             - name: "Channel 1 data packets"
@@ -91,14 +69,6 @@ advanced_network:
               match:
                 udp_src: 49153
                 udp_dst: 1234
-            - name: "Channel 2 data packets"
-              id: 1
-              action:
-                type: queue
-                id: 1
-              match:
-                udp_src: 49153
-                udp_dst: 1235
 
 chdr_converter:
   interface_name: sdr_data
@@ -106,21 +76,26 @@ chdr_converter:
   num_packets_per_fft: 20
   num_ffts_per_batch: 512
   num_simul_batches: 4
-  num_channels: 2
+  num_channels: 1
   log_packets: false
   log_data: false
 
 fft:
   burst_size: 20480
   num_bursts: 512
-  num_channels: 2
+  num_channels: 1
   spectrum_type: 1
   averaging_type: 1
   window_time: 0
   window_type: 0
+  # FFT length in bins. For this path it should stay aligned with burst_size.
   transform_points: 20480
+  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
   window_points: 20480
+  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
   resolution: 24414
+  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
+  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
   span: 500000000
   weighting_factor: 0
   f1_index: -10240
@@ -128,33 +103,63 @@ fft:
   window_time_delta: 0
 
 logger:
-  num_channels: 2
+  num_channels: 1
   log_interval: 5
 
 visualization:
-  enable: false
+  enable: true
+  renderer:
+    num_channels: 1
+    history_frames: 1
+    output_height: 512
+    output_width: 1024
+    display_time_rows: 2048
+    display_freq_bins: 20480
+    history_memory_budget_mb: 1024
+    rows_per_frame: 16
+    mask_frame_offset: 0
+    render_every_n_frames: 4
+    timing_summary_enable: true
+    timing_summary_every_n: 128
+    channel_filter: 0
+    tensor_name: "spectrogram"
+    blue_limit: 0.10
+    red_limit: 0.92
+    overlay_alpha: 0.7 #0.38
+    center_frequency_hz: 0.0
+    fft_size: 20480
+    dino_chunk_rows: 256
+    dino_chunk_cols: 512
+    db_floor: -22.0
+    db_ceil: 35.0
+    row_average_n: 1
+  holoviz:
+    width: 1280
+    height: 720
+    window_title: "USRP Wideband Spectrogram"
+    fullscreen: false
 
 spectrogram:
-  num_channels: 2
+  num_channels: 1
   enable_save: false
   enable_tensor_save: false
-  save_every_n_frames: 1
+  save_every_n_frames: 100
   max_images_per_channel: 0
   output_height: 256
   output_width: 512
   output_dir: "/workspace/spectrograms"
 
 dinov3_signal_detector:
-  num_channels: 2
+  num_channels: 1
   input_height: 256
   input_width: 512
   patch_size: 16
   emit_stride: 1
   mask_threshold_db: -20.0
-  log_detections: true
-  enable_mask_save: true
+  log_detections: false
+  enable_mask_save: false
   save_every_n_frames: 100
-  max_masks_per_channel: 2
+  max_masks_per_channel: 0
   output_dir: "/workspace/dino_masks"
   use_pytorch_backend: true
   inference_backend: "torchscript"
@@ -201,20 +206,25 @@ dinov3_signal_detector:
   timing_summary_window: 64
 
 coherent_power_signal_detector:
-  num_channels: 2
-  input_height: 250
-  input_width: 20480
-  emit_stride: 8
-  log_detections: false
-  fast_performance: false
+  num_channels: 1
+  input_height: 250 #256
+  input_width: 20480 #512
+  # Full-rate aggressive profile matching the active single-channel fast path,
+  # with artifact capture enabled for notebook validation.
+  fast_power_floor_db: 0.5
+  fast_power_span_db: 3.0
+  fast_score_threshold: 0.4
+  live_emit_mask_rows: 16
+  live_emit_mask_cols: 20480
+  live_emit_mask_min_coverage: 0.35
+  emit_stride: 1
+  log_detections: true
+  fast_performance: true
+  save_performance_path_artifacts: true
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0
-  output_dir: "/workspace/coherent_power_masks"
-  enable_tensor_snapshot_save: true
-  max_snapshots_per_channel: 2
-  tensor_snapshot_dir: "/workspace/coherent_power_snapshots"
-  save_power_db_snapshot: true
+  output_dir: "/workspace/coherent_power_snapshots"
   chunk_bandwidth_hz: 37500000.0
   chunk_overlap_hz: 2000000.0
   uncalibrated_chunk_fraction: 0.40
@@ -224,15 +234,16 @@ coherent_power_signal_detector:
   frontend_row_q: 25.0
   frontend_reference_q: 75.0
   frontend_smooth_sigma: 12.0
-  frontend_max_boost_db: 12.0
+  frontend_max_boost_db: 0.0
+  frontend_signal_cap_db: 0.0
   coherence_weight: 0.55
   power_weight: 0.45
   score_threshold_mode: "fixed"
-  fixed_score_threshold: 0.2
+  fixed_score_threshold: 0.4
   coherence_power_support_q: 0.82
   coherence_power_q: 0.92
   min_component_size: 1
-  filter_detection_mask: false
+  filter_detection_mask: true
   grouping_seed_score_q: 0.72
   grouping_bridge_freq_px: 33
   grouping_bridge_time_px: 5
@@ -242,5 +253,5 @@ coherent_power_signal_detector:
   grouping_min_density: 0.0
   grouping_time_continuity_ratio: 0.85
   timing_summary_enable: true
-  timing_summary_every_n: 1
-  timing_summary_window: 4
+  timing_summary_every_n: 512
+  timing_summary_window: 512

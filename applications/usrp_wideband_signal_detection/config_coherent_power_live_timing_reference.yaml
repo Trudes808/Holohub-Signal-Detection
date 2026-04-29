@@ -225,8 +225,6 @@ coherent_power_signal_detector:
   frontend_max_boost_db: 12.0
   coherence_weight: 0.55
   power_weight: 0.45
-  power_assist_mode: "absolute_direct"
-  coherence_source_mode: "power_assist"
   score_threshold_mode: "fixed"
   fixed_score_threshold: 0.2
   coherence_power_support_q: 0.82

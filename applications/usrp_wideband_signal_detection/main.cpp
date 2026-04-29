@@ -266,6 +266,17 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     const bool force_logger_from_spectrogram =
       enable_spectrogram && enable_logger_branch && !enable_detector && !enable_visualization;
     const bool effective_log_from_spectrogram = log_from_spectrogram || force_logger_from_spectrogram;
+    const bool coherent_power_fft_aligned_path =
+      enable_detector && detector_type == "coherent_power";
+    const bool visualization_consumes_fft_directly =
+      enable_visualization && coherent_power_fft_aligned_path;
+    const bool detector_consumes_fft_directly = coherent_power_fft_aligned_path;
+    const bool spectrogram_required =
+      enable_spectrogram && (spectrogram_save_enabled ||
+                             spectrogram_tensor_save_enabled ||
+                             (enable_logger_branch && effective_log_from_spectrogram) ||
+                             (enable_detector && !detector_consumes_fft_directly) ||
+                             (enable_visualization && !visualization_consumes_fft_directly));
     const bool detector_uses_dino_style_stride =
       enable_detector && (detector_type == "dinov3" || detector_type == "cuda_dino");
     const int configured_dino_emit_stride =
@@ -302,7 +313,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     std::vector<std::shared_ptr<holoscan::Operator>> dinoDetectorOps;
     std::vector<std::shared_ptr<holoscan::Operator>> cudaDinoDetectorOps;
     std::vector<std::shared_ptr<holoscan::Operator>> coherentDetectorOps;
-    if (enable_spectrogram) {
+    if (spectrogram_required) {
       spectrogramOps.reserve(static_cast<size_t>(pipeline_channels));
       for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
         spectrogramOps.push_back(make_operator<ops::Spectrogram>(
@@ -378,6 +389,10 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       HOLOSCAN_LOG_INFO(
           "Routing logger from spectrogram output because the detector is disabled and spectrogramOp needs a downstream consumer.");
     }
+    if (coherent_power_fft_aligned_path && enable_visualization) {
+      HOLOSCAN_LOG_INFO(
+          "Routing coherent power detector and visualizer directly from FFT output for exact frame alignment.");
+    }
 
     std::shared_ptr<holoscan::Operator> spectrogramVisualizerOp;
     std::shared_ptr<holoscan::Operator> holovizOp;
@@ -411,7 +426,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     for (auto& op : fftOps) {
       add_operator(op);
     }
-    if (enable_spectrogram && !bypass_spectrogram_passthrough) {
+    if (spectrogram_required) {
       for (auto& op : spectrogramOps) {
         add_operator(op);
       }
@@ -448,15 +463,24 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       add_flow(chdrConverterOp, fftOp, {{chdr_port, "in"}});
 
       std::shared_ptr<holoscan::Operator> detector_source = fftOp;
-      if (enable_spectrogram && !bypass_spectrogram_passthrough) {
+      std::shared_ptr<holoscan::Operator> logger_source = fftOp;
+      if (spectrogram_required) {
         auto& spectrogramOp = spectrogramOps[static_cast<size_t>(channel_index)];
         add_flow(fftOp, spectrogramOp);
-        detector_source = spectrogramOp;
+        if (!detector_consumes_fft_directly) {
+          detector_source = spectrogramOp;
+        }
+        if (enable_logger_branch && effective_log_from_spectrogram) {
+          logger_source = spectrogramOp;
+        }
 
-        if (enable_visualization) {
-          //add_flow(spectrogramOp, spectrogramVisualizerOp);
+        if (enable_visualization && !visualization_consumes_fft_directly) {
           add_flow(spectrogramOp, spectrogramVisualizerOp, {{"out", "in"}});
         }
+      }
+
+      if (enable_visualization && visualization_consumes_fft_directly) {
+        add_flow(fftOp, spectrogramVisualizerOp, {{"out", "in"}});
       }
 
       if (enable_detector) {
@@ -474,7 +498,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           HOLOSCAN_LOG_ERROR("pipeline.log_from_spectrogram=true requires pipeline.enable_spectrogram=true");
           exit(1);
         }
-        add_flow(detector_source, logOps[static_cast<size_t>(channel_index)]);
+        add_flow(logger_source, logOps[static_cast<size_t>(channel_index)]);
       } else if (enable_logger_branch) {
         add_flow(fftOp, logOps[static_cast<size_t>(channel_index)]);
       }

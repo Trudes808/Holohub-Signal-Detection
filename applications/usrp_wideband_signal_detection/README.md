@@ -451,7 +451,9 @@ Remote usage note:
 
 The `--screenshot` path is the current no-desktop fallback. It writes the same composed dashboard frame used by offline replay and does not depend on HoloViz, GLFW, or Vulkan. If a matching detector mask exists in `/workspace/dino_masks` or the directory passed to `--mask-dir`, the preview includes the overlay and sidebar overlay metrics. If you pass a simple filename such as `offline_preview.png`, it will be written to `/workspace/spectrograms/offline_preview.png` in the container and show up in the mapped host directory, typically `/tmp/usrp_spectrograms/offline_preview.png`.
 
-If you run inside the demo container and see `Failed to initialize glfw` or `Failed to detect any supported platform`, the container was started without host display forwarding. Relaunch it from a desktop-capable session with `DISPLAY` set so `run_demo_container.sh` can forward `/tmp/.X11-unix` and `XAUTHORITY` into the container.
+If you run inside the demo container and see `Failed to initialize glfw` or `Failed to detect any supported platform`, the container was created without usable host display forwarding. Restarting that same container is not enough because `docker start` cannot add `DISPLAY`, `XAUTHORITY`, or X11 mounts after creation.
+
+Recreate the container from the desktop-capable session you actually want to render through, including FastX sessions. From that session, confirm `DISPLAY` is set, then run `SKIP_IMAGE_BUILD=1 sudo -E ./build_demo_container.sh`. The updated launcher forwards `DISPLAY` whenever it is present, mounts `/tmp/.X11-unix` when that socket directory exists on the host, and forwards `XAUTHORITY` when the file exists. After recreation, `./run_demo_container.sh` will refuse to start a stale container if it was created without the current display settings.
 
 The next visualization step is to add a detector overlay postprocessor that emits HoloViz overlay tensors and `InputSpec` metadata.
 

@@ -251,9 +251,7 @@ STBIWDEF void stbi_flip_vertically_on_write(int flip_boolean);
     !defined(STBIW_REALLOC_SIZED)
 // ok
 #else
-#error \
-    "Must define all or none of STBIW_MALLOC, STBIW_FREE, and STBIW_REALLOC \ //  NOLINT
-    (or STBIW_REALLOC_SIZED)." //  NOLINT
+#error "Must define all or none of STBIW_MALLOC, STBIW_FREE, and STBIW_REALLOC (or STBIW_REALLOC_SIZED)."
 #endif
 
 #ifndef STBIW_MALLOC

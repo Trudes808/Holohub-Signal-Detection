@@ -21,9 +21,41 @@ MATX_DIR=${MATX_DIR:-/usr/local/lib/cmake/matx}
 BUILD_APP_DIR=${BUILD_APP_DIR:-${WORKSPACE_DIR}/${BUILD_DIR}/applications/${APP_NAME}}
 SOURCE_APP_DIR=${SOURCE_APP_DIR:-${WORKSPACE_DIR}/applications/${APP_NAME}}
 FORCE_REBUILD=${FORCE_REBUILD:-0}
+BUILD_OPTIONAL_TARGETS=${BUILD_OPTIONAL_TARGETS:-0}
 
 run_in_container() {
   sudo docker exec "${CONTAINER_NAME}" bash -lc "$1"
+}
+
+clear_incompatible_build_tree_cache() {
+  local cache_file="${WORKSPACE_DIR}/${BUILD_DIR}/CMakeCache.txt"
+
+  if ! run_in_container "test -f ${cache_file}"; then
+    return
+  fi
+
+  if run_in_container "python3 - <<'PY'
+from pathlib import Path
+
+cache_path = Path('${cache_file}')
+expected_build_dir = '${WORKSPACE_DIR}/${BUILD_DIR}'
+expected_source_dir = '${WORKSPACE_DIR}'
+
+build_dir = None
+source_dir = None
+for line in cache_path.read_text(errors='ignore').splitlines():
+    if line.startswith('# For build in directory:'):
+        build_dir = line.split(':', 1)[1].strip()
+    elif line.startswith('CMAKE_HOME_DIRECTORY:') and '=' in line:
+        source_dir = line.split('=', 1)[1].strip()
+
+raise SystemExit(0 if build_dir == expected_build_dir and source_dir == expected_source_dir else 1)
+PY"; then
+    return
+  fi
+
+  echo "==> Existing build tree was generated for a different source or build path; clearing ${WORKSPACE_DIR}/${BUILD_DIR}"
+  clear_build_tree
 }
 
 ensure_vulkan_runtime() {
@@ -41,11 +73,15 @@ raise SystemExit(0 if importlib.util.find_spec("torch") is not None else 1)
 PY'
 }
 
-build_targets() {
+primary_build_targets() {
+  echo "${APP_NAME}"
+}
+
+optional_build_targets() {
   if torch_available_in_container >/dev/null 2>&1; then
-    echo "${APP_NAME} ${VISUALIZER_TARGET} ${COHERENT_VALIDATOR_TARGET} ${DINO_VALIDATOR_TARGET} ${PERF_DINO_VALIDATOR_TARGET} coherent_power_signal_detector dinov3_signal_detector dinov3_libtorch_sandbox"
+    echo "${VISUALIZER_TARGET} ${COHERENT_VALIDATOR_TARGET} ${DINO_VALIDATOR_TARGET} ${PERF_DINO_VALIDATOR_TARGET} coherent_power_signal_detector dinov3_signal_detector dinov3_libtorch_sandbox"
   else
-    echo "${APP_NAME} ${VISUALIZER_TARGET} ${COHERENT_VALIDATOR_TARGET} ${DINO_VALIDATOR_TARGET} ${PERF_DINO_VALIDATOR_TARGET} coherent_power_signal_detector"
+    echo "${VISUALIZER_TARGET} ${COHERENT_VALIDATOR_TARGET} ${DINO_VALIDATOR_TARGET} ${PERF_DINO_VALIDATOR_TARGET} coherent_power_signal_detector"
   fi
 }
 
@@ -55,11 +91,16 @@ ninja_target_exists() {
 }
 
 build_auxiliary_targets() {
+  if [[ "${BUILD_OPTIONAL_TARGETS}" != "1" ]]; then
+    echo "==> Skipping optional validator/visualizer targets (set BUILD_OPTIONAL_TARGETS=1 to enable them)"
+    return 0
+  fi
+
   local targets
   local resolved_targets=()
   local target
 
-  targets=$(build_targets)
+  targets=$(optional_build_targets)
 
   for target in ${targets}; do
     if ninja_target_exists "${target}"; then
@@ -107,7 +148,7 @@ needs_rebuild() {
     return 0
   fi
 
-  targets=$(build_targets)
+  targets=$(primary_build_targets)
 
   set +e
   dry_run_output=$(sudo docker exec "${CONTAINER_NAME}" bash -lc "set -euo pipefail && ninja -C ${WORKSPACE_DIR}/${BUILD_DIR} -n ${targets}" 2>&1)
@@ -170,6 +211,8 @@ if torch_available_in_container >/dev/null 2>&1; then
     clear_build_tree
   fi
 fi
+
+clear_incompatible_build_tree_cache
 
 if needs_rebuild; then
   run_in_container "set -euo pipefail && \

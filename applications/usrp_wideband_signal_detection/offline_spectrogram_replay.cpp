@@ -131,10 +131,24 @@ int export_first_frame_png(const std::string& directory,
 
   int composed_width = 0;
   int composed_height = 0;
+  int panel_width = 512;
+  int panel_height = 256;
+  for (const auto& state : channel_states) {
+    if (!state.active) {
+      continue;
+    }
+    panel_width = std::max(panel_width, state.history_width);
+    panel_height = std::max(panel_height,
+                            std::max(1,
+                                     state.history_capacity_rows > 0 ? state.history_capacity_rows
+                                                                     : state.history_valid_rows));
+  }
   auto composed = holoscan::ops::compose_visualization_rgb(channel_states,
                                                            kBlueLimit,
                                                            kRedLimit,
                                                            0.38f,
+                                                           panel_width,
+                                                           panel_height,
                                                            composed_width,
                                                            composed_height);
 
