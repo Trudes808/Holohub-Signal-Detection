@@ -153,7 +153,7 @@ void maybe_log_channel_summary(const std::shared_ptr<ChdrConverterOpRx::Channel>
       (window_s > 0.0) ? (static_cast<double>(channel->periodic_summary_packets) / window_s / 1.0e6)
                        : 0.0;
   HOLOSCAN_LOG_INFO(
-      "CHDR summary ch={} window_s={:.3f} bursts={} packets={} rate={:.3f} Mpps queued={} emitted={} empty_polls={} backlog_events={} out_q_depth={} max_out_q_depth={} aggr_pkts_recv={} max_burst_packets={} refcounted_bursts={}",
+      "CHDR summary ch={} window_s={:.3f} bursts={} packets={} rate={:.3f} Mpps queued={} emitted={} empty_polls={} backlog_events={} out_q_depth={} max_out_q_depth={} aggr_pkts_recv={} max_burst_packets={} refcounted_bursts={} partial_drops={}",
       channel->channel_num,
       window_s,
       channel->periodic_summary_bursts,
@@ -167,7 +167,8 @@ void maybe_log_channel_summary(const std::shared_ptr<ChdrConverterOpRx::Channel>
       channel->max_out_q_depth,
       channel->aggr_pkts_recv,
       channel->max_burst_packets,
-      channel->burst_refcounts.size());
+      channel->burst_refcounts.size(),
+      channel->timeout_like_partial_drains);
 
   channel->periodic_summary_start_ns = channel->periodic_summary_last_ns;
   channel->periodic_summary_batches_queued = 0;
@@ -236,6 +237,11 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
       "log_packets",
       "Log Packets",
       "If true, log detailed packet information for debugging.", false);
+    spec.param<uint32_t>(partial_batch_drop_timeout_ms_,
+      "partial_batch_drop_timeout_ms",
+      "Partial Batch Drop Timeout Ms",
+      "Drop an incomplete aggregated batch after this many milliseconds without any new packets on that channel.",
+      250);
   spec.param<std::string>(channel_center_frequencies_hz_,
       "channel_center_frequencies_hz",
       "Channel Center Frequencies Hz",
@@ -394,6 +400,33 @@ void ChdrConverterOpRx::release_burst_ref(
     channel->burst_refcounts.erase(ref);
     free_all_packets_and_burst_rx(burst);
   }
+}
+
+void ChdrConverterOpRx::drop_partial_batch(
+        std::shared_ptr<struct Channel> channel,
+        const char* reason) {
+  if (!channel || channel->aggr_pkts_recv == 0 || channel->cur_msg.num_batches == 0) {
+    return;
+  }
+
+  const uint64_t held_packets = channel->aggr_pkts_recv;
+  const int held_bursts = channel->cur_msg.num_batches;
+  for (int batch_index = 0; batch_index < channel->cur_msg.num_batches; ++batch_index) {
+    if (channel->cur_msg.msg[batch_index] != nullptr) {
+      release_burst_ref(channel, channel->cur_msg.msg[batch_index]);
+      channel->cur_msg.msg[batch_index] = nullptr;
+    }
+  }
+  channel->cur_msg.num_batches = 0;
+  channel->aggr_pkts_recv = 0;
+  channel->timeout_like_partial_drains++;
+  HOLOSCAN_LOG_WARN(
+      "Dropped partial CHDR batch on channel {} reason={} held_packets={} held_bursts={} refcounted_bursts_remaining={}",
+      channel->channel_num,
+      reason,
+      held_packets,
+      held_bursts,
+      channel->burst_refcounts.size());
 }
 
 void ChdrConverterOpRx::queue_completed_batch(
@@ -611,6 +644,12 @@ void ChdrConverterOpRx::compute(
     } else {
       channel->empty_rx_polls++;
       channel->periodic_summary_empty_polls++;
+      if (channel->aggr_pkts_recv > 0) {
+        const double idle_ms = elapsed_ms_since(channel->last_receive_ns);
+        if (idle_ms >= static_cast<double>(partial_batch_drop_timeout_ms_.get())) {
+          drop_partial_batch(channel, "idle-timeout");
+        }
+      }
     }
     maybe_log_channel_summary(channel);
   }
@@ -762,6 +801,7 @@ void ChdrConverterOpRx::stop() {
         "Completed batches emitted: {}\n"
         "        RX bursts received: {}\n"
         "           Empty RX polls: {}\n"
+        "     Partial batch drops: {}\n"
         "         Backlog events: {}\n"
         "       Max out_q depth: {}\n"
         "      Max burst packets: {}\n"
@@ -777,6 +817,7 @@ void ChdrConverterOpRx::stop() {
         channel->completed_batches_emitted,
           channel->rx_bursts_received,
           channel->empty_rx_polls,
+        channel->timeout_like_partial_drains,
         channel->backlog_events,
         channel->max_out_q_depth,
           channel->max_burst_packets,

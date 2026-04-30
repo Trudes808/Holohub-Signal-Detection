@@ -643,6 +643,78 @@ std::vector<uint8_t> scale_rgb_to_fit(const std::vector<uint8_t>& rgb,
   return scaled;
 }
 
+struct ChannelPanelHeights {
+  int psd = 64;
+  int heat = 64;
+  int mask = 40;
+};
+
+ChannelPanelHeights compute_channel_panel_heights(int canvas_height, int active_channels) {
+  const int clamped_channels = std::max(1, active_channels);
+  const int rows = std::max(1, (clamped_channels + 1) / 2);
+  const int content_height = std::max(160, canvas_height - kHeaderHeight - kFooterHeight - kPanelPadding * 2);
+  const int panel_height_budget = std::max(180,
+                                           (content_height - (rows - 1) * kPanelPadding) / std::max(1, rows));
+  const int channel_header_band = 28;
+  const int section_gap = std::max(10, kPanelPadding / 2);
+  const int confidence_gap = 10;
+  const int confidence_height = 14;
+  const int plot_stack_height = std::max(140,
+      panel_height_budget - channel_header_band - confidence_gap - confidence_height - section_gap * 2);
+
+  ChannelPanelHeights heights{};
+  heights.psd = std::clamp(static_cast<int>(std::lround(plot_stack_height * 0.22)), 64, 112);
+  heights.mask = std::clamp(static_cast<int>(std::lround(plot_stack_height * 0.18)), 40, 88);
+  heights.heat = plot_stack_height - heights.psd - heights.mask;
+  if (heights.heat < 64) {
+    int deficit = 64 - heights.heat;
+    const int psd_reduction = std::min(deficit / 2 + deficit % 2, std::max(0, heights.psd - 64));
+    heights.psd -= psd_reduction;
+    deficit -= psd_reduction;
+    const int mask_reduction = std::min(deficit, std::max(0, heights.mask - 40));
+    heights.mask -= mask_reduction;
+    heights.heat = plot_stack_height - heights.psd - heights.mask;
+  }
+  return heights;
+}
+
+uint8_t sample_ring_canvas_value(const std::vector<uint8_t>& ring,
+                                 int src_width,
+                                 int capacity_rows,
+                                 int leading_blank_rows,
+                                 int oldest_row,
+                                 int src_canvas_row,
+                                 int src_col) {
+  if (src_canvas_row < 0 || src_canvas_row >= capacity_rows || src_canvas_row < leading_blank_rows) {
+    return 0;
+  }
+  const int logical_row = src_canvas_row - leading_blank_rows;
+  const int ring_row = (oldest_row + logical_row) % capacity_rows;
+  return ring[static_cast<size_t>(ring_row) * static_cast<size_t>(src_width) + static_cast<size_t>(src_col)];
+}
+
+uint8_t max_ring_canvas_value(const std::vector<uint8_t>& ring,
+                              int src_width,
+                              int capacity_rows,
+                              int leading_blank_rows,
+                              int oldest_row,
+                              int row_begin,
+                              int row_end,
+                              int src_col) {
+  uint8_t max_value = 0;
+  for (int src_canvas_row = std::max(0, row_begin); src_canvas_row < std::min(capacity_rows, row_end); ++src_canvas_row) {
+    max_value = std::max(max_value,
+                         sample_ring_canvas_value(ring,
+                                                  src_width,
+                                                  capacity_rows,
+                                                  leading_blank_rows,
+                                                  oldest_row,
+                                                  src_canvas_row,
+                                                  src_col));
+  }
+  return max_value;
+}
+
 RgbColor mask_overlay_color(float normalized_value) {
   const float t = std::clamp(std::sqrt(std::max(0.0f, normalized_value)), 0.0f, 1.0f);
   const auto blend_channel = [t](uint8_t low, uint8_t high) {
@@ -708,16 +780,30 @@ void blit_grayscale_ring_to_canvas(std::vector<uint8_t>& canvas,
   const float blue = std::clamp(blue_limit, 0.0f, 1.0f);
   const float red = std::clamp(red_limit, blue + 0.01f, 1.0f);
   for (int row = 0; row < dst_height; ++row) {
-    const int src_canvas_row = std::min(capacity_rows - 1, (row * capacity_rows) / std::max(1, dst_height));
-    if (src_canvas_row < leading_blank_rows) {
-      continue;
-    }
-    const int logical_row = src_canvas_row - leading_blank_rows;
-    const int ring_row = (oldest_row + logical_row) % capacity_rows;
+    const float src_row = ((static_cast<float>(row) + 0.5f) * static_cast<float>(capacity_rows)) /
+                              static_cast<float>(std::max(1, dst_height)) -
+                          0.5f;
+    const int src_row0 = std::clamp(static_cast<int>(std::floor(src_row)), 0, capacity_rows - 1);
+    const int src_row1 = std::min(capacity_rows - 1, src_row0 + 1);
+    const float row_mix = std::clamp(src_row - static_cast<float>(src_row0), 0.0f, 1.0f);
     for (int col = 0; col < dst_width; ++col) {
       const int src_col = std::min(src_width - 1, (col * src_width) / std::max(1, dst_width));
-      const uint8_t gray = ring[static_cast<size_t>(ring_row) * static_cast<size_t>(src_width) + static_cast<size_t>(src_col)];
-      const float normalized = static_cast<float>(gray) / 255.0f;
+      const float gray0 = static_cast<float>(sample_ring_canvas_value(ring,
+                                                                      src_width,
+                                                                      capacity_rows,
+                                                                      leading_blank_rows,
+                                                                      oldest_row,
+                                                                      src_row0,
+                                                                      src_col));
+      const float gray1 = static_cast<float>(sample_ring_canvas_value(ring,
+                                                                      src_width,
+                                                                      capacity_rows,
+                                                                      leading_blank_rows,
+                                                                      oldest_row,
+                                                                      src_row1,
+                                                                      src_col));
+      const float gray = gray0 + (gray1 - gray0) * row_mix;
+      const float normalized = gray / 255.0f;
       const float remapped = std::clamp((normalized - blue) / std::max(0.01f, red - blue), 0.0f, 1.0f);
       const auto color = heatmap_color(remapped);
       set_pixel(canvas, canvas_width, canvas_height, dst_x + col, dst_y + row, {color[0], color[1], color[2]});
@@ -744,15 +830,21 @@ void overlay_mask_ring(std::vector<uint8_t>& canvas,
   const int oldest_row = valid_rows == capacity_rows ? write_row : 0;
   const int leading_blank_rows = capacity_rows - valid_rows;
   for (int row = 0; row < dst_height; ++row) {
-    const int src_canvas_row = std::min(capacity_rows - 1, (row * capacity_rows) / std::max(1, dst_height));
-    if (src_canvas_row < leading_blank_rows) {
-      continue;
-    }
-    const int logical_row = src_canvas_row - leading_blank_rows;
-    const int ring_row = (oldest_row + logical_row) % capacity_rows;
+    const int row_begin = (row * capacity_rows) / std::max(1, dst_height);
+    const int row_end = std::min(capacity_rows,
+                                 std::max(row_begin + 1,
+                                          ((row + 1) * capacity_rows + std::max(1, dst_height) - 1) /
+                                              std::max(1, dst_height)));
     for (int col = 0; col < dst_width; ++col) {
       const int src_col = std::min(src_width - 1, (col * src_width) / std::max(1, dst_width));
-      const uint8_t value = ring[static_cast<size_t>(ring_row) * static_cast<size_t>(src_width) + static_cast<size_t>(src_col)];
+      const uint8_t value = max_ring_canvas_value(ring,
+                                                  src_width,
+                                                  capacity_rows,
+                                                  leading_blank_rows,
+                                                  oldest_row,
+                                                  row_begin,
+                                                  row_end,
+                                                  src_col);
       if (value > 0) {
         const float normalized_value = static_cast<float>(value) / 255.0f;
         const float boosted_visibility = std::pow(normalized_value, 0.65f);
@@ -787,16 +879,21 @@ void blit_mask_ring_to_canvas(std::vector<uint8_t>& canvas,
   const int oldest_row = valid_rows == capacity_rows ? write_row : 0;
   const int leading_blank_rows = capacity_rows - valid_rows;
   for (int row = 0; row < dst_height; ++row) {
-    const int src_canvas_row = std::min(capacity_rows - 1, (row * capacity_rows) / std::max(1, dst_height));
-    if (src_canvas_row < leading_blank_rows) {
-      continue;
-    }
-    const int logical_row = src_canvas_row - leading_blank_rows;
-    const int ring_row = (oldest_row + logical_row) % capacity_rows;
+    const int row_begin = (row * capacity_rows) / std::max(1, dst_height);
+    const int row_end = std::min(capacity_rows,
+                                 std::max(row_begin + 1,
+                                          ((row + 1) * capacity_rows + std::max(1, dst_height) - 1) /
+                                              std::max(1, dst_height)));
     for (int col = 0; col < dst_width; ++col) {
       const int src_col = std::min(src_width - 1, (col * src_width) / std::max(1, dst_width));
-      const uint8_t value = ring[static_cast<size_t>(ring_row) * static_cast<size_t>(src_width) +
-                                 static_cast<size_t>(src_col)];
+      const uint8_t value = max_ring_canvas_value(ring,
+                                                  src_width,
+                                                  capacity_rows,
+                                                  leading_blank_rows,
+                                                  oldest_row,
+                                                  row_begin,
+                                                  row_end,
+                                                  src_col);
       if (value == 0) {
         continue;
       }
@@ -1939,7 +2036,7 @@ void render_visualization_ui_overlay() {
     draw_kv("Time Bin", format_time_bin_label(channel.seconds_per_time_bin));
     draw_kv("FFT", std::to_string(channel.fft_size));
     draw_kv("History", std::to_string(channel.history_rows) + " bins");
-    draw_kv(channel.detector_label.c_str(),
+    draw_kv("Chunk",
             std::to_string(channel.dino_chunk_rows) + " x " + std::to_string(channel.dino_chunk_cols));
 
     const float bar_width = std::max(60.0f, rect_max(state.sidebar_rect).x - sidebar_min.x - 120.0f);
@@ -2066,8 +2163,9 @@ int live_visualization_width(int configured_width, int panel_width) {
   return std::max(1, std::min(configured_width, panel_width));
 }
 
-int live_visualization_history_rows(int configured_rows, int panel_height) {
-  return std::max(1, std::min(configured_rows, panel_height));
+int live_visualization_history_rows(int configured_rows, int canvas_height, int active_channels) {
+  const auto panel_heights = compute_channel_panel_heights(canvas_height, active_channels);
+  return std::max(1, std::min(configured_rows, panel_heights.heat));
 }
 }  // namespace
 
@@ -2166,7 +2264,8 @@ void SpectrogramToHolovizOp::initialize() {
   pending_composed_ready_ = false;
   const size_t channel_count = static_cast<size_t>(std::max(1, num_channels_.get()));
   const int live_width = live_visualization_width(display_freq_bins_.get(), output_width_.get());
-  const int live_rows = live_visualization_history_rows(display_time_rows_.get(), output_height_.get());
+  const int live_rows =
+      live_visualization_history_rows(display_time_rows_.get(), output_height_.get(), num_channels_.get());
   HOLOSCAN_LOG_INFO("Spectrogram visualizer initializing with num_channels={} display_freq_bins={} rows_per_frame={} render_every_n_frames={}",
                     channel_count,
                     live_width,
@@ -2432,8 +2531,8 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
       state.info.dino_chunk_cols = dino_chunk_cols_.get();
       state.info.detector_label = detector_label_.get();
 
-      const int snap_display_time_rows_requested =
-          live_visualization_history_rows(display_time_rows_.get(), output_height_.get());
+        const int snap_display_time_rows_requested =
+          live_visualization_history_rows(display_time_rows_.get(), output_height_.get(), num_channels_.get());
       const int snap_display_time_rows = clamp_history_rows_to_budget(std::max(1, spectrogram.width),
                                                                       snap_display_time_rows_requested,
                                                                       history_memory_budget_mb_.get());
@@ -3119,8 +3218,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
 
   const bool has_active_channels = !active_channel_states.empty();
   const int active_channels = std::max(1, static_cast<int>(active_channel_states.size()));
-  output_width = std::max(640, panel_width);
-  output_height = std::max(360, panel_height);
+  output_width = std::max(1, panel_width);
+  output_height = std::max(1, panel_height);
 
   const int columns = std::min(2, active_channels);
   const int rows = std::max(1, (active_channels + columns - 1) / columns);
@@ -3144,20 +3243,10 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   const int section_gap = std::max(10, kPanelPadding / 2);
   const int confidence_gap = 10;
   const int confidence_height = 14;
-  const int plot_stack_height = std::max(140,
-      panel_height_budget - channel_header_band - confidence_gap - confidence_height - section_gap * 2);
-  int channel_psd_height = std::clamp(static_cast<int>(std::lround(plot_stack_height * 0.22)), 64, 112);
-  int channel_mask_height = std::clamp(static_cast<int>(std::lround(plot_stack_height * 0.18)), 40, 88);
-  int channel_heat_height = plot_stack_height - channel_psd_height - channel_mask_height;
-  if (channel_heat_height < 64) {
-    int deficit = 64 - channel_heat_height;
-    const int psd_reduction = std::min(deficit / 2 + deficit % 2, std::max(0, channel_psd_height - 64));
-    channel_psd_height -= psd_reduction;
-    deficit -= psd_reduction;
-    const int mask_reduction = std::min(deficit, std::max(0, channel_mask_height - 40));
-    channel_mask_height -= mask_reduction;
-    channel_heat_height = plot_stack_height - channel_psd_height - channel_mask_height;
-  }
+  const auto panel_heights = compute_channel_panel_heights(output_height, active_channels);
+  const int channel_psd_height = panel_heights.psd;
+  const int channel_mask_height = panel_heights.mask;
+  const int channel_heat_height = panel_heights.heat;
 
   VisualizationUiState ui_state;
   ui_state.canvas_width = output_width;
@@ -3576,7 +3665,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
           {200, 212, 224},
           1);
     text_y += 12;
-    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, channel.info.detector_label, {122, 143, 168}, 1);
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "CHUNK", {122, 143, 168}, 1);
     draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y,
               std::to_string(channel.info.dino_chunk_rows) + "X" + std::to_string(channel.info.dino_chunk_cols),
               {200, 212, 224}, 1);

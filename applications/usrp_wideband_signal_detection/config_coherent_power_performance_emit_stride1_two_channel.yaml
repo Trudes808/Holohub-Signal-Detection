@@ -143,14 +143,14 @@ visualization:
   renderer:
     num_channels: 2
     history_frames: 1
-    output_height: 512
-    output_width: 2048
+    output_height: 720
+    output_width: 1920
     display_time_rows: 2048
     display_freq_bins: 20480
     history_memory_budget_mb: 1024
-    rows_per_frame: 16
+    rows_per_frame: 8
     mask_frame_offset: 0
-    render_every_n_frames: 4
+    render_every_n_frames: 1
     timing_summary_enable: true
     timing_summary_every_n: 128
     channel_filter: -1
@@ -166,7 +166,7 @@ visualization:
     db_ceil: 35.0
     row_average_n: 1
   holoviz:
-    width: 1280
+    width: 1920
     height: 720
     window_title: "USRP Wideband Spectrogram"
     fullscreen: false

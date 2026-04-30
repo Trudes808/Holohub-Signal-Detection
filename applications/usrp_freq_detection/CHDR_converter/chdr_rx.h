@@ -63,6 +63,7 @@ class ChdrConverterOpRx : public Operator {
   Parameter<std::string> interface_name_;
   Parameter<bool> log_data_;
   Parameter<bool> log_packets_;
+  Parameter<uint32_t> partial_batch_drop_timeout_ms_;
   Parameter<std::string> channel_center_frequencies_hz_;
   Parameter<std::string> channel_sample_rates_hz_;
   int port_id_;
@@ -127,6 +128,7 @@ class ChdrConverterOpRx : public Operator {
   bool free_bufs_and_emit_arrays(OutputContext& op_output, std::shared_ptr<struct Channel> channel);
   void retain_burst_ref(std::shared_ptr<struct Channel> channel, BurstParams* burst);
   void release_burst_ref(std::shared_ptr<struct Channel> channel, BurstParams* burst);
+  void drop_partial_batch(std::shared_ptr<struct Channel> channel, const char* reason);
   void queue_completed_batch(std::shared_ptr<struct Channel> channel);
   void process_channel_data(
           OutputContext& op_output,
