@@ -46,7 +46,7 @@ class Config(argparse.Namespace):
     """Configuration for remote RX streaming."""
     args: str
     rate: float
-    freq: float
+    freq: list[float]
     gain: float
     duration: Optional[float]
     channels: list[int]
@@ -76,8 +76,11 @@ def parse_args() -> Config:
         help="specifies the sample rate in samples/sec [default: %(default)s].",
     )
     parser.add_argument(
-        "-f", "--freq", type=float, required=True,
-        help="specifies the center frequency in Hz [input is required].",
+        "-f", "--freq", type=float, nargs="+", required=True,
+        help=(
+            "specifies the center frequency in Hz. Provide one value to apply to all "
+            "selected channels, or one value per selected channel [input is required]."
+        ),
     )
     parser.add_argument(
         "-g", "--gain", type=float, default=0.0,
@@ -157,6 +160,18 @@ def check_channels(usrp, args):
     return channels
 
 
+def expand_per_channel(values: list[float], channels: list[int], label: str) -> list[float]:
+    """Broadcast one value to all channels or validate one value per channel."""
+    if len(values) == 1:
+        return values * len(channels)
+    if len(values) != len(channels):
+        raise ValueError(
+            f"Number of {label} values must be 1 or match the number of channels. "
+            f"Got {len(values)} {label} value(s) for {len(channels)} channel(s)."
+        )
+    return values
+
+
 def main():
     """Run remote Rx."""
     args = parse_args()
@@ -167,17 +182,25 @@ def main():
     if len(channels) != len(args.dest_port):
         print("Number of channels must match number of ports.")
         return False
+    try:
+        freqs = expand_per_channel(args.freq, channels, "frequency")
+    except ValueError as exc:
+        print(exc)
+        return False
     print("Selected RX channels: {}.".format(", ".join(str(ch) for ch in channels)))
     if args.rate:
         print(f"Requesting sampling rate {args.rate/1e6} Msps...")
         for chan in channels:
             usrp.set_rx_rate(args.rate, chan)
-    actual_rate = usrp.get_rx_rate(channels[0])
-    print(f"Using sampling rate: {actual_rate/1e6} Msps.")
-    print(f"Requesting center frequency {args.freq/1e6} MHz...")
-    for chan in channels:
-        usrp.set_rx_freq(args.freq, chan)
-    print(f"Actual center frequency: {usrp.get_rx_freq(channels[0])/1e6} MHz.")
+    actual_rates = [usrp.get_rx_rate(chan) for chan in channels]
+    for chan, actual_rate in zip(channels, actual_rates):
+        print(f"Using sampling rate for channel {chan}: {actual_rate/1e6} Msps.")
+    for chan, freq in zip(channels, freqs):
+        print(f"Requesting center frequency for channel {chan}: {freq/1e6} MHz...")
+        usrp.set_rx_freq(freq, chan)
+    actual_freqs = [usrp.get_rx_freq(chan) for chan in channels]
+    for chan, actual_freq in zip(channels, actual_freqs):
+        print(f"Actual center frequency for channel {chan}: {actual_freq/1e6} MHz.")
     print(f"Requesting gain {args.gain} dB...")
     for chan in channels:
         usrp.set_rx_gain(args.gain, chan)
@@ -206,7 +229,7 @@ def main():
         else None
     )
     for rx_streamer in rx_streamers:
-        stream_cmd = get_stream_cmd(usrp, actual_rate, args.duration, start_time)
+        stream_cmd = get_stream_cmd(usrp, actual_rates[0], args.duration, start_time)
         rx_streamer.issue_stream_cmd(stream_cmd)
     print("Stream started. Press Ctrl-C to stop.")
     timeout = time.monotonic() + args.duration if args.duration else None

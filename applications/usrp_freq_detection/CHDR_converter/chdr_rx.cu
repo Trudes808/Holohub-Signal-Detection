@@ -16,7 +16,11 @@
  */
 #include "chdr_rx.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <sstream>
+#include <stdexcept>
 
 using out_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
 
@@ -101,6 +105,8 @@ namespace holoscan::ops {
 
 namespace {
 
+constexpr uint64_t kChdrSummaryPeriodNs = 1000000000ULL;
+
 uint64_t steady_time_ns() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now().time_since_epoch())
@@ -118,6 +124,60 @@ double elapsed_ms_since(uint64_t start_ns) {
   return static_cast<double>(now_ns - start_ns) / 1.0e6;
 }
 
+std::string trim_copy(const std::string& value) {
+  const auto begin = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) {
+    return std::isspace(ch);
+  });
+  const auto end = std::find_if_not(value.rbegin(), value.rend(), [](unsigned char ch) {
+    return std::isspace(ch);
+  }).base();
+  if (begin >= end) {
+    return {};
+  }
+  return std::string(begin, end);
+}
+
+void maybe_log_channel_summary(const std::shared_ptr<ChdrConverterOpRx::Channel>& channel) {
+  if (channel->periodic_summary_start_ns == 0 ||
+      channel->periodic_summary_last_ns <= channel->periodic_summary_start_ns) {
+    return;
+  }
+
+  const uint64_t window_ns = channel->periodic_summary_last_ns - channel->periodic_summary_start_ns;
+  if (window_ns < kChdrSummaryPeriodNs) {
+    return;
+  }
+
+  const double window_s = static_cast<double>(window_ns) / 1.0e9;
+  const double avg_mpps =
+      (window_s > 0.0) ? (static_cast<double>(channel->periodic_summary_packets) / window_s / 1.0e6)
+                       : 0.0;
+  HOLOSCAN_LOG_INFO(
+      "CHDR summary ch={} window_s={:.3f} bursts={} packets={} rate={:.3f} Mpps queued={} emitted={} empty_polls={} backlog_events={} out_q_depth={} max_out_q_depth={} aggr_pkts_recv={} max_burst_packets={} refcounted_bursts={}",
+      channel->channel_num,
+      window_s,
+      channel->periodic_summary_bursts,
+      channel->periodic_summary_packets,
+      avg_mpps,
+      channel->periodic_summary_batches_queued,
+      channel->periodic_summary_batches_emitted,
+      channel->periodic_summary_empty_polls,
+      channel->periodic_summary_backlog_events,
+      channel->out_q.size(),
+      channel->max_out_q_depth,
+      channel->aggr_pkts_recv,
+      channel->max_burst_packets,
+      channel->burst_refcounts.size());
+
+  channel->periodic_summary_start_ns = channel->periodic_summary_last_ns;
+  channel->periodic_summary_batches_queued = 0;
+  channel->periodic_summary_batches_emitted = 0;
+  channel->periodic_summary_packets = 0;
+  channel->periodic_summary_bursts = 0;
+  channel->periodic_summary_empty_polls = 0;
+  channel->periodic_summary_backlog_events = 0;
+}
+
 }  // namespace
 
 int ChdrConverterOpRx::max_inflight_batches() const {
@@ -128,8 +188,8 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
   // Use one output port per channel so we can drain more than one completed
   // batch per compute() call without publishing multiple messages on the same
   // typed output port in a single tick.
-  spec.output<out_t>("out0", holoscan::IOSpec::IOSize{8});
-  spec.output<out_t>("out1", holoscan::IOSpec::IOSize{8});
+  spec.output<out_t>("out0", holoscan::IOSpec::IOSize{16});
+  spec.output<out_t>("out1", holoscan::IOSpec::IOSize{16});
 
   // Data tensor configuration
   // Each packet contains 1024 samples
@@ -176,6 +236,65 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
       "log_packets",
       "Log Packets",
       "If true, log detailed packet information for debugging.", false);
+  spec.param<std::string>(channel_center_frequencies_hz_,
+      "channel_center_frequencies_hz",
+      "Channel Center Frequencies Hz",
+      "Comma-separated per-channel tuned RX center frequencies in Hz for downstream metadata.",
+      "");
+  spec.param<std::string>(channel_sample_rates_hz_,
+      "channel_sample_rates_hz",
+      "Channel Sample Rates Hz",
+      "Comma-separated per-channel RX sample rates in Hz for downstream metadata.",
+      "");
+}
+
+std::vector<std::optional<double>> ChdrConverterOpRx::parse_channel_values(
+        const std::string& values,
+        const char* field_name) const {
+  std::vector<std::optional<double>> parsed(num_channels_.get(), std::nullopt);
+  const auto trimmed_values = trim_copy(values);
+  if (trimmed_values.empty()) {
+    return parsed;
+  }
+
+  std::vector<double> numeric_values;
+  std::stringstream stream(trimmed_values);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    const auto trimmed_token = trim_copy(token);
+    if (trimmed_token.empty()) {
+      continue;
+    }
+    try {
+      numeric_values.push_back(std::stod(trimmed_token));
+    } catch (const std::exception&) {
+      HOLOSCAN_LOG_ERROR("Invalid {} value '{}'", field_name, trimmed_token);
+      exit(1);
+    }
+  }
+
+  if (numeric_values.empty()) {
+    return parsed;
+  }
+
+  if (numeric_values.size() == 1) {
+    std::fill(parsed.begin(), parsed.end(), numeric_values.front());
+    return parsed;
+  }
+
+  if (numeric_values.size() != num_channels_.get()) {
+    HOLOSCAN_LOG_ERROR(
+        "Configured {} count {} must be 1 or match num_channels {}",
+        field_name,
+        numeric_values.size(),
+        num_channels_.get());
+    exit(1);
+  }
+
+  for (size_t index = 0; index < numeric_values.size(); ++index) {
+    parsed[index] = numeric_values[index];
+  }
+  return parsed;
 }
 
 void ChdrConverterOpRx::initialize() {
@@ -201,6 +320,10 @@ void ChdrConverterOpRx::initialize() {
   }
 
   num_packets_per_batch = num_ffts_per_batch_.get() * num_packets_per_fft_.get();
+  center_frequency_by_channel_ = parse_channel_values(channel_center_frequencies_hz_.get(),
+                                                      "channel_center_frequencies_hz");
+  sample_rate_by_channel_ = parse_channel_values(channel_sample_rates_hz_.get(),
+                                                 "channel_sample_rates_hz");
 
   for (uint16_t channel_num = 0; channel_num < num_channels_.get(); channel_num++) {
     auto new_channel = std::make_shared<struct Channel>();
@@ -305,6 +428,7 @@ void ChdrConverterOpRx::queue_completed_batch(
   channel->cur_msg.queued_ns = steady_time_ns();
   channel->out_q.push(channel->cur_msg);
   channel->completed_batches_queued++;
+  channel->periodic_summary_batches_queued++;
   channel->max_out_q_depth = std::max(channel->max_out_q_depth, channel->out_q.size());
   channel->cur_msg.num_batches = 0;
   channel->ttl_pkts_recv += num_packets_per_batch;
@@ -323,16 +447,6 @@ void ChdrConverterOpRx::queue_completed_batch(
 bool ChdrConverterOpRx::free_bufs_and_emit_arrays(
         OutputContext& op_output,
         std::shared_ptr<struct Channel> channel) {
-  std::optional<ChdrConverterOpRx::RxMsg> completed_msg = free_buf(channel);
-  if (!completed_msg.has_value()) {
-    return false;
-  }
-
-  auto meta = metadata();
-  meta->clear();
-  meta->set("channel_number", channel->channel_num);
-  meta->set("chdr_emit_ts_ns", steady_time_ns());
-
   const char* output_name = nullptr;
   switch (channel->channel_num) {
     case 0:
@@ -346,11 +460,96 @@ bool ChdrConverterOpRx::free_bufs_and_emit_arrays(
       return false;
   }
 
-  auto data = slice<2>(channel->rf_data, {static_cast<index_t>(completed_msg.value().batch_idx), 0, 0},
-              {matxDropDim, matxEnd, matxEnd});
-  op_output.emit(out_t {data, completed_msg.value().stream}, output_name);
-  channel->completed_batches_emitted++;
-  return true;
+  bool emitted_any = false;
+  while (true) {
+    std::optional<ChdrConverterOpRx::RxMsg> completed_msg = free_buf(channel);
+    if (!completed_msg.has_value()) {
+      break;
+    }
+
+    auto meta = metadata();
+    meta->clear();
+    meta->set("channel_number", channel->channel_num);
+    meta->set("chdr_emit_ts_ns", steady_time_ns());
+    if (channel->channel_num < center_frequency_by_channel_.size() &&
+        center_frequency_by_channel_[channel->channel_num].has_value()) {
+      meta->set("rx_center_frequency_hz", center_frequency_by_channel_[channel->channel_num].value());
+    }
+    if (channel->channel_num < sample_rate_by_channel_.size() &&
+        sample_rate_by_channel_[channel->channel_num].has_value()) {
+      meta->set("rx_sample_rate_hz", sample_rate_by_channel_[channel->channel_num].value());
+    }
+
+    auto data = slice<2>(channel->rf_data, {static_cast<index_t>(completed_msg.value().batch_idx), 0, 0},
+                {matxDropDim, matxEnd, matxEnd});
+    op_output.emit(out_t {data, completed_msg.value().stream}, output_name);
+    channel->completed_batches_emitted++;
+    channel->periodic_summary_batches_emitted++;
+    emitted_any = true;
+  }
+
+  return emitted_any;
+}
+
+void ChdrConverterOpRx::release_channel_resources() {
+  if (resources_released_) {
+    return;
+  }
+  resources_released_ = true;
+
+  for (auto& channel : channel_list) {
+    if (!channel) {
+      continue;
+    }
+
+    for (int stream_index = 0; stream_index < num_simul_batches_.get(); ++stream_index) {
+      if (channel->streams[stream_index] != nullptr) {
+        cudaStreamSynchronize(channel->streams[stream_index]);
+      }
+    }
+
+    while (!channel->out_q.empty()) {
+      auto queued_msg = channel->out_q.front();
+      channel->out_q.pop();
+      for (int batch_index = 0; batch_index < queued_msg.num_batches; ++batch_index) {
+        if (queued_msg.msg[batch_index] != nullptr) {
+          release_burst_ref(channel, queued_msg.msg[batch_index]);
+          queued_msg.msg[batch_index] = nullptr;
+        }
+      }
+    }
+
+    for (int batch_index = 0; batch_index < channel->cur_msg.num_batches; ++batch_index) {
+      if (channel->cur_msg.msg[batch_index] != nullptr) {
+        release_burst_ref(channel, channel->cur_msg.msg[batch_index]);
+        channel->cur_msg.msg[batch_index] = nullptr;
+      }
+    }
+    channel->cur_msg.num_batches = 0;
+
+    for (auto& [burst, refcount] : channel->burst_refcounts) {
+      (void)refcount;
+      if (burst != nullptr) {
+        free_all_packets_and_burst_rx(burst);
+      }
+    }
+    channel->burst_refcounts.clear();
+
+    for (int stream_index = 0; stream_index < num_simul_batches_.get(); ++stream_index) {
+      if (channel->events[stream_index] != nullptr) {
+        cudaEventDestroy(channel->events[stream_index]);
+        channel->events[stream_index] = nullptr;
+      }
+      if (channel->streams[stream_index] != nullptr) {
+        cudaStreamDestroy(channel->streams[stream_index]);
+        channel->streams[stream_index] = nullptr;
+      }
+      if (channel->h_dev_ptrs[stream_index] != nullptr) {
+        cudaFreeHost(channel->h_dev_ptrs[stream_index]);
+        channel->h_dev_ptrs[stream_index] = nullptr;
+      }
+    }
+  }
 }
 
 void ChdrConverterOpRx::compute(
@@ -383,6 +582,7 @@ void ChdrConverterOpRx::compute(
     auto channel = channel_list.at(q);
     if (static_cast<int>(channel->out_q.size()) >= max_inflight_batches()) {
       channel->backlog_events++;
+      channel->periodic_summary_backlog_events++;
       HOLOSCAN_LOG_ERROR("Fell behind in processing on GPU!");
       HOLOSCAN_LOG_ERROR(
           "CHDR backlog state ch={} out_q_depth={} max_out_q_depth={} aggr_pkts_recv={} queued_batches={} emitted_batches={} refcounted_bursts={} oldest_release_ms={:.3f}",
@@ -404,9 +604,15 @@ void ChdrConverterOpRx::compute(
   for (uint16_t q = 0; q < num_rx_queues; q++) {
     // If there's new data, start processing it
     auto status = get_rx_burst(&burst, port_id_, q);
+    auto channel = channel_list.at(q);
+    channel->periodic_summary_last_ns = steady_time_ns();
     if (status == Status::SUCCESS) {
       process_channel_data(op_output, burst, q);
+    } else {
+      channel->empty_rx_polls++;
+      channel->periodic_summary_empty_polls++;
     }
+    maybe_log_channel_summary(channel);
   }
 }
 
@@ -418,6 +624,15 @@ void ChdrConverterOpRx::process_channel_data(
 
   const int burst_packets = get_num_packets(burst);
   const uint64_t receive_ts_ns = steady_time_ns();
+  if (channel->periodic_summary_start_ns == 0) {
+    channel->periodic_summary_start_ns = receive_ts_ns;
+  }
+  channel->periodic_summary_last_ns = receive_ts_ns;
+  channel->rx_bursts_received++;
+  channel->periodic_summary_bursts++;
+  channel->periodic_summary_packets += static_cast<uint64_t>(std::max(0, burst_packets));
+  channel->max_burst_packets = std::max<uint64_t>(channel->max_burst_packets,
+                                                  static_cast<uint64_t>(std::max(0, burst_packets)));
 
   if (!channel->first_receive_logged && burst_packets > 0) {
     channel->first_receive_logged = true;
@@ -517,6 +732,9 @@ void ChdrConverterOpRx::process_channel_data(
 }
 
 void ChdrConverterOpRx::stop() {
+  adv_net_shutdown();
+  release_channel_resources();
+
   HOLOSCAN_LOG_INFO("ChdrConverterOpRx exit report:");
   for (uint16_t channel_num = 0; channel_num < num_channels_.get(); channel_num++) {
     auto channel = channel_list.at(channel_num);
@@ -542,8 +760,11 @@ void ChdrConverterOpRx::stop() {
     " Average throughput: {:.2f} MSps ({:.2f} Gbps)\n"
         " Completed batches queued: {}\n"
         "Completed batches emitted: {}\n"
+        "        RX bursts received: {}\n"
+        "           Empty RX polls: {}\n"
         "         Backlog events: {}\n"
         "       Max out_q depth: {}\n"
+        "      Max burst packets: {}\n"
         " Mean release dwell ms: {:.3f}\n"
         "  Max release dwell ms: {:.3f}\n",
         channel->channel_num,
@@ -554,10 +775,14 @@ void ChdrConverterOpRx::stop() {
         avg_gbps,
         channel->completed_batches_queued,
         channel->completed_batches_emitted,
+          channel->rx_bursts_received,
+          channel->empty_rx_polls,
         channel->backlog_events,
         channel->max_out_q_depth,
+          channel->max_burst_packets,
         channel->release_samples == 0 ? 0.0 : channel->total_release_latency_ms / static_cast<double>(channel->release_samples),
         channel->max_release_latency_ms);
   }
+  holoscan::Operator::stop();
 }
 }  // namespace holoscan::ops

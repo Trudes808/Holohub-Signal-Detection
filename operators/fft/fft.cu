@@ -29,8 +29,8 @@ double elapsed_ms(uint64_t start_ns, uint64_t end_ns) {
 }  // namespace
 
 void FFT::setup(OperatorSpec& spec) {
-    spec.input<in_t>("in");
-    spec.output<out_t>("out", holoscan::IOSpec::IOSize{8});
+    spec.input<in_t>("in", holoscan::IOSpec::IOSize{16});
+    spec.output<out_t>("out", holoscan::IOSpec::IOSize{16});
     spec.param(burst_size,
         "burst_size",
         "Burst size"
@@ -100,6 +100,11 @@ void FFT::setup(OperatorSpec& spec) {
         "window_time_delta",
         "Window time delta",
         "VITA 49.2 window time delta to pass along in metadata");
+    spec.param(timing_summary_every_n,
+        "timing_summary_every_n",
+        "Timing Summary Every N",
+        "Emit live FFT ingress timing summaries every N emitted frames per channel.",
+        128);
 }
 
 void FFT::initialize() {
@@ -121,8 +126,11 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
         auto& stats = ingress_stats[channel_num];
         const double chdr_to_fft_ms = elapsed_ms(chdr_emit_ns, fft_enter_ns);
         stats.samples++;
+        stats.window_samples++;
         stats.total_chdr_to_fft_ms += chdr_to_fft_ms;
+        stats.window_total_chdr_to_fft_ms += chdr_to_fft_ms;
         stats.max_chdr_to_fft_ms = std::max(stats.max_chdr_to_fft_ms, chdr_to_fft_ms);
+        stats.window_max_chdr_to_fft_ms = std::max(stats.window_max_chdr_to_fft_ms, chdr_to_fft_ms);
     }
     meta->set("fft_enter_ts_ns", fft_enter_ns);
     auto out = slice<2>(outputs, {static_cast<index_t>(channel_num), 0, 0},
@@ -138,6 +146,27 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
     if (configured_emit_stride > 1 &&
         (frame_number % static_cast<uint64_t>(configured_emit_stride)) != 0) {
         return;
+    }
+
+    if (channel_num < ingress_stats.size()) {
+        auto& stats = ingress_stats[channel_num];
+        stats.emitted_frames++;
+        stats.window_emitted_frames++;
+        const uint64_t summary_every = static_cast<uint64_t>(std::max(1, timing_summary_every_n.get()));
+        if (stats.window_emitted_frames >= summary_every) {
+            const double window_samples = static_cast<double>(std::max<uint64_t>(1, stats.window_samples));
+            HOLOSCAN_LOG_INFO(
+                "FFT ingress live ch={} window_samples={} window_emitted={} mean_chdr_to_fft_ms={:.3f} max_chdr_to_fft_ms={:.3f}",
+                channel_num,
+                stats.window_samples,
+                stats.window_emitted_frames,
+                stats.window_total_chdr_to_fft_ms / window_samples,
+                stats.window_max_chdr_to_fft_ms);
+            stats.window_samples = 0;
+            stats.window_emitted_frames = 0;
+            stats.window_total_chdr_to_fft_ms = 0.0;
+            stats.window_max_chdr_to_fft_ms = 0.0;
+        }
     }
 
     if (spectrum_type.has_value())
@@ -205,9 +234,10 @@ void FFT::stop() {
     for (size_t channel_index = 0; channel_index < ingress_stats.size(); ++channel_index) {
         const auto& stats = ingress_stats[channel_index];
         HOLOSCAN_LOG_INFO(
-            "FFT ingress latency ch={} samples={} mean_chdr_to_fft_ms={:.3f} max_chdr_to_fft_ms={:.3f}",
+            "FFT ingress latency ch={} samples={} emitted_frames={} mean_chdr_to_fft_ms={:.3f} max_chdr_to_fft_ms={:.3f}",
             channel_index,
             stats.samples,
+            stats.emitted_frames,
             stats.samples == 0 ? 0.0 : stats.total_chdr_to_fft_ms / static_cast<double>(stats.samples),
             stats.max_chdr_to_fft_ms);
     }

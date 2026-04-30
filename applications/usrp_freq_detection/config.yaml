@@ -123,6 +123,8 @@ advanced_network:
 
 chdr_converter:
   interface_name: sdr_data
+  channel_center_frequencies_hz: ""
+  channel_sample_rates_hz: ""
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
   num_ffts_per_batch: 250

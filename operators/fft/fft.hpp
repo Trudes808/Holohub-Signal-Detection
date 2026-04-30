@@ -28,8 +28,13 @@ class FFT : public Operator {
  private:
      struct ChannelIngressStats {
          uint64_t samples = 0;
+         uint64_t emitted_frames = 0;
+         uint64_t window_samples = 0;
+         uint64_t window_emitted_frames = 0;
          double total_chdr_to_fft_ms = 0.0;
          double max_chdr_to_fft_ms = 0.0;
+         double window_total_chdr_to_fft_ms = 0.0;
+         double window_max_chdr_to_fft_ms = 0.0;
      };
 
      tensor_t<complex, 3> outputs;
@@ -51,6 +56,7 @@ class FFT : public Operator {
      Parameter<int32_t> f1_index;
      Parameter<int32_t> f2_index;
      Parameter<uint32_t> window_time_delta;
+    Parameter<int> timing_summary_every_n;
 };
 
 }  // namespace holoscan::ops

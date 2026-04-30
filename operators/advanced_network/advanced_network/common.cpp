@@ -16,6 +16,7 @@
  */
 
 #include <thread>
+#include <csignal>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -37,6 +38,7 @@ namespace holoscan::advanced_network {
 
 // Declare a static global variable for the manager
 static Manager* g_ano_mgr = nullptr;
+static volatile std::sig_atomic_t g_ano_shutdown_requested = 0;
 
 const std::unordered_map<LogLevel::Level, std::string> LogLevel::level_to_string_map = {
     {TRACE, "trace"},
@@ -303,6 +305,7 @@ void print_stats() {
 }
 
 Status adv_net_init(NetworkConfig &config) {
+  adv_net_clear_shutdown_request();
   ManagerFactory::set_manager_type(config.common_.manager_type);
 
   auto mgr = &(ManagerFactory::get_active_manager());
@@ -321,6 +324,26 @@ Status adv_net_init(NetworkConfig &config) {
   }
 
   return Status::SUCCESS;
+}
+
+void adv_net_request_shutdown() {
+  g_ano_shutdown_requested = 1;
+}
+
+void adv_net_clear_shutdown_request() {
+  g_ano_shutdown_requested = 0;
+}
+
+bool adv_net_shutdown_requested() {
+  return g_ano_shutdown_requested != 0;
+}
+
+void adv_net_shutdown() {
+  adv_net_request_shutdown();
+  if (g_ano_mgr == nullptr) {
+    return;
+  }
+  g_ano_mgr->shutdown();
 }
 
 

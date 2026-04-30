@@ -3,13 +3,20 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../usrp_freq_detection/CHDR_converter/chdr_rx.h"
 #include "spectrogram_visualization.hpp"
+#include "advanced_network/common.h"
 #include <algorithm>
+#include <atomic>
+#include <csignal>
+#include <cstdlib>
 #include <limits>
 #include <optional>
+#include <thread>
 #include <coherent_power_signal_detector.hpp>
 #include <cuda_dino_detector.hpp>
 #include <dinov3_signal_detector.hpp>
 #include <fft.hpp>
+#include <gxf/core/gxf.h>
+#include <holoscan/holoscan.hpp>
 #include <holoscan/operators/holoviz/holoviz.hpp>
 #include <holoviz/holoviz.hpp>
 #include <holoviz/imgui/imgui.h>
@@ -20,6 +27,33 @@
 #endif
 
 namespace {
+
+std::shared_ptr<holoscan::BooleanCondition> g_visualization_shutdown_term;
+std::shared_ptr<holoscan::BooleanCondition> g_pipeline_shutdown_term;
+
+void request_visualization_shutdown() {
+  auto shutdown_term = g_visualization_shutdown_term;
+  if (shutdown_term) {
+    shutdown_term->disable_tick();
+  }
+}
+
+void request_pipeline_shutdown() {
+  auto shutdown_term = g_pipeline_shutdown_term;
+  if (shutdown_term) {
+    shutdown_term->disable_tick();
+  }
+}
+
+void request_graceful_shutdown(gxf_context_t app_context) {
+  static_cast<void>(app_context);
+  std::fprintf(stderr, "[copilot-probe] request_graceful_shutdown()\n");
+  std::fflush(stderr);
+  HOLOSCAN_LOG_INFO("request_graceful_shutdown()");
+  holoscan::advanced_network::adv_net_request_shutdown();
+  request_pipeline_shutdown();
+  request_visualization_shutdown();
+}
 
 std::filesystem::path resolve_config_path(const char* argv0, const char* config_arg) {
   const std::filesystem::path requested(config_arg);
@@ -237,6 +271,28 @@ class DropOp: public holoscan::Operator {
   }
 };
 
+class LoggingHolovizOp : public holoscan::ops::HolovizOp {
+ public:
+      using holoscan::ops::HolovizOp::HolovizOp;
+
+  void initialize() override {
+    std::fprintf(stderr, "[copilot-probe] LoggingHolovizOp::initialize()\n");
+    std::fflush(stderr);
+    HOLOSCAN_LOG_INFO("LoggingHolovizOp::initialize()");
+    holoscan::ops::HolovizOp::initialize();
+  }
+
+  void stop() override {
+    std::fprintf(stderr, "[copilot-probe] LoggingHolovizOp::stop() begin\n");
+    std::fflush(stderr);
+    HOLOSCAN_LOG_INFO("LoggingHolovizOp::stop() begin");
+    holoscan::ops::HolovizOp::stop();
+    std::fprintf(stderr, "[copilot-probe] LoggingHolovizOp::stop() complete\n");
+    std::fflush(stderr);
+    HOLOSCAN_LOG_INFO("LoggingHolovizOp::stop() complete");
+  }
+};
+
 class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
  public:
   void layer_callback(const std::vector<holoscan::gxf::Entity>&) {
@@ -255,7 +311,12 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     }
     HOLOSCAN_LOG_INFO("Configured the Advanced Network manager");
 
-    auto chdrConverterOp = make_operator<ops::ChdrConverterOpRx>("chdrConverterOp", from_config("chdr_converter"));
+    auto pipeline_shutdown_term = make_condition<BooleanCondition>("pipeline_shutdown_term", true);
+    g_pipeline_shutdown_term = pipeline_shutdown_term;
+    HOLOSCAN_LOG_INFO("Configured pipeline_shutdown_term for chdrConverterOp");
+
+    auto chdrConverterOp = make_operator<ops::ChdrConverterOpRx>(
+      "chdrConverterOp", pipeline_shutdown_term, from_config("chdr_converter"));
     const int pipeline_channels = std::max(1, from_config("chdr_converter.num_channels").as<int>());
 
     const bool enable_spectrogram = from_config("pipeline.enable_spectrogram").as<bool>();
@@ -296,6 +357,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     const bool enable_fft_emit_stride =
       bypass_spectrogram_passthrough && detector_uses_dino_style_stride &&
         configured_dino_emit_stride > 1;
+    const int visual_emit_stride =
+      enable_visualization ? std::max(1, from_config("visualization.renderer.render_every_n_frames").as<int>()) : 1;
+    const int visual_mask_emit_stride = visual_emit_stride;
 
     std::vector<std::shared_ptr<holoscan::Operator>> fftOps;
     fftOps.reserve(static_cast<size_t>(pipeline_channels));
@@ -404,24 +468,64 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     std::shared_ptr<holoscan::Operator> spectrogramVisualizerOp;
     std::shared_ptr<holoscan::Operator> holovizOp;
+    std::vector<std::shared_ptr<holoscan::Operator>> visualSpectrogramGateOps;
+    std::vector<std::shared_ptr<holoscan::Operator>> visualMaskGateOps;
+    std::vector<std::shared_ptr<holoscan::Operator>> visualSpectrogramStoreOps;
+    std::vector<std::shared_ptr<holoscan::Operator>> visualMaskStoreOps;
     if (enable_visualization) {
+        auto visualization_shutdown_term = pipeline_shutdown_term;
+        g_visualization_shutdown_term = visualization_shutdown_term;
+        HOLOSCAN_LOG_INFO("Sharing pipeline_shutdown_term with visualization shutdown handling");
       ops::set_visualization_full_ui_enabled(true);
       const auto tensor_name = from_config("visualization.renderer.tensor_name").as<std::string>();
       const auto fft_span_hz = from_config("fft.span").as<double>();
       const auto center_frequency_hz = from_config("visualization.renderer.center_frequency_hz").as<double>();
+        const auto visualization_channel_filter =
+          from_config("visualization.renderer.channel_filter").as<int>();
       const std::string detector_label =
           (!enable_detector || detector_type == "dinov3" || detector_type == "cuda_dino")
               ? std::string("Dinov3")
               : std::string("Coherent Power");
       spectrogramVisualizerOp = make_operator<ops::SpectrogramToHolovizOp>(
         "spectrogramVisualizerOp",
+        Arg("shutdown_scheduling_term") = visualization_shutdown_term,
+        make_condition<PeriodicCondition>("periodic-condition",
+                                          Arg("recess_period") = std::string("10hz")),
         from_config("visualization.renderer"),
+        Arg("num_channels") = pipeline_channels,
+        Arg("channel_filter") = visualization_channel_filter,
         Arg("center_frequency_hz") = center_frequency_hz,
         Arg("span_hz") = fft_span_hz,
-        Arg("detector_label") = detector_label);
+        Arg("detector_label") = detector_label,
+        Arg("render_every_n_frames") = 1);
+
+      visualSpectrogramGateOps.reserve(static_cast<size_t>(pipeline_channels));
+      visualMaskGateOps.reserve(static_cast<size_t>(pipeline_channels));
+      visualSpectrogramStoreOps.reserve(static_cast<size_t>(pipeline_channels));
+      visualMaskStoreOps.reserve(static_cast<size_t>(pipeline_channels));
+      for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+        visualSpectrogramGateOps.push_back(make_operator<ops::SpectrogramPreviewOp>(
+            std::string("visualSpectrogramGateOpCh") + std::to_string(channel_index),
+          Arg("channel_index") = channel_index,
+          Arg("emit_every_n") = visual_emit_stride,
+          Arg("output_width") = from_config("visualization.renderer.output_width").as<int>(),
+          Arg("output_height") = from_config("visualization.renderer.rows_per_frame").as<int>(),
+          Arg("db_floor") = from_config("visualization.renderer.db_floor").as<float>(),
+          Arg("db_ceil") = from_config("visualization.renderer.db_ceil").as<float>()));
+        visualMaskGateOps.push_back(make_operator<ops::MaskPreviewOp>(
+            std::string("visualMaskGateOpCh") + std::to_string(channel_index),
+          Arg("emit_every_n") = visual_mask_emit_stride,
+          Arg("output_width") = from_config("visualization.renderer.output_width").as<int>(),
+          Arg("output_height") = from_config("visualization.renderer.rows_per_frame").as<int>()));
+        visualSpectrogramStoreOps.push_back(make_operator<ops::SpectrogramPreviewStoreOp>(
+          std::string("visualSpectrogramStoreOpCh") + std::to_string(channel_index)));
+        visualMaskStoreOps.push_back(make_operator<ops::MaskPreviewStoreOp>(
+          std::string("visualMaskStoreOpCh") + std::to_string(channel_index)));
+      }
         
-      holovizOp = make_operator<ops::HolovizOp>(
+      holovizOp = make_operator<LoggingHolovizOp>(
         "holovizOp",
+        Arg("window_close_scheduling_term") = visualization_shutdown_term,
         from_config("visualization.holoviz"),
         Arg("layer_callback",
           ops::HolovizOp::LayerCallbackFunction(
@@ -470,6 +574,18 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       }
     }
     if (enable_visualization) {
+      for (auto& op : visualSpectrogramGateOps) {
+        add_operator(op);
+      }
+      for (auto& op : visualMaskGateOps) {
+        add_operator(op);
+      }
+      for (auto& op : visualSpectrogramStoreOps) {
+        add_operator(op);
+      }
+      for (auto& op : visualMaskStoreOps) {
+        add_operator(op);
+      }
       add_operator(spectrogramVisualizerOp);
       add_operator(holovizOp);
     }
@@ -498,12 +614,22 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         }
 
         if (enable_visualization && !visualization_consumes_fft_directly) {
-          add_flow(spectrogramOp, spectrogramVisualizerOp, {{"out", "in"}});
+          add_flow(spectrogramOp,
+                   visualSpectrogramGateOps[static_cast<size_t>(channel_index)],
+                   {{"out", "in"}});
+          add_flow(visualSpectrogramGateOps[static_cast<size_t>(channel_index)],
+                   visualSpectrogramStoreOps[static_cast<size_t>(channel_index)],
+                   {{"out", "in"}});
         }
       }
 
       if (enable_visualization && visualization_consumes_fft_directly) {
-        add_flow(fftOp, spectrogramVisualizerOp, {{"out", "in"}});
+        add_flow(fftOp,
+                 visualSpectrogramGateOps[static_cast<size_t>(channel_index)],
+                 {{"out", "in"}});
+        add_flow(visualSpectrogramGateOps[static_cast<size_t>(channel_index)],
+                 visualSpectrogramStoreOps[static_cast<size_t>(channel_index)],
+                 {{"out", "in"}});
       }
 
       if (enable_detector) {
@@ -537,8 +663,11 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     if (enable_visualization && enable_detector && detector_type == "coherent_power") {
       for (int ch = 0; ch < pipeline_channels; ++ch) {
         add_flow(coherentDetectorOps[static_cast<size_t>(ch)],
-                 spectrogramVisualizerOp,
-                 {{"mask_out", "mask_in"}});
+                 visualMaskGateOps[static_cast<size_t>(ch)],
+                 {{"mask_out", "in"}});
+        add_flow(visualMaskGateOps[static_cast<size_t>(ch)],
+                 visualMaskStoreOps[static_cast<size_t>(ch)],
+                 {{"out", "in"}});
       }
     }
   }
@@ -566,7 +695,52 @@ int main(int argc, char** argv) {
   app->scheduler(
       app->make_scheduler<holoscan::EventBasedScheduler>("event-based-scheduler", app->from_config("scheduler")));
 
+  sigset_t sigint_set {};
+  sigemptyset(&sigint_set);
+  sigaddset(&sigint_set, SIGINT);
+  if (pthread_sigmask(SIG_BLOCK, &sigint_set, nullptr) != 0) {
+    HOLOSCAN_LOG_ERROR("Failed to block SIGINT for dedicated shutdown handling thread");
+    return -1;
+  }
+
+  const gxf_context_t app_context = app->executor().context();
+  std::atomic<bool> signal_thread_exit {false};
+  std::thread signal_thread([app_context, sigint_set, &signal_thread_exit]() mutable {
+    int interrupt_count = 0;
+    while (true) {
+      int signal_number = 0;
+      const int wait_result = sigwait(&sigint_set, &signal_number);
+      if (wait_result != 0) {
+        continue;
+      }
+      if (signal_thread_exit.load(std::memory_order_relaxed)) {
+        break;
+      }
+      if (signal_number != SIGINT) {
+        continue;
+      }
+
+      interrupt_count += 1;
+      std::fprintf(stderr,
+                   "[copilot-probe] sigwait received signal=%d count=%d\n",
+                   signal_number,
+                   interrupt_count);
+      std::fflush(stderr);
+      HOLOSCAN_LOG_INFO("sigwait received signal={} count={}", signal_number, interrupt_count);
+      if (interrupt_count == 1) {
+        request_graceful_shutdown(app_context);
+        continue;
+      }
+
+      std::_Exit(128 + SIGINT);
+    }
+  });
+
   app->run();
+
+  signal_thread_exit.store(true, std::memory_order_relaxed);
+  pthread_kill(signal_thread.native_handle(), SIGINT);
+  signal_thread.join();
 
   shutdown();
   return 0;

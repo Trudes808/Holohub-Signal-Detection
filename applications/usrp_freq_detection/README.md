@@ -43,5 +43,18 @@ the `spp` and `mtu` arguments. This command will work:
         -i $REMOTE_IP_ADDRESS -p 1234 --adapter sfp0 \
         --dest-mac-addr $REMOTE_MAC_ADDR --mtu 8000 --spp 1024
 
+  To tune different center frequencies per channel, provide one `-f/--freq`
+  value per selected channel, for example `-c 0 1 -f 2.40e9 2.45e9 -p 1234 1235`.
+
+  The Holoscan receive pipeline already exports per-message operator metadata.
+  `ChdrConverterOpRx` always sets `channel_number` and `chdr_emit_ts_ns`, and it
+  can now also attach `rx_center_frequency_hz` and `rx_sample_rate_hz`. Because
+  the sender script and the Holoscan app are separate processes, the app cannot
+  discover those RF settings automatically; set
+  `chdr_converter.channel_center_frequencies_hz` and
+  `chdr_converter.channel_sample_rates_hz` in
+  `applications/usrp_freq_detection/config.yaml` if downstream operators need
+  those values.
+
 
 The Holoscan app should run and report the streaming throughput rate.

@@ -1,7 +1,10 @@
 #pragma once
 
+#include <cuda/std/complex>
 #include <holoscan/holoscan.hpp>
 #include <holoscan/operators/holoviz/holoviz.hpp>
+
+#include <matx.h>
 
 #include <atomic>
 #include <chrono>
@@ -10,12 +13,122 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace holoscan::ops {
+
+using SpectrogramComplex = cuda::std::complex<float>;
+using SpectrogramTensor = matx::tensor_t<SpectrogramComplex, 2>;
+
+struct VisualSpectrogramMessage {
+  std::vector<uint8_t> pixels;
+  int width = 0;
+  int height = 0;
+  int channel = 0;
+  uint64_t frame_number = 0;
+  uint64_t fft_emit_ts_ns = 0;
+  uint64_t preview_enter_ts_ns = 0;
+  uint64_t preview_emit_ts_ns = 0;
+  double center_frequency_hz = 0.0;
+  double sample_rate_hz = 0.0;
+  double span_hz = 0.0;
+  double resolution_hz = 0.0;
+};
+
+struct DetectorMaskMessage;
+
+class SpectrogramPreviewOp : public Operator {
+ public:
+  HOLOSCAN_OPERATOR_FORWARD_ARGS(SpectrogramPreviewOp)
+
+  using in_t = std::tuple<SpectrogramTensor, cudaStream_t>;
+  using out_t = VisualSpectrogramMessage;
+
+  void setup(OperatorSpec& spec) override;
+  void initialize() override;
+  void stop() override;
+  void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
+
+ private:
+  struct PreviewTimingStats {
+    uint64_t frames_seen = 0;
+    double fft_to_preview_total_ms = 0.0;
+    double fft_to_preview_max_ms = 0.0;
+    double preview_compute_total_ms = 0.0;
+    double preview_compute_max_ms = 0.0;
+    double fft_to_preview_emit_total_ms = 0.0;
+    double fft_to_preview_emit_max_ms = 0.0;
+  };
+
+  Parameter<int> channel_index_;
+  Parameter<int> emit_every_n_;
+  Parameter<int> output_width_;
+  Parameter<int> output_height_;
+  Parameter<float> db_floor_;
+  Parameter<float> db_ceil_;
+  Parameter<bool> timing_summary_enable_;
+  Parameter<int> timing_summary_every_n_;
+  uint64_t frames_seen_ = 0;
+  cudaStream_t reduce_stream_ = nullptr;
+  uint8_t* device_output_ = nullptr;
+  void* pinned_output_ = nullptr;
+  size_t buffer_bytes_ = 0;
+  std::vector<PreviewTimingStats> timing_stats_;
+
+  void ensure_preview_capacity(size_t required_bytes);
+};
+
+class MaskPreviewOp : public Operator {
+ public:
+  HOLOSCAN_OPERATOR_FORWARD_ARGS(MaskPreviewOp)
+
+  using in_t = DetectorMaskMessage;
+
+  void setup(OperatorSpec& spec) override;
+  void initialize() override;
+  void stop() override;
+  void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
+
+ private:
+  Parameter<int> emit_every_n_;
+  Parameter<int> output_width_;
+  Parameter<int> output_height_;
+  uint64_t frames_seen_ = 0;
+  cudaStream_t reduce_stream_ = nullptr;
+  uint8_t* device_output_ = nullptr;
+  void* pinned_output_ = nullptr;
+  size_t buffer_bytes_ = 0;
+
+  void ensure_preview_capacity(size_t required_bytes);
+};
+
+class SpectrogramPreviewStoreOp : public Operator {
+ public:
+  HOLOSCAN_OPERATOR_FORWARD_ARGS(SpectrogramPreviewStoreOp)
+
+  SpectrogramPreviewStoreOp() = default;
+
+  using in_t = VisualSpectrogramMessage;
+
+  void setup(OperatorSpec& spec) override;
+  void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
+};
+
+class MaskPreviewStoreOp : public Operator {
+ public:
+  HOLOSCAN_OPERATOR_FORWARD_ARGS(MaskPreviewStoreOp)
+
+  MaskPreviewStoreOp() = default;
+
+  using in_t = DetectorMaskMessage;
+
+  void setup(OperatorSpec& spec) override;
+  void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
+};
 
 struct ChannelVisualizationState;
 
@@ -58,6 +171,7 @@ class SpectrogramToHolovizOp : public Operator {
   Parameter<int> render_every_n_frames_;
   Parameter<bool> timing_summary_enable_;
   Parameter<int> timing_summary_every_n_;
+  Parameter<std::shared_ptr<BooleanCondition>> shutdown_scheduling_term_;
   Parameter<float> db_floor_;
   Parameter<float> db_ceil_;
   Parameter<int> row_average_n_;
@@ -69,6 +183,20 @@ class SpectrogramToHolovizOp : public Operator {
     uint8_t* device_mask_buffer = nullptr;
     void* pinned_mask_buffer = nullptr;
     size_t grayscale_buffer_bytes = 0;
+  };
+
+  struct PendingChannelFrame {
+    bool pending = false;
+    bool compose_requested = false;
+    int channel = -1;
+    std::vector<uint8_t> pixels;
+    int width = 0;
+    int height = 0;
+    int display_time_rows = 0;
+    uint64_t frame_number = 0;
+    double center_frequency_hz = 0.0;
+    double span_hz = 0.0;
+    double resolution_hz = 0.0;
   };
 
   struct VisualTimingStats {
@@ -92,23 +220,37 @@ class SpectrogramToHolovizOp : public Operator {
     double compose_max_ms = 0.0;
     double render_total_ms = 0.0;
     double render_max_ms = 0.0;
+    double fft_to_visualizer_total_ms = 0.0;
+    double fft_to_visualizer_max_ms = 0.0;
+    double preview_to_visualizer_total_ms = 0.0;
+    double preview_to_visualizer_max_ms = 0.0;
+  };
+
+  struct PerChannelVisualTimingStats {
+    uint64_t frames_processed = 0;
+    uint64_t last_frame_number = 0;
+    double fft_to_visualizer_total_ms = 0.0;
+    double fft_to_visualizer_max_ms = 0.0;
+    double preview_to_visualizer_total_ms = 0.0;
+    double preview_to_visualizer_max_ms = 0.0;
   };
 
   std::vector<ChannelVisualizationState> channel_states_;
   std::mutex channel_states_mutex_;
   std::vector<VisualChannelResources> channel_resources_;
+  std::vector<PendingChannelFrame> pending_channel_frames_;
   uint64_t dropped_frames_ = 0;
   uint64_t total_frames_ = 0;
   std::mutex timing_mutex_;
   VisualTimingStats timing_stats_;
+  std::vector<PerChannelVisualTimingStats> per_channel_timing_stats_;
 
   // Background render thread — keeps operator thread free
   std::thread render_thread_;
   std::mutex render_mutex_;
   std::condition_variable render_cv_;
-  bool render_ready_ = false;
+  bool render_work_pending_ = false;
   bool render_stop_ = false;
-  std::function<void()> render_task_;
 
   // Pending composed frame — background thread fills this,
   // operator thread emits it on the next tick
@@ -118,6 +260,10 @@ class SpectrogramToHolovizOp : public Operator {
   int pending_composed_height_ = 0;
   bool pending_composed_ready_ = false;
   std::atomic<bool> history_budget_warning_emitted_{false};
+  std::atomic<bool> channel_filter_override_warning_emitted_{false};
+  std::vector<uint64_t> latest_rendered_frame_numbers_;
+
+  void ensure_channel_resource_capacity(size_t channel_index, size_t required_bytes);
 
 };
 

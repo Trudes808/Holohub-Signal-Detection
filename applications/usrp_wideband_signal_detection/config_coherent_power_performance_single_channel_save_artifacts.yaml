@@ -217,6 +217,8 @@ coherent_power_signal_detector:
   live_emit_mask_rows: 16
   live_emit_mask_cols: 20480
   live_emit_mask_min_coverage: 0.35
+  live_emit_freq_persistence_window: 45
+  live_emit_freq_persistence_min_hits: 11
   emit_stride: 1
   log_detections: true
   fast_performance: true

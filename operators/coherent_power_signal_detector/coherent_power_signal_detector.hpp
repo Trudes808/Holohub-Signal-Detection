@@ -168,6 +168,10 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
     uint64_t final_mask_component_count_max = 0;
     uint64_t final_mask_grouped_box_count_total = 0;
     uint64_t final_mask_grouped_box_count_max = 0;
+    double fft_to_detector_enter_total_ms = 0.0;
+    double fft_to_detector_enter_max_ms = 0.0;
+    double fft_to_detector_done_total_ms = 0.0;
+    double fft_to_detector_done_max_ms = 0.0;
     std::array<double, kTimingStageCount> total_ms {};
     std::array<double, kTimingStageCount> max_ms {};
     std::array<double, kReferenceTimingStageCount> reference_total_ms {};
@@ -232,6 +236,8 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<int> live_emit_mask_rows_;
   holoscan::Parameter<int> live_emit_mask_cols_;
   holoscan::Parameter<double> live_emit_mask_min_coverage_;
+  holoscan::Parameter<int> live_emit_freq_persistence_window_;
+  holoscan::Parameter<int> live_emit_freq_persistence_min_hits_;
   holoscan::Parameter<int> fast_time_smooth_radius_;
   holoscan::Parameter<int> fast_freq_smooth_radius_;
   holoscan::Parameter<int> fast_background_freq_radius_;

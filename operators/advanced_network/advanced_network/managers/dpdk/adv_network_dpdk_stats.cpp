@@ -190,7 +190,7 @@ void DpdkStats::Run() {
   pthread_setname_np(thread, "DPDK_STATS");
   HOLOSCAN_LOG_INFO("Starting stats thread on core {}", cfg_.common_.master_core_);
 
-  while (!force_quit_.load()) {
+  while (!force_quit_.load() && !adv_net_shutdown_requested()) {
     // Poll xstats for each port
     for (const auto &port : cfg_.ifs_) {
       int port_id = port.port_id_;
@@ -237,6 +237,7 @@ void DpdkStats::Run() {
         uint64_t old_rx_queue_errors = port_stats.old_xstats[error_idx].value;
 
         if (rx_queue_errors > old_rx_queue_errors) {
+          const auto queue_errors_since_last_check = rx_queue_errors - old_rx_queue_errors;
           // Get memory region names for this port/queue combination
           uint32_t key = (port_id << 16) | queue_id;
           std::string mr_names = "unknown";
@@ -248,10 +249,11 @@ void DpdkStats::Run() {
           const auto q_cfg = port.rx_.queues_[queue_id].common_;
 
           HOLOSCAN_LOG_WARN("'{}' interface ({}), Rx '{}' queue ({}): "
-          "Packets to '{}' might get dropped. Either CPU #{} couldn't read from the NIC fast "
+          "Packets to '{}' might get dropped (delta={}, total={}). Either CPU #{} couldn't read from the NIC fast "
           "enough, downstream software was not processing and freeing packets fast enough, "
           "or not enough buffers were allocated in this memory region to begin with.",
-          interface_name, port_id, q_cfg.name_, queue_id, mr_names, q_cfg.cpu_core_);
+          interface_name, port_id, q_cfg.name_, queue_id, mr_names,
+          queue_errors_since_last_check, rx_queue_errors, q_cfg.cpu_core_);
         }
       }
 
@@ -274,6 +276,9 @@ void DpdkStats::Run() {
     }
 
     // Sleep for a short time to avoid excessive CPU usage
+    if (force_quit_.load() || adv_net_shutdown_requested()) {
+      break;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(POLLING_INTERVAL_MS));
   }
 }

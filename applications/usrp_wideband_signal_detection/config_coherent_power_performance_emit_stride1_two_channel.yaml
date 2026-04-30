@@ -21,6 +21,7 @@ advanced_network:
     master_core: 9
     debug: false
     log_level: "info"
+    rx_meta_buffers: 4096
 
     memory_regions:
       - name: "Headers_RX_CPU"
@@ -28,35 +29,35 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144
         buf_size: 42
       - name: "CH1_CHDR_Headers_RX_CPU"
         kind: "huge"
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144
         buf_size: 64
       - name: "CH1_Data_RX_GPU"
         kind: "device"
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144
         buf_size: 4096
       - name: "CH2_CHDR_Headers_RX_CPU"
         kind: "huge"
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144
         buf_size: 64
       - name: "CH2_Data_RX_GPU"
         kind: "device"
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144
         buf_size: 4096
 
     interfaces:
@@ -68,7 +69,7 @@ advanced_network:
             - name: "Channel 1 data"
               id: 0
               cpu_core: 10
-              batch_size: 1024
+              batch_size: 2048
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
@@ -76,7 +77,7 @@ advanced_network:
             - name: "Channel 2 data"
               id: 1
               cpu_core: 11
-              batch_size: 1024
+              batch_size: 2048
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH2_CHDR_Headers_RX_CPU"
@@ -102,6 +103,7 @@ advanced_network:
 
 chdr_converter:
   interface_name: sdr_data
+  channel_center_frequencies_hz: "2400e6,1000e6"
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
   num_ffts_per_batch: 512
@@ -139,10 +141,10 @@ logger:
 visualization:
   enable: true
   renderer:
-    num_channels: 1
-    history_frames: 5
-    output_height: 256
-    output_width: 512
+    num_channels: 2
+    history_frames: 1
+    output_height: 512
+    output_width: 1024
     display_time_rows: 2048
     display_freq_bins: 20480
     history_memory_budget_mb: 1024
@@ -151,11 +153,11 @@ visualization:
     render_every_n_frames: 4
     timing_summary_enable: true
     timing_summary_every_n: 128
-    channel_filter: 0
+    channel_filter: -1
     tensor_name: "spectrogram"
     blue_limit: 0.10
     red_limit: 0.92
-    overlay_alpha: 0.9 #0.38
+    overlay_alpha: 0.7 #0.38
     center_frequency_hz: 0.0
     fft_size: 20480
     dino_chunk_rows: 256
@@ -231,7 +233,7 @@ dinov3_signal_detector:
   pipeline_strong_speckle_min_component: 10
   pipeline_texture_speckle_clean_threshold: 0.85
   pipeline_texture_speckle_strong_threshold: 0.20
-  timing_summary_enable: false
+  timing_summary_enable: true
   timing_summary_every_n: 64
   timing_summary_window: 64
 
@@ -239,7 +241,16 @@ coherent_power_signal_detector:
   num_channels: 2
   input_height: 250
   input_width: 20480
-  # Full-rate aggressive profile for two-channel performance validation.
+  # Full-rate aggressive profile matching the active single-channel fast path,
+  # extended to dual-channel artifact capture.
+  fast_power_floor_db: 0.5
+  fast_power_span_db: 3.0
+  fast_score_threshold: 0.4
+  live_emit_mask_rows: 16
+  live_emit_mask_cols: 20480
+  live_emit_mask_min_coverage: 0.35
+  live_emit_freq_persistence_window: 45
+  live_emit_freq_persistence_min_hits: 11
   emit_stride: 1
   log_detections: false
   fast_performance: true
@@ -257,7 +268,8 @@ coherent_power_signal_detector:
   frontend_row_q: 25.0
   frontend_reference_q: 75.0
   frontend_smooth_sigma: 12.0
-  frontend_max_boost_db: 12.0
+  frontend_max_boost_db: 0.0
+  frontend_signal_cap_db: 0.0
   coherence_weight: 0.55
   power_weight: 0.45
   score_threshold_mode: "fixed"
@@ -274,6 +286,6 @@ coherent_power_signal_detector:
   grouping_min_time_span_px: 1
   grouping_min_density: 0.0
   grouping_time_continuity_ratio: 0.85
-  timing_summary_enable: false
-  timing_summary_every_n: 64
-  timing_summary_window: 64
+  timing_summary_enable: true
+  timing_summary_every_n: 512
+  timing_summary_window: 512

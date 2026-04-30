@@ -22,7 +22,10 @@
 #include "matx.h"
 #include "advanced_network/common.h"
 
+#include <optional>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 using namespace holoscan::advanced_network;
 using namespace matx;
@@ -60,8 +63,13 @@ class ChdrConverterOpRx : public Operator {
   Parameter<std::string> interface_name_;
   Parameter<bool> log_data_;
   Parameter<bool> log_packets_;
+  Parameter<std::string> channel_center_frequencies_hz_;
+  Parameter<std::string> channel_sample_rates_hz_;
   int port_id_;
   uint32_t num_packets_per_batch;
+  std::vector<std::optional<double>> center_frequency_by_channel_;
+  std::vector<std::optional<double>> sample_rate_by_channel_;
+  bool resources_released_ = false;
 
   // Holds burst buffers that cannot be freed yet
   struct RxMsg {
@@ -73,6 +81,7 @@ class ChdrConverterOpRx : public Operator {
     uint64_t queued_ns = 0;
   };
 
+ public:
   struct Channel {
     uint16_t channel_num;
     int cur_idx = 0;
@@ -89,6 +98,18 @@ class ChdrConverterOpRx : public Operator {
     uint64_t completed_batches_queued = 0;
     uint64_t completed_batches_emitted = 0;
     uint64_t backlog_events = 0;
+    uint64_t rx_bursts_received = 0;
+    uint64_t empty_rx_polls = 0;
+    uint64_t max_burst_packets = 0;
+    uint64_t timeout_like_partial_drains = 0;
+    uint64_t periodic_summary_start_ns = 0;
+    uint64_t periodic_summary_last_ns = 0;
+    uint64_t periodic_summary_batches_queued = 0;
+    uint64_t periodic_summary_batches_emitted = 0;
+    uint64_t periodic_summary_packets = 0;
+    uint64_t periodic_summary_bursts = 0;
+    uint64_t periodic_summary_empty_polls = 0;
+    uint64_t periodic_summary_backlog_events = 0;
     size_t max_out_q_depth = 0;
     uint64_t release_samples = 0;
     double total_release_latency_ms = 0.0;
@@ -97,6 +118,8 @@ class ChdrConverterOpRx : public Operator {
     uint64_t first_receive_ns = 0;
     uint64_t last_receive_ns = 0;
   };
+
+ private:
 
   std::vector<std::shared_ptr<struct Channel>> channel_list;
 
@@ -110,6 +133,9 @@ class ChdrConverterOpRx : public Operator {
           BurstParams *burst,
           uint16_t channel_num);
   int max_inflight_batches() const;
+    void release_channel_resources();
+  std::vector<std::optional<double>> parse_channel_values(const std::string& values,
+                                                          const char* field_name) const;
 };  // ChdrConverterOpRx
 
 }  // namespace holoscan::ops

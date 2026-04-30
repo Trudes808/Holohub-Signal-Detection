@@ -79,6 +79,32 @@ inline int EnabledDirections(const std::string& dir) {
 Status adv_net_init(NetworkConfig &config);
 
 /**
+ * @brief Request that advanced network backends stop as soon as possible.
+ *
+ * This is intended for early interrupt handling paths that need backend workers to
+ * observe shutdown before the full graph teardown reaches operator stop().
+ */
+void adv_net_request_shutdown();
+
+/**
+ * @brief Clear any pending advanced network shutdown request.
+ */
+void adv_net_clear_shutdown_request();
+
+/**
+ * @brief Returns true if an early advanced network shutdown has been requested.
+ */
+bool adv_net_shutdown_requested();
+
+/**
+ * @brief Shutdown the active advanced network manager.
+ *
+ * This is safe to call more than once. Backends may use internal reference counting
+ * to make repeated calls a no-op after the first effective shutdown.
+ */
+void adv_net_shutdown();
+
+/**
  * @brief Returns a manager type
  *
  * @return Manager type
