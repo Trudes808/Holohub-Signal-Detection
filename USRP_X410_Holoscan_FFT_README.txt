@@ -152,9 +152,6 @@ Fix  : sudo mount -t hugetlbfs nodev /dev/hugepages
 Issue: nvidia_peermem not loaded
 Fix  : sudo modprobe nvidia-peermem
 
-Issue: DMA map error (GPU BAR1 limit)
-Fix  : Keep CH1_Data_RX_GPU and CH2_Data_RX_GPU num_bufs <= 25000
-
 Issue: DPDK rte_flow_field_data compile error
 Fix  : Already integrated in this branch. Pull latest holohub-sage-dev.
 

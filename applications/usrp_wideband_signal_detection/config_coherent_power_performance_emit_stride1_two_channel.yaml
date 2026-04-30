@@ -144,7 +144,7 @@ visualization:
     num_channels: 2
     history_frames: 1
     output_height: 512
-    output_width: 1024
+    output_width: 2048
     display_time_rows: 2048
     display_freq_bins: 20480
     history_memory_budget_mb: 1024
@@ -251,6 +251,11 @@ coherent_power_signal_detector:
   live_emit_mask_min_coverage: 0.35
   live_emit_freq_persistence_window: 45
   live_emit_freq_persistence_min_hits: 11
+  live_emit_always_on_enable: true
+  live_emit_always_on_row_mean_stride: 4
+  live_emit_always_on_low_quantile: 10.0
+  live_emit_always_on_excess_db: 5.0
+  live_emit_always_on_min_time_coverage: 0.90
   emit_stride: 1
   log_detections: false
   fast_performance: true

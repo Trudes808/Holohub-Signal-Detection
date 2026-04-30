@@ -238,6 +238,11 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<double> live_emit_mask_min_coverage_;
   holoscan::Parameter<int> live_emit_freq_persistence_window_;
   holoscan::Parameter<int> live_emit_freq_persistence_min_hits_;
+  holoscan::Parameter<bool> live_emit_always_on_enable_;
+  holoscan::Parameter<int> live_emit_always_on_row_mean_stride_;
+  holoscan::Parameter<double> live_emit_always_on_low_quantile_;
+  holoscan::Parameter<double> live_emit_always_on_excess_db_;
+  holoscan::Parameter<double> live_emit_always_on_min_time_coverage_;
   holoscan::Parameter<int> fast_time_smooth_radius_;
   holoscan::Parameter<int> fast_freq_smooth_radius_;
   holoscan::Parameter<int> fast_background_freq_radius_;

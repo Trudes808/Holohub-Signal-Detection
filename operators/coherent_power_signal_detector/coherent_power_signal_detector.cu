@@ -565,6 +565,8 @@ struct FastGpuMetadataSummary {
   uint32_t raw_mask_nonzero_pixels = 0;
   uint32_t post_emit_close_mask_nonzero_pixels = 0;
   uint32_t post_smooth_mask_nonzero_pixels = 0;
+  float always_on_floor_db = 0.0f;
+  uint32_t always_on_stripe_count = 0;
 };
 
 struct CanonicalTensorView {
@@ -894,6 +896,118 @@ __global__ void coherent_power_row_mean_kernel(const float* input,
 
   if (tid == 0) {
     row_mean[row] = partial[0] / static_cast<float>(max(cols, 1));
+  }
+}
+
+__global__ void coherent_power_row_sampled_mean_kernel(const float* input,
+                                                       int rows,
+                                                       int cols,
+                                                       int col_stride,
+                                                       float* row_mean) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  __shared__ float partial_sum[256];
+  __shared__ unsigned int partial_count[256];
+  const int tid = threadIdx.x;
+  const int sample_stride = max(col_stride, 1);
+  float sum = 0.0f;
+  unsigned int count = 0;
+  for (int col = tid * sample_stride; col < cols; col += blockDim.x * sample_stride) {
+    sum += input[static_cast<size_t>(row) * static_cast<size_t>(cols) + static_cast<size_t>(col)];
+    ++count;
+  }
+  partial_sum[tid] = sum;
+  partial_count[tid] = count;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      partial_sum[tid] += partial_sum[tid + stride];
+      partial_count[tid] += partial_count[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    row_mean[row] = partial_count[0] > 0 ? partial_sum[0] / static_cast<float>(partial_count[0]) : 0.0f;
+  }
+}
+
+__global__ void coherent_power_valid_frequency_row_mask_kernel(int rows,
+                                                               int ignore_bins_per_side,
+                                                               uint8_t* row_mask) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  row_mask[row] = (row >= ignore_bins_per_side && row < (rows - ignore_bins_per_side)) ? 1 : 0;
+}
+
+__global__ void coherent_power_row_coverage_keep_kernel(const float* corrected,
+                                                        int rows,
+                                                        int cols,
+                                                        const float* floor_db,
+                                                        float excess_db,
+                                                        float min_time_coverage,
+                                                        uint8_t* row_keep) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  if (!row_keep[row]) {
+    if (threadIdx.x == 0) {
+      row_keep[row] = 0;
+    }
+    return;
+  }
+
+  __shared__ unsigned int partial_hits[256];
+  const int tid = threadIdx.x;
+  const float threshold_db = floor_db[0] + excess_db;
+  unsigned int hits = 0;
+  const size_t row_offset = static_cast<size_t>(row) * static_cast<size_t>(cols);
+  for (int col = tid; col < cols; col += blockDim.x) {
+    if (corrected[row_offset + static_cast<size_t>(col)] >= threshold_db) {
+      ++hits;
+    }
+  }
+  partial_hits[tid] = hits;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      partial_hits[tid] += partial_hits[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const float coverage = static_cast<float>(partial_hits[0]) / static_cast<float>(max(cols, 1));
+    row_keep[row] = coverage >= min_time_coverage ? 1 : 0;
+  }
+}
+
+__global__ void coherent_power_or_stripe_flags_kernel(uint8_t* mask,
+                                                      int rows,
+                                                      int cols,
+                                                      const uint8_t* stripe_flags,
+                                                      bool stripes_are_rows) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+
+  const int row = idx / cols;
+  const int col = idx % cols;
+  const int stripe_index = stripes_are_rows ? row : col;
+  if (stripe_flags[stripe_index]) {
+    mask[idx] = 1;
   }
 }
 
@@ -6902,6 +7016,31 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
              "Live emit frequency persistence minimum hits",
              "Minimum in-window horizontal hits required by the post-morph live emit frequency persistence pass.",
              1);
+  spec.param(live_emit_always_on_enable_,
+             "live_emit_always_on_enable",
+             "Live emit always-on enable",
+             "Enable the detector-side always-on stripe bypass for obvious full-time signals.",
+             false);
+  spec.param(live_emit_always_on_row_mean_stride_,
+             "live_emit_always_on_row_mean_stride",
+             "Live emit always-on row mean stride",
+             "Column stride used when sampling background row means for the always-on floor estimate.",
+             4);
+  spec.param(live_emit_always_on_low_quantile_,
+             "live_emit_always_on_low_quantile",
+             "Live emit always-on low quantile",
+             "Low quantile across sampled background row means used as the always-on floor estimate.",
+             10.0);
+  spec.param(live_emit_always_on_excess_db_,
+             "live_emit_always_on_excess_db",
+             "Live emit always-on excess dB",
+             "Required excess above the always-on floor to preserve a full-time stripe.",
+             5.0);
+  spec.param(live_emit_always_on_min_time_coverage_,
+             "live_emit_always_on_min_time_coverage",
+             "Live emit always-on minimum time coverage",
+             "Minimum fraction of time bins that must exceed the always-on floor plus excess to preserve a stripe.",
+             0.90);
   spec.param(fast_time_smooth_radius_, "fast_time_smooth_radius", "Fast path time radius", "Time-axis radius for the fast GPU coherence proxy.", 4);
   spec.param(fast_freq_smooth_radius_, "fast_freq_smooth_radius", "Fast path frequency radius", "Frequency-axis radius for the fast GPU coherence proxy.", 3);
   spec.param(fast_background_freq_radius_, "fast_background_freq_radius", "Fast path background frequency radius", "Frequency-axis radius for the fast GPU local background.", 8);
@@ -7447,6 +7586,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   std::shared_ptr<unsigned int> fast_raw_mask_nonzero_device;
   std::shared_ptr<unsigned int> fast_post_emit_close_mask_nonzero_device;
   std::shared_ptr<unsigned int> fast_post_smooth_mask_nonzero_device;
+  std::shared_ptr<unsigned int> fast_always_on_stripe_count_device;
   std::string coherent_backend_name = "coherent_power_live_v1";
   std::string coherent_variant_name = "frontend_live_mask_v1";
   const bool materialize_reference_final_mask = should_write_mask_image || should_save_reference_debug_artifacts || should_save_path_artifacts || timing_enabled;
@@ -7708,6 +7848,66 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     kernel_result = cudaGetLastError();
     if (kernel_result != cudaSuccess) {
       throw std::runtime_error(std::string("fast_score kernel launch failed: ") + cudaGetErrorString(kernel_result));
+    }
+
+    if (live_emit_always_on_enable_.get()) {
+      auto& scratch = chunk_cuda_scratch();
+      if (!scratch.ensure_capacity(static_cast<size_t>(total_bins))) {
+        throw std::runtime_error("failed to allocate always-on histogram scratch");
+      }
+      unsigned int* histogram_device = scratch.histogram_buffers[0];
+      const int row_mask_blocks = (src_rows + threads - 1) / threads;
+      coherent_power_row_sampled_mean_kernel<<<src_rows, threads, 0, stream>>>(buffers.background_device,
+                                                                                src_rows,
+                                                                                src_cols,
+                                                                                std::max(1, live_emit_always_on_row_mean_stride_.get()),
+                                                                                buffers.row_stat_device);
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("always-on row sampled mean kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+
+      coherent_power_valid_frequency_row_mask_kernel<<<row_mask_blocks, threads, 0, stream>>>(src_rows,
+                                                                                                ignore_bins_per_side,
+                                                                                                buffers.scratch_mask_device);
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("always-on valid row mask kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+
+      device_quantile_from_histogram_masked_async(buffers.row_stat_device,
+                                                  buffers.scratch_mask_device,
+                                                  src_rows,
+                                                  clamp_float(static_cast<float>(live_emit_always_on_low_quantile_.get() / 100.0), 0.0f, 1.0f),
+                                                  -200.0f,
+                                                  200.0f,
+                                                  histogram_device,
+                                                  buffers.frontend_reference_device,
+                                                  stream);
+
+      coherent_power_row_coverage_keep_kernel<<<src_rows, threads, 0, stream>>>(buffers.corrected_db_device,
+                                                                                  src_rows,
+                                                                                  src_cols,
+                                                                                  buffers.frontend_reference_device,
+                                                                                  static_cast<float>(live_emit_always_on_excess_db_.get()),
+                                                                                  static_cast<float>(live_emit_always_on_min_time_coverage_.get()),
+                                                                                  buffers.scratch_mask_device);
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("always-on row coverage kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+
+      fast_always_on_stripe_count_device = allocate_owned_u32_buffer();
+      if (cudaMemsetAsync(fast_always_on_stripe_count_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
+        throw std::runtime_error("failed to reset always-on stripe counter");
+      }
+      count_nonzero_u8_kernel<<<row_mask_blocks, threads, 0, stream>>>(buffers.scratch_mask_device,
+                                                                        src_rows,
+                                                                        fast_always_on_stripe_count_device.get());
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("always-on stripe count kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
     }
 
     fast_raw_mask_nonzero_device = acquire_pooled_u32_buffer();
@@ -8551,6 +8751,18 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       const int compact_total = dst_rows * dst_cols;
       constexpr int count_threads = 256;
       const int count_blocks = (compact_total + count_threads - 1) / count_threads;
+      if (live_emit_always_on_enable_.get()) {
+        coherent_power_or_stripe_flags_kernel<<<count_blocks, count_threads, 0, stream>>>(mask_buffer.get(),
+                                                                                            dst_rows,
+                                                                                            dst_cols,
+                                                                                            buffers.scratch_mask_device,
+                                                                                            !canonical_view.transposed);
+        emit_mask_result = cudaGetLastError();
+        if (emit_mask_result != cudaSuccess) {
+          throw std::runtime_error(std::string("always-on stripe OR kernel launch failed: ") + cudaGetErrorString(emit_mask_result));
+        }
+      }
+
       count_nonzero_u8_kernel<<<count_blocks, count_threads, 0, stream>>>(mask_buffer.get(),
                                                                            compact_total,
                                                                            emitted_nonzero_device.get());
@@ -8599,6 +8811,26 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         }
         fast_summary.post_smooth_mask_nonzero_pixels = post_smooth_nonzero_count;
       }
+      if (live_emit_always_on_enable_.get()) {
+        float always_on_floor_db = 0.0f;
+        if (cudaMemcpy(&always_on_floor_db,
+                       buffers.frontend_reference_device,
+                       sizeof(float),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+          throw std::runtime_error("failed to copy always-on floor");
+        }
+        fast_summary.always_on_floor_db = always_on_floor_db;
+      }
+      if (fast_always_on_stripe_count_device) {
+        unsigned int always_on_stripe_count = 0;
+        if (cudaMemcpy(&always_on_stripe_count,
+                       fast_always_on_stripe_count_device.get(),
+                       sizeof(unsigned int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+          throw std::runtime_error("failed to copy always-on stripe count");
+        }
+        fast_summary.always_on_stripe_count = always_on_stripe_count;
+      }
       holoscan::ops::DetectorMaskMessage mask_msg;
       mask_msg.device_pixels = std::move(mask_buffer);
       coherent_emitted_mask_nonzero_pixels = emitted_nonzero_count;
@@ -8607,13 +8839,15 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       mask_msg.height = dst_rows;
       mask_msg.channel = channel_number;
       mask_msg.frame_number = frame_number;
-      HOLOSCAN_LOG_INFO("Mask emit audit ch={} frame={} dims={}x{} raw_nonzero={} post_smooth_nonzero={} post_close_nonzero={} emitted_nonzero={} device_ptr=yes",
+      HOLOSCAN_LOG_INFO("Mask emit audit ch={} frame={} dims={}x{} raw_nonzero={} post_smooth_nonzero={} always_on_floor_db={} always_on_stripes={} post_close_nonzero={} emitted_nonzero={} device_ptr=yes",
                         channel_number,
                         frame_number,
                         dst_cols,
                         dst_rows,
                         fast_summary.raw_mask_nonzero_pixels,
                         fast_summary.post_smooth_mask_nonzero_pixels,
+                        fast_summary.always_on_floor_db,
+                        fast_summary.always_on_stripe_count,
                         fast_summary.post_emit_close_mask_nonzero_pixels,
                         emitted_nonzero_count);
       op_output.emit(mask_msg, "mask_out");
@@ -8628,6 +8862,10 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
             use_reference_backend ? coherent_reference_mask_nonzero_pixels : fast_summary.post_emit_close_mask_nonzero_pixels);
   meta->set("coherent_fast_post_smooth_mask_nonzero_pixels",
             use_reference_backend ? coherent_reference_mask_nonzero_pixels : fast_summary.post_smooth_mask_nonzero_pixels);
+  meta->set("coherent_fast_always_on_floor_db",
+            use_reference_backend ? 0.0f : fast_summary.always_on_floor_db);
+  meta->set("coherent_fast_always_on_stripe_count",
+            use_reference_backend ? 0u : fast_summary.always_on_stripe_count);
   meta->set("coherent_final_mask_metrics_meaningful",
             use_reference_backend ? pipeline_summary.final_mask_metrics_meaningful : coherent_emitted_mask_metrics_meaningful);
   meta->set("coherent_final_mask_nonzero_pixels",

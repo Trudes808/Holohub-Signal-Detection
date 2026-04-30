@@ -845,8 +845,8 @@ void draw_grid(std::vector<uint8_t>& canvas,
                int rect_height) {
   const RgbColor grid_color{90, 104, 128};
   for (int step = 1; step < 8; ++step) {
-    const int gx = x + (rect_width * step) / 8;
-    const int gy = y + (rect_height * step) / 8;
+    const int gx = x + static_cast<int>(std::lround((static_cast<double>(rect_width - 1) * step) / 8.0));
+    const int gy = y + static_cast<int>(std::lround((static_cast<double>(rect_height - 1) * step) / 8.0));
     fill_rect(canvas, width, height, gx, y, 1, rect_height, grid_color);
     fill_rect(canvas, width, height, x, gy, rect_width, 1, grid_color);
   }
@@ -1054,11 +1054,11 @@ void draw_plot_axes(std::vector<uint8_t>& canvas,
   const RgbColor axis_color{142, 156, 174};
   draw_rect_outline(canvas, width, height, x, y, plot_width, plot_height, axis_color, 1);
   for (int step = 1; step < 5; ++step) {
-    const int gy = y + (plot_height * step) / 5;
+    const int gy = y + static_cast<int>(std::lround((static_cast<double>(plot_height - 1) * step) / 5.0));
     fill_rect(canvas, width, height, x, gy, plot_width, 1, {48, 58, 76});
   }
   for (int step = 1; step < 8; ++step) {
-    const int gx = x + (plot_width * step) / 8;
+    const int gx = x + static_cast<int>(std::lround((static_cast<double>(plot_width - 1) * step) / 8.0));
     fill_rect(canvas, width, height, gx, y, 1, plot_height, {40, 48, 64});
   }
   if (label_scale <= 0) {
@@ -3119,34 +3119,45 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
 
   const bool has_active_channels = !active_channel_states.empty();
   const int active_channels = std::max(1, static_cast<int>(active_channel_states.size()));
-  const int requested_panel_width = std::max(128, panel_width);
-  const int requested_panel_height = std::max(128, panel_height);
-  int main_width = requested_panel_width;
-  int history_panel_height = requested_panel_height;
-  for (const auto* channel : active_channel_states) {
-    if (channel->history_width > 0) {
-      main_width = std::min(main_width, std::max(1, channel->history_width));
-      history_panel_height = std::min(history_panel_height,
-                                      std::max(1,
-                                               channel->history_capacity_rows > 0 ? channel->history_capacity_rows
-                                                                                 : channel->history_valid_rows));
-    }
-  }
-  const int channel_psd_height = 92;
-  const int channel_heat_height = history_panel_height;
-  const int channel_mask_height = std::max(40, history_panel_height / 4);
-  const int channel_block_height = channel_psd_height + channel_heat_height + channel_mask_height + kPanelPadding * 4 + 56;
+  output_width = std::max(640, panel_width);
+  output_height = std::max(360, panel_height);
+
   const int columns = std::min(2, active_channels);
   const int rows = std::max(1, (active_channels + columns - 1) / columns);
+  const int content_x = kPanelPadding;
+  const int content_y = kHeaderHeight + kPanelPadding;
+  const int content_width = std::max(128, output_width - kSidebarWidth - kPanelPadding * 3);
+  const int content_height = std::max(160, output_height - kHeaderHeight - kFooterHeight - kPanelPadding * 2);
+  const int main_width = std::max(128,
+                                  (content_width - (columns - 1) * kPanelPadding) / std::max(1, columns));
+  const int panel_height_budget = std::max(180,
+                                           (content_height - (rows - 1) * kPanelPadding) / std::max(1, rows));
   const int grid_width = columns * main_width + (columns - 1) * kPanelPadding;
-
-  output_width = grid_width + kSidebarWidth + kPanelPadding * 3;
-  output_height = kHeaderHeight + rows * channel_block_height + kFooterHeight + kPanelPadding * 2;
-
-  const int grid_x = kPanelPadding;
-  const int sidebar_x = grid_x + grid_width + kPanelPadding;
+  const int grid_height = rows * panel_height_budget + (rows - 1) * kPanelPadding;
+  const int grid_x = content_x + std::max(0, (content_width - grid_width) / 2);
+  const int grid_y = content_y + std::max(0, (content_height - grid_height) / 2);
+  const int sidebar_x = output_width - kSidebarWidth - kPanelPadding;
   const int sidebar_y = kHeaderHeight + kPanelPadding;
-  const int sidebar_height = output_height - sidebar_y - kFooterHeight - kPanelPadding;
+  const int sidebar_height = std::max(80, output_height - sidebar_y - kFooterHeight - kPanelPadding);
+
+  const int channel_header_band = 28;
+  const int section_gap = std::max(10, kPanelPadding / 2);
+  const int confidence_gap = 10;
+  const int confidence_height = 14;
+  const int plot_stack_height = std::max(140,
+      panel_height_budget - channel_header_band - confidence_gap - confidence_height - section_gap * 2);
+  int channel_psd_height = std::clamp(static_cast<int>(std::lround(plot_stack_height * 0.22)), 64, 112);
+  int channel_mask_height = std::clamp(static_cast<int>(std::lround(plot_stack_height * 0.18)), 40, 88);
+  int channel_heat_height = plot_stack_height - channel_psd_height - channel_mask_height;
+  if (channel_heat_height < 64) {
+    int deficit = 64 - channel_heat_height;
+    const int psd_reduction = std::min(deficit / 2 + deficit % 2, std::max(0, channel_psd_height - 64));
+    channel_psd_height -= psd_reduction;
+    deficit -= psd_reduction;
+    const int mask_reduction = std::min(deficit, std::max(0, channel_mask_height - 40));
+    channel_mask_height -= mask_reduction;
+    channel_heat_height = plot_stack_height - channel_psd_height - channel_mask_height;
+  }
 
   VisualizationUiState ui_state;
   ui_state.canvas_width = output_width;
@@ -3159,10 +3170,10 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   ui_state.title = "USRP WIDEBAND";
   ui_state.subtitle = "REAL TIME SIGNAL DETECTION";
   ui_state.header_rect = normalized_rect(0, 0, output_width, kHeaderHeight, output_width, output_height);
-  ui_state.content_rect = normalized_rect(grid_x,
-                                          kHeaderHeight + kPanelPadding,
-                                          grid_width,
-                                          rows * channel_block_height,
+  ui_state.content_rect = normalized_rect(content_x,
+                                          content_y,
+                                          content_width,
+                                          content_height,
                                           output_width,
                                           output_height);
   ui_state.sidebar_rect = normalized_rect(sidebar_x,
@@ -3245,29 +3256,29 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     const int column_index = channel_index % columns;
     const int row_index = channel_index / columns;
     const int panel_x = grid_x + column_index * (main_width + kPanelPadding);
-    const int panel_y = kHeaderHeight + kPanelPadding + row_index * channel_block_height;
-    const int psd_y = panel_y;
-    const int heatmap_y = panel_y + channel_psd_height + kPanelPadding;
-    const int mask_y = heatmap_y + channel_heat_height + kPanelPadding;
+    const int panel_y = grid_y + row_index * (panel_height_budget + kPanelPadding);
+    const int psd_y = panel_y + channel_header_band;
+    const int heatmap_y = psd_y + channel_psd_height + section_gap;
+    const int mask_y = heatmap_y + channel_heat_height + section_gap;
 
 
     // Channel accent color
     const RgbColor& accent = kAccents[std::min(channel_index, 1)];
 
     // Panel header bar with channel label, freq, rate
-    fill_rect(canvas, output_width, output_height, panel_x - 8, psd_y - 28, main_width + 16, 20, {10, 18, 32});
-    draw_rect_outline(canvas, output_width, output_height, panel_x - 8, psd_y - 28, main_width + 16, 20, {26, 42, 58}, 1);
+    fill_rect(canvas, output_width, output_height, panel_x - 8, panel_y, main_width + 16, 20, {10, 18, 32});
+    draw_rect_outline(canvas, output_width, output_height, panel_x - 8, panel_y, main_width + 16, 20, {26, 42, 58}, 1);
     // Left accent stripe
-    fill_rect(canvas, output_width, output_height, panel_x - 8, psd_y - 28, 3, 20, accent);
+    fill_rect(canvas, output_width, output_height, panel_x - 8, panel_y, 3, 20, accent);
     // CH label
     if (render_canvas_chrome) {
-      draw_text(canvas, output_width, output_height, panel_x, psd_y - 22, std::string("CH-") + std::to_string(channel.info.channel >= 0 ? channel.info.channel : channel_index), accent, 1);
+      draw_text(canvas, output_width, output_height, panel_x, panel_y + 6, std::string("CH-") + std::to_string(channel.info.channel >= 0 ? channel.info.channel : channel_index), accent, 1);
     }
     // Freq label
     std::ostringstream freq_ss;
     freq_ss << std::fixed << std::setprecision(3) << (channel.info.center_frequency_hz / 1.0e6) << " MHZ";
     if (render_canvas_chrome) {
-      draw_text(canvas, output_width, output_height, panel_x + 60, psd_y - 22, freq_ss.str(), {122, 143, 168}, 1);
+      draw_text(canvas, output_width, output_height, panel_x + 60, panel_y + 6, freq_ss.str(), {122, 143, 168}, 1);
     }
 
     const double span_hz = resolved_display_span_hz(channel, main_width);
@@ -3287,7 +3298,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     VisualizationChannelUiState channel_ui;
     channel_ui.active = channel.active;
     channel_ui.channel = channel.info.channel >= 0 ? channel.info.channel : channel_index;
-    channel_ui.header_rect = normalized_rect(panel_x - 8, psd_y - 28, main_width + 16, 20, output_width, output_height);
+    channel_ui.header_rect = normalized_rect(panel_x - 8, panel_y, main_width + 16, 20, output_width, output_height);
     channel_ui.psd_rect = normalized_rect(panel_x, psd_y, main_width, channel_psd_height, output_width, output_height);
     channel_ui.waterfall_rect = normalized_rect(panel_x, heatmap_y, main_width, channel_heat_height, output_width, output_height);
     channel_ui.mask_rect = normalized_rect(panel_x, mask_y, main_width, channel_mask_height, output_width, output_height);
