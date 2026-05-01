@@ -80,6 +80,8 @@ class ChdrConverterOpRx : public Operator {
     cudaStream_t stream;
     cudaEvent_t evt;
     uint64_t queued_ns = 0;
+    uint32_t packets_in_batch = 0;
+    bool partial_batch = false;
   };
 
  public:
@@ -128,8 +130,10 @@ class ChdrConverterOpRx : public Operator {
   bool free_bufs_and_emit_arrays(OutputContext& op_output, std::shared_ptr<struct Channel> channel);
   void retain_burst_ref(std::shared_ptr<struct Channel> channel, BurstParams* burst);
   void release_burst_ref(std::shared_ptr<struct Channel> channel, BurstParams* burst);
-  void drop_partial_batch(std::shared_ptr<struct Channel> channel, const char* reason);
-  void queue_completed_batch(std::shared_ptr<struct Channel> channel);
+  void flush_partial_batch(std::shared_ptr<struct Channel> channel, const char* reason);
+  void queue_completed_batch(std::shared_ptr<struct Channel> channel,
+                             uint32_t packets_in_batch,
+                             bool partial_batch);
   void process_channel_data(
           OutputContext& op_output,
           BurstParams *burst,

@@ -28,6 +28,7 @@ struct VisualSpectrogramMessage {
   std::vector<uint8_t> pixels;
   int width = 0;
   int height = 0;
+  int source_rows = 0;
   int channel = 0;
   uint64_t frame_number = 0;
   uint64_t fft_emit_ts_ns = 0;
@@ -339,6 +340,12 @@ struct VisualizationFrameInfo {
   double center_frequency_hz = 0.0;
   double span_hz = 0.0;
   double resolution_hz = 0.0;
+  double display_frequency_bin_hz = 0.0;
+  double display_time_bin_seconds = 0.0;
+  double displayed_frame_ratio = 1.0;
+  int displayed_frame_stride = 1;
+  int fft_rows_per_frame = 0;
+  int displayed_fft_rows_per_frame = 0;
   int fft_size = 0;
   int dino_chunk_rows = 0;
   int dino_chunk_cols = 0;
@@ -366,7 +373,12 @@ struct VisualizationChannelUiState {
   double center_frequency_hz = 0.0;
   double span_hz = 0.0;
   double resolution_hz = 0.0;
+  double display_frequency_bin_hz = 0.0;
   double seconds_per_time_bin = 0.0;
+  double displayed_frame_ratio = 1.0;
+  int displayed_frame_stride = 1;
+  int fft_rows_per_frame = 0;
+  int displayed_fft_rows_per_frame = 0;
   int fft_size = 0;
   int history_rows = 0;
   int dino_chunk_rows = 0;

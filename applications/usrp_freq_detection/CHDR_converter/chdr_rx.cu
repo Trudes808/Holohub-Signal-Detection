@@ -30,11 +30,17 @@ using namespace std::complex_literals;
 __global__ void place_packet_data_kernel(complex* out,
                                          const void* const* const __restrict__ in,
                                          const int cur_idx,
-                                         const int num_complex_samples_per_packet
+                                         const int num_complex_samples_per_packet,
+                                         const int packets_in_batch
   ) {
   // Warmup
   if (out == nullptr)
     return;
+
+  const int packet_index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (packet_index >= packets_in_batch) {
+    return;
+  }
 
   // The in pointer is an array holding a pointer to the samples for
   // an entire batch (in[640]).
@@ -79,7 +85,8 @@ void place_packet_data(complex* out,
                        const int num_ffts_per_batch,
                        const int num_packets_per_fft,
                        const int num_complex_samples_per_packet,
-                       cudaStream_t stream) {
+                       cudaStream_t stream,
+                       const int packets_in_batch) {
   // CUDA execution config <<<Dg, Db, Ns, S>>> where:
   // Dg: dimensionality of the grid of blocks
   // Db: dimensionality of the block of threads
@@ -98,7 +105,8 @@ void place_packet_data(complex* out,
           out,
           in,
           cur_idx,
-          num_complex_samples_per_packet);
+          num_complex_samples_per_packet,
+          packets_in_batch);
 }
 
 namespace holoscan::ops {
@@ -352,7 +360,8 @@ void ChdrConverterOpRx::initialize() {
                         num_ffts_per_batch_.get(),
                         num_packets_per_fft_.get(),
                         num_complex_samples_per_packet_.get(),
-                        new_channel->streams[n]);
+                        new_channel->streams[n],
+                        num_packets_per_batch);
       cudaStreamSynchronize(new_channel->streams[n]);
     }
 
@@ -402,7 +411,7 @@ void ChdrConverterOpRx::release_burst_ref(
   }
 }
 
-void ChdrConverterOpRx::drop_partial_batch(
+void ChdrConverterOpRx::flush_partial_batch(
         std::shared_ptr<struct Channel> channel,
         const char* reason) {
   if (!channel || channel->aggr_pkts_recv == 0 || channel->cur_msg.num_batches == 0) {
@@ -411,32 +420,38 @@ void ChdrConverterOpRx::drop_partial_batch(
 
   const uint64_t held_packets = channel->aggr_pkts_recv;
   const int held_bursts = channel->cur_msg.num_batches;
-  for (int batch_index = 0; batch_index < channel->cur_msg.num_batches; ++batch_index) {
-    if (channel->cur_msg.msg[batch_index] != nullptr) {
-      release_burst_ref(channel, channel->cur_msg.msg[batch_index]);
-      channel->cur_msg.msg[batch_index] = nullptr;
-    }
-  }
-  channel->cur_msg.num_batches = 0;
-  channel->aggr_pkts_recv = 0;
   channel->timeout_like_partial_drains++;
   HOLOSCAN_LOG_WARN(
-      "Dropped partial CHDR batch on channel {} reason={} held_packets={} held_bursts={} refcounted_bursts_remaining={}",
+      "Flushing partial CHDR batch on channel {} reason={} held_packets={} held_bursts={} refcounted_bursts_before_flush={}",
       channel->channel_num,
       reason,
       held_packets,
       held_bursts,
       channel->burst_refcounts.size());
+  queue_completed_batch(channel, static_cast<uint32_t>(held_packets), true);
 }
 
 void ChdrConverterOpRx::queue_completed_batch(
-        std::shared_ptr<struct Channel> channel) {
+        std::shared_ptr<struct Channel> channel,
+        uint32_t packets_in_batch,
+        bool partial_batch) {
   const int completed_batch_idx = channel->cur_idx;
+  const uint32_t safe_packets_in_batch = std::min<uint32_t>(packets_in_batch, num_packets_per_batch);
 
   HOLOSCAN_LOG_DEBUG("Aggregated {} packets on channel {} index {} - sending downstream",
-                     channel->aggr_pkts_recv,
+                     safe_packets_in_batch,
                      channel->channel_num,
                      completed_batch_idx);
+
+  if (partial_batch && safe_packets_in_batch < num_packets_per_batch) {
+    auto batch = slice<2>(channel->rf_data,
+                          {static_cast<index_t>(completed_batch_idx), 0, 0},
+                          {matxDropDim, matxEnd, matxEnd});
+    cudaMemsetAsync(batch.Data(),
+                    0,
+                    batch.TotalSize() * sizeof(complex),
+                    channel->streams[completed_batch_idx]);
+  }
 
   place_packet_data(channel->rf_data.Data(),
                     channel->h_dev_ptrs[completed_batch_idx],
@@ -444,7 +459,8 @@ void ChdrConverterOpRx::queue_completed_batch(
                     num_ffts_per_batch_.get(),
                     num_packets_per_fft_.get(),
                     num_complex_samples_per_packet_.get(),
-                    channel->streams[completed_batch_idx]);
+                    channel->streams[completed_batch_idx],
+                    static_cast<int>(safe_packets_in_batch));
 
   if (log_data_) {
     HOLOSCAN_LOG_INFO("Inspecting RF channel {} data from thread {} with shape: ({}, {}, {})",
@@ -459,12 +475,14 @@ void ChdrConverterOpRx::queue_completed_batch(
   channel->cur_msg.stream = channel->streams[completed_batch_idx];
   channel->cur_msg.evt = channel->events[completed_batch_idx];
   channel->cur_msg.queued_ns = steady_time_ns();
+  channel->cur_msg.packets_in_batch = safe_packets_in_batch;
+  channel->cur_msg.partial_batch = partial_batch;
   channel->out_q.push(channel->cur_msg);
   channel->completed_batches_queued++;
   channel->periodic_summary_batches_queued++;
   channel->max_out_q_depth = std::max(channel->max_out_q_depth, channel->out_q.size());
   channel->cur_msg.num_batches = 0;
-  channel->ttl_pkts_recv += num_packets_per_batch;
+  channel->ttl_pkts_recv += safe_packets_in_batch;
 
   auto ret = cudaGetLastError();
   if (ret != cudaSuccess) {
@@ -493,35 +511,33 @@ bool ChdrConverterOpRx::free_bufs_and_emit_arrays(
       return false;
   }
 
-  bool emitted_any = false;
-  while (true) {
-    std::optional<ChdrConverterOpRx::RxMsg> completed_msg = free_buf(channel);
-    if (!completed_msg.has_value()) {
-      break;
-    }
-
-    auto meta = metadata();
-    meta->clear();
-    meta->set("channel_number", channel->channel_num);
-    meta->set("chdr_emit_ts_ns", steady_time_ns());
-    if (channel->channel_num < center_frequency_by_channel_.size() &&
-        center_frequency_by_channel_[channel->channel_num].has_value()) {
-      meta->set("rx_center_frequency_hz", center_frequency_by_channel_[channel->channel_num].value());
-    }
-    if (channel->channel_num < sample_rate_by_channel_.size() &&
-        sample_rate_by_channel_[channel->channel_num].has_value()) {
-      meta->set("rx_sample_rate_hz", sample_rate_by_channel_[channel->channel_num].value());
-    }
-
-    auto data = slice<2>(channel->rf_data, {static_cast<index_t>(completed_msg.value().batch_idx), 0, 0},
-                {matxDropDim, matxEnd, matxEnd});
-    op_output.emit(out_t {data, completed_msg.value().stream}, output_name);
-    channel->completed_batches_emitted++;
-    channel->periodic_summary_batches_emitted++;
-    emitted_any = true;
+  std::optional<ChdrConverterOpRx::RxMsg> completed_msg = free_buf(channel);
+  if (!completed_msg.has_value()) {
+    return false;
   }
 
-  return emitted_any;
+  auto meta = metadata();
+  meta->clear();
+  meta->set("channel_number", channel->channel_num);
+  meta->set("chdr_emit_ts_ns", steady_time_ns());
+  if (channel->channel_num < center_frequency_by_channel_.size() &&
+      center_frequency_by_channel_[channel->channel_num].has_value()) {
+    meta->set("rx_center_frequency_hz", center_frequency_by_channel_[channel->channel_num].value());
+  }
+  if (channel->channel_num < sample_rate_by_channel_.size() &&
+      sample_rate_by_channel_[channel->channel_num].has_value()) {
+    meta->set("rx_sample_rate_hz", sample_rate_by_channel_[channel->channel_num].value());
+  }
+    meta->set("chdr_packets_in_batch", completed_msg.value().packets_in_batch);
+    meta->set("chdr_expected_packets_in_batch", num_packets_per_batch);
+    meta->set("chdr_partial_batch", completed_msg.value().partial_batch);
+
+  auto data = slice<2>(channel->rf_data, {static_cast<index_t>(completed_msg.value().batch_idx), 0, 0},
+              {matxDropDim, matxEnd, matxEnd});
+  op_output.emit(out_t {data, completed_msg.value().stream}, output_name);
+  channel->completed_batches_emitted++;
+  channel->periodic_summary_batches_emitted++;
+  return true;
 }
 
 void ChdrConverterOpRx::release_channel_resources() {
@@ -604,10 +620,11 @@ void ChdrConverterOpRx::compute(
     }
   }
 
+  std::vector<uint8_t> emitted_this_tick(num_rx_queues, 0);
   for (uint16_t offset = 0; offset < num_rx_queues; offset++) {
     const uint16_t q = (preferred_q + offset) % num_rx_queues;
     auto channel = channel_list.at(q);
-    free_bufs_and_emit_arrays(op_output, channel);
+    emitted_this_tick[q] = free_bufs_and_emit_arrays(op_output, channel) ? 1 : 0;
   }
 
   for (uint16_t offset = 0; offset < num_rx_queues; offset++) {
@@ -628,7 +645,9 @@ void ChdrConverterOpRx::compute(
           channel->burst_refcounts.size(),
           channel->out_q.empty() ? 0.0 : elapsed_ms_since(channel->out_q.front().queued_ns));
       cudaStreamSynchronize(channel->streams[channel->cur_idx]);
-      free_bufs_and_emit_arrays(op_output, channel);
+      if (!emitted_this_tick[q]) {
+        emitted_this_tick[q] = free_bufs_and_emit_arrays(op_output, channel) ? 1 : 0;
+      }
     }
   }
 
@@ -647,7 +666,7 @@ void ChdrConverterOpRx::compute(
       if (channel->aggr_pkts_recv > 0) {
         const double idle_ms = elapsed_ms_since(channel->last_receive_ns);
         if (idle_ms >= static_cast<double>(partial_batch_drop_timeout_ms_.get())) {
-          drop_partial_batch(channel, "idle-timeout");
+          flush_partial_batch(channel, "idle-timeout");
         }
       }
     }
@@ -731,7 +750,7 @@ void ChdrConverterOpRx::process_channel_data(
   int packet_offset = 0;
   while (packet_offset < burst_packets) {
     if (channel->aggr_pkts_recv == num_packets_per_batch) {
-      queue_completed_batch(channel);
+      queue_completed_batch(channel, num_packets_per_batch, false);
     }
 
     const uint32_t remaining_capacity = num_packets_per_batch - channel->aggr_pkts_recv;
@@ -765,7 +784,7 @@ void ChdrConverterOpRx::process_channel_data(
     packet_offset += packets_to_copy;
 
     if (channel->aggr_pkts_recv == num_packets_per_batch) {
-      queue_completed_batch(channel);
+      queue_completed_batch(channel, num_packets_per_batch, false);
     }
   }
 }
