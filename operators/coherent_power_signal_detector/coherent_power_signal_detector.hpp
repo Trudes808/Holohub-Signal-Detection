@@ -147,6 +147,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
     float* row_stat_device = nullptr;
     float* row_smooth_device = nullptr;
     float* frontend_reference_device = nullptr;
+    uint8_t* always_on_stripe_flags_device = nullptr;
     float* power_db_host = nullptr;
     uint8_t* mask_device = nullptr;
     uint8_t* scratch_mask_device = nullptr;

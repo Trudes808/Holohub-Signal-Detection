@@ -564,6 +564,7 @@ struct FastGpuMetadataSummary {
   float seed_threshold = 0.0f;
   uint32_t raw_mask_nonzero_pixels = 0;
   uint32_t post_emit_close_mask_nonzero_pixels = 0;
+  uint32_t post_emit_persistence_mask_nonzero_pixels = 0;
   uint32_t post_smooth_mask_nonzero_pixels = 0;
   float always_on_floor_db = 0.0f;
   uint32_t always_on_stripe_count = 0;
@@ -2195,6 +2196,7 @@ void apply_emit_mask_morphology(uint8_t* mask_device,
                                 int freq_persistence_window,
                                 int freq_persistence_min_hits,
                                 unsigned int* post_close_nonzero_device,
+                                unsigned int* post_persistence_nonzero_device,
                                 cudaStream_t stream) {
   if (mask_device == nullptr || scratch0_device == nullptr || scratch1_device == nullptr || rows <= 0 || cols <= 0) {
     return;
@@ -2335,6 +2337,36 @@ void apply_emit_mask_morphology(uint8_t* mask_device,
                                     stream);
     if (kernel_result != cudaSuccess) {
       throw std::runtime_error(std::string("emit mask frequency persistence device copy failed: ") +
+                               cudaGetErrorString(kernel_result));
+    }
+
+    if (post_persistence_nonzero_device != nullptr) {
+      kernel_result = cudaMemsetAsync(post_persistence_nonzero_device, 0, sizeof(unsigned int), stream);
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("emit mask post-persistence counter reset failed: ") +
+                                 cudaGetErrorString(kernel_result));
+      }
+      count_nonzero_u8_kernel<<<blocks, threads, 0, stream>>>(mask_device,
+                                                               total,
+                                                               post_persistence_nonzero_device);
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("emit mask post-persistence count kernel launch failed: ") +
+                                 cudaGetErrorString(kernel_result));
+      }
+    }
+  } else if (post_persistence_nonzero_device != nullptr) {
+    kernel_result = cudaMemsetAsync(post_persistence_nonzero_device, 0, sizeof(unsigned int), stream);
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("emit mask post-persistence counter reset failed: ") +
+                               cudaGetErrorString(kernel_result));
+    }
+    count_nonzero_u8_kernel<<<blocks, threads, 0, stream>>>(mask_device,
+                                                             total,
+                                                             post_persistence_nonzero_device);
+    kernel_result = cudaGetLastError();
+    if (kernel_result != cudaSuccess) {
+      throw std::runtime_error(std::string("emit mask post-persistence count kernel launch failed: ") +
                                cudaGetErrorString(kernel_result));
     }
   }
@@ -6934,6 +6966,7 @@ CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
     cudaFree(buffers.row_stat_device);
     cudaFree(buffers.row_smooth_device);
     cudaFree(buffers.frontend_reference_device);
+    cudaFree(buffers.always_on_stripe_flags_device);
     cudaFree(buffers.mask_device);
     cudaFree(buffers.scratch_mask_device);
     cudaFreeHost(buffers.power_db_host);
@@ -7128,6 +7161,7 @@ void CoherentPowerSignalDetector::initialize() {
     allocate_device_float(buffers.row_stat_device, static_cast<size_t>(configured_rows));
     allocate_device_float(buffers.row_smooth_device, static_cast<size_t>(configured_rows));
     allocate_device_float(buffers.frontend_reference_device, 1);
+    allocate_device_u8(buffers.always_on_stripe_flags_device, static_cast<size_t>(configured_rows));
     allocate_device_u8(buffers.mask_device, configured_elements);
     allocate_device_u8(buffers.scratch_mask_device, configured_elements);
     const auto analysis_tensor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
@@ -7435,6 +7469,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       cudaFree(buffers.mask_device);
       cudaFree(buffers.scratch_mask_device);
       cudaFree(buffers.frontend_reference_device);
+      cudaFree(buffers.always_on_stripe_flags_device);
       cudaFree(buffers.analysis_tensor_device);
       cudaFreeHost(buffers.power_db_host);
       cudaFreeHost(buffers.mask_host);
@@ -7451,6 +7486,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       buffers.mask_device = nullptr;
       buffers.scratch_mask_device = nullptr;
       buffers.frontend_reference_device = nullptr;
+      buffers.always_on_stripe_flags_device = nullptr;
       buffers.power_db_host = nullptr;
       buffers.mask_host = nullptr;
 
@@ -7462,6 +7498,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       allocate_device_float(buffers.box_filter_scratch_device, static_cast<size_t>(total_bins));
       allocate_device_float(buffers.score_device, static_cast<size_t>(total_bins));
       allocate_device_float(buffers.frontend_reference_device, 1);
+      allocate_device_u8(buffers.always_on_stripe_flags_device, static_cast<size_t>(src_rows));
       allocate_device_u8(buffers.mask_device, static_cast<size_t>(total_bins));
       allocate_device_u8(buffers.scratch_mask_device, static_cast<size_t>(total_bins));
       const auto analysis_tensor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
@@ -7491,6 +7528,10 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         cudaFree(buffers.row_smooth_device);
         buffers.row_smooth_device = nullptr;
       }
+      if (buffers.always_on_stripe_flags_device != nullptr) {
+        cudaFree(buffers.always_on_stripe_flags_device);
+        buffers.always_on_stripe_flags_device = nullptr;
+      }
       const auto row_stat_result = cudaMalloc(reinterpret_cast<void**>(&buffers.row_stat_device), static_cast<size_t>(src_rows) * sizeof(float));
       if (row_stat_result != cudaSuccess) {
         throw std::runtime_error(std::string("row_stat buffer allocation failed: ") + cudaGetErrorString(row_stat_result));
@@ -7498,6 +7539,10 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       const auto row_smooth_result = cudaMalloc(reinterpret_cast<void**>(&buffers.row_smooth_device), static_cast<size_t>(src_rows) * sizeof(float));
       if (row_smooth_result != cudaSuccess) {
         throw std::runtime_error(std::string("row_smooth buffer allocation failed: ") + cudaGetErrorString(row_smooth_result));
+      }
+      const auto stripe_flags_result = cudaMalloc(reinterpret_cast<void**>(&buffers.always_on_stripe_flags_device), static_cast<size_t>(src_rows) * sizeof(uint8_t));
+      if (stripe_flags_result != cudaSuccess) {
+        throw std::runtime_error(std::string("always-on stripe flag buffer allocation failed: ") + cudaGetErrorString(stripe_flags_result));
       }
       buffers.row_elements = static_cast<size_t>(src_rows);
     }
@@ -7869,14 +7914,14 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
       coherent_power_valid_frequency_row_mask_kernel<<<row_mask_blocks, threads, 0, stream>>>(src_rows,
                                                                                                 ignore_bins_per_side,
-                                                                                                buffers.scratch_mask_device);
+                                                                                                buffers.always_on_stripe_flags_device);
       kernel_result = cudaGetLastError();
       if (kernel_result != cudaSuccess) {
         throw std::runtime_error(std::string("always-on valid row mask kernel launch failed: ") + cudaGetErrorString(kernel_result));
       }
 
       device_quantile_from_histogram_masked_async(buffers.row_stat_device,
-                                                  buffers.scratch_mask_device,
+                                                  buffers.always_on_stripe_flags_device,
                                                   src_rows,
                                                   clamp_float(static_cast<float>(live_emit_always_on_low_quantile_.get() / 100.0), 0.0f, 1.0f),
                                                   -200.0f,
@@ -7891,7 +7936,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                                                                   buffers.frontend_reference_device,
                                                                                   static_cast<float>(live_emit_always_on_excess_db_.get()),
                                                                                   static_cast<float>(live_emit_always_on_min_time_coverage_.get()),
-                                                                                  buffers.scratch_mask_device);
+                                                                                  buffers.always_on_stripe_flags_device);
       kernel_result = cudaGetLastError();
       if (kernel_result != cudaSuccess) {
         throw std::runtime_error(std::string("always-on row coverage kernel launch failed: ") + cudaGetErrorString(kernel_result));
@@ -7901,7 +7946,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       if (cudaMemsetAsync(fast_always_on_stripe_count_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
         throw std::runtime_error("failed to reset always-on stripe counter");
       }
-      count_nonzero_u8_kernel<<<row_mask_blocks, threads, 0, stream>>>(buffers.scratch_mask_device,
+      count_nonzero_u8_kernel<<<row_mask_blocks, threads, 0, stream>>>(buffers.always_on_stripe_flags_device,
                                                                         src_rows,
                                                                         fast_always_on_stripe_count_device.get());
       kernel_result = cudaGetLastError();
@@ -8343,6 +8388,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                      live_emit_freq_persistence_window_.get(),
                                      live_emit_freq_persistence_min_hits_.get(),
                                      nullptr,
+                                     nullptr,
                                      stream);
         }
 
@@ -8737,6 +8783,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         auto emit_scratch0_device = allocate_owned_u8_buffer(emitted_mask_bytes);
         auto emit_scratch1_device = allocate_owned_u8_buffer(emitted_mask_bytes);
         fast_post_emit_close_mask_nonzero_device = allocate_owned_u32_buffer();
+        auto fast_post_emit_persistence_mask_nonzero_device = allocate_owned_u32_buffer();
         apply_emit_mask_morphology(mask_buffer.get(),
                                    dst_rows,
                                    dst_cols,
@@ -8745,7 +8792,16 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                    live_emit_freq_persistence_window_.get(),
                                    live_emit_freq_persistence_min_hits_.get(),
                                    fast_post_emit_close_mask_nonzero_device.get(),
+                                   fast_post_emit_persistence_mask_nonzero_device.get(),
                                    stream);
+        unsigned int post_persistence_nonzero_count = 0;
+        if (cudaMemcpy(&post_persistence_nonzero_count,
+                       fast_post_emit_persistence_mask_nonzero_device.get(),
+                       sizeof(unsigned int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+          throw std::runtime_error("failed to copy fast post-persistence mask nonzero count");
+        }
+        fast_summary.post_emit_persistence_mask_nonzero_pixels = post_persistence_nonzero_count;
       }
 
       const int compact_total = dst_rows * dst_cols;
@@ -8755,7 +8811,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         coherent_power_or_stripe_flags_kernel<<<count_blocks, count_threads, 0, stream>>>(mask_buffer.get(),
                                                                                             dst_rows,
                                                                                             dst_cols,
-                                                                                            buffers.scratch_mask_device,
+                                                                                            buffers.always_on_stripe_flags_device,
                                                                                             !canonical_view.transposed);
         emit_mask_result = cudaGetLastError();
         if (emit_mask_result != cudaSuccess) {
@@ -8839,7 +8895,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       mask_msg.height = dst_rows;
       mask_msg.channel = channel_number;
       mask_msg.frame_number = frame_number;
-      HOLOSCAN_LOG_INFO("Mask emit audit ch={} frame={} dims={}x{} raw_nonzero={} post_smooth_nonzero={} always_on_floor_db={} always_on_stripes={} post_close_nonzero={} emitted_nonzero={} device_ptr=yes",
+      HOLOSCAN_LOG_INFO("Mask emit audit ch={} frame={} dims={}x{} raw_nonzero={} post_smooth_nonzero={} always_on_floor_db={} always_on_stripes={} post_close_nonzero={} post_persistence_nonzero={} emitted_nonzero={} device_ptr=yes",
                         channel_number,
                         frame_number,
                         dst_cols,
@@ -8849,6 +8905,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                         fast_summary.always_on_floor_db,
                         fast_summary.always_on_stripe_count,
                         fast_summary.post_emit_close_mask_nonzero_pixels,
+            fast_summary.post_emit_persistence_mask_nonzero_pixels,
                         emitted_nonzero_count);
       op_output.emit(mask_msg, "mask_out");
     }
@@ -8860,6 +8917,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
             use_reference_backend ? coherent_reference_mask_nonzero_pixels : fast_summary.raw_mask_nonzero_pixels);
   meta->set("coherent_fast_post_emit_close_mask_nonzero_pixels",
             use_reference_backend ? coherent_reference_mask_nonzero_pixels : fast_summary.post_emit_close_mask_nonzero_pixels);
+  meta->set("coherent_fast_post_emit_persistence_mask_nonzero_pixels",
+            use_reference_backend ? coherent_reference_mask_nonzero_pixels : fast_summary.post_emit_persistence_mask_nonzero_pixels);
   meta->set("coherent_fast_post_smooth_mask_nonzero_pixels",
             use_reference_backend ? coherent_reference_mask_nonzero_pixels : fast_summary.post_smooth_mask_nonzero_pixels);
   meta->set("coherent_fast_always_on_floor_db",

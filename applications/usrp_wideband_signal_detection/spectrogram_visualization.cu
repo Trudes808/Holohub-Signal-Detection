@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <atomic>
@@ -1385,9 +1386,11 @@ namespace holoscan::ops {
 namespace {
 
 struct PreviewChannelMailbox {
-  std::optional<VisualSpectrogramMessage> latest_spectrogram;
-  std::optional<DetectorMaskMessage> latest_mask;
+  std::deque<VisualSpectrogramMessage> spectrogram_queue;
+  std::deque<DetectorMaskMessage> mask_queue;
 };
+
+constexpr size_t kPreviewMailboxMaxDepth = 256;
 
 std::mutex& preview_mailbox_mutex() {
   static std::mutex mutex;
@@ -1737,7 +1740,11 @@ void SpectrogramPreviewStoreOp::compute(InputContext& op_input,
   }
   std::lock_guard<std::mutex> lock(preview_mailbox_mutex());
   ensure_preview_mailbox_capacity(static_cast<size_t>(message.channel + 1));
-  preview_mailboxes()[static_cast<size_t>(message.channel)].latest_spectrogram = std::move(message);
+  auto& queue = preview_mailboxes()[static_cast<size_t>(message.channel)].spectrogram_queue;
+  queue.push_back(std::move(message));
+  while (queue.size() > kPreviewMailboxMaxDepth) {
+    queue.pop_front();
+  }
 }
 
 void MaskPreviewStoreOp::setup(OperatorSpec& spec) {
@@ -1760,7 +1767,11 @@ void MaskPreviewStoreOp::compute(InputContext& op_input,
   }
   std::lock_guard<std::mutex> lock(preview_mailbox_mutex());
   ensure_preview_mailbox_capacity(static_cast<size_t>(message.channel + 1));
-  preview_mailboxes()[static_cast<size_t>(message.channel)].latest_mask = std::move(message);
+  auto& queue = preview_mailboxes()[static_cast<size_t>(message.channel)].mask_queue;
+  queue.push_back(std::move(message));
+  while (queue.size() > kPreviewMailboxMaxDepth) {
+    queue.pop_front();
+  }
 }
 
 std::vector<uint8_t> reduce_mask_to_history_rows_gpu(const uint8_t* device_input,
@@ -2464,7 +2475,12 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
   {
     std::lock_guard<std::mutex> lock(preview_mailbox_mutex());
     ensure_preview_mailbox_capacity(static_cast<size_t>(std::max(1, num_channels_.get())));
-    snapshot_mailboxes = preview_mailboxes();
+    auto& live_mailboxes = preview_mailboxes();
+    snapshot_mailboxes.resize(live_mailboxes.size());
+    for (size_t channel_index = 0; channel_index < live_mailboxes.size(); ++channel_index) {
+      snapshot_mailboxes[channel_index].spectrogram_queue = std::move(live_mailboxes[channel_index].spectrogram_queue);
+      snapshot_mailboxes[channel_index].mask_queue = std::move(live_mailboxes[channel_index].mask_queue);
+    }
   }
 
   int effective_channel_filter = channel_filter_.get();
@@ -2472,7 +2488,8 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
     bool has_second_channel_data = false;
     for (size_t channel_index = 1; channel_index < snapshot_mailboxes.size(); ++channel_index) {
       const auto& mailbox = snapshot_mailboxes[channel_index];
-      if (mailbox.latest_spectrogram.has_value() && mailbox.latest_spectrogram->channel == static_cast<int>(channel_index)) {
+      if (!mailbox.spectrogram_queue.empty() &&
+          mailbox.spectrogram_queue.back().channel == static_cast<int>(channel_index)) {
         has_second_channel_data = true;
         break;
       }
@@ -2488,6 +2505,11 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
   }
 
   bool any_updates = false;
+  std::vector<std::deque<DetectorMaskMessage>> residual_mask_queues(snapshot_mailboxes.size());
+  uint64_t drained_mask_count = 0;
+  uint64_t backfilled_mask_count = 0;
+  uint64_t deferred_mask_count = 0;
+  uint64_t pending_mask_peak = 0;
   {
     std::lock_guard<std::mutex> state_lock(channel_states_mutex_);
     if (channel_states_.size() < snapshot_mailboxes.size()) {
@@ -2498,102 +2520,161 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
     }
 
     for (size_t channel_index = 0; channel_index < snapshot_mailboxes.size(); ++channel_index) {
-      const auto& mailbox = snapshot_mailboxes[channel_index];
-      if (!mailbox.latest_spectrogram.has_value()) {
+      auto& mailbox = snapshot_mailboxes[channel_index];
+      pending_mask_peak = std::max<uint64_t>(pending_mask_peak, mailbox.mask_queue.size());
+      if (mailbox.spectrogram_queue.empty()) {
         continue;
       }
-
-      const auto& spectrogram = mailbox.latest_spectrogram.value();
-      const uint64_t visualizer_enter_ns = steady_time_ns();
-      if (effective_channel_filter >= 0 && spectrogram.channel != effective_channel_filter) {
-        continue;
-      }
-      if (spectrogram.channel < 0) {
-        continue;
-      }
-      if (spectrogram.frame_number <= latest_rendered_frame_numbers_[channel_index]) {
-        continue;
-      }
-
       auto& state = channel_states_[channel_index];
-      state.active = true;
-      state.info.channel = spectrogram.channel;
-      state.info.frame_number = static_cast<int64_t>(spectrogram.frame_number);
-      state.info.center_frequency_hz = spectrogram.center_frequency_hz > 0.0 ? spectrogram.center_frequency_hz
-                                                                             : center_frequency_hz_.get();
-      const double resolved_span_hz = spectrogram.span_hz > 0.0 ? spectrogram.span_hz
-          : (spectrogram.sample_rate_hz > 0.0 ? spectrogram.sample_rate_hz : span_hz_.get());
-      state.info.span_hz = resolved_span_hz;
-      state.info.resolution_hz = spectrogram.resolution_hz > 0.0 ? spectrogram.resolution_hz
-          : (resolved_span_hz > 0.0 ? resolved_span_hz / static_cast<double>(std::max(1, spectrogram.width)) : 0.0);
-      state.info.fft_size = fft_size_.get();
-      state.info.dino_chunk_rows = dino_chunk_rows_.get();
-      state.info.dino_chunk_cols = dino_chunk_cols_.get();
-      state.info.detector_label = detector_label_.get();
+      while (!mailbox.spectrogram_queue.empty()) {
+        auto spectrogram = std::move(mailbox.spectrogram_queue.front());
+        mailbox.spectrogram_queue.pop_front();
+        const uint64_t visualizer_enter_ns = steady_time_ns();
+        if (effective_channel_filter >= 0 && spectrogram.channel != effective_channel_filter) {
+          continue;
+        }
+        if (spectrogram.channel < 0) {
+          continue;
+        }
+        if (spectrogram.frame_number <= latest_rendered_frame_numbers_[channel_index]) {
+          continue;
+        }
+
+        state.active = true;
+        state.info.channel = spectrogram.channel;
+        state.info.frame_number = static_cast<int64_t>(spectrogram.frame_number);
+        state.info.center_frequency_hz = spectrogram.center_frequency_hz > 0.0 ? spectrogram.center_frequency_hz
+                                                                               : center_frequency_hz_.get();
+        const double resolved_span_hz = spectrogram.span_hz > 0.0 ? spectrogram.span_hz
+            : (spectrogram.sample_rate_hz > 0.0 ? spectrogram.sample_rate_hz : span_hz_.get());
+        state.info.span_hz = resolved_span_hz;
+        state.info.resolution_hz = spectrogram.resolution_hz > 0.0 ? spectrogram.resolution_hz
+            : (resolved_span_hz > 0.0 ? resolved_span_hz / static_cast<double>(std::max(1, spectrogram.width)) : 0.0);
+        state.info.fft_size = fft_size_.get();
+        state.info.dino_chunk_rows = dino_chunk_rows_.get();
+        state.info.dino_chunk_cols = dino_chunk_cols_.get();
+        state.info.detector_label = detector_label_.get();
+
+        bool patched_mask_history = false;
+        while (!mailbox.mask_queue.empty() && mailbox.mask_queue.front().frame_number < spectrogram.frame_number) {
+          auto late_mask = std::move(mailbox.mask_queue.front());
+          mailbox.mask_queue.pop_front();
+          ++drained_mask_count;
+          if (late_mask.channel != spectrogram.channel || late_mask.pixels.empty()) {
+            continue;
+          }
+          state.latest_mask = {late_mask.width, late_mask.height, late_mask.pixels};
+          state.latest_mask_frame_number = static_cast<int64_t>(late_mask.frame_number);
+          const bool patched_late_mask = patch_history_mask_for_frame(
+              state,
+              static_cast<int64_t>(late_mask.frame_number) + static_cast<int64_t>(mask_frame_offset_.get()),
+              late_mask.pixels,
+              late_mask.width);
+          backfilled_mask_count += patched_late_mask ? 1 : 0;
+          patched_mask_history = patched_late_mask || patched_mask_history;
+        }
+
+        std::optional<DetectorMaskMessage> current_frame_mask;
+        while (!mailbox.mask_queue.empty() && mailbox.mask_queue.front().frame_number == spectrogram.frame_number) {
+          current_frame_mask = std::move(mailbox.mask_queue.front());
+          mailbox.mask_queue.pop_front();
+          ++drained_mask_count;
+        }
 
         const int snap_display_time_rows_requested =
-          live_visualization_history_rows(display_time_rows_.get(), output_height_.get(), num_channels_.get());
-      const int snap_display_time_rows = clamp_history_rows_to_budget(std::max(1, spectrogram.width),
-                                                                      snap_display_time_rows_requested,
-                                                                      history_memory_budget_mb_.get());
-      append_spectrogram_history(state,
-                                 spectrogram.pixels,
-                                 std::max(1, spectrogram.width),
-                                 std::max(1, spectrogram.height),
-                                 snap_display_time_rows);
-      state.current_psd_trace = compute_psd_trace(spectrogram.pixels,
-                                                  std::max(1, spectrogram.width),
-                                                  std::max(1, spectrogram.height));
-      update_max_hold_trace(state.current_psd_trace, state.max_hold_trace);
-      update_density_history(compute_density_trace_from_grayscale(spectrogram.pixels,
-                                                                  std::max(1, spectrogram.width),
-                                                                  std::max(1, spectrogram.height),
-                                                                  red_limit_.get()),
-                             state.density_trace,
-                             state.density_frames_seen);
+            live_visualization_history_rows(display_time_rows_.get(), output_height_.get(), num_channels_.get());
+        const int snap_display_time_rows = clamp_history_rows_to_budget(std::max(1, spectrogram.width),
+                                                                        snap_display_time_rows_requested,
+                                                                        history_memory_budget_mb_.get());
+        append_spectrogram_history(state,
+                                   spectrogram.pixels,
+                                   std::max(1, spectrogram.width),
+                                   std::max(1, spectrogram.height),
+                                   snap_display_time_rows);
+        state.current_psd_trace = compute_psd_trace(spectrogram.pixels,
+                                                    std::max(1, spectrogram.width),
+                                                    std::max(1, spectrogram.height));
+        update_max_hold_trace(state.current_psd_trace, state.max_hold_trace);
+        update_density_history(compute_density_trace_from_grayscale(spectrogram.pixels,
+                                                                    std::max(1, spectrogram.width),
+                                                                    std::max(1, spectrogram.height),
+                                                                    red_limit_.get()),
+                               state.density_trace,
+                               state.density_frames_seen);
 
-      state.overlay_available = false;
-      if (mailbox.latest_mask.has_value()) {
-        const auto& mask = mailbox.latest_mask.value();
-        if (mask.frame_number == spectrogram.frame_number &&
-            mask.channel == spectrogram.channel &&
-            !mask.pixels.empty()) {
-          state.latest_mask = {mask.width, mask.height, mask.pixels};
-          state.latest_mask_frame_number = static_cast<int64_t>(mask.frame_number);
-          patch_history_mask_for_frame(state,
-                                       static_cast<int64_t>(mask.frame_number) + static_cast<int64_t>(mask_frame_offset_.get()),
-                                       mask.pixels,
-                                       mask.width);
-          state.overlay_available = true;
+        state.overlay_available = patched_mask_history;
+        if (current_frame_mask.has_value() &&
+            current_frame_mask->channel == spectrogram.channel &&
+            !current_frame_mask->pixels.empty()) {
+          state.latest_mask = {current_frame_mask->width, current_frame_mask->height, current_frame_mask->pixels};
+          state.latest_mask_frame_number = static_cast<int64_t>(current_frame_mask->frame_number);
+          const bool patched_current_mask = patch_history_mask_for_frame(
+              state,
+              static_cast<int64_t>(current_frame_mask->frame_number) + static_cast<int64_t>(mask_frame_offset_.get()),
+              current_frame_mask->pixels,
+              current_frame_mask->width);
+          backfilled_mask_count += patched_current_mask ? 1 : 0;
+          state.overlay_available = patched_current_mask || state.overlay_available;
+        }
+
+        latest_rendered_frame_numbers_[channel_index] = spectrogram.frame_number;
+        any_updates = true;
+        {
+          std::lock_guard<std::mutex> lock(timing_mutex_);
+          ++timing_stats_.frames_seen;
+          ++timing_stats_.frames_processed;
+          const double fft_to_visualizer_ms = elapsed_ms(spectrogram.fft_emit_ts_ns, visualizer_enter_ns);
+          const double preview_to_visualizer_ms = elapsed_ms(spectrogram.preview_emit_ts_ns, visualizer_enter_ns);
+          timing_stats_.fft_to_visualizer_total_ms += fft_to_visualizer_ms;
+          timing_stats_.fft_to_visualizer_max_ms = std::max(timing_stats_.fft_to_visualizer_max_ms,
+                                                            fft_to_visualizer_ms);
+          timing_stats_.preview_to_visualizer_total_ms += preview_to_visualizer_ms;
+          timing_stats_.preview_to_visualizer_max_ms = std::max(timing_stats_.preview_to_visualizer_max_ms,
+                                                                preview_to_visualizer_ms);
+          if (per_channel_timing_stats_.size() <= channel_index) {
+            per_channel_timing_stats_.resize(channel_index + 1);
+          }
+          auto& channel_stats = per_channel_timing_stats_[channel_index];
+          ++channel_stats.frames_processed;
+          channel_stats.last_frame_number = spectrogram.frame_number;
+          channel_stats.fft_to_visualizer_total_ms += fft_to_visualizer_ms;
+          channel_stats.fft_to_visualizer_max_ms = std::max(channel_stats.fft_to_visualizer_max_ms,
+                                                            fft_to_visualizer_ms);
+          channel_stats.preview_to_visualizer_total_ms += preview_to_visualizer_ms;
+          channel_stats.preview_to_visualizer_max_ms = std::max(channel_stats.preview_to_visualizer_max_ms,
+                                                                preview_to_visualizer_ms);
         }
       }
 
-      latest_rendered_frame_numbers_[channel_index] = spectrogram.frame_number;
-      any_updates = true;
-      {
-        std::lock_guard<std::mutex> lock(timing_mutex_);
-        ++timing_stats_.frames_seen;
-        ++timing_stats_.frames_processed;
-        const double fft_to_visualizer_ms = elapsed_ms(spectrogram.fft_emit_ts_ns, visualizer_enter_ns);
-        const double preview_to_visualizer_ms = elapsed_ms(spectrogram.preview_emit_ts_ns, visualizer_enter_ns);
-        timing_stats_.fft_to_visualizer_total_ms += fft_to_visualizer_ms;
-        timing_stats_.fft_to_visualizer_max_ms = std::max(timing_stats_.fft_to_visualizer_max_ms,
-                                                          fft_to_visualizer_ms);
-        timing_stats_.preview_to_visualizer_total_ms += preview_to_visualizer_ms;
-        timing_stats_.preview_to_visualizer_max_ms = std::max(timing_stats_.preview_to_visualizer_max_ms,
-                                                              preview_to_visualizer_ms);
-        if (per_channel_timing_stats_.size() <= channel_index) {
-          per_channel_timing_stats_.resize(channel_index + 1);
-        }
-        auto& channel_stats = per_channel_timing_stats_[channel_index];
-        ++channel_stats.frames_processed;
-        channel_stats.last_frame_number = spectrogram.frame_number;
-        channel_stats.fft_to_visualizer_total_ms += fft_to_visualizer_ms;
-        channel_stats.fft_to_visualizer_max_ms = std::max(channel_stats.fft_to_visualizer_max_ms,
-                                                          fft_to_visualizer_ms);
-        channel_stats.preview_to_visualizer_total_ms += preview_to_visualizer_ms;
-        channel_stats.preview_to_visualizer_max_ms = std::max(channel_stats.preview_to_visualizer_max_ms,
-                                                              preview_to_visualizer_ms);
+      residual_mask_queues[channel_index] = std::move(mailbox.mask_queue);
+      deferred_mask_count += residual_mask_queues[channel_index].size();
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(timing_mutex_);
+    timing_stats_.masks_received += drained_mask_count;
+    timing_stats_.masks_backfilled += backfilled_mask_count;
+    timing_stats_.masks_deferred += deferred_mask_count;
+    timing_stats_.masks_pending_peak = std::max<uint64_t>(timing_stats_.masks_pending_peak, pending_mask_peak);
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(preview_mailbox_mutex());
+    ensure_preview_mailbox_capacity(snapshot_mailboxes.size());
+    auto& live_mailboxes = preview_mailboxes();
+    for (size_t channel_index = 0; channel_index < residual_mask_queues.size(); ++channel_index) {
+      auto& residual_masks = residual_mask_queues[channel_index];
+      if (residual_masks.empty()) {
+        continue;
+      }
+      auto& live_masks = live_mailboxes[channel_index].mask_queue;
+      while (!residual_masks.empty()) {
+        live_masks.push_front(std::move(residual_masks.back()));
+        residual_masks.pop_back();
+      }
+      while (live_masks.size() > kPreviewMailboxMaxDepth) {
+        live_masks.pop_back();
       }
     }
   }
