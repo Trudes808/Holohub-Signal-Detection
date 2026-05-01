@@ -526,6 +526,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       holovizOp = make_operator<LoggingHolovizOp>(
         "holovizOp",
         Arg("window_close_scheduling_term") = visualization_shutdown_term,
+        Arg("enable_render_buffer_output") = false,
         from_config("visualization.holoviz"),
         Arg("layer_callback",
           ops::HolovizOp::LayerCallbackFunction(
