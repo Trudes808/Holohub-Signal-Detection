@@ -9,6 +9,7 @@ enable_language(CUDA)
 
 find_package(holoscan 2.5.0 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
+find_package(CUDAToolkit REQUIRED)
 find_package(matx CONFIG REQUIRED)
 
 add_library(fft
@@ -20,6 +21,7 @@ target_include_directories(fft INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(fft
   PRIVATE
+    CUDA::cufft
     holoscan::core
     matx::matx
 )

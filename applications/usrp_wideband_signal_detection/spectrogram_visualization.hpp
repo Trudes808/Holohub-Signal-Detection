@@ -95,6 +95,7 @@ class MaskPreviewOp : public Operator {
   void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
 
  private:
+  Parameter<int> channel_index_;
   Parameter<int> emit_every_n_;
   Parameter<int> output_width_;
   Parameter<int> output_height_;

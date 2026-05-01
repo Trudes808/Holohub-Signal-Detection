@@ -17,8 +17,10 @@
 #include "chdr_rx.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <sstream>
 #include <stdexcept>
 
@@ -114,6 +116,7 @@ namespace holoscan::ops {
 namespace {
 
 constexpr uint64_t kChdrSummaryPeriodNs = 1000000000ULL;
+constexpr size_t kContentFingerprintComplexSamples = 64;
 
 uint64_t steady_time_ns() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -130,6 +133,38 @@ double elapsed_ms_since(uint64_t start_ns) {
     return 0.0;
   }
   return static_cast<double>(now_ns - start_ns) / 1.0e6;
+}
+
+uint64_t fnv1a_hash_bytes(const uint8_t* data, size_t size) {
+  constexpr uint64_t kOffsetBasis = 1469598103934665603ULL;
+  constexpr uint64_t kPrime = 1099511628211ULL;
+  uint64_t hash = kOffsetBasis;
+  for (size_t index = 0; index < size; ++index) {
+    hash ^= static_cast<uint64_t>(data[index]);
+    hash *= kPrime;
+  }
+  return hash;
+}
+
+uint64_t compute_complex_tensor_prefix_fingerprint(const complex* device_ptr, size_t element_count) {
+  if (device_ptr == nullptr || element_count == 0) {
+    return 0;
+  }
+
+  const size_t sample_count = std::min(element_count, kContentFingerprintComplexSamples);
+  std::array<complex, kContentFingerprintComplexSamples> host_samples {};
+  const auto copy_result = cudaMemcpy(host_samples.data(),
+                                      device_ptr,
+                                      sample_count * sizeof(complex),
+                                      cudaMemcpyDeviceToHost);
+  if (copy_result != cudaSuccess) {
+    HOLOSCAN_LOG_WARN("Failed to copy CHDR batch prefix for fingerprinting: {}",
+                      cudaGetErrorString(copy_result));
+    return 0;
+  }
+
+  return fnv1a_hash_bytes(reinterpret_cast<const uint8_t*>(host_samples.data()),
+                          sample_count * sizeof(complex));
 }
 
 std::string trim_copy(const std::string& value) {
@@ -185,6 +220,54 @@ void maybe_log_channel_summary(const std::shared_ptr<ChdrConverterOpRx::Channel>
   channel->periodic_summary_bursts = 0;
   channel->periodic_summary_empty_polls = 0;
   channel->periodic_summary_backlog_events = 0;
+}
+
+uint16_t resolve_channel_from_burst_flow(BurstParams* burst,
+                                         uint16_t fallback_channel,
+                                         uint16_t num_channels) {
+  if (burst == nullptr || num_channels == 0) {
+    return fallback_channel;
+  }
+
+  const int burst_packets = get_num_packets(burst);
+  if (burst_packets <= 0) {
+    return fallback_channel;
+  }
+
+  const uint16_t first_flow_id = get_packet_flow_id(burst, 0);
+  bool mixed_flow_ids = false;
+  for (int packet_index = 1; packet_index < burst_packets; ++packet_index) {
+    if (get_packet_flow_id(burst, packet_index) != first_flow_id) {
+      mixed_flow_ids = true;
+      break;
+    }
+  }
+
+  if (mixed_flow_ids) {
+    HOLOSCAN_LOG_WARN(
+        "CHDR burst on queue {} contains mixed flow IDs; falling back to queue-derived channel assignment",
+        fallback_channel);
+    return fallback_channel;
+  }
+
+  if (first_flow_id >= num_channels) {
+    HOLOSCAN_LOG_WARN(
+        "CHDR burst on queue {} matched flow_id={} outside configured channel range {}; falling back to queue-derived channel assignment",
+        fallback_channel,
+        first_flow_id,
+        num_channels);
+    return fallback_channel;
+  }
+
+  if (first_flow_id != fallback_channel) {
+    HOLOSCAN_LOG_WARN(
+        "CHDR queue/flow mismatch: queue {} received flow_id {}. Routing burst to logical channel {} instead of queue index.",
+        fallback_channel,
+        first_flow_id,
+        first_flow_id);
+  }
+
+  return first_flow_id;
 }
 
 }  // namespace
@@ -534,6 +617,9 @@ bool ChdrConverterOpRx::free_bufs_and_emit_arrays(
 
   auto data = slice<2>(channel->rf_data, {static_cast<index_t>(completed_msg.value().batch_idx), 0, 0},
               {matxDropDim, matxEnd, matxEnd});
+  const size_t data_elements = static_cast<size_t>(data.Size(0)) * static_cast<size_t>(data.Size(1));
+  meta->set("chdr_content_fingerprint",
+            compute_complex_tensor_prefix_fingerprint(data.Data(), data_elements));
   op_output.emit(out_t {data, completed_msg.value().stream}, output_name);
   channel->completed_batches_emitted++;
   channel->periodic_summary_batches_emitted++;
@@ -659,7 +745,9 @@ void ChdrConverterOpRx::compute(
     auto channel = channel_list.at(q);
     channel->periodic_summary_last_ns = steady_time_ns();
     if (status == Status::SUCCESS) {
-      process_channel_data(op_output, burst, q);
+      const uint16_t resolved_channel =
+          resolve_channel_from_burst_flow(burst, q, num_channels_.get());
+      process_channel_data(op_output, burst, resolved_channel);
     } else {
       channel->empty_rx_polls++;
       channel->periodic_summary_empty_polls++;

@@ -8,9 +8,14 @@
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <optional>
+#include <pthread.h>
+#include <sched.h>
+#include <sstream>
 #include <thread>
+#include <unistd.h>
 #include <coherent_power_signal_detector.hpp>
 #include <cuda_dino_detector.hpp>
 #include <dinov3_signal_detector.hpp>
@@ -78,6 +83,93 @@ std::filesystem::path resolve_config_path(const char* argv0, const char* config_
   }
 
   return from_binary_dir;
+}
+
+void reserve_adv_network_cores_for_process_threads(const holoscan::advanced_network::NetworkConfig& config) {
+  std::vector<int> reserved_cores;
+  reserved_cores.push_back(config.common_.master_core_);
+  for (const auto& intf : config.ifs_) {
+    for (const auto& queue : intf.rx_.queues_) {
+      reserved_cores.push_back(std::strtol(queue.common_.cpu_core_.c_str(), nullptr, 10));
+    }
+    for (const auto& queue : intf.tx_.queues_) {
+      reserved_cores.push_back(std::strtol(queue.common_.cpu_core_.c_str(), nullptr, 10));
+    }
+  }
+
+  auto add_thread_siblings = [&](int cpu) {
+    if (cpu < 0) {
+      return;
+    }
+    std::ifstream siblings_file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                                "/topology/thread_siblings_list");
+    if (!siblings_file.is_open()) {
+      return;
+    }
+
+    std::string siblings;
+    std::getline(siblings_file, siblings);
+    std::stringstream range_stream(siblings);
+    std::string token;
+    while (std::getline(range_stream, token, ',')) {
+      const auto dash = token.find('-');
+      if (dash == std::string::npos) {
+        reserved_cores.push_back(std::strtol(token.c_str(), nullptr, 10));
+        continue;
+      }
+
+      const int start = std::strtol(token.substr(0, dash).c_str(), nullptr, 10);
+      const int stop = std::strtol(token.substr(dash + 1).c_str(), nullptr, 10);
+      for (int sibling = start; sibling <= stop; ++sibling) {
+        reserved_cores.push_back(sibling);
+      }
+    }
+  };
+
+  const auto explicit_reserved_cores = reserved_cores;
+  for (const int cpu : explicit_reserved_cores) {
+    add_thread_siblings(cpu);
+  }
+
+  std::sort(reserved_cores.begin(), reserved_cores.end());
+  reserved_cores.erase(std::unique(reserved_cores.begin(), reserved_cores.end()), reserved_cores.end());
+
+  cpu_set_t allowed_cores;
+  CPU_ZERO(&allowed_cores);
+  const long cpu_count = ::sysconf(_SC_NPROCESSORS_ONLN);
+  if (cpu_count <= 0) {
+    return;
+  }
+
+  int allowed_count = 0;
+  for (int cpu = 0; cpu < cpu_count; ++cpu) {
+    if (!std::binary_search(reserved_cores.begin(), reserved_cores.end(), cpu)) {
+      CPU_SET(cpu, &allowed_cores);
+      ++allowed_count;
+    }
+  }
+
+  if (allowed_count == 0) {
+    HOLOSCAN_LOG_WARN("Skipping process CPU affinity isolation because advanced-network reserved all online CPUs");
+    return;
+  }
+
+  const int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &allowed_cores);
+  if (rc != 0) {
+    HOLOSCAN_LOG_WARN("Failed to reserve advanced-network cores from process threads: pthread_setaffinity_np returned {}",
+                      rc);
+    return;
+  }
+
+  std::ostringstream reserved_desc;
+  for (size_t index = 0; index < reserved_cores.size(); ++index) {
+    if (index > 0) {
+      reserved_desc << ',';
+    }
+    reserved_desc << reserved_cores[index];
+  }
+  HOLOSCAN_LOG_INFO("Reserved advanced-network cores and SMT siblings [{}] from non-DPDK process threads",
+                    reserved_desc.str());
 }
 
 }  // namespace
@@ -310,6 +402,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       exit(1);
     }
     HOLOSCAN_LOG_INFO("Configured the Advanced Network manager");
+    reserve_adv_network_cores_for_process_threads(adv_net_config);
 
     auto pipeline_shutdown_term = make_condition<BooleanCondition>("pipeline_shutdown_term", true);
     g_pipeline_shutdown_term = pipeline_shutdown_term;
@@ -357,9 +450,10 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     const bool enable_fft_emit_stride =
       bypass_spectrogram_passthrough && detector_uses_dino_style_stride &&
         configured_dino_emit_stride > 1;
-    const int visual_emit_stride =
+    const int visual_render_stride =
       enable_visualization ? std::max(1, from_config("visualization.renderer.render_every_n_frames").as<int>()) : 1;
-    const int visual_mask_emit_stride = visual_emit_stride;
+    const int visual_emit_stride = 1;
+    const int visual_mask_emit_stride = 1;
 
     std::vector<std::shared_ptr<holoscan::Operator>> fftOps;
     fftOps.reserve(static_cast<size_t>(pipeline_channels));
@@ -490,14 +584,14 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         "spectrogramVisualizerOp",
         Arg("shutdown_scheduling_term") = visualization_shutdown_term,
         make_condition<PeriodicCondition>("periodic-condition",
-                                          Arg("recess_period") = std::string("10hz")),
+                                          Arg("recess_period") = std::string("30hz")),
         from_config("visualization.renderer"),
         Arg("num_channels") = pipeline_channels,
         Arg("channel_filter") = visualization_channel_filter,
         Arg("center_frequency_hz") = center_frequency_hz,
         Arg("span_hz") = fft_span_hz,
         Arg("detector_label") = detector_label,
-        Arg("render_every_n_frames") = 1);
+        Arg("render_every_n_frames") = visual_render_stride);
 
       visualSpectrogramGateOps.reserve(static_cast<size_t>(pipeline_channels));
       visualMaskGateOps.reserve(static_cast<size_t>(pipeline_channels));
@@ -514,6 +608,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           Arg("db_ceil") = from_config("visualization.renderer.db_ceil").as<float>()));
         visualMaskGateOps.push_back(make_operator<ops::MaskPreviewOp>(
             std::string("visualMaskGateOpCh") + std::to_string(channel_index),
+          Arg("channel_index") = channel_index,
           Arg("emit_every_n") = visual_mask_emit_stride,
           Arg("output_width") = from_config("visualization.renderer.output_width").as<int>(),
           Arg("output_height") = from_config("visualization.renderer.rows_per_frame").as<int>()));

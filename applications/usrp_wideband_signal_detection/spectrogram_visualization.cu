@@ -1543,6 +1543,13 @@ void SpectrogramPreviewOp::compute(InputContext& op_input,
     return;
   }
   auto meta = metadata();
+  const int configured_channel = channel_index_.get();
+  if (meta && meta->get<bool>("chdr_partial_batch", false)) {
+    HOLOSCAN_LOG_WARN("Skipping partial CHDR spectrogram preview for channel {} frame {}",
+                      meta->get<uint16_t>("channel_number", 0),
+                      meta->get<uint64_t>("fft_emitted_frame_number", 0));
+    return;
+  }
   const uint64_t frame_number = meta ? meta->get<uint64_t>("fft_emitted_frame_number", ++frames_seen_) : ++frames_seen_;
   const uint64_t emit_every_n = static_cast<uint64_t>(std::max(1, emit_every_n_.get()));
   if ((frame_number % emit_every_n) != 0) {
@@ -1592,15 +1599,18 @@ void SpectrogramPreviewOp::compute(InputContext& op_input,
   message.width = preview_width;
   message.height = preview_height;
   message.source_rows = canonical_rows;
-  message.channel = channel_index_.get();
+  message.channel = configured_channel;
   if (meta) {
     const int metadata_channel = static_cast<int>(meta->get<uint16_t>("channel_number", 0));
+    if (configured_channel >= 0 && metadata_channel != configured_channel) {
+      HOLOSCAN_LOG_WARN("Dropping spectrogram preview on configured channel {} because metadata channel {} does not match frame {}",
+                        configured_channel,
+                        metadata_channel,
+                        frame_number);
+      return;
+    }
     if (message.channel < 0) {
       message.channel = metadata_channel;
-    } else if (metadata_channel != message.channel) {
-      HOLOSCAN_LOG_DEBUG("Spectrogram preview channel mismatch: configured={} metadata={}",
-                         message.channel,
-                         metadata_channel);
     }
     message.frame_number = meta->get<uint64_t>("fft_emitted_frame_number", frame_number);
     message.fft_emit_ts_ns = meta->get<uint64_t>("fft_emit_ts_ns", 0);
@@ -1682,6 +1692,11 @@ void MaskPreviewOp::setup(OperatorSpec& spec) {
       holoscan::ConditionType::kMessageAvailable,
       std::make_shared<holoscan::MessageAvailableCondition>(size_t{1}));
   spec.output<in_t>("out").condition(holoscan::ConditionType::kNone);
+  spec.param(channel_index_,
+             "channel_index",
+             "Channel Index",
+             "Channel index for this mask preview branch when metadata is absent or stale.",
+             -1);
   spec.param(emit_every_n_, "emit_every_n", "Emit Every N", "Forward only every Nth reduced preview mask.", 1);
   spec.param(output_width_, "output_width", "Output Width", "Preview mask width in bins.", 1024);
   spec.param(output_height_, "output_height", "Output Height", "Preview mask height in rows.", 16);
@@ -1732,13 +1747,22 @@ void MaskPreviewOp::compute(InputContext& op_input,
     return;
   }
 
+  const int configured_channel = channel_index_.get();
+  if (configured_channel >= 0 && mask.channel >= 0 && mask.channel != configured_channel) {
+    HOLOSCAN_LOG_WARN("Dropping mask preview on configured channel {} because message channel {} does not match frame {}",
+                      configured_channel,
+                      mask.channel,
+                      frame_number);
+    return;
+  }
+
   const int preview_width = std::max(1, output_width_.get());
   const int preview_height = std::max(1, output_height_.get());
   const size_t bytes = static_cast<size_t>(preview_width) * static_cast<size_t>(preview_height) * sizeof(uint8_t);
   ensure_preview_capacity(bytes);
 
   DetectorMaskMessage reduced_mask;
-  reduced_mask.channel = mask.channel;
+  reduced_mask.channel = configured_channel >= 0 ? configured_channel : mask.channel;
   reduced_mask.frame_number = frame_number;
   reduced_mask.width = preview_width;
   reduced_mask.height = preview_height;
@@ -2588,10 +2612,25 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
         continue;
       }
       auto& state = channel_states_[channel_index];
-      while (!mailbox.spectrogram_queue.empty()) {
-        auto spectrogram = std::move(mailbox.spectrogram_queue.front());
-        mailbox.spectrogram_queue.pop_front();
+      while (!mailbox.spectrogram_queue.empty() &&
+             mailbox.spectrogram_queue.back().frame_number <= latest_rendered_frame_numbers_[channel_index]) {
+        mailbox.spectrogram_queue.pop_back();
+      }
+      if (mailbox.spectrogram_queue.empty()) {
+        continue;
+      }
+
+      // Coalesce backlog to the newest pending spectrogram so the live view stays current.
+      auto spectrogram = std::move(mailbox.spectrogram_queue.back());
+      mailbox.spectrogram_queue.clear();
         const uint64_t visualizer_enter_ns = steady_time_ns();
+        if (spectrogram.channel != static_cast<int>(channel_index)) {
+          HOLOSCAN_LOG_WARN("Dropping spectrogram from mailbox {} because message channel {} does not match frame {}",
+                            channel_index,
+                            spectrogram.channel,
+                            spectrogram.frame_number);
+          continue;
+        }
         if (effective_channel_filter >= 0 && spectrogram.channel != effective_channel_filter) {
           continue;
         }
@@ -2631,7 +2670,15 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
           auto late_mask = std::move(mailbox.mask_queue.front());
           mailbox.mask_queue.pop_front();
           ++drained_mask_count;
-          if (late_mask.channel != spectrogram.channel || late_mask.pixels.empty()) {
+          if (late_mask.channel != static_cast<int>(channel_index) ||
+              late_mask.channel != spectrogram.channel ||
+              late_mask.pixels.empty()) {
+            if (late_mask.channel != static_cast<int>(channel_index)) {
+              HOLOSCAN_LOG_WARN("Dropping late mask from mailbox {} because message channel {} does not match frame {}",
+                                channel_index,
+                                late_mask.channel,
+                                late_mask.frame_number);
+            }
             continue;
           }
           state.latest_mask = {late_mask.width, late_mask.height, late_mask.pixels};
@@ -2647,9 +2694,17 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
 
         std::optional<DetectorMaskMessage> current_frame_mask;
         while (!mailbox.mask_queue.empty() && mailbox.mask_queue.front().frame_number == spectrogram.frame_number) {
-          current_frame_mask = std::move(mailbox.mask_queue.front());
+          auto candidate_mask = std::move(mailbox.mask_queue.front());
           mailbox.mask_queue.pop_front();
           ++drained_mask_count;
+          if (candidate_mask.channel != static_cast<int>(channel_index)) {
+            HOLOSCAN_LOG_WARN("Dropping current-frame mask from mailbox {} because message channel {} does not match frame {}",
+                              channel_index,
+                              candidate_mask.channel,
+                              candidate_mask.frame_number);
+            continue;
+          }
+          current_frame_mask = std::move(candidate_mask);
         }
 
         const int snap_display_time_rows_requested =
@@ -2675,7 +2730,8 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
 
         state.overlay_available = patched_mask_history;
         if (current_frame_mask.has_value() &&
-            current_frame_mask->channel == spectrogram.channel &&
+          current_frame_mask->channel == static_cast<int>(channel_index) &&
+          current_frame_mask->channel == spectrogram.channel &&
             !current_frame_mask->pixels.empty()) {
           state.latest_mask = {current_frame_mask->width, current_frame_mask->height, current_frame_mask->pixels};
           state.latest_mask_frame_number = static_cast<int64_t>(current_frame_mask->frame_number);
@@ -2715,7 +2771,6 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
           channel_stats.preview_to_visualizer_max_ms = std::max(channel_stats.preview_to_visualizer_max_ms,
                                                                 preview_to_visualizer_ms);
         }
-      }
 
       residual_mask_queues[channel_index] = std::move(mailbox.mask_queue);
       deferred_mask_count += residual_mask_queues[channel_index].size();
@@ -2728,6 +2783,23 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
     timing_stats_.masks_backfilled += backfilled_mask_count;
     timing_stats_.masks_deferred += deferred_mask_count;
     timing_stats_.masks_pending_peak = std::max<uint64_t>(timing_stats_.masks_pending_peak, pending_mask_peak);
+  }
+
+  bool should_render = any_updates;
+  {
+    std::lock_guard<std::mutex> lock(timing_mutex_);
+    if (should_render) {
+      const uint64_t render_every_n = static_cast<uint64_t>(std::max(1, render_every_n_frames_.get()));
+      if ((timing_stats_.frames_processed % render_every_n) != 0) {
+        should_render = false;
+        ++timing_stats_.render_skipped_by_cadence;
+      }
+    }
+  }
+
+  if (!should_render) {
+    maybe_emit_timing_summary();
+    return;
   }
 
   {

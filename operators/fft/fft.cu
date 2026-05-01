@@ -6,6 +6,10 @@
 #include <chrono>
 #include <cmath>
 
+#include <stdexcept>
+
+#include <cufft.h>
+
 using in_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
 using out_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
 
@@ -24,6 +28,30 @@ double elapsed_ms(uint64_t start_ns, uint64_t end_ns) {
         return 0.0;
     }
     return static_cast<double>(end_ns - start_ns) / 1.0e6;
+}
+
+void throw_if_cufft_error(cufftResult result, const char* operation) {
+    if (result == CUFFT_SUCCESS) {
+        return;
+    }
+
+    throw std::runtime_error(std::string("cuFFT error during ") + operation + ": code=" +
+                             std::to_string(static_cast<int>(result)));
+}
+
+__global__ void fftshift_rows_kernel(const complex* input,
+                                     complex* output,
+                                     int rows,
+                                     int cols,
+                                     int shift) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= rows || col >= cols) {
+        return;
+    }
+
+    const int src_col = (col + shift) % cols;
+    output[row * cols + col] = input[row * cols + src_col];
 }
 
 }  // namespace
@@ -109,11 +137,24 @@ void FFT::setup(OperatorSpec& spec) {
 
 void FFT::initialize() {
     holoscan::Operator::initialize();
-    make_tensor(outputs,
-                {num_channels.get(), num_bursts.get(), burst_size.get()},
-                MATX_DEVICE_MEMORY);
+    make_tensor(fft_scratch_, {num_bursts.get(), burst_size.get()}, MATX_DEVICE_MEMORY);
     ingress_stats.assign(static_cast<size_t>(std::max<uint16_t>(1, num_channels.get())), ChannelIngressStats {});
     output_frame_count.assign(static_cast<size_t>(std::max<uint16_t>(1, num_channels.get())), 0);
+
+    int fft_dims[1] = {burst_size.get()};
+    throw_if_cufft_error(cufftPlanMany(&fft_plan_,
+                                       1,
+                                       fft_dims,
+                                       fft_dims,
+                                       1,
+                                       burst_size.get(),
+                                       fft_dims,
+                                       1,
+                                       burst_size.get(),
+                                       CUFFT_C2C,
+                                       num_bursts.get()),
+                         "cufftPlanMany");
+    fft_plan_initialized_ = true;
 }
 
 void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) {
@@ -133,10 +174,26 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
         stats.window_max_chdr_to_fft_ms = std::max(stats.window_max_chdr_to_fft_ms, chdr_to_fft_ms);
     }
     meta->set("fft_enter_ts_ns", fft_enter_ns);
-    auto out = slice<2>(outputs, {static_cast<index_t>(channel_num), 0, 0},
-            {matxDropDim, matxEnd, matxEnd});
+    tensor_t<complex, 2> out;
+    make_tensor(out, {num_bursts.get(), burst_size.get()}, MATX_DEVICE_MEMORY);
 
-    (out = fftshift1D(fft(std::get<0>(input)))).run(std::get<1>(input));
+    auto stream = std::get<1>(input);
+    throw_if_cufft_error(cufftSetStream(fft_plan_, stream), "cufftSetStream");
+    throw_if_cufft_error(
+        cufftExecC2C(fft_plan_,
+                     reinterpret_cast<cufftComplex*>(std::get<0>(input).Data()),
+                     reinterpret_cast<cufftComplex*>(fft_scratch_.Data()),
+                     CUFFT_FORWARD),
+        "cufftExecC2C");
+
+    const dim3 block(32, 8);
+    const dim3 grid((burst_size.get() + block.x - 1) / block.x,
+                    (num_bursts.get() + block.y - 1) / block.y);
+    fftshift_rows_kernel<<<grid, block, 0, stream>>>(fft_scratch_.Data(),
+                                                     out.Data(),
+                                                     num_bursts.get(),
+                                                     burst_size.get(),
+                                                     burst_size.get() / 2);
 
     const int configured_emit_stride = std::max(1, emit_stride.get());
     uint64_t frame_number = 0;
@@ -231,6 +288,11 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
 }
 
 void FFT::stop() {
+    if (fft_plan_initialized_) {
+        cufftDestroy(fft_plan_);
+        fft_plan_ = 0;
+        fft_plan_initialized_ = false;
+    }
     for (size_t channel_index = 0; channel_index < ingress_stats.size(); ++channel_index) {
         const auto& stats = ingress_stats[channel_index];
         HOLOSCAN_LOG_INFO(

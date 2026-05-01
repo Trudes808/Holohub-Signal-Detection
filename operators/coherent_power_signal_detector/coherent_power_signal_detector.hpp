@@ -267,7 +267,13 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   std::vector<int> path_artifacts_saved_;
   std::vector<ChannelTimingStats> timing_stats_;
   std::vector<ChannelBuffers> channel_buffers_;
+  std::vector<uint8_t> reset_detector_state_on_next_full_batch_;
   std::atomic<bool> stop_requested_ {false};
+
+  void reset_channel_state(uint16_t channel_number,
+                           size_t row_elements,
+                           size_t frame_elements,
+                           cudaStream_t stream);
 };
 
 }  // namespace holoscan::ops

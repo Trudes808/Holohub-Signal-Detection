@@ -32,6 +32,8 @@
 
 namespace {
 
+using coherent_power_complex = holoscan::ops::coherent_power_complex;
+
 uint64_t steady_time_ns() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now().time_since_epoch())
@@ -6976,6 +6978,33 @@ CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
   }
 }
 
+void CoherentPowerSignalDetector::reset_channel_state(uint16_t channel_number,
+                                                      size_t row_elements,
+                                                      size_t frame_elements,
+                                                      cudaStream_t stream) {
+  auto& buffers = channel_buffers_[channel_number];
+
+  auto reset_bytes = [&](void* ptr, size_t bytes, const char* label) {
+    if (ptr == nullptr || bytes == 0) {
+      return;
+    }
+    const auto reset_result = cudaMemsetAsync(ptr, 0, bytes, stream);
+    if (reset_result != cudaSuccess) {
+      throw std::runtime_error(std::string("failed to reset detector ") + label + ": " +
+                               cudaGetErrorString(reset_result));
+    }
+  };
+
+  reset_bytes(buffers.background_device, frame_elements * sizeof(float), "background buffer");
+  reset_bytes(buffers.frontend_reference_device, sizeof(float), "always-on floor buffer");
+  reset_bytes(buffers.always_on_stripe_flags_device, row_elements * sizeof(uint8_t), "always-on stripe flags");
+  reset_bytes(buffers.mask_device, frame_elements * sizeof(uint8_t), "mask buffer");
+  reset_bytes(buffers.scratch_mask_device, frame_elements * sizeof(uint8_t), "scratch mask buffer");
+
+  HOLOSCAN_LOG_INFO("Reset coherent detector state for channel {} before processing the next full batch",
+                    channel_number);
+}
+
 void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   auto& input_port = spec.input<coherent_power_in_t>("in", holoscan::IOSpec::IOSize{16});
   input_port.conditions().emplace_back(
@@ -7123,6 +7152,7 @@ void CoherentPowerSignalDetector::initialize() {
   path_artifacts_saved_.assign(num_channels_.get(), 0);
   timing_stats_.assign(num_channels_.get(), ChannelTimingStats {});
   channel_buffers_.assign(num_channels_.get(), ChannelBuffers {});
+  reset_detector_state_on_next_full_batch_.assign(num_channels_.get(), 0);
 
   auto cuda_result = cudaFree(nullptr);
   if (cuda_result != cudaSuccess) {
@@ -7321,6 +7351,26 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     return;
   }
 
+  const bool chdr_partial_batch = meta->get<bool>("chdr_partial_batch", false);
+  const uint32_t chdr_packets_in_batch = meta->get<uint32_t>("chdr_packets_in_batch", 0);
+  const uint32_t chdr_expected_packets_in_batch = meta->get<uint32_t>("chdr_expected_packets_in_batch", 0);
+  if (chdr_partial_batch) {
+    reset_detector_state_on_next_full_batch_[channel_number] = 1;
+    const uint64_t partial_frame_number = meta->has_key("fft_emitted_frame_number")
+                                              ? meta->get<uint64_t>("fft_emitted_frame_number", 0)
+                                              : 0;
+    HOLOSCAN_LOG_WARN(
+        "Skipping partial CHDR batch in coherent detector ch={} frame={} packets_in_batch={} expected_packets={}"
+        ", detector state will reset on the next full batch",
+        channel_number,
+        partial_frame_number,
+        chdr_packets_in_batch,
+        chdr_expected_packets_in_batch);
+    meta->set("coherent_skipped_partial_batch", true);
+    return;
+  }
+  meta->set("coherent_skipped_partial_batch", false);
+
   const uint64_t processing_frame_number = ++frame_count_[channel_number];
   const int emit_stride = std::max(1, emit_stride_.get());
   if ((processing_frame_number % static_cast<uint64_t>(emit_stride)) != 0) {
@@ -7416,6 +7466,11 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   const size_t power_db_bytes = static_cast<size_t>(total_bins) * sizeof(float);
   const size_t mask_bytes = static_cast<size_t>(total_bins) * sizeof(uint8_t);
   auto& buffers = channel_buffers_[channel_number];
+
+  if (reset_detector_state_on_next_full_batch_[channel_number] != 0) {
+    reset_channel_state(channel_number, static_cast<size_t>(src_rows), static_cast<size_t>(total_bins), stream);
+    reset_detector_state_on_next_full_batch_[channel_number] = 0;
+  }
 
   const bool require_reference_dimensions = src_rows != configured_analysis_rows || src_cols != configured_analysis_cols;
   const bool save_requested = enable_mask_save_.get();
@@ -8895,7 +8950,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       mask_msg.height = dst_rows;
       mask_msg.channel = channel_number;
       mask_msg.frame_number = frame_number;
-      HOLOSCAN_LOG_INFO("Mask emit audit ch={} frame={} dims={}x{} raw_nonzero={} post_smooth_nonzero={} always_on_floor_db={} always_on_stripes={} post_close_nonzero={} post_persistence_nonzero={} emitted_nonzero={} device_ptr=yes",
+      HOLOSCAN_LOG_DEBUG("Mask emit audit ch={} frame={} dims={}x{} raw_nonzero={} post_smooth_nonzero={} always_on_floor_db={} always_on_stripes={} post_close_nonzero={} post_persistence_nonzero={} emitted_nonzero={} device_ptr=yes",
                         channel_number,
                         frame_number,
                         dst_cols,

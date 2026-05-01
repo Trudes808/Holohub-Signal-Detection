@@ -6,7 +6,10 @@
 #include <array>
 #include <cstdint>
 #include <vector>
+
+#include <cufft.h>
 #include <matx.h>
+
 #include "holoscan/holoscan.hpp"
 
 using namespace matx;
@@ -37,9 +40,11 @@ class FFT : public Operator {
          double window_max_chdr_to_fft_ms = 0.0;
      };
 
-     tensor_t<complex, 3> outputs;
+    tensor_t<complex, 2> fft_scratch_;
      std::vector<ChannelIngressStats> ingress_stats;
      std::vector<uint64_t> output_frame_count;
+    cufftHandle fft_plan_ = 0;
+    bool fft_plan_initialized_ = false;
      Parameter<int> burst_size;
      Parameter<int> emit_stride;
      Parameter<int> num_bursts;
