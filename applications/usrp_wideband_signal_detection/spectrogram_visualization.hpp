@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda/std/complex>
+#include <cuda_runtime.h>
 #include <holoscan/holoscan.hpp>
 #include <holoscan/operators/holoviz/holoviz.hpp>
 
@@ -326,13 +327,26 @@ struct OfflinePgmFrame {
   std::vector<uint8_t> pixels;
 };
 
+struct CudaReadyEvent {
+  cudaEvent_t event = nullptr;
+
+  ~CudaReadyEvent() {
+    if (event != nullptr) {
+      cudaEventDestroy(event);
+      event = nullptr;
+    }
+  }
+};
+
 struct DetectorMaskMessage {
   std::vector<uint8_t> pixels;
   std::shared_ptr<uint8_t> device_pixels;
+  std::shared_ptr<CudaReadyEvent> ready_event;
   int width = 0;
   int height = 0;
   int channel = 0;
   uint64_t frame_number = 0;
+  bool transpose_input = false;
 };
 
 struct VisualizationFrameInfo {

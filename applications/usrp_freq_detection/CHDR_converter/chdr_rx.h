@@ -61,16 +61,27 @@ class ChdrConverterOpRx : public Operator {
   Parameter<uint16_t> num_simul_batches_;
   Parameter<uint16_t> num_channels_;
   Parameter<std::string> interface_name_;
+  Parameter<std::string> interface_names_;
   Parameter<bool> log_data_;
   Parameter<bool> log_packets_;
   Parameter<uint32_t> partial_batch_drop_timeout_ms_;
   Parameter<std::string> channel_center_frequencies_hz_;
   Parameter<std::string> channel_sample_rates_hz_;
-  int port_id_;
   uint32_t num_packets_per_batch;
   std::vector<std::optional<double>> center_frequency_by_channel_;
   std::vector<std::optional<double>> sample_rate_by_channel_;
   bool resources_released_ = false;
+  bool use_flow_id_routing_ = true;
+  bool use_single_channel_fast_path_ = false;
+  int single_channel_port_id_ = -1;
+  uint16_t single_channel_queue_id_ = 0;
+
+  struct RxSource {
+    int port_id = -1;
+    uint16_t queue_id = 0;
+    uint16_t fallback_channel = 0;
+    std::string interface_name;
+  };
 
   // Holds burst buffers that cannot be freed yet
   struct RxMsg {
@@ -125,6 +136,7 @@ class ChdrConverterOpRx : public Operator {
  private:
 
   std::vector<std::shared_ptr<struct Channel>> channel_list;
+  std::vector<RxSource> rx_sources_;
 
   std::optional<RxMsg> free_buf(std::shared_ptr<struct Channel> channel);
   bool free_bufs_and_emit_arrays(OutputContext& op_output, std::shared_ptr<struct Channel> channel);
@@ -142,6 +154,7 @@ class ChdrConverterOpRx : public Operator {
     void release_channel_resources();
   std::vector<std::optional<double>> parse_channel_values(const std::string& values,
                                                           const char* field_name) const;
+  std::vector<std::string> parse_interface_names() const;
 };  // ChdrConverterOpRx
 
 }  // namespace holoscan::ops

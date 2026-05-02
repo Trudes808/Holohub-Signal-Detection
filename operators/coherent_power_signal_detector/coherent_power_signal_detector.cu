@@ -54,6 +54,8 @@ enum TimingStageIndex : size_t {
   kInputStage = 0,
   kPowerDbStage,
   kPipelineStage,
+  kEmitStage,
+  kTimingSyncStage,
   kDeviceCopyStage,
   kMaskSaveStage,
   kTotalStage,
@@ -63,7 +65,9 @@ constexpr std::array<const char*, holoscan::ops::CoherentPowerSignalDetector::kT
     kTimingStageNames = {
         "input_ms",
         "power_db_ms",
-      "pipeline_ms",
+        "pipeline_ms",
+        "emit_ms",
+        "timing_sync_ms",
         "device_copy_ms",
         "mask_save_ms",
         "total_ms",
@@ -858,6 +862,7 @@ __host__ __device__ inline size_t flat_index(int rows, int cols, int row, int co
 __global__ void coherent_power_power_db_kernel(const cuda::std::complex<float>* input,
                                                int src_rows,
                                                int src_cols,
+                                               bool transpose_input,
                                                float* output) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = src_rows * src_cols;
@@ -865,7 +870,13 @@ __global__ void coherent_power_power_db_kernel(const cuda::std::complex<float>* 
     return;
   }
 
-  const auto value = input[idx];
+  const int canonical_cols = transpose_input ? src_rows : src_cols;
+  const int canonical_row = idx / canonical_cols;
+  const int canonical_col = idx % canonical_cols;
+  const int input_row = transpose_input ? canonical_col : canonical_row;
+  const int input_col = transpose_input ? canonical_row : canonical_col;
+  const auto value = input[static_cast<size_t>(input_row) * static_cast<size_t>(src_cols) +
+                           static_cast<size_t>(input_col)];
   const float re = value.real();
   const float im = value.imag();
   const float power = re * re + im * im + 1e-12f;
@@ -6779,6 +6790,7 @@ CoherentPowerReferenceResult run_coherent_power_live_validation(
     coherent_power_power_db_kernel<<<blocks, threads, 0, stream>>>(input_device,
                                                                     src_rows,
                                                                     src_cols,
+                                                                    false,
                                                                     power_db_device);
     auto kernel_result = cudaGetLastError();
     if (kernel_result != cudaSuccess) {
@@ -6971,6 +6983,8 @@ CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
     cudaFree(buffers.always_on_stripe_flags_device);
     cudaFree(buffers.mask_device);
     cudaFree(buffers.scratch_mask_device);
+    cudaFree(buffers.emit_scratch0_device);
+    cudaFree(buffers.emit_scratch1_device);
     cudaFreeHost(buffers.power_db_host);
     cudaFreeHost(buffers.mask_host);
 
@@ -7000,6 +7014,8 @@ void CoherentPowerSignalDetector::reset_channel_state(uint16_t channel_number,
   reset_bytes(buffers.always_on_stripe_flags_device, row_elements * sizeof(uint8_t), "always-on stripe flags");
   reset_bytes(buffers.mask_device, frame_elements * sizeof(uint8_t), "mask buffer");
   reset_bytes(buffers.scratch_mask_device, frame_elements * sizeof(uint8_t), "scratch mask buffer");
+  reset_bytes(buffers.emit_scratch0_device, frame_elements * sizeof(uint8_t), "emit scratch0 buffer");
+  reset_bytes(buffers.emit_scratch1_device, frame_elements * sizeof(uint8_t), "emit scratch1 buffer");
 
   HOLOSCAN_LOG_INFO("Reset coherent detector state for channel {} before processing the next full batch",
                     channel_number);
@@ -7421,7 +7437,48 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
 
   const auto total_start = std::chrono::steady_clock::now();
   std::array<double, kTimingStageCount> stage_ms {};
-  const bool timing_enabled = timing_summary_enable_.get();
+  bool timing_enabled = timing_summary_enable_.get();
+  const bool collect_pipeline_mask_metrics = false;
+
+  struct ScopedStageTimingEvents {
+    std::array<cudaEvent_t, kTimingStageCount> start {};
+    std::array<cudaEvent_t, kTimingStageCount> stop {};
+    std::array<bool, kTimingStageCount> active {};
+    std::array<bool, kTimingStageCount> recorded {};
+
+    ~ScopedStageTimingEvents() {
+      for (size_t index = 0; index < kTimingStageCount; ++index) {
+        if (!active[index]) {
+          continue;
+        }
+        if (start[index] != nullptr) {
+          cudaEventDestroy(start[index]);
+        }
+        if (stop[index] != nullptr) {
+          cudaEventDestroy(stop[index]);
+        }
+      }
+    }
+  } stage_events;
+
+  if (timing_enabled) {
+    for (size_t stage_index = 0; stage_index < kTimingStageCount; ++stage_index) {
+      if (stage_index == kDeviceCopyStage || stage_index == kMaskSaveStage ||
+          stage_index == kEmitStage || stage_index == kTimingSyncStage ||
+          stage_index == kTotalStage) {
+        continue;
+      }
+
+      const auto start_result = cudaEventCreate(&stage_events.start[stage_index]);
+      const auto stop_result = cudaEventCreate(&stage_events.stop[stage_index]);
+      if (start_result != cudaSuccess || stop_result != cudaSuccess) {
+        HOLOSCAN_LOG_WARN("Falling back from coherent detector GPU timing because CUDA event creation failed");
+        timing_enabled = false;
+        break;
+      }
+      stage_events.active[stage_index] = true;
+    }
+  }
 
   auto time_step_ms = [&](size_t stage_index, auto&& fn) {
     if (!timing_enabled) {
@@ -7429,17 +7486,36 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       return;
     }
 
-    const auto stage_start = std::chrono::steady_clock::now();
-    fn();
-    auto sync_result = cudaStreamSynchronize(stream);
-    if (sync_result != cudaSuccess) {
-      HOLOSCAN_LOG_ERROR("Coherent power detector timing sync failed at {}: {}",
-                         kTimingStageNames[stage_index],
-                         cudaGetErrorString(sync_result));
+    if (stage_index == kMaskSaveStage || stage_index == kEmitStage ||
+      stage_index == kTimingSyncStage || !stage_events.active[stage_index]) {
+      const auto stage_start = std::chrono::steady_clock::now();
+      fn();
+      stage_ms[stage_index] =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
       return;
     }
-    stage_ms[stage_index] =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
+
+    auto event_result = cudaEventRecord(stage_events.start[stage_index], stream);
+    if (event_result != cudaSuccess) {
+      HOLOSCAN_LOG_WARN("Coherent power detector timing start event failed at {}: {}",
+                         kTimingStageNames[stage_index],
+                         cudaGetErrorString(event_result));
+      fn();
+      return;
+    }
+
+    const auto stage_start = std::chrono::steady_clock::now();
+    fn();
+    event_result = cudaEventRecord(stage_events.stop[stage_index], stream);
+    if (event_result != cudaSuccess) {
+      HOLOSCAN_LOG_WARN("Coherent power detector timing stop event failed at {}: {}",
+                         kTimingStageNames[stage_index],
+                         cudaGetErrorString(event_result));
+      return;
+    }
+    stage_events.recorded[stage_index] = true;
+
+    static_cast<void>(stage_start);
   };
 
   int ignore_bins_per_side = 0;
@@ -7526,6 +7602,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       cudaFree(buffers.frontend_reference_device);
       cudaFree(buffers.always_on_stripe_flags_device);
       cudaFree(buffers.analysis_tensor_device);
+      cudaFree(buffers.emit_scratch0_device);
+      cudaFree(buffers.emit_scratch1_device);
       cudaFreeHost(buffers.power_db_host);
       cudaFreeHost(buffers.mask_host);
 
@@ -7544,6 +7622,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       buffers.always_on_stripe_flags_device = nullptr;
       buffers.power_db_host = nullptr;
       buffers.mask_host = nullptr;
+      buffers.emit_scratch0_device = nullptr;
+      buffers.emit_scratch1_device = nullptr;
 
       allocate_device_float(buffers.power_db_device, static_cast<size_t>(total_bins));
       allocate_device_float(buffers.corrected_db_device, static_cast<size_t>(total_bins));
@@ -7556,17 +7636,14 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       allocate_device_u8(buffers.always_on_stripe_flags_device, static_cast<size_t>(src_rows));
       allocate_device_u8(buffers.mask_device, static_cast<size_t>(total_bins));
       allocate_device_u8(buffers.scratch_mask_device, static_cast<size_t>(total_bins));
-      const auto analysis_tensor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
-                                                     static_cast<size_t>(total_bins) * sizeof(coherent_power_complex));
-      if (analysis_tensor_result != cudaSuccess) {
-        throw std::runtime_error(std::string("analysis tensor buffer allocation failed: ") + cudaGetErrorString(analysis_tensor_result));
-      }
+      allocate_device_u8(buffers.emit_scratch0_device, static_cast<size_t>(total_bins));
+      allocate_device_u8(buffers.emit_scratch1_device, static_cast<size_t>(total_bins));
 
       buffers.frame_elements = static_cast<size_t>(total_bins);
       buffers.mask_elements = static_cast<size_t>(total_bins);
     }
 
-    if (buffers.analysis_tensor_device == nullptr) {
+    if (should_save_tensor_snapshot && buffers.analysis_tensor_device == nullptr) {
       const auto analysis_tensor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
                                                      static_cast<size_t>(total_bins) * sizeof(coherent_power_complex));
       if (analysis_tensor_result != cudaSuccess) {
@@ -7609,6 +7686,13 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       }
     }
 
+    if (buffers.emit_scratch0_device == nullptr) {
+      allocate_device_u8(buffers.emit_scratch0_device, static_cast<size_t>(total_bins));
+    }
+    if (buffers.emit_scratch1_device == nullptr) {
+      allocate_device_u8(buffers.emit_scratch1_device, static_cast<size_t>(total_bins));
+    }
+
     if (should_save_power_db_snapshot && buffers.power_db_host == nullptr) {
       const auto alloc_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.power_db_host), power_db_bytes);
       if (alloc_result != cudaSuccess) {
@@ -7631,29 +7715,29 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       }
     }
 
-    constexpr int threads = 256;
-    const int blocks = (total_bins + threads - 1) / threads;
-    if (canonical_view.transposed) {
-      coherent_power_transpose_kernel<<<blocks, threads, 0, stream>>>(fft_tensor.Data(),
-                                                                       input_rows,
-                                                                       input_cols,
-                                                                       buffers.analysis_tensor_device);
-      auto kernel_result = cudaGetLastError();
-      if (kernel_result != cudaSuccess) {
-        throw std::runtime_error(std::string("analysis transpose kernel launch failed: ") + cudaGetErrorString(kernel_result));
-      }
-    } else {
-      auto copy_result = cudaMemcpyAsync(buffers.analysis_tensor_device,
-                                         fft_tensor.Data(),
-                                         static_cast<size_t>(total_bins) * sizeof(coherent_power_complex),
-                                         cudaMemcpyDeviceToDevice,
-                                         stream);
-      if (copy_result != cudaSuccess) {
-        throw std::runtime_error(std::string("analysis tensor copy failed: ") + cudaGetErrorString(copy_result));
-      }
-    }
-
     if (should_save_tensor_snapshot) {
+      constexpr int threads = 256;
+      const int blocks = (total_bins + threads - 1) / threads;
+      if (canonical_view.transposed) {
+        coherent_power_transpose_kernel<<<blocks, threads, 0, stream>>>(fft_tensor.Data(),
+                                                                         input_rows,
+                                                                         input_cols,
+                                                                         buffers.analysis_tensor_device);
+        auto kernel_result = cudaGetLastError();
+        if (kernel_result != cudaSuccess) {
+          throw std::runtime_error(std::string("analysis transpose kernel launch failed: ") + cudaGetErrorString(kernel_result));
+        }
+      } else {
+        auto copy_result = cudaMemcpyAsync(buffers.analysis_tensor_device,
+                                           fft_tensor.Data(),
+                                           static_cast<size_t>(total_bins) * sizeof(coherent_power_complex),
+                                           cudaMemcpyDeviceToDevice,
+                                           stream);
+        if (copy_result != cudaSuccess) {
+          throw std::runtime_error(std::string("analysis tensor copy failed: ") + cudaGetErrorString(copy_result));
+        }
+      }
+
       auto sync_result = cudaStreamSynchronize(stream);
       if (sync_result != cudaSuccess) {
         throw std::runtime_error(std::string("input tensor snapshot pre-copy sync failed: ") + cudaGetErrorString(sync_result));
@@ -7671,9 +7755,10 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   time_step_ms(kPowerDbStage, [&] {
     constexpr int threads = 256;
     const int blocks = (total_bins + threads - 1) / threads;
-    coherent_power_power_db_kernel<<<blocks, threads, 0, stream>>>(buffers.analysis_tensor_device,
-                                                                    src_rows,
-                                                                    src_cols,
+    coherent_power_power_db_kernel<<<blocks, threads, 0, stream>>>(fft_tensor.Data(),
+                                                                    input_rows,
+                                                                    input_cols,
+                                                                    canonical_view.transposed,
                                                                     buffers.power_db_device);
     auto kernel_result = cudaGetLastError();
     if (kernel_result != cudaSuccess) {
@@ -7997,29 +8082,33 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         throw std::runtime_error(std::string("always-on row coverage kernel launch failed: ") + cudaGetErrorString(kernel_result));
       }
 
-      fast_always_on_stripe_count_device = allocate_owned_u32_buffer();
-      if (cudaMemsetAsync(fast_always_on_stripe_count_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
-        throw std::runtime_error("failed to reset always-on stripe counter");
-      }
-      count_nonzero_u8_kernel<<<row_mask_blocks, threads, 0, stream>>>(buffers.always_on_stripe_flags_device,
-                                                                        src_rows,
-                                                                        fast_always_on_stripe_count_device.get());
-      kernel_result = cudaGetLastError();
-      if (kernel_result != cudaSuccess) {
-        throw std::runtime_error(std::string("always-on stripe count kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      if (collect_pipeline_mask_metrics) {
+        fast_always_on_stripe_count_device = allocate_owned_u32_buffer();
+        if (cudaMemsetAsync(fast_always_on_stripe_count_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
+          throw std::runtime_error("failed to reset always-on stripe counter");
+        }
+        count_nonzero_u8_kernel<<<row_mask_blocks, threads, 0, stream>>>(buffers.always_on_stripe_flags_device,
+                                                                          src_rows,
+                                                                          fast_always_on_stripe_count_device.get());
+        kernel_result = cudaGetLastError();
+        if (kernel_result != cudaSuccess) {
+          throw std::runtime_error(std::string("always-on stripe count kernel launch failed: ") + cudaGetErrorString(kernel_result));
+        }
       }
     }
 
-    fast_raw_mask_nonzero_device = acquire_pooled_u32_buffer();
-    if (cudaMemsetAsync(fast_raw_mask_nonzero_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
-      throw std::runtime_error("failed to reset fast raw mask nonzero counter");
-    }
-    count_nonzero_u8_kernel<<<blocks, threads, 0, stream>>>(buffers.mask_device,
-                                                             total_bins,
-                                                             fast_raw_mask_nonzero_device.get());
-    kernel_result = cudaGetLastError();
-    if (kernel_result != cudaSuccess) {
-      throw std::runtime_error(std::string("fast raw mask count kernel launch failed: ") + cudaGetErrorString(kernel_result));
+    if (collect_pipeline_mask_metrics) {
+      fast_raw_mask_nonzero_device = acquire_pooled_u32_buffer();
+      if (cudaMemsetAsync(fast_raw_mask_nonzero_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
+        throw std::runtime_error("failed to reset fast raw mask nonzero counter");
+      }
+      count_nonzero_u8_kernel<<<blocks, threads, 0, stream>>>(buffers.mask_device,
+                                                               total_bins,
+                                                               fast_raw_mask_nonzero_device.get());
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("fast raw mask count kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
     }
 
     for (int iter = 0; iter < std::max(0, fast_mask_smooth_iterations_.get()); ++iter) {
@@ -8035,16 +8124,18 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       std::swap(buffers.mask_device, buffers.scratch_mask_device);
     }
 
-    fast_post_smooth_mask_nonzero_device = acquire_pooled_u32_buffer();
-    if (cudaMemsetAsync(fast_post_smooth_mask_nonzero_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
-      throw std::runtime_error("failed to reset fast post-smooth mask nonzero counter");
-    }
-    count_nonzero_u8_kernel<<<blocks, threads, 0, stream>>>(buffers.mask_device,
-                                                             total_bins,
-                                                             fast_post_smooth_mask_nonzero_device.get());
-    kernel_result = cudaGetLastError();
-    if (kernel_result != cudaSuccess) {
-      throw std::runtime_error(std::string("fast post-smooth mask count kernel launch failed: ") + cudaGetErrorString(kernel_result));
+    if (collect_pipeline_mask_metrics) {
+      fast_post_smooth_mask_nonzero_device = acquire_pooled_u32_buffer();
+      if (cudaMemsetAsync(fast_post_smooth_mask_nonzero_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
+        throw std::runtime_error("failed to reset fast post-smooth mask nonzero counter");
+      }
+      count_nonzero_u8_kernel<<<blocks, threads, 0, stream>>>(buffers.mask_device,
+                                                               total_bins,
+                                                               fast_post_smooth_mask_nonzero_device.get());
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("fast post-smooth mask count kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
     }
 
     fast_summary.ignore_bins_per_side = ignore_bins_per_side;
@@ -8751,12 +8842,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   } else {
     stage_ms[kMaskSaveStage] = 0.0;
   }
-
-  stage_ms[kTotalStage] =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - total_start).count();
-
   const double fft_to_detector_enter_ms = elapsed_ms(fft_emit_ts_ns, detector_enter_ns);
-  const double fft_to_detector_done_ms = fft_to_detector_enter_ms + stage_ms[kTotalStage];
 
   meta->set("coherent_frame_number", frame_number);
   meta->set("coherent_mask_height", static_cast<uint32_t>(emitted_mask_rows));
@@ -8770,7 +8856,6 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   meta->set("coherent_merged_threshold", use_reference_backend ? pipeline_summary.merged_threshold : fast_summary.merged_threshold);
   meta->set("coherent_seed_threshold", use_reference_backend ? pipeline_summary.seed_threshold : fast_summary.seed_threshold);
   meta->set("coherent_pipeline_variant", coherent_variant_name);
-  meta->set("coherent_timing_total_ms", stage_ms[kTotalStage]);
   meta->set("coherent_grouped_box_count_meaningful",
             use_reference_backend ? pipeline_summary.grouped_box_count_meaningful : true);
   meta->set("coherent_final_mask_component_count",
@@ -8789,182 +8874,185 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   uint32_t coherent_emitted_mask_nonzero_pixels = coherent_reference_mask_nonzero_pixels;
   bool coherent_emitted_mask_metrics_meaningful = use_reference_backend && !pipeline_summary.final_mask.empty();
 
-  if (use_reference_backend) {
-    if (!pipeline_summary.final_mask.empty()) {
-      holoscan::ops::DetectorMaskMessage mask_msg;
-      mask_msg.pixels = binary_float_mask_to_u8(pipeline_summary.final_mask);
-      mask_msg.width = output_cols;
-      mask_msg.height = output_rows;
-      mask_msg.channel = channel_number;
-      mask_msg.frame_number = frame_number;
-      op_output.emit(mask_msg, "mask_out");
+  time_step_ms(kEmitStage, [&] {
+    if (use_reference_backend) {
+      if (!pipeline_summary.final_mask.empty()) {
+        holoscan::ops::DetectorMaskMessage mask_msg;
+        mask_msg.pixels = binary_float_mask_to_u8(pipeline_summary.final_mask);
+        mask_msg.width = output_cols;
+        mask_msg.height = output_rows;
+        mask_msg.channel = channel_number;
+        mask_msg.frame_number = frame_number;
+        op_output.emit(mask_msg, "mask_out");
+      }
+
+    } else {
+      auto& buffers = channel_buffers_[static_cast<size_t>(channel_number)];
+      if (buffers.mask_device != nullptr && buffers.mask_elements > 0) {
+        const bool collect_live_emit_metrics = false;
+        const size_t emitted_mask_bytes = static_cast<size_t>(buffers.mask_elements) * sizeof(uint8_t);
+        auto emitted_mask = std::shared_ptr<uint8_t>(buffers.mask_device,
+                                                     [emitted_mask_bytes](uint8_t* ptr) {
+                                                       recycle_mask_output_buffer(ptr, emitted_mask_bytes);
+                                                     });
+        buffers.mask_device = static_cast<uint8_t*>(acquire_mask_output_buffer(emitted_mask_bytes));
+        std::shared_ptr<unsigned int> emitted_nonzero_device;
+        if (collect_live_emit_metrics) {
+          emitted_nonzero_device = allocate_owned_u32_buffer();
+          if (cudaMemsetAsync(emitted_nonzero_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
+            throw std::runtime_error("failed to reset emitted mask nonzero counter");
+          }
+        }
+        auto emit_mask_result = cudaSuccess;
+
+        if (filter_detection_mask_.get()) {
+          if (collect_live_emit_metrics) {
+            fast_post_emit_close_mask_nonzero_device = allocate_owned_u32_buffer();
+          }
+          std::shared_ptr<unsigned int> fast_post_emit_persistence_mask_nonzero_device;
+          if (collect_live_emit_metrics) {
+            fast_post_emit_persistence_mask_nonzero_device = allocate_owned_u32_buffer();
+          }
+          apply_emit_mask_morphology(emitted_mask.get(),
+                                     src_rows,
+                                     src_cols,
+                                     buffers.emit_scratch0_device,
+                                     buffers.emit_scratch1_device,
+                                     live_emit_freq_persistence_window_.get(),
+                                     live_emit_freq_persistence_min_hits_.get(),
+                                     collect_live_emit_metrics ? fast_post_emit_close_mask_nonzero_device.get() : nullptr,
+                                     collect_live_emit_metrics ? fast_post_emit_persistence_mask_nonzero_device.get() : nullptr,
+                                     stream);
+          if (collect_live_emit_metrics) {
+            unsigned int post_persistence_nonzero_count = 0;
+            if (cudaMemcpy(&post_persistence_nonzero_count,
+                           fast_post_emit_persistence_mask_nonzero_device.get(),
+                           sizeof(unsigned int),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+              throw std::runtime_error("failed to copy fast post-persistence mask nonzero count");
+            }
+            fast_summary.post_emit_persistence_mask_nonzero_pixels = post_persistence_nonzero_count;
+          }
+        }
+
+        const int compact_total = src_rows * src_cols;
+        constexpr int count_threads = 256;
+        const int count_blocks = (compact_total + count_threads - 1) / count_threads;
+        if (live_emit_always_on_enable_.get()) {
+          coherent_power_or_stripe_flags_kernel<<<count_blocks, count_threads, 0, stream>>>(emitted_mask.get(),
+                                                                                              src_rows,
+                                                                                              src_cols,
+                                                                                              buffers.always_on_stripe_flags_device,
+                                                                                              true);
+          emit_mask_result = cudaGetLastError();
+          if (emit_mask_result != cudaSuccess) {
+            throw std::runtime_error(std::string("always-on stripe OR kernel launch failed: ") + cudaGetErrorString(emit_mask_result));
+          }
+        }
+
+        if (collect_live_emit_metrics) {
+          count_nonzero_u8_kernel<<<count_blocks, count_threads, 0, stream>>>(emitted_mask.get(),
+                                                                               compact_total,
+                                                                               emitted_nonzero_device.get());
+          auto kernel_result = cudaGetLastError();
+          if (kernel_result != cudaSuccess) {
+            throw std::runtime_error(std::string("live mask count kernel launch failed: ") + cudaGetErrorString(kernel_result));
+          }
+        }
+        unsigned int emitted_nonzero_count = 0;
+        if (collect_live_emit_metrics &&
+            cudaMemcpyAsync(&emitted_nonzero_count,
+                            emitted_nonzero_device.get(),
+                            sizeof(unsigned int),
+                            cudaMemcpyDeviceToHost,
+                            stream) != cudaSuccess) {
+          throw std::runtime_error("failed to copy emitted mask nonzero count");
+        }
+        if (collect_live_emit_metrics && fast_raw_mask_nonzero_device) {
+          unsigned int raw_nonzero_count = 0;
+          if (cudaMemcpy(&raw_nonzero_count,
+                         fast_raw_mask_nonzero_device.get(),
+                         sizeof(unsigned int),
+                         cudaMemcpyDeviceToHost) != cudaSuccess) {
+            throw std::runtime_error("failed to copy fast raw mask nonzero count");
+          }
+          fast_summary.raw_mask_nonzero_pixels = raw_nonzero_count;
+        }
+        if (collect_live_emit_metrics && fast_post_emit_close_mask_nonzero_device) {
+          unsigned int post_close_nonzero_count = 0;
+          if (cudaMemcpy(&post_close_nonzero_count,
+                         fast_post_emit_close_mask_nonzero_device.get(),
+                         sizeof(unsigned int),
+                         cudaMemcpyDeviceToHost) != cudaSuccess) {
+            throw std::runtime_error("failed to copy fast post-close mask nonzero count");
+          }
+          fast_summary.post_emit_close_mask_nonzero_pixels = post_close_nonzero_count;
+        }
+        if (collect_live_emit_metrics && fast_post_smooth_mask_nonzero_device) {
+          unsigned int post_smooth_nonzero_count = 0;
+          if (cudaMemcpy(&post_smooth_nonzero_count,
+                         fast_post_smooth_mask_nonzero_device.get(),
+                         sizeof(unsigned int),
+                         cudaMemcpyDeviceToHost) != cudaSuccess) {
+            throw std::runtime_error("failed to copy fast post-smooth mask nonzero count");
+          }
+          fast_summary.post_smooth_mask_nonzero_pixels = post_smooth_nonzero_count;
+        }
+        if (collect_live_emit_metrics && live_emit_always_on_enable_.get()) {
+          float always_on_floor_db = 0.0f;
+          if (cudaMemcpy(&always_on_floor_db,
+                         buffers.frontend_reference_device,
+                         sizeof(float),
+                         cudaMemcpyDeviceToHost) != cudaSuccess) {
+            throw std::runtime_error("failed to copy always-on floor");
+          }
+          fast_summary.always_on_floor_db = always_on_floor_db;
+        }
+        if (collect_live_emit_metrics && fast_always_on_stripe_count_device) {
+          unsigned int always_on_stripe_count = 0;
+          if (cudaMemcpy(&always_on_stripe_count,
+                         fast_always_on_stripe_count_device.get(),
+                         sizeof(unsigned int),
+                         cudaMemcpyDeviceToHost) != cudaSuccess) {
+            throw std::runtime_error("failed to copy always-on stripe count");
+          }
+          fast_summary.always_on_stripe_count = always_on_stripe_count;
+        }
+        holoscan::ops::DetectorMaskMessage mask_msg;
+        auto ready_event = std::make_shared<holoscan::ops::CudaReadyEvent>();
+        const auto event_create_result = cudaEventCreateWithFlags(&ready_event->event, cudaEventDisableTiming);
+        if (event_create_result != cudaSuccess) {
+          throw std::runtime_error(std::string("failed to create detector mask ready event: ") + cudaGetErrorString(event_create_result));
+        }
+        const auto event_record_result = cudaEventRecord(ready_event->event, stream);
+        if (event_record_result != cudaSuccess) {
+          throw std::runtime_error(std::string("failed to record detector mask ready event: ") + cudaGetErrorString(event_record_result));
+        }
+        mask_msg.device_pixels = std::move(emitted_mask);
+        mask_msg.ready_event = std::move(ready_event);
+        coherent_emitted_mask_nonzero_pixels = collect_live_emit_metrics ? emitted_nonzero_count : 0U;
+        coherent_emitted_mask_metrics_meaningful = collect_live_emit_metrics;
+        mask_msg.width = src_cols;
+        mask_msg.height = src_rows;
+        mask_msg.channel = channel_number;
+        mask_msg.frame_number = frame_number;
+        mask_msg.transpose_input = canonical_view.transposed;
+        HOLOSCAN_LOG_DEBUG("Mask emit audit ch={} frame={} dims={}x{} raw_nonzero={} post_smooth_nonzero={} always_on_floor_db={} always_on_stripes={} post_close_nonzero={} post_persistence_nonzero={} emitted_nonzero={} device_ptr=yes",
+                          channel_number,
+                          frame_number,
+                          src_cols,
+                          src_rows,
+                          fast_summary.raw_mask_nonzero_pixels,
+                          fast_summary.post_smooth_mask_nonzero_pixels,
+                          fast_summary.always_on_floor_db,
+                          fast_summary.always_on_stripe_count,
+                          fast_summary.post_emit_close_mask_nonzero_pixels,
+                          fast_summary.post_emit_persistence_mask_nonzero_pixels,
+                          emitted_nonzero_count);
+        op_output.emit(mask_msg, "mask_out");
+      }
     }
-
-  } else {
-    auto& buffers = channel_buffers_[static_cast<size_t>(channel_number)];
-    if (buffers.mask_device != nullptr && buffers.mask_elements > 0) {
-      const int dst_rows = emitted_mask_rows;
-      const int dst_cols = emitted_mask_cols;
-        const size_t emitted_mask_bytes = static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols) * sizeof(uint8_t);
-      auto mask_buffer = allocate_owned_u8_buffer(emitted_mask_bytes);
-      auto emitted_nonzero_device = allocate_owned_u32_buffer();
-      if (cudaMemsetAsync(emitted_nonzero_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
-        throw std::runtime_error("failed to reset emitted mask nonzero counter");
-      }
-      auto emit_mask_result = cudaSuccess;
-      if (canonical_view.transposed) {
-        constexpr int transpose_threads = 256;
-        const int transpose_blocks = (total_bins + transpose_threads - 1) / transpose_threads;
-        transpose_u8_kernel<<<transpose_blocks, transpose_threads, 0, stream>>>(buffers.mask_device,
-                                                                                 src_rows,
-                                                                                 src_cols,
-                                                                                 mask_buffer.get());
-        emit_mask_result = cudaGetLastError();
-        if (emit_mask_result != cudaSuccess) {
-          throw std::runtime_error(std::string("mask transpose-to-emit kernel launch failed: ") + cudaGetErrorString(emit_mask_result));
-        }
-      } else {
-        emit_mask_result = cudaMemcpyAsync(mask_buffer.get(),
-                                           buffers.mask_device,
-                                           emitted_mask_bytes,
-                                           cudaMemcpyDeviceToDevice,
-                                           stream);
-        if (emit_mask_result != cudaSuccess) {
-          throw std::runtime_error(std::string("mask emit device copy failed: ") + cudaGetErrorString(emit_mask_result));
-        }
-      }
-
-      if (filter_detection_mask_.get()) {
-        auto emit_scratch0_device = allocate_owned_u8_buffer(emitted_mask_bytes);
-        auto emit_scratch1_device = allocate_owned_u8_buffer(emitted_mask_bytes);
-        fast_post_emit_close_mask_nonzero_device = allocate_owned_u32_buffer();
-        auto fast_post_emit_persistence_mask_nonzero_device = allocate_owned_u32_buffer();
-        apply_emit_mask_morphology(mask_buffer.get(),
-                                   dst_rows,
-                                   dst_cols,
-                                   emit_scratch0_device.get(),
-                                   emit_scratch1_device.get(),
-                                   live_emit_freq_persistence_window_.get(),
-                                   live_emit_freq_persistence_min_hits_.get(),
-                                   fast_post_emit_close_mask_nonzero_device.get(),
-                                   fast_post_emit_persistence_mask_nonzero_device.get(),
-                                   stream);
-        unsigned int post_persistence_nonzero_count = 0;
-        if (cudaMemcpy(&post_persistence_nonzero_count,
-                       fast_post_emit_persistence_mask_nonzero_device.get(),
-                       sizeof(unsigned int),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          throw std::runtime_error("failed to copy fast post-persistence mask nonzero count");
-        }
-        fast_summary.post_emit_persistence_mask_nonzero_pixels = post_persistence_nonzero_count;
-      }
-
-      const int compact_total = dst_rows * dst_cols;
-      constexpr int count_threads = 256;
-      const int count_blocks = (compact_total + count_threads - 1) / count_threads;
-      if (live_emit_always_on_enable_.get()) {
-        coherent_power_or_stripe_flags_kernel<<<count_blocks, count_threads, 0, stream>>>(mask_buffer.get(),
-                                                                                            dst_rows,
-                                                                                            dst_cols,
-                                                                                            buffers.always_on_stripe_flags_device,
-                                                                                            !canonical_view.transposed);
-        emit_mask_result = cudaGetLastError();
-        if (emit_mask_result != cudaSuccess) {
-          throw std::runtime_error(std::string("always-on stripe OR kernel launch failed: ") + cudaGetErrorString(emit_mask_result));
-        }
-      }
-
-      count_nonzero_u8_kernel<<<count_blocks, count_threads, 0, stream>>>(mask_buffer.get(),
-                                                                           compact_total,
-                                                                           emitted_nonzero_device.get());
-      auto kernel_result = cudaGetLastError();
-      if (kernel_result != cudaSuccess) {
-        throw std::runtime_error(std::string("live mask count kernel launch failed: ") + cudaGetErrorString(kernel_result));
-      }
-      unsigned int emitted_nonzero_count = 0;
-      if (cudaMemcpyAsync(&emitted_nonzero_count,
-                          emitted_nonzero_device.get(),
-                          sizeof(unsigned int),
-                          cudaMemcpyDeviceToHost,
-                          stream) != cudaSuccess) {
-        throw std::runtime_error("failed to copy emitted mask nonzero count");
-      }
-      if (cudaStreamSynchronize(stream) != cudaSuccess) {
-        throw std::runtime_error("failed to synchronize live mask emission stream");
-      }
-      if (fast_raw_mask_nonzero_device) {
-        unsigned int raw_nonzero_count = 0;
-        if (cudaMemcpy(&raw_nonzero_count,
-                       fast_raw_mask_nonzero_device.get(),
-                       sizeof(unsigned int),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          throw std::runtime_error("failed to copy fast raw mask nonzero count");
-        }
-        fast_summary.raw_mask_nonzero_pixels = raw_nonzero_count;
-      }
-      if (fast_post_emit_close_mask_nonzero_device) {
-        unsigned int post_close_nonzero_count = 0;
-        if (cudaMemcpy(&post_close_nonzero_count,
-                       fast_post_emit_close_mask_nonzero_device.get(),
-                       sizeof(unsigned int),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          throw std::runtime_error("failed to copy fast post-close mask nonzero count");
-        }
-        fast_summary.post_emit_close_mask_nonzero_pixels = post_close_nonzero_count;
-      }
-      if (fast_post_smooth_mask_nonzero_device) {
-        unsigned int post_smooth_nonzero_count = 0;
-        if (cudaMemcpy(&post_smooth_nonzero_count,
-                       fast_post_smooth_mask_nonzero_device.get(),
-                       sizeof(unsigned int),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          throw std::runtime_error("failed to copy fast post-smooth mask nonzero count");
-        }
-        fast_summary.post_smooth_mask_nonzero_pixels = post_smooth_nonzero_count;
-      }
-      if (live_emit_always_on_enable_.get()) {
-        float always_on_floor_db = 0.0f;
-        if (cudaMemcpy(&always_on_floor_db,
-                       buffers.frontend_reference_device,
-                       sizeof(float),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          throw std::runtime_error("failed to copy always-on floor");
-        }
-        fast_summary.always_on_floor_db = always_on_floor_db;
-      }
-      if (fast_always_on_stripe_count_device) {
-        unsigned int always_on_stripe_count = 0;
-        if (cudaMemcpy(&always_on_stripe_count,
-                       fast_always_on_stripe_count_device.get(),
-                       sizeof(unsigned int),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          throw std::runtime_error("failed to copy always-on stripe count");
-        }
-        fast_summary.always_on_stripe_count = always_on_stripe_count;
-      }
-      holoscan::ops::DetectorMaskMessage mask_msg;
-      mask_msg.device_pixels = std::move(mask_buffer);
-      coherent_emitted_mask_nonzero_pixels = emitted_nonzero_count;
-      coherent_emitted_mask_metrics_meaningful = true;
-      mask_msg.width = dst_cols;
-      mask_msg.height = dst_rows;
-      mask_msg.channel = channel_number;
-      mask_msg.frame_number = frame_number;
-      HOLOSCAN_LOG_DEBUG("Mask emit audit ch={} frame={} dims={}x{} raw_nonzero={} post_smooth_nonzero={} always_on_floor_db={} always_on_stripes={} post_close_nonzero={} post_persistence_nonzero={} emitted_nonzero={} device_ptr=yes",
-                        channel_number,
-                        frame_number,
-                        dst_cols,
-                        dst_rows,
-                        fast_summary.raw_mask_nonzero_pixels,
-                        fast_summary.post_smooth_mask_nonzero_pixels,
-                        fast_summary.always_on_floor_db,
-                        fast_summary.always_on_stripe_count,
-                        fast_summary.post_emit_close_mask_nonzero_pixels,
-            fast_summary.post_emit_persistence_mask_nonzero_pixels,
-                        emitted_nonzero_count);
-      op_output.emit(mask_msg, "mask_out");
-    }
-  }
+  });
 
   meta->set("coherent_emitted_mask_metrics_meaningful", coherent_emitted_mask_metrics_meaningful);
   meta->set("coherent_emitted_mask_nonzero_pixels", coherent_emitted_mask_nonzero_pixels);
@@ -8984,6 +9072,38 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
             use_reference_backend ? pipeline_summary.final_mask_metrics_meaningful : coherent_emitted_mask_metrics_meaningful);
   meta->set("coherent_final_mask_nonzero_pixels",
             use_reference_backend ? coherent_reference_mask_nonzero_pixels : coherent_emitted_mask_nonzero_pixels);
+
+  if (timing_enabled) {
+    const auto sync_start = std::chrono::steady_clock::now();
+    auto sync_result = cudaStreamSynchronize(stream);
+    stage_ms[kTimingSyncStage] =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync_start).count();
+    if (sync_result != cudaSuccess) {
+      HOLOSCAN_LOG_ERROR("Coherent power detector timing final sync failed: {}",
+                         cudaGetErrorString(sync_result));
+    } else {
+      for (size_t stage_index = 0; stage_index < kTimingStageCount; ++stage_index) {
+        if (!stage_events.active[stage_index] || !stage_events.recorded[stage_index]) {
+          continue;
+        }
+        float elapsed_ms = 0.0f;
+        const auto elapsed_result =
+            cudaEventElapsedTime(&elapsed_ms, stage_events.start[stage_index], stage_events.stop[stage_index]);
+        if (elapsed_result != cudaSuccess) {
+          HOLOSCAN_LOG_WARN("Coherent power detector timing elapsed query failed at {}: {}",
+                             kTimingStageNames[stage_index],
+                             cudaGetErrorString(elapsed_result));
+          continue;
+        }
+        stage_ms[stage_index] = static_cast<double>(elapsed_ms);
+      }
+    }
+  }
+
+  stage_ms[kTotalStage] =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - total_start).count();
+  const double fft_to_detector_done_ms = fft_to_detector_enter_ms + stage_ms[kTotalStage];
+  meta->set("coherent_timing_total_ms", stage_ms[kTotalStage]);
 
   if (!timing_enabled) {
     return;

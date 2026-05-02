@@ -6,10 +6,6 @@
 #include <chrono>
 #include <cmath>
 
-#include <stdexcept>
-
-#include <cufft.h>
-
 using in_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
 using out_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
 
@@ -28,30 +24,6 @@ double elapsed_ms(uint64_t start_ns, uint64_t end_ns) {
         return 0.0;
     }
     return static_cast<double>(end_ns - start_ns) / 1.0e6;
-}
-
-void throw_if_cufft_error(cufftResult result, const char* operation) {
-    if (result == CUFFT_SUCCESS) {
-        return;
-    }
-
-    throw std::runtime_error(std::string("cuFFT error during ") + operation + ": code=" +
-                             std::to_string(static_cast<int>(result)));
-}
-
-__global__ void fftshift_rows_kernel(const complex* input,
-                                     complex* output,
-                                     int rows,
-                                     int cols,
-                                     int shift) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row = blockIdx.y * blockDim.y + threadIdx.y;
-    if (row >= rows || col >= cols) {
-        return;
-    }
-
-    const int src_col = (col + shift) % cols;
-    output[row * cols + col] = input[row * cols + src_col];
 }
 
 }  // namespace
@@ -137,30 +109,66 @@ void FFT::setup(OperatorSpec& spec) {
 
 void FFT::initialize() {
     holoscan::Operator::initialize();
-    make_tensor(fft_scratch_, {num_bursts.get(), burst_size.get()}, MATX_DEVICE_MEMORY);
+    make_tensor(outputs,
+                {num_channels.get(), num_bursts.get(), burst_size.get()},
+                MATX_DEVICE_MEMORY);
     ingress_stats.assign(static_cast<size_t>(std::max<uint16_t>(1, num_channels.get())), ChannelIngressStats {});
+    pending_timings.assign(static_cast<size_t>(std::max<uint16_t>(1, num_channels.get())), {});
     output_frame_count.assign(static_cast<size_t>(std::max<uint16_t>(1, num_channels.get())), 0);
+}
 
-    int fft_dims[1] = {burst_size.get()};
-    throw_if_cufft_error(cufftPlanMany(&fft_plan_,
-                                       1,
-                                       fft_dims,
-                                       fft_dims,
-                                       1,
-                                       burst_size.get(),
-                                       fft_dims,
-                                       1,
-                                       burst_size.get(),
-                                       CUFFT_C2C,
-                                       num_bursts.get()),
-                         "cufftPlanMany");
-    fft_plan_initialized_ = true;
+void FFT::harvest_completed_timings(size_t channel_index, bool wait_all) {
+    if (channel_index >= pending_timings.size() || channel_index >= ingress_stats.size()) {
+        return;
+    }
+
+    auto& queue = pending_timings[channel_index];
+    auto& stats = ingress_stats[channel_index];
+    while (!queue.empty()) {
+        auto& pending = queue.front();
+        const auto query_result = wait_all ? cudaEventSynchronize(pending.stop) : cudaEventQuery(pending.stop);
+        if (!wait_all && query_result == cudaErrorNotReady) {
+            break;
+        }
+        if (query_result != cudaSuccess) {
+            HOLOSCAN_LOG_WARN("FFT compute timing query failed on ch={} with {}",
+                              channel_index,
+                              cudaGetErrorString(query_result));
+            cudaEventDestroy(pending.start);
+            cudaEventDestroy(pending.stop);
+            queue.pop_front();
+            continue;
+        }
+
+        float elapsed_ms_value = 0.0f;
+        const auto elapsed_result = cudaEventElapsedTime(&elapsed_ms_value, pending.start, pending.stop);
+        if (elapsed_result == cudaSuccess) {
+            const double fft_compute_ms = static_cast<double>(elapsed_ms_value);
+            stats.timed_frames++;
+            stats.window_timed_frames++;
+            stats.total_fft_compute_ms += fft_compute_ms;
+            stats.window_total_fft_compute_ms += fft_compute_ms;
+            stats.max_fft_compute_ms = std::max(stats.max_fft_compute_ms, fft_compute_ms);
+            stats.window_max_fft_compute_ms = std::max(stats.window_max_fft_compute_ms, fft_compute_ms);
+        } else {
+            HOLOSCAN_LOG_WARN("FFT compute timing elapsed query failed on ch={} with {}",
+                              channel_index,
+                              cudaGetErrorString(elapsed_result));
+        }
+
+        cudaEventDestroy(pending.start);
+        cudaEventDestroy(pending.stop);
+        queue.pop_front();
+    }
 }
 
 void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) {
     auto input = op_input.receive<in_t>("in").value();
     auto meta = metadata();
     auto channel_num = meta->get<uint16_t>("channel_number", 0);
+    if (channel_num < pending_timings.size()) {
+        harvest_completed_timings(channel_num, false);
+    }
     const uint64_t fft_enter_ns = steady_time_ns();
     if (channel_num < ingress_stats.size()) {
         const uint64_t chdr_emit_ns = meta->get<uint64_t>("chdr_emit_ts_ns", 0);
@@ -172,28 +180,56 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
         stats.window_total_chdr_to_fft_ms += chdr_to_fft_ms;
         stats.max_chdr_to_fft_ms = std::max(stats.max_chdr_to_fft_ms, chdr_to_fft_ms);
         stats.window_max_chdr_to_fft_ms = std::max(stats.window_max_chdr_to_fft_ms, chdr_to_fft_ms);
+        if (stats.last_chdr_emit_ts_ns != 0 && chdr_emit_ns > stats.last_chdr_emit_ts_ns) {
+            const double chdr_emit_gap_ms = elapsed_ms(stats.last_chdr_emit_ts_ns, chdr_emit_ns);
+            stats.gap_samples++;
+            stats.window_gap_samples++;
+            stats.total_chdr_emit_gap_ms += chdr_emit_gap_ms;
+            stats.window_total_chdr_emit_gap_ms += chdr_emit_gap_ms;
+            stats.max_chdr_emit_gap_ms = std::max(stats.max_chdr_emit_gap_ms, chdr_emit_gap_ms);
+            stats.window_max_chdr_emit_gap_ms = std::max(stats.window_max_chdr_emit_gap_ms, chdr_emit_gap_ms);
+        }
+        if (stats.last_fft_enter_ts_ns != 0 && fft_enter_ns > stats.last_fft_enter_ts_ns) {
+            const double fft_enter_gap_ms = elapsed_ms(stats.last_fft_enter_ts_ns, fft_enter_ns);
+            stats.total_fft_enter_gap_ms += fft_enter_gap_ms;
+            stats.window_total_fft_enter_gap_ms += fft_enter_gap_ms;
+            stats.max_fft_enter_gap_ms = std::max(stats.max_fft_enter_gap_ms, fft_enter_gap_ms);
+            stats.window_max_fft_enter_gap_ms = std::max(stats.window_max_fft_enter_gap_ms, fft_enter_gap_ms);
+        }
+        stats.last_chdr_emit_ts_ns = chdr_emit_ns;
+        stats.last_fft_enter_ts_ns = fft_enter_ns;
     }
     meta->set("fft_enter_ts_ns", fft_enter_ns);
-    tensor_t<complex, 2> out;
-    make_tensor(out, {num_bursts.get(), burst_size.get()}, MATX_DEVICE_MEMORY);
+        auto out = slice<2>(outputs, {static_cast<index_t>(channel_num), 0, 0},
+            {matxDropDim, matxEnd, matxEnd});
 
-    auto stream = std::get<1>(input);
-    throw_if_cufft_error(cufftSetStream(fft_plan_, stream), "cufftSetStream");
-    throw_if_cufft_error(
-        cufftExecC2C(fft_plan_,
-                     reinterpret_cast<cufftComplex*>(std::get<0>(input).Data()),
-                     reinterpret_cast<cufftComplex*>(fft_scratch_.Data()),
-                     CUFFT_FORWARD),
-        "cufftExecC2C");
+    cudaEvent_t fft_start_event = nullptr;
+    cudaEvent_t fft_stop_event = nullptr;
+    bool timing_events_recorded = false;
+    if (channel_num < pending_timings.size()) {
+        if (cudaEventCreate(&fft_start_event) == cudaSuccess && cudaEventCreate(&fft_stop_event) == cudaSuccess) {
+            if (cudaEventRecord(fft_start_event, std::get<1>(input)) == cudaSuccess) {
+                timing_events_recorded = true;
+            }
+        }
+        if (!timing_events_recorded) {
+            if (fft_start_event != nullptr) cudaEventDestroy(fft_start_event);
+            if (fft_stop_event != nullptr) cudaEventDestroy(fft_stop_event);
+            fft_start_event = nullptr;
+            fft_stop_event = nullptr;
+        }
+    }
 
-    const dim3 block(32, 8);
-    const dim3 grid((burst_size.get() + block.x - 1) / block.x,
-                    (num_bursts.get() + block.y - 1) / block.y);
-    fftshift_rows_kernel<<<grid, block, 0, stream>>>(fft_scratch_.Data(),
-                                                     out.Data(),
-                                                     num_bursts.get(),
-                                                     burst_size.get(),
-                                                     burst_size.get() / 2);
+    (out = fftshift1D(fft(std::get<0>(input)))).run(std::get<1>(input));
+
+    if (timing_events_recorded) {
+        if (cudaEventRecord(fft_stop_event, std::get<1>(input)) == cudaSuccess) {
+            pending_timings[channel_num].push_back(PendingTiming {fft_start_event, fft_stop_event});
+        } else {
+            cudaEventDestroy(fft_start_event);
+            cudaEventDestroy(fft_stop_event);
+        }
+    }
 
     const int configured_emit_stride = std::max(1, emit_stride.get());
     uint64_t frame_number = 0;
@@ -212,17 +248,36 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
         const uint64_t summary_every = static_cast<uint64_t>(std::max(1, timing_summary_every_n.get()));
         if (stats.window_emitted_frames >= summary_every) {
             const double window_samples = static_cast<double>(std::max<uint64_t>(1, stats.window_samples));
+            const double window_timed_frames = static_cast<double>(std::max<uint64_t>(1, stats.window_timed_frames));
+            const double window_gap_samples = static_cast<double>(std::max<uint64_t>(1, stats.window_gap_samples));
             HOLOSCAN_LOG_INFO(
-                "FFT ingress live ch={} window_samples={} window_emitted={} mean_chdr_to_fft_ms={:.3f} max_chdr_to_fft_ms={:.3f}",
+                "FFT ingress live op={} ch={} window_samples={} window_emitted={} window_timed={} window_gaps={} mean_chdr_to_fft_ms={:.3f} max_chdr_to_fft_ms={:.3f} mean_chdr_emit_gap_ms={:.3f} max_chdr_emit_gap_ms={:.3f} mean_fft_enter_gap_ms={:.3f} max_fft_enter_gap_ms={:.3f} mean_fft_compute_ms={:.3f} max_fft_compute_ms={:.3f}",
+                this->name(),
                 channel_num,
                 stats.window_samples,
                 stats.window_emitted_frames,
+                stats.window_timed_frames,
+                stats.window_gap_samples,
                 stats.window_total_chdr_to_fft_ms / window_samples,
-                stats.window_max_chdr_to_fft_ms);
+                stats.window_max_chdr_to_fft_ms,
+                stats.window_total_chdr_emit_gap_ms / window_gap_samples,
+                stats.window_max_chdr_emit_gap_ms,
+                stats.window_total_fft_enter_gap_ms / window_gap_samples,
+                stats.window_max_fft_enter_gap_ms,
+                stats.window_total_fft_compute_ms / window_timed_frames,
+                stats.window_max_fft_compute_ms);
             stats.window_samples = 0;
             stats.window_emitted_frames = 0;
+            stats.window_timed_frames = 0;
+            stats.window_gap_samples = 0;
             stats.window_total_chdr_to_fft_ms = 0.0;
             stats.window_max_chdr_to_fft_ms = 0.0;
+            stats.window_total_chdr_emit_gap_ms = 0.0;
+            stats.window_max_chdr_emit_gap_ms = 0.0;
+            stats.window_total_fft_enter_gap_ms = 0.0;
+            stats.window_max_fft_enter_gap_ms = 0.0;
+            stats.window_total_fft_compute_ms = 0.0;
+            stats.window_max_fft_compute_ms = 0.0;
         }
     }
 
@@ -288,20 +343,25 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
 }
 
 void FFT::stop() {
-    if (fft_plan_initialized_) {
-        cufftDestroy(fft_plan_);
-        fft_plan_ = 0;
-        fft_plan_initialized_ = false;
-    }
     for (size_t channel_index = 0; channel_index < ingress_stats.size(); ++channel_index) {
+        harvest_completed_timings(channel_index, true);
         const auto& stats = ingress_stats[channel_index];
         HOLOSCAN_LOG_INFO(
-            "FFT ingress latency ch={} samples={} emitted_frames={} mean_chdr_to_fft_ms={:.3f} max_chdr_to_fft_ms={:.3f}",
+            "FFT ingress latency op={} ch={} samples={} emitted_frames={} timed_frames={} gap_samples={} mean_chdr_to_fft_ms={:.3f} max_chdr_to_fft_ms={:.3f} mean_chdr_emit_gap_ms={:.3f} max_chdr_emit_gap_ms={:.3f} mean_fft_enter_gap_ms={:.3f} max_fft_enter_gap_ms={:.3f} mean_fft_compute_ms={:.3f} max_fft_compute_ms={:.3f}",
+            this->name(),
             channel_index,
             stats.samples,
             stats.emitted_frames,
+            stats.timed_frames,
+            stats.gap_samples,
             stats.samples == 0 ? 0.0 : stats.total_chdr_to_fft_ms / static_cast<double>(stats.samples),
-            stats.max_chdr_to_fft_ms);
+            stats.max_chdr_to_fft_ms,
+            stats.gap_samples == 0 ? 0.0 : stats.total_chdr_emit_gap_ms / static_cast<double>(stats.gap_samples),
+            stats.max_chdr_emit_gap_ms,
+            stats.gap_samples == 0 ? 0.0 : stats.total_fft_enter_gap_ms / static_cast<double>(stats.gap_samples),
+            stats.max_fft_enter_gap_ms,
+            stats.timed_frames == 0 ? 0.0 : stats.total_fft_compute_ms / static_cast<double>(stats.timed_frames),
+            stats.max_fft_compute_ms);
     }
     holoscan::Operator::stop();
 }

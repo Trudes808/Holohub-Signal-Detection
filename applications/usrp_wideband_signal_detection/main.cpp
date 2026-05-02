@@ -52,9 +52,6 @@ void request_pipeline_shutdown() {
 
 void request_graceful_shutdown(gxf_context_t app_context) {
   static_cast<void>(app_context);
-  std::fprintf(stderr, "[copilot-probe] request_graceful_shutdown()\n");
-  std::fflush(stderr);
-  HOLOSCAN_LOG_INFO("request_graceful_shutdown()");
   holoscan::advanced_network::adv_net_request_shutdown();
   request_pipeline_shutdown();
   request_visualization_shutdown();
@@ -363,28 +360,6 @@ class DropOp: public holoscan::Operator {
   }
 };
 
-class LoggingHolovizOp : public holoscan::ops::HolovizOp {
- public:
-      using holoscan::ops::HolovizOp::HolovizOp;
-
-  void initialize() override {
-    std::fprintf(stderr, "[copilot-probe] LoggingHolovizOp::initialize()\n");
-    std::fflush(stderr);
-    HOLOSCAN_LOG_INFO("LoggingHolovizOp::initialize()");
-    holoscan::ops::HolovizOp::initialize();
-  }
-
-  void stop() override {
-    std::fprintf(stderr, "[copilot-probe] LoggingHolovizOp::stop() begin\n");
-    std::fflush(stderr);
-    HOLOSCAN_LOG_INFO("LoggingHolovizOp::stop() begin");
-    holoscan::ops::HolovizOp::stop();
-    std::fprintf(stderr, "[copilot-probe] LoggingHolovizOp::stop() complete\n");
-    std::fflush(stderr);
-    HOLOSCAN_LOG_INFO("LoggingHolovizOp::stop() complete");
-  }
-};
-
 class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
  public:
   void layer_callback(const std::vector<holoscan::gxf::Entity>&) {
@@ -402,7 +377,6 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       exit(1);
     }
     HOLOSCAN_LOG_INFO("Configured the Advanced Network manager");
-    reserve_adv_network_cores_for_process_threads(adv_net_config);
 
     auto pipeline_shutdown_term = make_condition<BooleanCondition>("pipeline_shutdown_term", true);
     g_pipeline_shutdown_term = pipeline_shutdown_term;
@@ -452,8 +426,8 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         configured_dino_emit_stride > 1;
     const int visual_render_stride =
       enable_visualization ? std::max(1, from_config("visualization.renderer.render_every_n_frames").as<int>()) : 1;
-    const int visual_emit_stride = 1;
-    const int visual_mask_emit_stride = 1;
+    const int visual_emit_stride = visual_render_stride;
+    const int visual_mask_emit_stride = visual_render_stride;
 
     std::vector<std::shared_ptr<holoscan::Operator>> fftOps;
     fftOps.reserve(static_cast<size_t>(pipeline_channels));
@@ -618,7 +592,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           std::string("visualMaskStoreOpCh") + std::to_string(channel_index)));
       }
         
-      holovizOp = make_operator<LoggingHolovizOp>(
+      holovizOp = make_operator<holoscan::ops::HolovizOp>(
         "holovizOp",
         Arg("window_close_scheduling_term") = visualization_shutdown_term,
         Arg("enable_render_buffer_output") = false,
@@ -817,12 +791,6 @@ int main(int argc, char** argv) {
       }
 
       interrupt_count += 1;
-      std::fprintf(stderr,
-                   "[copilot-probe] sigwait received signal=%d count=%d\n",
-                   signal_number,
-                   interrupt_count);
-      std::fflush(stderr);
-      HOLOSCAN_LOG_INFO("sigwait received signal={} count={}", signal_number, interrupt_count);
       if (interrupt_count == 1) {
         request_graceful_shutdown(app_context);
         continue;

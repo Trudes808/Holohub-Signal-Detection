@@ -46,8 +46,8 @@ advanced_network:
         buf_size: 4096
 
     interfaces:
-      - name: sdr_data
-        address: 0000:a2:00.1
+      - name: sdr_data0
+        address: 0000:a2:00.0
         rx:
           flow_isolation: true
           queues:
@@ -69,10 +69,12 @@ advanced_network:
                 id: 0
               match:
                 udp_src: 49153
-                udp_dst: 1234
+                # Two-port configs in this repo record that, on this host, traffic for
+                # the .0 Mellanox function arrives on UDP dst 1235 rather than 1234.
+                udp_dst: 1235
 
 chdr_converter:
-  interface_name: sdr_data
+  interface_name: sdr_data0
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
   num_ffts_per_batch: 512
@@ -89,14 +91,9 @@ fft:
   averaging_type: 1
   window_time: 0
   window_type: 0
-  # FFT length in bins. For this path it should stay aligned with burst_size.
   transform_points: 20480
-  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
   window_points: 20480
-  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
   resolution: 24414
-  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
-  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
   span: 500000000
   weighting_factor: 0
   f1_index: -10240
@@ -117,16 +114,16 @@ visualization:
     display_time_rows: 2048
     display_freq_bins: 20480
     history_memory_budget_mb: 1024
-    rows_per_frame: 16
+    rows_per_frame: 2
     mask_frame_offset: 0
-    render_every_n_frames: 4
+    render_every_n_frames: 1
     timing_summary_enable: true
     timing_summary_every_n: 128
     channel_filter: 0
     tensor_name: "spectrogram"
     blue_limit: 0.10
     red_limit: 0.92
-    overlay_alpha: 0.7 #0.38
+    overlay_alpha: 0.7
     center_frequency_hz: 0.0
     fft_size: 20480
     dino_chunk_rows: 256
@@ -208,10 +205,8 @@ dinov3_signal_detector:
 
 coherent_power_signal_detector:
   num_channels: 1
-  input_height: 250 #256
-  input_width: 20480 #512
-  # Full-rate aggressive profile matching the active single-channel fast path,
-  # with artifact capture enabled for notebook validation.
+  input_height: 250
+  input_width: 20480
   fast_power_floor_db: 0.5
   fast_power_span_db: 3.0
   fast_score_threshold: 0.4
@@ -223,11 +218,11 @@ coherent_power_signal_detector:
   emit_stride: 1
   log_detections: true
   fast_performance: true
-  save_performance_path_artifacts: true
+  save_performance_path_artifacts: false
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0
-  output_dir: "/workspace/coherent_power_snapshots"
+  output_dir: "/workspace/coherent_power_masks"
   chunk_bandwidth_hz: 37500000.0
   chunk_overlap_hz: 2000000.0
   uncalibrated_chunk_fraction: 0.40

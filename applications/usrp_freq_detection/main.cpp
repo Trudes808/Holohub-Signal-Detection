@@ -117,6 +117,9 @@ class UsrpFreqDetectPipeline : public holoscan::Application {
     void compose() override {
         using namespace holoscan;
 
+        const bool enable_spectrogram = from_config("pipeline.enable_spectrogram").as<bool>();
+        const bool enable_logger = from_config("pipeline.enable_logger").as<bool>();
+
         auto adv_net_config = from_config("advanced_network").as<NetworkConfig>();
         if (adv_net_init(adv_net_config) != Status::SUCCESS) {
             HOLOSCAN_LOG_ERROR("Failed to configure the Advanced Network manager");
@@ -130,35 +133,45 @@ class UsrpFreqDetectPipeline : public holoscan::Application {
         const int pipeline_channels = std::max(1, from_config("chdr_converter.num_channels").as<int>());
 
         std::vector<std::shared_ptr<holoscan::Operator>> fftOps;
-        std::vector<std::shared_ptr<holoscan::Operator>> spectrogramOps;
-        std::vector<std::shared_ptr<holoscan::Operator>> logOps;
+        std::vector<std::shared_ptr<holoscan::Operator>> spectrogramOps(static_cast<size_t>(pipeline_channels));
+        std::vector<std::shared_ptr<holoscan::Operator>> logOps(static_cast<size_t>(pipeline_channels));
         fftOps.reserve(static_cast<size_t>(pipeline_channels));
-        spectrogramOps.reserve(static_cast<size_t>(pipeline_channels));
-        logOps.reserve(static_cast<size_t>(pipeline_channels));
 
         for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
             fftOps.push_back(make_operator<ops::FFT>(
                 std::string("fftOpCh") + std::to_string(channel_index),
                 from_config("fft")));
-            spectrogramOps.push_back(make_operator<ops::Spectrogram>(
-                std::string("spectrogramOpCh") + std::to_string(channel_index),
-                from_config("spectrogram")));
-            logOps.push_back(make_operator<LogOp>(
-                std::string("logOpCh") + std::to_string(channel_index),
-                from_config("logger"),
-                make_condition<CountCondition>(from_config("num_runs").as<int64_t>())));
+            if (enable_spectrogram) {
+                spectrogramOps[static_cast<size_t>(channel_index)] = make_operator<ops::Spectrogram>(
+                    std::string("spectrogramOpCh") + std::to_string(channel_index),
+                    from_config("spectrogram"));
+            }
+            if (enable_logger) {
+                logOps[static_cast<size_t>(channel_index)] = make_operator<LogOp>(
+                    std::string("logOpCh") + std::to_string(channel_index),
+                    from_config("logger"),
+                    make_condition<CountCondition>(from_config("num_runs").as<int64_t>()));
+            }
         }
 
         add_operator(chdrConverterOp);
         for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
             add_operator(fftOps[static_cast<size_t>(channel_index)]);
-            add_operator(spectrogramOps[static_cast<size_t>(channel_index)]);
-            add_operator(logOps[static_cast<size_t>(channel_index)]);
+            if (enable_spectrogram) {
+                add_operator(spectrogramOps[static_cast<size_t>(channel_index)]);
+            }
+            if (enable_logger) {
+                add_operator(logOps[static_cast<size_t>(channel_index)]);
+            }
 
             const char* chdr_port = channel_index == 0 ? "out0" : "out1";
             add_flow(chdrConverterOp, fftOps[static_cast<size_t>(channel_index)], {{chdr_port, "in"}});
-            add_flow(fftOps[static_cast<size_t>(channel_index)], spectrogramOps[static_cast<size_t>(channel_index)]);
-            add_flow(fftOps[static_cast<size_t>(channel_index)], logOps[static_cast<size_t>(channel_index)]);
+            if (enable_spectrogram) {
+                add_flow(fftOps[static_cast<size_t>(channel_index)], spectrogramOps[static_cast<size_t>(channel_index)]);
+            }
+            if (enable_logger) {
+                add_flow(fftOps[static_cast<size_t>(channel_index)], logOps[static_cast<size_t>(channel_index)]);
+            }
         }
     }
 };

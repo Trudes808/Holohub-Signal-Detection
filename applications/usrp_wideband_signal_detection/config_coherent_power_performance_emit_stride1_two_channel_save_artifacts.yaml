@@ -61,27 +61,19 @@ advanced_network:
         buf_size: 4096
 
     interfaces:
-      - name: sdr_data
-        address: 0000:a2:00.1
+      - name: sdr_data0
+        address: 0000:a2:00.0
         rx:
           flow_isolation: true
           queues:
             - name: "Channel 1 data"
               id: 0
               cpu_core: 10
-              batch_size: 2048
+              batch_size: 10240
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
                 - "CH1_Data_RX_GPU"
-            - name: "Channel 2 data"
-              id: 1
-              cpu_core: 11
-              batch_size: 2048
-              memory_regions:
-                - "Headers_RX_CPU"
-                - "CH2_CHDR_Headers_RX_CPU"
-                - "CH2_Data_RX_GPU"
 
           flows:
             - name: "Channel 1 data packets"
@@ -90,20 +82,37 @@ advanced_network:
                 type: queue
                 id: 0
               match:
-                udp_src: 49153
-                udp_dst: 1234
+                udp_dst: 1235
+      - name: sdr_data1
+        address: 0000:a2:00.1
+        rx:
+          flow_isolation: true
+          queues:
+            - name: "Channel 2 data"
+              id: 0
+              cpu_core: 11
+              batch_size: 10240
+              memory_regions:
+                - "Headers_RX_CPU"
+                - "CH2_CHDR_Headers_RX_CPU"
+                - "CH2_Data_RX_GPU"
+
+          flows:
             - name: "Channel 2 data packets"
               id: 1
               action:
                 type: queue
-                id: 1
+                id: 0
               match:
-                udp_src: 49153
-                udp_dst: 1235
+                udp_dst: 1234
 
 chdr_converter:
-  interface_name: sdr_data
+  # Observed dual-link routing on this host places UDP dst 1234 on sdr_data1
+  # and UDP dst 1235 on sdr_data0, so keep logical channel 0 aligned with 1234
+  # by reversing the fixed interface-to-channel mapping order here.
+  interface_names: "sdr_data1,sdr_data0"
   channel_center_frequencies_hz: "2400e6,1000e6"
+  channel_sample_rates_hz: "500e6,500e6"
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
   num_ffts_per_batch: 512
@@ -139,7 +148,7 @@ logger:
   log_interval: 5
 
 visualization:
-  enable: true
+  enable: false
   renderer:
     num_channels: 2
     history_frames: 1

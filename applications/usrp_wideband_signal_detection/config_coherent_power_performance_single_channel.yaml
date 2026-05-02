@@ -28,21 +28,21 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144
         buf_size: 42
       - name: "CH1_CHDR_Headers_RX_CPU"
         kind: "huge"
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144
         buf_size: 64
       - name: "CH1_Data_RX_GPU"
         kind: "device"
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144
         buf_size: 4096
 
     interfaces:
@@ -54,7 +54,8 @@ advanced_network:
             - name: "Channel 1 data"
               id: 0
               cpu_core: 10
-              batch_size: 1024
+              batch_size: 10240
+              timeout_us: 25000
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
@@ -116,9 +117,9 @@ visualization:
     display_time_rows: 2048
     display_freq_bins: 20480
     history_memory_budget_mb: 1024
-    rows_per_frame: 16
+    rows_per_frame: 2
     mask_frame_offset: 0
-    render_every_n_frames: 4
+    render_every_n_frames: 1
     timing_summary_enable: true
     timing_summary_every_n: 128
     channel_filter: 0
@@ -255,6 +256,6 @@ coherent_power_signal_detector:
   grouping_min_density: 0.0
   grouping_time_continuity_ratio: 0.85
   timing_summary_enable: true
-  timing_summary_every_n: 512
-  timing_summary_window: 512
+  timing_summary_every_n: 128
+  timing_summary_window: 128
 

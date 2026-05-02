@@ -3,6 +3,10 @@
 ---
 num_runs: -1  # Number of iterations the application will run, -1 is infinite
 
+pipeline:
+  enable_spectrogram: true
+  enable_logger: true
+
 scheduler:
   worker_thread_number: 4
   stop_on_deadlock: true

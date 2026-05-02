@@ -54,8 +54,10 @@ advanced_network:
             - name: "Channel 1 data"
               id: 0
               cpu_core: 10
-              batch_size: 10240
-              timeout_us: 25000
+              # Diagnostic profile: release smaller RX bursts to userspace more often
+              # so we can see whether coarse DPDK batching is amplifying NIC misses.
+              batch_size: 2048
+              timeout_us: 5000
               memory_regions:
                 - "Headers_RX_CPU"
                 - "CH1_CHDR_Headers_RX_CPU"
@@ -80,6 +82,10 @@ chdr_converter:
   num_channels: 1
   log_packets: false
   log_data: false
+  # The emitted FFT batch still represents ~20.97 ms of RF data at 500 MSps.
+  # Tighten the partial-batch flush timeout so ingress loss does not add 250 ms
+  # of artificial pre-FFT latency before we see the damage downstream.
+  partial_batch_drop_timeout_ms: 25
 
 fft:
   burst_size: 20480
@@ -89,14 +95,9 @@ fft:
   averaging_type: 1
   window_time: 0
   window_type: 0
-  # FFT length in bins. For this path it should stay aligned with burst_size.
   transform_points: 20480
-  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
   window_points: 20480
-  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
   resolution: 24414
-  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
-  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
   span: 500000000
   weighting_factor: 0
   f1_index: -10240
@@ -117,16 +118,16 @@ visualization:
     display_time_rows: 2048
     display_freq_bins: 20480
     history_memory_budget_mb: 1024
-    rows_per_frame: 16
+    rows_per_frame: 2
     mask_frame_offset: 0
-    render_every_n_frames: 4
+    render_every_n_frames: 1
     timing_summary_enable: true
     timing_summary_every_n: 128
     channel_filter: 0
     tensor_name: "spectrogram"
     blue_limit: 0.10
     red_limit: 0.92
-    overlay_alpha: 0.7 #0.38
+    overlay_alpha: 0.7
     center_frequency_hz: 0.0
     fft_size: 20480
     dino_chunk_rows: 256
@@ -208,10 +209,8 @@ dinov3_signal_detector:
 
 coherent_power_signal_detector:
   num_channels: 1
-  input_height: 250 #256
-  input_width: 20480 #512
-  # Full-rate aggressive profile matching the active single-channel fast path,
-  # with artifact capture enabled for notebook validation.
+  input_height: 250
+  input_width: 20480
   fast_power_floor_db: 0.5
   fast_power_span_db: 3.0
   fast_score_threshold: 0.4
@@ -223,11 +222,11 @@ coherent_power_signal_detector:
   emit_stride: 1
   log_detections: true
   fast_performance: true
-  save_performance_path_artifacts: true
+  save_performance_path_artifacts: false
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0
-  output_dir: "/workspace/coherent_power_snapshots"
+  output_dir: "/workspace/coherent_power_masks"
   chunk_bandwidth_hz: 37500000.0
   chunk_overlap_hz: 2000000.0
   uncalibrated_chunk_fraction: 0.40

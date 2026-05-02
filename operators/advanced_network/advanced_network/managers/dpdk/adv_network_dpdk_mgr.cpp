@@ -1334,14 +1334,14 @@ struct rte_flow* DpdkMgr::add_flow(int port, const FlowConfig& cfg) {
     HOLOSCAN_LOG_INFO("Adding IPv4 length match for {}", cfg.match_.ipv4_len_);
   }
 
-  if (cfg.match_.udp_src_ > 0) {
+  if (cfg.match_.udp_src_ > 0 || cfg.match_.udp_dst_ > 0) {
     udp_spec.hdr.src_port = htons(cfg.match_.udp_src_);
     udp_spec.hdr.dst_port = htons(cfg.match_.udp_dst_);
     udp_spec.hdr.dgram_len = 0;
     udp_spec.hdr.dgram_cksum = 0;
 
-    udp_mask.hdr.src_port = 0xffff;
-    udp_mask.hdr.dst_port = 0xffff;
+    udp_mask.hdr.src_port = (cfg.match_.udp_src_ > 0) ? 0xffff : 0;
+    udp_mask.hdr.dst_port = (cfg.match_.udp_dst_ > 0) ? 0xffff : 0;
     udp_mask.hdr.dgram_len = 0;
     udp_mask.hdr.dgram_cksum = 0;
 
@@ -1351,8 +1351,14 @@ struct rte_flow* DpdkMgr::add_flow(int port, const FlowConfig& cfg) {
     udp_item.last = NULL;
 
     pattern[2] = udp_item;
-    HOLOSCAN_LOG_INFO("Adding UDP port match for src/dst {}/{}",
-      cfg.match_.udp_src_, cfg.match_.udp_dst_);
+    if (cfg.match_.udp_src_ > 0 && cfg.match_.udp_dst_ > 0) {
+      HOLOSCAN_LOG_INFO("Adding UDP port match for src/dst {}/{}",
+        cfg.match_.udp_src_, cfg.match_.udp_dst_);
+    } else if (cfg.match_.udp_dst_ > 0) {
+      HOLOSCAN_LOG_INFO("Adding UDP port match for dst {}", cfg.match_.udp_dst_);
+    } else {
+      HOLOSCAN_LOG_INFO("Adding UDP port match for src {}", cfg.match_.udp_src_);
+    }
   }
 
   attr.ingress = 1;

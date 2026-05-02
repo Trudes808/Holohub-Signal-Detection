@@ -72,6 +72,7 @@ constexpr float kLiveMaskGroupingMinDensity = 0.06f;
 __global__ void reduce_binary_mask_to_alpha_kernel(const uint8_t* input,
                                                    int src_rows,
                                                    int src_cols,
+                                                   bool transpose_input,
                                                    uint8_t* output,
                                                    int dst_rows,
                                                    int dst_cols) {
@@ -81,16 +82,20 @@ __global__ void reduce_binary_mask_to_alpha_kernel(const uint8_t* input,
     return;
   }
 
-  const int row_start = (out_row * src_rows) / dst_rows;
-  const int row_end = max(row_start + 1, ((out_row + 1) * src_rows) / dst_rows);
-  const int col_start = (out_col * src_cols) / dst_cols;
-  const int col_end = max(col_start + 1, ((out_col + 1) * src_cols) / dst_cols);
+  const int canonical_rows = transpose_input ? src_cols : src_rows;
+  const int canonical_cols = transpose_input ? src_rows : src_cols;
+  const int row_start = (out_row * canonical_rows) / dst_rows;
+  const int row_end = max(row_start + 1, ((out_row + 1) * canonical_rows) / dst_rows);
+  const int col_start = (out_col * canonical_cols) / dst_cols;
+  const int col_end = max(col_start + 1, ((out_col + 1) * canonical_cols) / dst_cols);
 
   int active = 0;
   int count = 0;
-  for (int src_row = row_start; src_row < row_end; ++src_row) {
-    const size_t row_offset = static_cast<size_t>(src_row) * static_cast<size_t>(src_cols);
-    for (int src_col = col_start; src_col < col_end; ++src_col) {
+  for (int canonical_row = row_start; canonical_row < row_end; ++canonical_row) {
+    for (int canonical_col = col_start; canonical_col < col_end; ++canonical_col) {
+      const int src_row = transpose_input ? canonical_col : canonical_row;
+      const int src_col = transpose_input ? canonical_row : canonical_col;
+      const size_t row_offset = static_cast<size_t>(src_row) * static_cast<size_t>(src_cols);
       active += input[row_offset + static_cast<size_t>(src_col)] > 0 ? 1 : 0;
       ++count;
     }
@@ -1468,6 +1473,7 @@ void ensure_preview_mailbox_capacity(size_t channel_count) {
 std::vector<uint8_t> reduce_mask_to_history_rows_gpu(const uint8_t* device_input,
                                                      int src_height,
                                                      int src_width,
+                                                     bool transpose_input,
                                                      int dst_width,
                                                      int dst_rows,
                                                      cudaStream_t stream,
@@ -1767,9 +1773,16 @@ void MaskPreviewOp::compute(InputContext& op_input,
   reduced_mask.width = preview_width;
   reduced_mask.height = preview_height;
   if (mask.device_pixels) {
+    if (mask.ready_event && mask.ready_event->event != nullptr) {
+      const auto wait_result = cudaStreamWaitEvent(reduce_stream_, mask.ready_event->event, 0);
+      if (wait_result != cudaSuccess) {
+        throw std::runtime_error(std::string("Failed to wait on detector mask event: ") + cudaGetErrorString(wait_result));
+      }
+    }
     reduced_mask.pixels = reduce_mask_to_history_rows_gpu(mask.device_pixels.get(),
                                                           mask.height,
                                                           mask.width,
+                                                          mask.transpose_input,
                                                           preview_width,
                                                           preview_height,
                                                           reduce_stream_,
@@ -1861,6 +1874,7 @@ void MaskPreviewStoreOp::compute(InputContext& op_input,
 std::vector<uint8_t> reduce_mask_to_history_rows_gpu(const uint8_t* device_input,
                                                      int src_height,
                                                      int src_width,
+                                                     bool transpose_input,
                                                      int dst_width,
                                                      int dst_rows,
                                                      cudaStream_t stream,
@@ -1881,6 +1895,7 @@ std::vector<uint8_t> reduce_mask_to_history_rows_gpu(const uint8_t* device_input
   reduce_binary_mask_to_alpha_kernel<<<grid, block, 0, stream>>>(device_input,
                                                                   src_height,
                                                                   src_width,
+                                                                  transpose_input,
                                                                   device_output,
                                                                   dst_rows,
                                                                   dst_width);
@@ -2682,7 +2697,8 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
             continue;
           }
           state.latest_mask = {late_mask.width, late_mask.height, late_mask.pixels};
-          state.latest_mask_frame_number = static_cast<int64_t>(late_mask.frame_number);
+          state.latest_mask_frame_number = static_cast<int64_t>(late_mask.frame_number) +
+                                           static_cast<int64_t>(mask_frame_offset_.get());
           const bool patched_late_mask = patch_history_mask_for_frame(
               state,
               static_cast<int64_t>(late_mask.frame_number) + static_cast<int64_t>(mask_frame_offset_.get()),
@@ -2734,7 +2750,8 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
           current_frame_mask->channel == spectrogram.channel &&
             !current_frame_mask->pixels.empty()) {
           state.latest_mask = {current_frame_mask->width, current_frame_mask->height, current_frame_mask->pixels};
-          state.latest_mask_frame_number = static_cast<int64_t>(current_frame_mask->frame_number);
+          state.latest_mask_frame_number = static_cast<int64_t>(current_frame_mask->frame_number) +
+                                           static_cast<int64_t>(mask_frame_offset_.get());
           const bool patched_current_mask = patch_history_mask_for_frame(
               state,
               static_cast<int64_t>(current_frame_mask->frame_number) + static_cast<int64_t>(mask_frame_offset_.get()),
@@ -3771,7 +3788,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                            history_rows,
                                            channel.history_valid_rows,
                                            channel.history_write_row);
-                } else if (!channel.latest_mask.pixels.empty() && channel.latest_mask.width > 0 && channel.latest_mask.height > 0) {
+                } else if (!channel.latest_mask.pixels.empty() && channel.latest_mask.width > 0 && channel.latest_mask.height > 0 &&
+                           channel.latest_mask_frame_number == channel.info.frame_number) {
                   blit_mask_frame_to_canvas(canvas,
                                             output_width,
                                             output_height,

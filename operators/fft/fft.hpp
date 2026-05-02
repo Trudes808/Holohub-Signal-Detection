@@ -5,9 +5,10 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
+#include <cuda_runtime.h>
 #include <vector>
 
-#include <cufft.h>
 #include <matx.h>
 
 #include "holoscan/holoscan.hpp"
@@ -34,17 +35,39 @@ class FFT : public Operator {
          uint64_t emitted_frames = 0;
          uint64_t window_samples = 0;
          uint64_t window_emitted_frames = 0;
+         uint64_t timed_frames = 0;
+         uint64_t window_timed_frames = 0;
+         uint64_t gap_samples = 0;
+         uint64_t window_gap_samples = 0;
+         uint64_t last_chdr_emit_ts_ns = 0;
+         uint64_t last_fft_enter_ts_ns = 0;
          double total_chdr_to_fft_ms = 0.0;
          double max_chdr_to_fft_ms = 0.0;
          double window_total_chdr_to_fft_ms = 0.0;
          double window_max_chdr_to_fft_ms = 0.0;
+         double total_chdr_emit_gap_ms = 0.0;
+         double max_chdr_emit_gap_ms = 0.0;
+         double window_total_chdr_emit_gap_ms = 0.0;
+         double window_max_chdr_emit_gap_ms = 0.0;
+         double total_fft_enter_gap_ms = 0.0;
+         double max_fft_enter_gap_ms = 0.0;
+         double window_total_fft_enter_gap_ms = 0.0;
+         double window_max_fft_enter_gap_ms = 0.0;
+         double total_fft_compute_ms = 0.0;
+         double max_fft_compute_ms = 0.0;
+         double window_total_fft_compute_ms = 0.0;
+         double window_max_fft_compute_ms = 0.0;
      };
 
-    tensor_t<complex, 2> fft_scratch_;
-     std::vector<ChannelIngressStats> ingress_stats;
-     std::vector<uint64_t> output_frame_count;
-    cufftHandle fft_plan_ = 0;
-    bool fft_plan_initialized_ = false;
+     struct PendingTiming {
+         cudaEvent_t start = nullptr;
+         cudaEvent_t stop = nullptr;
+     };
+
+    tensor_t<complex, 3> outputs;
+    std::vector<ChannelIngressStats> ingress_stats;
+    std::vector<std::deque<PendingTiming>> pending_timings;
+    std::vector<uint64_t> output_frame_count;
      Parameter<int> burst_size;
      Parameter<int> emit_stride;
      Parameter<int> num_bursts;
@@ -62,6 +85,8 @@ class FFT : public Operator {
      Parameter<int32_t> f2_index;
      Parameter<uint32_t> window_time_delta;
     Parameter<int> timing_summary_every_n;
+
+    void harvest_completed_timings(size_t channel_index, bool wait_all);
 };
 
 }  // namespace holoscan::ops

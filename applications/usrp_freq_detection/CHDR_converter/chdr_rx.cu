@@ -17,10 +17,8 @@
 #include "chdr_rx.h"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cctype>
-#include <cstdint>
 #include <sstream>
 #include <stdexcept>
 
@@ -116,7 +114,6 @@ namespace holoscan::ops {
 namespace {
 
 constexpr uint64_t kChdrSummaryPeriodNs = 1000000000ULL;
-constexpr size_t kContentFingerprintComplexSamples = 64;
 
 uint64_t steady_time_ns() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -135,38 +132,6 @@ double elapsed_ms_since(uint64_t start_ns) {
   return static_cast<double>(now_ns - start_ns) / 1.0e6;
 }
 
-uint64_t fnv1a_hash_bytes(const uint8_t* data, size_t size) {
-  constexpr uint64_t kOffsetBasis = 1469598103934665603ULL;
-  constexpr uint64_t kPrime = 1099511628211ULL;
-  uint64_t hash = kOffsetBasis;
-  for (size_t index = 0; index < size; ++index) {
-    hash ^= static_cast<uint64_t>(data[index]);
-    hash *= kPrime;
-  }
-  return hash;
-}
-
-uint64_t compute_complex_tensor_prefix_fingerprint(const complex* device_ptr, size_t element_count) {
-  if (device_ptr == nullptr || element_count == 0) {
-    return 0;
-  }
-
-  const size_t sample_count = std::min(element_count, kContentFingerprintComplexSamples);
-  std::array<complex, kContentFingerprintComplexSamples> host_samples {};
-  const auto copy_result = cudaMemcpy(host_samples.data(),
-                                      device_ptr,
-                                      sample_count * sizeof(complex),
-                                      cudaMemcpyDeviceToHost);
-  if (copy_result != cudaSuccess) {
-    HOLOSCAN_LOG_WARN("Failed to copy CHDR batch prefix for fingerprinting: {}",
-                      cudaGetErrorString(copy_result));
-    return 0;
-  }
-
-  return fnv1a_hash_bytes(reinterpret_cast<const uint8_t*>(host_samples.data()),
-                          sample_count * sizeof(complex));
-}
-
 std::string trim_copy(const std::string& value) {
   const auto begin = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) {
     return std::isspace(ch);
@@ -178,6 +143,19 @@ std::string trim_copy(const std::string& value) {
     return {};
   }
   return std::string(begin, end);
+}
+
+std::vector<std::string> split_csv_strings(const std::string& values) {
+  std::vector<std::string> parsed;
+  std::stringstream stream(values);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    const auto trimmed_token = trim_copy(token);
+    if (!trimmed_token.empty()) {
+      parsed.push_back(trimmed_token);
+    }
+  }
+  return parsed;
 }
 
 void maybe_log_channel_summary(const std::shared_ptr<ChdrConverterOpRx::Channel>& channel) {
@@ -320,6 +298,11 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
       "Name of the RX port",
       "Name of the RX port from the advanced_network config",
       "sdr_data");
+  spec.param<std::string>(interface_names_,
+      "interface_names",
+      "Names of RX ports",
+      "Comma-separated names of RX ports from the advanced_network config. When set, channels are assigned to interfaces and queues in listed order.",
+      "");
   spec.param<bool>(log_data_,
       "log_data",
       "Log Data",
@@ -328,7 +311,7 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
       "log_packets",
       "Log Packets",
       "If true, log detailed packet information for debugging.", false);
-    spec.param<uint32_t>(partial_batch_drop_timeout_ms_,
+  spec.param<uint32_t>(partial_batch_drop_timeout_ms_,
       "partial_batch_drop_timeout_ms",
       "Partial Batch Drop Timeout Ms",
       "Drop an incomplete aggregated batch after this many milliseconds without any new packets on that channel.",
@@ -394,6 +377,21 @@ std::vector<std::optional<double>> ChdrConverterOpRx::parse_channel_values(
   return parsed;
 }
 
+std::vector<std::string> ChdrConverterOpRx::parse_interface_names() const {
+  auto interface_names = split_csv_strings(interface_names_.get());
+  if (!interface_names.empty()) {
+    return interface_names;
+  }
+
+  const auto interface_name = trim_copy(interface_name_.get());
+  if (!interface_name.empty()) {
+    return {interface_name};
+  }
+
+  HOLOSCAN_LOG_ERROR("CHDR converter requires at least one configured RX interface name");
+  exit(1);
+}
+
 void ChdrConverterOpRx::initialize() {
   holoscan::Operator::initialize();
 
@@ -410,10 +408,87 @@ void ChdrConverterOpRx::initialize() {
     exit(1);
   }
 
-  port_id_ = get_port_id(interface_name_.get());
-  if (port_id_ == -1) {
-    HOLOSCAN_LOG_ERROR("Invalid RX port {} specified in the config", interface_name_.get());
+  const auto interface_names = parse_interface_names();
+  use_single_channel_fast_path_ = (interface_names.size() == 1 && num_channels_.get() == 1);
+  use_flow_id_routing_ = (interface_names.size() == 1 && num_channels_.get() > 1);
+
+  struct PortInfo {
+    std::string interface_name;
+    int port_id = -1;
+    uint16_t num_rx_queues = 0;
+  };
+
+  std::vector<PortInfo> port_infos;
+  port_infos.reserve(interface_names.size());
+  for (const auto& interface_name : interface_names) {
+    const int port_id = get_port_id(interface_name);
+    if (port_id == -1) {
+      HOLOSCAN_LOG_ERROR("Invalid RX port {} specified in the config", interface_name);
+      exit(1);
+    }
+
+    const auto num_rx_queues = get_num_rx_queues(port_id);
+    if (num_rx_queues <= 0) {
+      HOLOSCAN_LOG_ERROR("RX port {} has no configured RX queues", interface_name);
+      exit(1);
+    }
+
+    PortInfo port_info;
+    port_info.interface_name = interface_name;
+    port_info.port_id = port_id;
+    port_info.num_rx_queues = static_cast<uint16_t>(num_rx_queues);
+    port_infos.push_back(port_info);
+  }
+
+  rx_sources_.clear();
+  for (uint16_t queue_id = 0; rx_sources_.size() < num_channels_.get(); ++queue_id) {
+    bool added_any_source = false;
+    for (const auto& port_info : port_infos) {
+      if (queue_id >= port_info.num_rx_queues || rx_sources_.size() >= num_channels_.get()) {
+        continue;
+      }
+
+      RxSource rx_source;
+      rx_source.port_id = port_info.port_id;
+      rx_source.queue_id = queue_id;
+      rx_source.fallback_channel = static_cast<uint16_t>(rx_sources_.size());
+      rx_source.interface_name = port_info.interface_name;
+      rx_sources_.push_back(rx_source);
+      added_any_source = true;
+    }
+
+    if (!added_any_source) {
+      break;
+    }
+  }
+
+  if (rx_sources_.size() < num_channels_.get()) {
+    HOLOSCAN_LOG_ERROR(
+        "Configured RX interfaces expose {} queue(s), but num_channels={} requires at least one queue per channel",
+        rx_sources_.size(),
+        num_channels_.get());
     exit(1);
+  }
+
+  if (use_single_channel_fast_path_) {
+    single_channel_port_id_ = rx_sources_.front().port_id;
+    single_channel_queue_id_ = rx_sources_.front().queue_id;
+  }
+
+  HOLOSCAN_LOG_INFO(
+      "CHDR RX source mapping mode={} sources={} num_channels={}",
+      use_single_channel_fast_path_
+          ? "single-interface-single-channel-fast-path"
+          : (use_flow_id_routing_ ? "single-interface-flow-routing" : "multi-interface-fixed-routing"),
+      rx_sources_.size(),
+      num_channels_.get());
+  for (const auto& rx_source : rx_sources_) {
+    HOLOSCAN_LOG_INFO(
+        "CHDR RX source mapped interface={} port_id={} queue_id={} -> logical_channel={}",
+        rx_source.interface_name,
+        rx_source.port_id,
+        rx_source.queue_id,
+        rx_source.fallback_channel);
   }
 
   num_packets_per_batch = num_ffts_per_batch_.get() * num_packets_per_fft_.get();
@@ -611,15 +686,12 @@ bool ChdrConverterOpRx::free_bufs_and_emit_arrays(
       sample_rate_by_channel_[channel->channel_num].has_value()) {
     meta->set("rx_sample_rate_hz", sample_rate_by_channel_[channel->channel_num].value());
   }
-    meta->set("chdr_packets_in_batch", completed_msg.value().packets_in_batch);
-    meta->set("chdr_expected_packets_in_batch", num_packets_per_batch);
-    meta->set("chdr_partial_batch", completed_msg.value().partial_batch);
+  meta->set("chdr_packets_in_batch", completed_msg.value().packets_in_batch);
+  meta->set("chdr_expected_packets_in_batch", num_packets_per_batch);
+  meta->set("chdr_partial_batch", completed_msg.value().partial_batch);
 
   auto data = slice<2>(channel->rf_data, {static_cast<index_t>(completed_msg.value().batch_idx), 0, 0},
               {matxDropDim, matxEnd, matxEnd});
-  const size_t data_elements = static_cast<size_t>(data.Size(0)) * static_cast<size_t>(data.Size(1));
-  meta->set("chdr_content_fingerprint",
-            compute_complex_tensor_prefix_fingerprint(data.Data(), data_elements));
   op_output.emit(out_t {data, completed_msg.value().stream}, output_name);
   channel->completed_batches_emitted++;
   channel->periodic_summary_batches_emitted++;
@@ -691,31 +763,11 @@ void ChdrConverterOpRx::compute(
         InputContext& op_input,
         OutputContext& op_output,
         ExecutionContext& context) {
-  const auto num_rx_queues = get_num_rx_queues(port_id_);
+  if (use_single_channel_fast_path_) {
+    auto channel = channel_list.front();
 
-  // Drain any completed batches first so ANO buffers can be freed as early as possible.
-  // We reset the operator metadata before each emit so each message carries the correct
-  // channel_number even when more than one completed batch is emitted in a single compute.
-  uint16_t preferred_q = 0;
-  size_t preferred_depth = 0;
-  for (uint16_t q = 0; q < num_rx_queues; q++) {
-    const auto channel = channel_list.at(q);
-    if (channel->out_q.size() > preferred_depth) {
-      preferred_depth = channel->out_q.size();
-      preferred_q = q;
-    }
-  }
+    free_bufs_and_emit_arrays(op_output, channel);
 
-  std::vector<uint8_t> emitted_this_tick(num_rx_queues, 0);
-  for (uint16_t offset = 0; offset < num_rx_queues; offset++) {
-    const uint16_t q = (preferred_q + offset) % num_rx_queues;
-    auto channel = channel_list.at(q);
-    emitted_this_tick[q] = free_bufs_and_emit_arrays(op_output, channel) ? 1 : 0;
-  }
-
-  for (uint16_t offset = 0; offset < num_rx_queues; offset++) {
-    const uint16_t q = (preferred_q + offset) % num_rx_queues;
-    auto channel = channel_list.at(q);
     if (static_cast<int>(channel->out_q.size()) >= max_inflight_batches()) {
       channel->backlog_events++;
       channel->periodic_summary_backlog_events++;
@@ -731,22 +783,94 @@ void ChdrConverterOpRx::compute(
           channel->burst_refcounts.size(),
           channel->out_q.empty() ? 0.0 : elapsed_ms_since(channel->out_q.front().queued_ns));
       cudaStreamSynchronize(channel->streams[channel->cur_idx]);
-      if (!emitted_this_tick[q]) {
-        emitted_this_tick[q] = free_bufs_and_emit_arrays(op_output, channel) ? 1 : 0;
+      free_bufs_and_emit_arrays(op_output, channel);
+    }
+
+    BurstParams* burst = nullptr;
+    auto status = get_rx_burst(&burst, single_channel_port_id_, single_channel_queue_id_);
+    channel->periodic_summary_last_ns = steady_time_ns();
+    if (status == Status::SUCCESS) {
+      process_channel_data(op_output, burst, 0);
+    } else {
+      channel->empty_rx_polls++;
+      channel->periodic_summary_empty_polls++;
+      if (channel->aggr_pkts_recv > 0) {
+        const double idle_ms = elapsed_ms_since(channel->last_receive_ns);
+        if (idle_ms >= static_cast<double>(partial_batch_drop_timeout_ms_.get())) {
+          flush_partial_batch(channel, "idle-timeout");
+        }
+      }
+    }
+    maybe_log_channel_summary(channel);
+    return;
+  }
+
+  const auto num_rx_sources = rx_sources_.size();
+
+  // Drain any completed batches first so ANO buffers can be freed as early as possible.
+  // We reset the operator metadata before each emit so each message carries the correct
+  // channel_number even when more than one completed batch is emitted in a single compute.
+  uint16_t preferred_q = 0;
+  size_t preferred_depth = 0;
+  for (uint16_t source_index = 0; source_index < num_rx_sources; source_index++) {
+    const auto& rx_source = rx_sources_.at(source_index);
+    const auto channel = channel_list.at(rx_source.fallback_channel);
+    if (channel->out_q.size() > preferred_depth) {
+      preferred_depth = channel->out_q.size();
+      preferred_q = source_index;
+    }
+  }
+
+  std::vector<uint8_t> emitted_this_tick(num_rx_sources, 0);
+  for (uint16_t offset = 0; offset < num_rx_sources; offset++) {
+    const uint16_t source_index = (preferred_q + offset) % num_rx_sources;
+    const auto& rx_source = rx_sources_.at(source_index);
+    auto channel = channel_list.at(rx_source.fallback_channel);
+    emitted_this_tick[source_index] = free_bufs_and_emit_arrays(op_output, channel) ? 1 : 0;
+  }
+
+  for (uint16_t offset = 0; offset < num_rx_sources; offset++) {
+    const uint16_t source_index = (preferred_q + offset) % num_rx_sources;
+    const auto& rx_source = rx_sources_.at(source_index);
+    auto channel = channel_list.at(rx_source.fallback_channel);
+    if (static_cast<int>(channel->out_q.size()) >= max_inflight_batches()) {
+      channel->backlog_events++;
+      channel->periodic_summary_backlog_events++;
+      HOLOSCAN_LOG_ERROR("Fell behind in processing on GPU!");
+      HOLOSCAN_LOG_ERROR(
+          "CHDR backlog state ch={} interface={} queue_id={} out_q_depth={} max_out_q_depth={} aggr_pkts_recv={} queued_batches={} emitted_batches={} refcounted_bursts={} oldest_release_ms={:.3f}",
+          channel->channel_num,
+          rx_source.interface_name,
+          rx_source.queue_id,
+          channel->out_q.size(),
+          channel->max_out_q_depth,
+          channel->aggr_pkts_recv,
+          channel->completed_batches_queued,
+          channel->completed_batches_emitted,
+          channel->burst_refcounts.size(),
+          channel->out_q.empty() ? 0.0 : elapsed_ms_since(channel->out_q.front().queued_ns));
+      cudaStreamSynchronize(channel->streams[channel->cur_idx]);
+      if (!emitted_this_tick[source_index]) {
+        emitted_this_tick[source_index] = free_bufs_and_emit_arrays(op_output, channel) ? 1 : 0;
       }
     }
   }
 
 
   BurstParams *burst;
-  for (uint16_t q = 0; q < num_rx_queues; q++) {
+  for (uint16_t source_index = 0; source_index < num_rx_sources; source_index++) {
+    const auto& rx_source = rx_sources_.at(source_index);
     // If there's new data, start processing it
-    auto status = get_rx_burst(&burst, port_id_, q);
-    auto channel = channel_list.at(q);
+    auto status = get_rx_burst(&burst, rx_source.port_id, rx_source.queue_id);
+    auto channel = channel_list.at(rx_source.fallback_channel);
     channel->periodic_summary_last_ns = steady_time_ns();
     if (status == Status::SUCCESS) {
-      const uint16_t resolved_channel =
-          resolve_channel_from_burst_flow(burst, q, num_channels_.get());
+      const uint16_t resolved_channel = use_flow_id_routing_
+                                             ? resolve_channel_from_burst_flow(
+                                                   burst,
+                                                   rx_source.fallback_channel,
+                                                   num_channels_.get())
+                                             : rx_source.fallback_channel;
       process_channel_data(op_output, burst, resolved_channel);
     } else {
       channel->empty_rx_polls++;
@@ -879,7 +1003,9 @@ void ChdrConverterOpRx::process_channel_data(
 
 void ChdrConverterOpRx::stop() {
   adv_net_shutdown();
-  release_channel_resources();
+  // Downstream operators can still hold queued messages that reference these
+  // CUDA streams while the graph is unwinding. Releasing them here can leave
+  // late-stage kernels with invalid resource handles during shutdown.
 
   HOLOSCAN_LOG_INFO("ChdrConverterOpRx exit report:");
   for (uint16_t channel_num = 0; channel_num < num_channels_.get(); channel_num++) {

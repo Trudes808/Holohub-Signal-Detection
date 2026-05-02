@@ -27,6 +27,8 @@ a few things:
 ```yaml
 chdr_converter:
   interface_name: sdr_data
+  # Or use interface_names: "sdr_data0,sdr_data1" to bind one logical channel
+  # per physical interface/queue in listed order.
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
   num_ffts_per_batch: 125
@@ -37,6 +39,9 @@ chdr_converter:
 ```
 
 - `interface_name`: Name of the RX port from the advanced_network config
+- `interface_names`: Optional comma-separated RX port names. When set, the converter
+  assigns channels to interfaces and queues in listed order and disables flow-ID-based
+  cross-port channel reassignment.
 - `num_complex_samples_per_packet`: Number of complex samples contained in every CHDR data packet
 - `num_packets_per_fft`: Number of packets you'd like to process in each FFT
 - `num_ffts_per_batch`: Number of FFTs you'd like to perform in one downstream run

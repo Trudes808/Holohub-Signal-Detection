@@ -6,8 +6,10 @@
 #include <array>
 #include <chrono>
 #include <cuda/std/complex>
+#include <memory>
 #include <holoscan/holoscan.hpp>
 #include <matx.h>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -118,7 +120,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(CoherentPowerSignalDetector)
 
-  static constexpr size_t kTimingStageCount = 6;
+  static constexpr size_t kTimingStageCount = 8;
   static constexpr size_t kReferenceTimingStageCount = 6;
   static constexpr size_t kChunkTimingStageCount = 5;
   static constexpr size_t kPowerSupportTimingStageCount = 4;
@@ -151,6 +153,8 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
     float* power_db_host = nullptr;
     uint8_t* mask_device = nullptr;
     uint8_t* scratch_mask_device = nullptr;
+    uint8_t* emit_scratch0_device = nullptr;
+    uint8_t* emit_scratch1_device = nullptr;
     uint8_t* mask_host = nullptr;
     size_t frame_elements = 0;
     size_t row_elements = 0;
