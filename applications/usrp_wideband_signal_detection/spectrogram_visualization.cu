@@ -2785,19 +2785,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
     timing_stats_.masks_pending_peak = std::max<uint64_t>(timing_stats_.masks_pending_peak, pending_mask_peak);
   }
 
-  bool should_render = any_updates;
-  {
-    std::lock_guard<std::mutex> lock(timing_mutex_);
-    if (should_render) {
-      const uint64_t render_every_n = static_cast<uint64_t>(std::max(1, render_every_n_frames_.get()));
-      if ((timing_stats_.frames_processed % render_every_n) != 0) {
-        should_render = false;
-        ++timing_stats_.render_skipped_by_cadence;
-      }
-    }
-  }
-
-  if (!should_render) {
+  if (!any_updates) {
     maybe_emit_timing_summary();
     return;
   }

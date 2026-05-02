@@ -22,10 +22,7 @@
 #include <chrono>
 #include <iostream>
 #include <map>
-#include <pthread.h>
-#include <sched.h>
 #include <set>
-#include <cstring>
 #include <sys/time.h>
 #include <thread>
 #include <unordered_map>
@@ -40,27 +37,6 @@ namespace holoscan::advanced_network {
 
 namespace {
 constexpr unsigned int kRxRingSize = 8192;
-
-void best_effort_raise_rx_worker_priority(const std::string& worker_name) {
-  sched_param params {};
-  const int max_priority = sched_get_priority_max(SCHED_FIFO);
-  if (max_priority <= 0) {
-    return;
-  }
-
-  params.sched_priority = std::max(1, max_priority - 1);
-  const int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &params);
-  if (rc != 0) {
-    HOLOSCAN_LOG_WARN(
-        "Unable to raise {} thread priority to SCHED_FIFO (rc={} '{}'). Continuing with default scheduler.",
-        worker_name,
-        rc,
-        std::strerror(rc));
-    return;
-  }
-
-  HOLOSCAN_LOG_INFO("Raised {} thread priority to SCHED_FIFO:{}", worker_name, params.sched_priority);
-}
 }
 
 
@@ -1652,8 +1628,6 @@ void DpdkMgr::flush_packets(int port) {
 int DpdkMgr::rx_core_multi_q_worker(void* arg) {
   RxWorkerMultiQParams* tparams = (RxWorkerMultiQParams*)arg;
 
-  best_effort_raise_rx_worker_priority("multi-queue RX worker");
-
   int ret = 0;
   uint64_t freq = rte_get_tsc_hz();
   uint64_t timeout_ticks = freq * 0.02;  // expect all packets within 20ms
@@ -1921,9 +1895,6 @@ int DpdkMgr::rx_core_multi_q_worker(void* arg) {
 ////////////////////////////////////////////////////////////////////////////////
 int DpdkMgr::rx_core_worker(void* arg) {
   RxWorkerParams* tparams = (RxWorkerParams*)arg;
-
-  best_effort_raise_rx_worker_priority(
-      "RX worker port " + std::to_string(tparams->port) + " queue " + std::to_string(tparams->queue));
 
   // In the future we may want to periodically update this if the CPU clock drifts
   uint64_t freq = rte_get_tsc_hz();
