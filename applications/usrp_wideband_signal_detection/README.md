@@ -207,21 +207,41 @@ cd applications/usrp_wideband_signal_detection
 ./enter_demo_container.sh
 ```
 
-Inside the container, run the application from the build directory. For the current non-Torch smoke-test path that saves spectrograms and detector masks to the mounted host `/tmp` directories:
+Use two terminals for the active live flow.
+
+In a host Python terminal, start the dual-channel radio stream:
+
+```bash
+python3.12 rx_to_remote_udp.py \
+	--args "mgmt_addr=192.168.20.3,addr=192.168.100.3,second_addr=192.168.10.2" \
+	--freq 2400e6 1000e6 \
+	--rate 500e6 \
+	--gain 30 \
+	--channels 0 1 \
+	--dest-addr 192.168.10.51 \
+	--dest-port 1234 1235 \
+	--adapter sfp0 \
+	--dest-mac-addr E0:9D:73:E0:5B:6B \
+	--spp 1024
+```
+
+In a second terminal, enter the demo container and run the application from the build directory.
+
+Dual-channel active config:
 
 ```bash
 cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection
-./usrp_wideband_signal_detection old_configs/config_cuda_fallback.yaml
+./usrp_wideband_signal_detection config_coherent_power_performance_emit_stride1_two_channel.yaml
 ```
 
-If you want the stable placeholder debug path instead:
+Single-channel active config:
 
 ```bash
 cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection
-./usrp_wideband_signal_detection old_configs/config.yaml
+./usrp_wideband_signal_detection config_coherent_power_performance_single_channel.yaml
 ```
 
-Start the radio stream from a second host terminal using the same external USRP command family as `usrp_freq_detection`.
+For the cleanest startup behavior, launch the app before starting the RF transmitter. The advanced-network DPDK workers are started during app initialization, before the Holoscan graph is fully active, so starting the transmitter first can produce a brief burst of startup-only drops even when steady-state throughput is healthy.
 
 ### After Code Changes
 
@@ -239,7 +259,14 @@ Then rerun the app inside the container:
 
 ```bash
 cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection
-./usrp_wideband_signal_detection old_configs/config_cuda_fallback.yaml
+./usrp_wideband_signal_detection config_coherent_power_performance_emit_stride1_two_channel.yaml
+```
+
+For the single-channel rerun path instead:
+
+```bash
+cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection
+./usrp_wideband_signal_detection config_coherent_power_performance_single_channel.yaml
 ```
 
 For the two-channel performance pass with the real TorchScript detector path and debug outputs disabled:
@@ -264,8 +291,6 @@ For the two-channel coherent-power real-time path with the coherent detector sel
 cd applications/usrp_wideband_signal_detection
 ./run_coherent_power_performance.sh
 ```
-
-For the cleanest startup behavior, launch the app before starting the RF transmitter. The advanced-network DPDK workers are started during app initialization, before the Holoscan graph is fully active, so starting the transmitter first can produce a brief burst of startup-only drops even when steady-state throughput is healthy.
 
 To quantify the three remaining DINO optimization levers with the same helper script:
 

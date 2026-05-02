@@ -2127,7 +2127,8 @@ void render_visualization_ui_overlay() {
 
     draw_kv("Center", format_frequency_label(channel.center_frequency_hz));
     draw_kv("Span", format_frequency_label(channel.span_hz));
-    draw_kv("Freq Bin", format_frequency_label(channel.display_frequency_bin_hz));
+    draw_kv("Det Bin", format_frequency_label(channel.resolution_hz));
+    draw_kv("Disp Px", format_frequency_label(channel.display_frequency_bin_hz));
     draw_kv("Time Bin", format_time_bin_label(channel.seconds_per_time_bin));
     draw_kv("Frames", format_displayed_frame_ratio_label(channel.displayed_frame_ratio,
                                 channel.displayed_frame_stride));
@@ -3852,10 +3853,15 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
     draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y,
               std::to_string(channel.info.fft_size), {200, 212, 224}, 1);
     text_y += 12;
-    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "FREQ BIN", {122, 143, 168}, 1);
-    std::ostringstream res_text;
-        res_text << format_frequency_label(channel.info.display_frequency_bin_hz);
-    draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, res_text.str(), {200, 212, 224}, 1);
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "DET BIN", {122, 143, 168}, 1);
+    std::ostringstream det_bin_text;
+    det_bin_text << format_frequency_label(channel.info.resolution_hz);
+    draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, det_bin_text.str(), {200, 212, 224}, 1);
+    text_y += 12;
+    draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "DISP PX", {122, 143, 168}, 1);
+    std::ostringstream disp_px_text;
+    disp_px_text << format_frequency_label(channel.info.display_frequency_bin_hz);
+    draw_text(canvas, output_width, output_height, sidebar_x + 60, text_y, disp_px_text.str(), {200, 212, 224}, 1);
     text_y += 12;
     draw_text(canvas, output_width, output_height, sidebar_x + 16, text_y, "TIME BIN", {122, 143, 168}, 1);
     draw_text(canvas,

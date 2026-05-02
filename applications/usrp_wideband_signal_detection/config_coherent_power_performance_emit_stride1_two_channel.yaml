@@ -150,7 +150,7 @@ visualization:
     history_memory_budget_mb: 1024
     rows_per_frame: 8
     mask_frame_offset: 0
-    render_every_n_frames: 4
+    render_every_n_frames: 1
     timing_summary_enable: true
     timing_summary_every_n: 128
     channel_filter: -1
@@ -278,7 +278,7 @@ coherent_power_signal_detector:
   coherence_weight: 0.55
   power_weight: 0.45
   score_threshold_mode: "fixed"
-  fixed_score_threshold: 0.4
+  fixed_score_threshold: 0.5
   coherence_power_support_q: 0.82
   coherence_power_q: 0.92
   min_component_size: 1
