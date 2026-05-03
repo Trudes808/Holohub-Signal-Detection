@@ -17,14 +17,66 @@
 
 #include "adv_network_dpdk_stats.h"
 #include "holoscan/holoscan.hpp"
-#include <thread>
 #include <chrono>
+#include <mutex>
+#include <thread>
 
 namespace holoscan::advanced_network {
+
+namespace {
+
+std::mutex& rx_queue_error_tracking_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<uint32_t, uint64_t>& rx_queue_error_warning_counts() {
+  static std::unordered_map<uint32_t, uint64_t> counts;
+  return counts;
+}
+
+std::unordered_map<uint32_t, uint64_t>& rx_queue_error_totals() {
+  static std::unordered_map<uint32_t, uint64_t> totals;
+  return totals;
+}
+
+uint32_t make_port_queue_key(int port_id, int queue_id) {
+  return (static_cast<uint32_t>(port_id) << 16) | static_cast<uint32_t>(queue_id);
+}
+
+void record_dpdk_rx_queue_error_warning(int port_id, int queue_id, uint64_t total_errors) {
+  std::lock_guard<std::mutex> lock(rx_queue_error_tracking_mutex());
+  const uint32_t key = make_port_queue_key(port_id, queue_id);
+  rx_queue_error_warning_counts()[key]++;
+  rx_queue_error_totals()[key] = total_errors;
+}
+
+}  // namespace
+
+uint64_t get_dpdk_rx_queue_error_warning_count(int port_id, int queue_id) {
+  std::lock_guard<std::mutex> lock(rx_queue_error_tracking_mutex());
+  const uint32_t key = make_port_queue_key(port_id, queue_id);
+  const auto it = rx_queue_error_warning_counts().find(key);
+  return it == rx_queue_error_warning_counts().end() ? 0ULL : it->second;
+}
+
+uint64_t get_dpdk_rx_queue_error_total(int port_id, int queue_id) {
+  std::lock_guard<std::mutex> lock(rx_queue_error_tracking_mutex());
+  const uint32_t key = make_port_queue_key(port_id, queue_id);
+  const auto it = rx_queue_error_totals().find(key);
+  return it == rx_queue_error_totals().end() ? 0ULL : it->second;
+}
+
+void reset_dpdk_rx_queue_error_tracking() {
+  std::lock_guard<std::mutex> lock(rx_queue_error_tracking_mutex());
+  rx_queue_error_warning_counts().clear();
+  rx_queue_error_totals().clear();
+}
 
 void DpdkStats::Init(const NetworkConfig &cfg) {
   cfg_ = cfg;
   init_ = true;
+  reset_dpdk_rx_queue_error_tracking();
 
   HOLOSCAN_LOG_INFO("Initializing DPDK stats");
 
@@ -238,6 +290,7 @@ void DpdkStats::Run() {
 
         if (rx_queue_errors > old_rx_queue_errors) {
           const auto queue_errors_since_last_check = rx_queue_errors - old_rx_queue_errors;
+          record_dpdk_rx_queue_error_warning(port_id, queue_id, rx_queue_errors);
           // Get memory region names for this port/queue combination
           uint32_t key = (port_id << 16) | queue_id;
           std::string mr_names = "unknown";

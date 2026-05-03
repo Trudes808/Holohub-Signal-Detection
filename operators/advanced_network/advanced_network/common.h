@@ -97,6 +97,18 @@ void adv_net_clear_shutdown_request();
 bool adv_net_shutdown_requested();
 
 /**
+ * @brief Request a soft data-path resync for the specified channel bitmask.
+ *
+ * The request remains pending until consumed by the visualization path.
+ */
+void adv_net_request_soft_resync(uint64_t channel_mask);
+
+/**
+ * @brief Consume and clear any pending soft data-path resync request bitmask.
+ */
+uint64_t adv_net_consume_soft_resync_mask();
+
+/**
  * @brief Shutdown the active advanced network manager.
  *
  * This is safe to call more than once. Backends may use internal reference counting
@@ -447,6 +459,14 @@ Status send_tx_burst(BurstParams* burst);
 Status get_rx_burst(BurstParams** burst, int port, int q);
 
 /**
+ * @brief Drain queued receive data for a specific port/queue.
+ *
+ * This frees any receive bursts already staged in the manager ring and flushes
+ * any packets still pending in the NIC RX queue.
+ */
+Status drain_rx_queue(int port, int q);
+
+/**
  * @brief Get a RX burst from any queue on a specific port
  *
  * @param burst Burst structure
@@ -507,6 +527,18 @@ void print_stats();
  * @return uint16_t Number of RX queues
  */
 uint16_t get_num_rx_queues(int port_id);
+
+/**
+ * @brief Get the number of times the DPDK stats thread observed RX queue error growth for a
+ * specific port/queue since initialization.
+ */
+uint64_t get_rx_queue_error_warning_count(int port_id, int queue_id);
+
+/**
+ * @brief Get the latest total RX queue error counter value observed by the DPDK stats thread for
+ * a specific port/queue.
+ */
+uint64_t get_rx_queue_error_total(int port_id, int queue_id);
 
 };  // namespace holoscan::advanced_network
 

@@ -185,6 +185,7 @@ class DpdkMgr : public Manager {
   void free_tx_burst(BurstParams* burst) override;
 
   Status get_rx_burst(BurstParams** burst, int port, int q) override;
+  Status drain_rx_queue(int port, int q) override;
   using holoscan::advanced_network::Manager::get_rx_burst;  // for overloads
   Status set_packet_tx_time(BurstParams* burst, int idx, uint64_t timestamp);
   void free_rx_metadata(BurstParams* burst) override;
@@ -206,7 +207,7 @@ class DpdkMgr : public Manager {
   static int rx_core_worker(void* arg);
   static int rx_core_multi_q_worker(void* arg);
   static int tx_core_worker(void* arg);
-  static void flush_packets(int port);
+  static void flush_packets(int port, int queue);
   void setup_accurate_send_scheduling_mask();
   int setup_pools_and_rings(int max_rx_batch, int max_tx_batch);
   struct rte_flow* add_flow(int port, const FlowConfig& cfg);

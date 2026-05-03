@@ -16,12 +16,14 @@
  */
 
 #include <thread>
+#include <atomic>
 #include <csignal>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "advanced_network/manager.h"
 #include "advanced_network/common.h"
+#include "advanced_network/managers/dpdk/adv_network_dpdk_stats.h"
 #include "holoscan/holoscan.hpp"
 #if ANO_MGR_DPDK || ANO_MGR_GPUNETIO
 #include <rte_mbuf.h>
@@ -39,6 +41,7 @@ namespace holoscan::advanced_network {
 // Declare a static global variable for the manager
 static Manager* g_ano_mgr = nullptr;
 static volatile std::sig_atomic_t g_ano_shutdown_requested = 0;
+static std::atomic<uint64_t> g_ano_soft_resync_mask{0};
 
 const std::unordered_map<LogLevel::Level, std::string> LogLevel::level_to_string_map = {
     {TRACE, "trace"},
@@ -284,6 +287,11 @@ Status get_rx_burst(BurstParams** burst, int port, int q) {
   return g_ano_mgr->get_rx_burst(burst, port, q);
 }
 
+Status drain_rx_queue(int port, int q) {
+  ASSERT_ANO_MGR_INITIALIZED();
+  return g_ano_mgr->drain_rx_queue(port, q);
+}
+
 Status get_rx_burst(BurstParams** burst, int port) {
   ASSERT_ANO_MGR_INITIALIZED();
   return g_ano_mgr->get_rx_burst(burst, port);
@@ -297,6 +305,16 @@ Status get_rx_burst(BurstParams** burst) {
 uint16_t get_num_rx_queues(int port_id) {
   ASSERT_ANO_MGR_INITIALIZED();
   return g_ano_mgr->get_num_rx_queues(port_id);
+}
+
+uint64_t get_rx_queue_error_warning_count(int port_id, int queue_id) {
+  ASSERT_ANO_MGR_INITIALIZED();
+  return get_dpdk_rx_queue_error_warning_count(port_id, queue_id);
+}
+
+uint64_t get_rx_queue_error_total(int port_id, int queue_id) {
+  ASSERT_ANO_MGR_INITIALIZED();
+  return get_dpdk_rx_queue_error_total(port_id, queue_id);
 }
 
 void print_stats() {
@@ -336,6 +354,14 @@ void adv_net_clear_shutdown_request() {
 
 bool adv_net_shutdown_requested() {
   return g_ano_shutdown_requested != 0;
+}
+
+void adv_net_request_soft_resync(uint64_t channel_mask) {
+  g_ano_soft_resync_mask.fetch_or(channel_mask, std::memory_order_relaxed);
+}
+
+uint64_t adv_net_consume_soft_resync_mask() {
+  return g_ano_soft_resync_mask.exchange(0, std::memory_order_acq_rel);
 }
 
 void adv_net_shutdown() {

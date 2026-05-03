@@ -35,6 +35,7 @@
 
 namespace holoscan::advanced_network {
 bool adv_net_shutdown_requested();
+uint64_t adv_net_consume_soft_resync_mask();
 }
 
 namespace {
@@ -44,6 +45,14 @@ bool adv_net_shutdown_requested_if_available() {
   return holoscan::advanced_network::adv_net_shutdown_requested();
 #else
   return false;
+#endif
+}
+
+uint64_t adv_net_consume_soft_resync_mask_if_available() {
+#if defined(ANO_MGR_DPDK) || defined(ANO_MGR_GPUNETIO) || defined(ANO_MGR_dpdk) || defined(ANO_MGR_gpunetio)
+  return holoscan::advanced_network::adv_net_consume_soft_resync_mask();
+#else
+  return 0;
 #endif
 }
 
@@ -1463,6 +1472,16 @@ void ensure_preview_mailbox_capacity(size_t channel_count) {
   }
 }
 
+void clear_preview_mailbox_channel(size_t channel_index) {
+  std::lock_guard<std::mutex> lock(preview_mailbox_mutex());
+  auto& mailboxes = preview_mailboxes();
+  if (channel_index >= mailboxes.size()) {
+    return;
+  }
+  mailboxes[channel_index].spectrogram_queue.clear();
+  mailboxes[channel_index].mask_queue.clear();
+}
+
 }  // namespace
 
 std::vector<uint8_t> reduce_mask_to_history_rows_gpu(const uint8_t* device_input,
@@ -2502,6 +2521,50 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
       shutdown_term->disable_tick();
     }
     return;
+  }
+
+  const uint64_t soft_resync_mask = adv_net_consume_soft_resync_mask_if_available();
+  if (soft_resync_mask != 0) {
+    std::lock_guard<std::mutex> state_lock(channel_states_mutex_);
+    for (size_t channel_index = 0; channel_index < channel_states_.size() && channel_index < 64;
+         ++channel_index) {
+      if ((soft_resync_mask & (uint64_t{1} << channel_index)) == 0) {
+        continue;
+      }
+      clear_preview_mailbox_channel(channel_index);
+      auto& state = channel_states_[channel_index];
+      state.history_valid_rows = 0;
+      state.history_write_row = 0;
+      std::fill(state.history_grayscale.begin(), state.history_grayscale.end(), 0);
+      std::fill(state.history_mask.begin(), state.history_mask.end(), 0);
+      std::fill(state.history_row_frame_numbers.begin(), state.history_row_frame_numbers.end(), -1);
+      std::fill(state.history_row_indices_within_frame.begin(),
+                state.history_row_indices_within_frame.end(),
+                -1);
+      state.current_psd_trace.clear();
+      state.max_hold_trace.clear();
+      state.density_trace.clear();
+      state.density_frames_seen = 0;
+      state.latest_mask = {};
+      state.latest_mask_frame_number = -1;
+      state.overlay_available = false;
+      state.info.overlay_available = false;
+      state.pending_masks.clear();
+      state.row_accumulator.clear();
+      state.row_accumulator_count = 0;
+      state.latest_frame_height = 0;
+      if (channel_index < pending_channel_frames_.size()) {
+        pending_channel_frames_[channel_index] = PendingChannelFrame {};
+      }
+      if (channel_index < latest_rendered_frame_numbers_.size()) {
+        latest_rendered_frame_numbers_[channel_index] = 0;
+      }
+      if (channel_index < per_channel_timing_stats_.size()) {
+        per_channel_timing_stats_[channel_index] = PerChannelVisualTimingStats {};
+      }
+      HOLOSCAN_LOG_WARN("Cleared visualizer state for channel {} after soft resync request",
+                        channel_index);
+    }
   }
 
   auto maybe_emit_timing_summary = [this]() {

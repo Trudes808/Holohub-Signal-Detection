@@ -70,6 +70,7 @@ class Manager {
   virtual uint64_t get_burst_tot_byte(BurstParams* burst) = 0;
   virtual BurstParams* create_tx_burst_params() = 0;
   virtual Status get_rx_burst(BurstParams** burst, int port, int q) = 0;
+  virtual Status drain_rx_queue(int port, int q) { return Status::NOT_SUPPORTED; }
   virtual Status get_rx_burst(BurstParams** burst, int port_id);
   virtual Status get_rx_burst(BurstParams** burst);
   virtual void free_rx_metadata(BurstParams* burst) = 0;

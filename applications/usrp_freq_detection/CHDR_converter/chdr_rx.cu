@@ -16,13 +16,18 @@
  */
 #include "chdr_rx.h"
 
+#include <gxf/core/gxf.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 using out_t = std::tuple<tensor_t<complex, 2>, cudaStream_t>;
 
@@ -196,7 +201,7 @@ void maybe_log_channel_summary(const std::shared_ptr<ChdrConverterOpRx::Channel>
       (window_s > 0.0) ? (static_cast<double>(channel->periodic_summary_packets) / window_s / 1.0e6)
                        : 0.0;
   HOLOSCAN_LOG_INFO(
-      "CHDR summary ch={} window_s={:.3f} bursts={} packets={} rate={:.3f} Mpps queued={} emitted={} empty_polls={} backlog_events={} out_q_depth={} max_out_q_depth={} aggr_pkts_recv={} max_burst_packets={} refcounted_bursts={} partial_drops={}",
+      "CHDR summary ch={} window_s={:.3f} bursts={} packets={} rate={:.3f} Mpps queued={} emitted={} empty_polls={} backlog_events={} out_q_depth={} max_out_q_depth={} aggr_pkts_recv={} max_burst_packets={} refcounted_bursts={} partial_drops={} consecutive_partial_flushes={} panic_resets={}",
       channel->channel_num,
       window_s,
       channel->periodic_summary_bursts,
@@ -211,7 +216,9 @@ void maybe_log_channel_summary(const std::shared_ptr<ChdrConverterOpRx::Channel>
       channel->aggr_pkts_recv,
       channel->max_burst_packets,
       channel->burst_refcounts.size(),
-      channel->timeout_like_partial_drains);
+      channel->timeout_like_partial_drains,
+      channel->consecutive_partial_flushes,
+      channel->panic_resets);
 
   channel->periodic_summary_start_ns = channel->periodic_summary_last_ns;
   channel->periodic_summary_batches_queued = 0;
@@ -333,6 +340,31 @@ void ChdrConverterOpRx::setup(OperatorSpec& spec) {
       "Partial Batch Drop Timeout Ms",
       "Drop an incomplete aggregated batch after this many milliseconds without any new packets on that channel.",
       250);
+      spec.param<bool>(degraded_reset_on_rx_queue_warning_,
+        "degraded_reset_on_rx_queue_warning",
+        "Degraded Reset On RX Queue Warning",
+        "If true, trigger a channel soft resync as soon as the DPDK stats thread reports a new RX queue drop warning for that channel's port/queue.",
+        false);
+        spec.param<uint32_t>(degraded_shutdown_on_rx_queue_warning_threshold_,
+          "degraded_shutdown_on_rx_queue_warning_threshold",
+          "Degraded Soft Resync On RX Queue Warning Threshold",
+          "If greater than zero, trigger a deeper channel soft resync after this many RX queue warning events have been observed for a channel's port/queue.",
+          0);
+          spec.param<uint32_t>(degraded_shutdown_force_exit_timeout_ms_,
+            "degraded_shutdown_force_exit_timeout_ms",
+            "Degraded Shutdown Force Exit Timeout Ms",
+            "After degraded shutdown is requested, force-exit the process if graceful shutdown has not completed within this many milliseconds. Set to 0 to disable the watchdog.",
+            2000);
+    spec.param<uint32_t>(degraded_reset_partial_flush_threshold_,
+      "degraded_reset_partial_flush_threshold",
+      "Degraded Reset Partial Flush Threshold",
+      "When a channel hits this many consecutive partial-batch flushes without a full batch in between, perform a local CHDR panic reset. Set to 0 to disable.",
+      3);
+    spec.param<uint32_t>(degraded_reset_cooldown_ms_,
+      "degraded_reset_cooldown_ms",
+      "Degraded Reset Cooldown Ms",
+      "Minimum time between channel-local CHDR panic resets triggered by repeated partial flushes.",
+      1000);
   spec.param<std::string>(channel_center_frequencies_hz_,
       "channel_center_frequencies_hz",
       "Channel Center Frequencies Hz",
@@ -504,6 +536,7 @@ void ChdrConverterOpRx::flush_partial_batch(
   const uint64_t held_packets = channel->aggr_pkts_recv;
   const int held_bursts = channel->cur_msg.num_batches;
   channel->timeout_like_partial_drains++;
+  channel->consecutive_partial_flushes++;
   HOLOSCAN_LOG_WARN(
       "Flushing partial CHDR batch on channel {} reason={} held_packets={} held_bursts={} refcounted_bursts_before_flush={}",
       channel->channel_num,
@@ -511,7 +544,104 @@ void ChdrConverterOpRx::flush_partial_batch(
       held_packets,
       held_bursts,
       channel->burst_refcounts.size());
+
+  const uint32_t reset_threshold = degraded_reset_partial_flush_threshold_.get();
+  if (reset_threshold > 0 && channel->consecutive_partial_flushes >= reset_threshold) {
+    const uint64_t now_ns = steady_time_ns();
+    const double ms_since_last_reset = elapsed_ms_since(channel->last_panic_reset_ns);
+    if (channel->last_panic_reset_ns == 0 ||
+        ms_since_last_reset >= static_cast<double>(degraded_reset_cooldown_ms_.get())) {
+      panic_reset_channel(channel, reason);
+      return;
+    }
+  }
+
   queue_completed_batch(channel, static_cast<uint32_t>(held_packets), true);
+}
+
+void ChdrConverterOpRx::panic_reset_channel(
+        std::shared_ptr<struct Channel> channel,
+        const char* reason) {
+  if (!channel) {
+    return;
+  }
+
+  HOLOSCAN_LOG_ERROR(
+      "Triggering CHDR panic reset on channel {} after {} consecutive partial flushes (reason={} aggr_pkts_recv={} out_q_depth={} refcounted_bursts={})",
+      channel->channel_num,
+      channel->consecutive_partial_flushes,
+      reason,
+      channel->aggr_pkts_recv,
+      channel->out_q.size(),
+      channel->burst_refcounts.size());
+
+  for (int stream_index = 0; stream_index < num_simul_batches_.get(); ++stream_index) {
+    if (channel->streams[stream_index] != nullptr) {
+      cudaStreamSynchronize(channel->streams[stream_index]);
+    }
+  }
+
+  const uint64_t channel_mask =
+      channel->channel_num < 64 ? (uint64_t{1} << channel->channel_num) : 0;
+  if (channel_mask != 0) {
+    adv_net_request_soft_resync(channel_mask);
+  }
+
+  const auto drain_status = drain_rx_queue(port_id_, channel->channel_num);
+  if (drain_status == Status::SUCCESS) {
+    HOLOSCAN_LOG_WARN(
+        "Soft-resynced upstream RX queue for port {} queue {} while resetting channel {}",
+        port_id_,
+        channel->channel_num,
+        channel->channel_num);
+  } else if (drain_status != Status::NOT_SUPPORTED) {
+    HOLOSCAN_LOG_WARN(
+        "Failed to drain upstream RX queue for port {} queue {} during channel {} reset (status={})",
+        port_id_,
+        channel->channel_num,
+        channel->channel_num,
+        static_cast<int>(drain_status));
+  }
+
+  while (!channel->out_q.empty()) {
+    auto queued_msg = channel->out_q.front();
+    channel->out_q.pop();
+    for (int batch_index = 0; batch_index < queued_msg.num_batches; ++batch_index) {
+      if (queued_msg.msg[batch_index] != nullptr) {
+        release_burst_ref(channel, queued_msg.msg[batch_index]);
+        queued_msg.msg[batch_index] = nullptr;
+      }
+    }
+  }
+
+  for (int batch_index = 0; batch_index < channel->cur_msg.num_batches; ++batch_index) {
+    if (channel->cur_msg.msg[batch_index] != nullptr) {
+      release_burst_ref(channel, channel->cur_msg.msg[batch_index]);
+      channel->cur_msg.msg[batch_index] = nullptr;
+    }
+  }
+  channel->cur_msg = RxMsg {};
+
+  for (auto& [burst, refcount] : channel->burst_refcounts) {
+    (void)refcount;
+    if (burst != nullptr) {
+      free_all_packets_and_burst_rx(burst);
+    }
+  }
+  channel->burst_refcounts.clear();
+
+  for (int stream_index = 0; stream_index < num_simul_batches_.get(); ++stream_index) {
+    if (channel->h_dev_ptrs[stream_index] != nullptr) {
+      std::fill_n(channel->h_dev_ptrs[stream_index], num_packets_per_batch, nullptr);
+    }
+  }
+
+  cudaMemset(channel->rf_data.Data(), 0, channel->rf_data.TotalSize() * sizeof(complex));
+  channel->aggr_pkts_recv = 0;
+  channel->cur_idx = 0;
+  channel->consecutive_partial_flushes = 0;
+  channel->last_panic_reset_ns = steady_time_ns();
+  channel->panic_resets++;
 }
 
 void ChdrConverterOpRx::queue_completed_batch(
@@ -566,6 +696,9 @@ void ChdrConverterOpRx::queue_completed_batch(
   channel->max_out_q_depth = std::max(channel->max_out_q_depth, channel->out_q.size());
   channel->cur_msg.num_batches = 0;
   channel->ttl_pkts_recv += safe_packets_in_batch;
+  if (!partial_batch) {
+    channel->consecutive_partial_flushes = 0;
+  }
 
   auto ret = cudaGetLastError();
   if (ret != cudaSuccess) {
@@ -741,9 +874,44 @@ void ChdrConverterOpRx::compute(
   BurstParams *burst;
   for (uint16_t q = 0; q < num_rx_queues; q++) {
     // If there's new data, start processing it
-    auto status = get_rx_burst(&burst, port_id_, q);
     auto channel = channel_list.at(q);
     channel->periodic_summary_last_ns = steady_time_ns();
+    if (degraded_reset_on_rx_queue_warning_.get() ||
+        degraded_shutdown_on_rx_queue_warning_threshold_.get() > 0) {
+      const uint64_t warning_count = get_rx_queue_error_warning_count(port_id_, q);
+      if (warning_count > channel->last_seen_rx_queue_error_warning_count) {
+        channel->last_seen_rx_queue_error_warning_count = warning_count;
+        const uint32_t shutdown_threshold = degraded_shutdown_on_rx_queue_warning_threshold_.get();
+        if (shutdown_threshold > 0 && warning_count >= shutdown_threshold) {
+          HOLOSCAN_LOG_ERROR(
+              "Observed RX queue warning threshold for port {} queue {} (warning_count={} total_errors={}); triggering channel soft resync",
+              port_id_,
+              q,
+              warning_count,
+              get_rx_queue_error_total(port_id_, q));
+          panic_reset_channel(channel, "dpdk-rx-queue-warning-threshold");
+          continue;
+        }
+
+        if (degraded_reset_on_rx_queue_warning_.get()) {
+          const double ms_since_last_reset = elapsed_ms_since(channel->last_panic_reset_ns);
+          if (channel->last_panic_reset_ns == 0 ||
+              ms_since_last_reset >= static_cast<double>(degraded_reset_cooldown_ms_.get())) {
+            HOLOSCAN_LOG_WARN(
+                "Observed new DPDK RX queue warning for port {} queue {} (warning_count={} total_errors={}); triggering immediate CHDR panic reset for channel {}",
+                port_id_,
+                q,
+                warning_count,
+                get_rx_queue_error_total(port_id_, q),
+                channel->channel_num);
+            panic_reset_channel(channel, "dpdk-rx-queue-warning");
+            continue;
+          }
+        }
+      }
+    }
+
+    auto status = get_rx_burst(&burst, port_id_, q);
     if (status == Status::SUCCESS) {
       const uint16_t resolved_channel =
           resolve_channel_from_burst_flow(burst, q, num_channels_.get());
@@ -909,6 +1077,8 @@ void ChdrConverterOpRx::stop() {
         "        RX bursts received: {}\n"
         "           Empty RX polls: {}\n"
         "     Partial batch drops: {}\n"
+        "Consecutive partial flushes: {}\n"
+        "            Panic resets: {}\n"
         "         Backlog events: {}\n"
         "       Max out_q depth: {}\n"
         "      Max burst packets: {}\n"
@@ -925,6 +1095,8 @@ void ChdrConverterOpRx::stop() {
           channel->rx_bursts_received,
           channel->empty_rx_polls,
         channel->timeout_like_partial_drains,
+        channel->consecutive_partial_flushes,
+        channel->panic_resets,
         channel->backlog_events,
         channel->max_out_q_depth,
           channel->max_burst_packets,

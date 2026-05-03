@@ -64,6 +64,11 @@ class ChdrConverterOpRx : public Operator {
   Parameter<bool> log_data_;
   Parameter<bool> log_packets_;
   Parameter<uint32_t> partial_batch_drop_timeout_ms_;
+  Parameter<bool> degraded_reset_on_rx_queue_warning_;
+  Parameter<uint32_t> degraded_shutdown_on_rx_queue_warning_threshold_;
+  Parameter<uint32_t> degraded_shutdown_force_exit_timeout_ms_;
+  Parameter<uint32_t> degraded_reset_partial_flush_threshold_;
+  Parameter<uint32_t> degraded_reset_cooldown_ms_;
   Parameter<std::string> channel_center_frequencies_hz_;
   Parameter<std::string> channel_sample_rates_hz_;
   int port_id_;
@@ -105,6 +110,10 @@ class ChdrConverterOpRx : public Operator {
     uint64_t empty_rx_polls = 0;
     uint64_t max_burst_packets = 0;
     uint64_t timeout_like_partial_drains = 0;
+    uint64_t consecutive_partial_flushes = 0;
+    uint64_t panic_resets = 0;
+    uint64_t last_panic_reset_ns = 0;
+    uint64_t last_seen_rx_queue_error_warning_count = 0;
     uint64_t periodic_summary_start_ns = 0;
     uint64_t periodic_summary_last_ns = 0;
     uint64_t periodic_summary_batches_queued = 0;
@@ -125,12 +134,15 @@ class ChdrConverterOpRx : public Operator {
  private:
 
   std::vector<std::shared_ptr<struct Channel>> channel_list;
+  bool shutdown_requested_ = false;
+  bool shutdown_force_exit_armed_ = false;
 
   std::optional<RxMsg> free_buf(std::shared_ptr<struct Channel> channel);
   bool free_bufs_and_emit_arrays(OutputContext& op_output, std::shared_ptr<struct Channel> channel);
   void retain_burst_ref(std::shared_ptr<struct Channel> channel, BurstParams* burst);
   void release_burst_ref(std::shared_ptr<struct Channel> channel, BurstParams* burst);
   void flush_partial_batch(std::shared_ptr<struct Channel> channel, const char* reason);
+  void panic_reset_channel(std::shared_ptr<struct Channel> channel, const char* reason);
   void queue_completed_batch(std::shared_ptr<struct Channel> channel,
                              uint32_t packets_in_batch,
                              bool partial_batch);

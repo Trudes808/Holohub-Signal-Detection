@@ -1614,10 +1614,18 @@ void DpdkMgr::run() {
 ///  \brief
 ///
 ////////////////////////////////////////////////////////////////////////////////
-void DpdkMgr::flush_packets(int port) {
-  struct rte_mbuf* rx_mbuf;
-  HOLOSCAN_LOG_INFO("Flushing packet on port {}", port);
-  while (rte_eth_rx_burst(port, 0, &rx_mbuf, 1) != 0) { rte_pktmbuf_free(rx_mbuf); }
+void DpdkMgr::flush_packets(int port, int queue) {
+  struct rte_mbuf* rx_mbuf_arr[DEFAULT_NUM_RX_BURST];
+  HOLOSCAN_LOG_INFO("Flushing packets on port {} queue {}", port, queue);
+  while (true) {
+    const uint16_t burst_count = rte_eth_rx_burst(port, queue, rx_mbuf_arr, DEFAULT_NUM_RX_BURST);
+    if (burst_count == 0) {
+      break;
+    }
+    for (uint16_t packet_index = 0; packet_index < burst_count; ++packet_index) {
+      rte_pktmbuf_free(rx_mbuf_arr[packet_index]);
+    }
+  }
 }
 
 /*
@@ -1902,7 +1910,7 @@ int DpdkMgr::rx_core_worker(void* arg) {
   uint64_t last_cycles = rte_get_tsc_cycles();
   uint64_t total_pkts = 0;
 
-  flush_packets(tparams->port);
+  flush_packets(tparams->port, tparams->queue);
   struct rte_mbuf* mbuf_arr[DEFAULT_NUM_RX_BURST];
 
   HOLOSCAN_LOG_INFO("Starting RX Core {}, port {}, queue {}, socket {}",
@@ -2371,6 +2379,43 @@ Status DpdkMgr::get_rx_burst(BurstParams** burst, int port, int q) {
     return Status::NOT_READY;
   }
 
+  return Status::SUCCESS;
+}
+
+Status DpdkMgr::drain_rx_queue(int port, int q) {
+  uint32_t key = generate_queue_key(port, q);
+  const auto ring_it = rx_rings.find(key);
+
+  if (ring_it == rx_rings.end()) {
+    HOLOSCAN_LOG_ERROR("Invalid port/queue combination in drain_rx_queue: {}/{}", port, q);
+    return Status::INVALID_PARAMETER;
+  }
+
+  auto drain_ring = [this, &ring_it](uint64_t& drained_bursts, uint64_t& drained_packets) {
+    BurstParams* burst = nullptr;
+    while (rte_ring_dequeue(ring_it->second, reinterpret_cast<void**>(&burst)) == 0) {
+      if (burst == nullptr) {
+        continue;
+      }
+      drained_packets += static_cast<uint64_t>(std::max<int64_t>(0, burst->hdr.hdr.num_pkts));
+      free_all_packets(burst);
+      free_rx_burst(burst);
+      drained_bursts++;
+    }
+  };
+
+  uint64_t drained_bursts = 0;
+  uint64_t drained_packets = 0;
+  drain_ring(drained_bursts, drained_packets);
+  flush_packets(port, q);
+  drain_ring(drained_bursts, drained_packets);
+
+  HOLOSCAN_LOG_WARN(
+      "Drained RX queue port={} queue={} bursts={} packets={}",
+      port,
+      q,
+      drained_bursts,
+      drained_packets);
   return Status::SUCCESS;
 }
 

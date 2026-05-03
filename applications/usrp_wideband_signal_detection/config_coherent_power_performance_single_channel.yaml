@@ -79,6 +79,12 @@ chdr_converter:
   num_channels: 1
   log_packets: false
   log_data: false
+  partial_batch_drop_timeout_ms: 250
+  degraded_reset_on_rx_queue_warning: false
+  degraded_shutdown_on_rx_queue_warning_threshold: 3
+  degraded_shutdown_force_exit_timeout_ms: 2000
+  degraded_reset_partial_flush_threshold: 3
+  degraded_reset_cooldown_ms: 1000
 
 fft:
   burst_size: 20480

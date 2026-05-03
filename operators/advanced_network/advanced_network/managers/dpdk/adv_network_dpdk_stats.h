@@ -24,6 +24,10 @@
 
 namespace holoscan::advanced_network {
 
+uint64_t get_dpdk_rx_queue_error_warning_count(int port_id, int queue_id);
+uint64_t get_dpdk_rx_queue_error_total(int port_id, int queue_id);
+void reset_dpdk_rx_queue_error_tracking();
+
 class DpdkStats {
  public:
     DpdkStats() = default;
