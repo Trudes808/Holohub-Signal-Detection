@@ -223,21 +223,15 @@ coherent_power_signal_detector:
   fast_score_threshold: 0.4
   live_emit_mask_rows: 16
   live_emit_mask_cols: 20480
-  live_emit_mask_min_coverage: 0.35
   live_emit_freq_persistence_window: 45
   live_emit_freq_persistence_min_hits: 11
   emit_stride: 1
   log_detections: true
-  fast_performance: true
   save_performance_path_artifacts: false
   enable_mask_save: false
   save_every_n_frames: 100
   max_masks_per_channel: 0
   output_dir: "/workspace/coherent_power_masks"
-  chunk_bandwidth_hz: 37500000.0
-  chunk_overlap_hz: 2000000.0
-  uncalibrated_chunk_fraction: 0.40
-  uncalibrated_overlap_fraction: 0.20
   ignore_sideband_percent: 0.0
   ignore_sideband_hz: 7000000.0
   frontend_row_q: 25.0
@@ -245,15 +239,8 @@ coherent_power_signal_detector:
   frontend_smooth_sigma: 12.0
   frontend_max_boost_db: 0.0
   frontend_signal_cap_db: 0.0
-  coherence_weight: 0.55
-  power_weight: 0.45
-  score_threshold_mode: "fixed"
-  fixed_score_threshold: 0.4
-  coherence_power_support_q: 0.82
-  coherence_power_q: 0.92
   min_component_size: 1
   filter_detection_mask: true
-  grouping_seed_score_q: 0.72
   grouping_bridge_freq_px: 33
   grouping_bridge_time_px: 5
   grouping_min_component_size: 1

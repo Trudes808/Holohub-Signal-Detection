@@ -166,6 +166,8 @@ class SpectrogramToHolovizOp : public Operator {
   Parameter<float> overlay_alpha_;
   Parameter<bool> overlay_enable_;
   Parameter<std::string> detector_label_;
+  Parameter<std::string> demo_title_;
+  Parameter<std::string> demo_subtitle_;
   Parameter<double> center_frequency_hz_;
   Parameter<double> span_hz_;
   Parameter<int> fft_size_;
@@ -506,6 +508,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                                float red_limit,
                                                float overlay_alpha,
                                                bool overlay_enabled,
+                                               const std::string& demo_title,
+                                               const std::string& demo_subtitle,
                                                int panel_width,
                                                int panel_height,
                                                int& output_width,

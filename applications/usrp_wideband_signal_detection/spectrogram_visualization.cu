@@ -275,12 +275,14 @@ struct RgbColor {
   uint8_t b;
 };
 
-constexpr int kHeaderHeight = 52;
+constexpr int kHeaderHeight = 96;
 constexpr int kFooterHeight = 40;
 constexpr int kSidebarWidth = 260;
 constexpr int kPsdHeight = 142;
 constexpr int kPanelPadding = 28;
 constexpr size_t kBytesPerMegabyte = 1024 * 1024;
+constexpr int kHeaderTitleScale = 3;
+constexpr int kHeaderSubtitleScale = 1;
 
 std::atomic<bool>& global_overlay_enabled() {
   static std::atomic<bool> enabled{true};
@@ -2124,20 +2126,24 @@ void render_visualization_ui_overlay() {
   draw_list->AddText(ImVec2(header_min.x + 18.0f, header_min.y + 30.0f), accent_blue, state.subtitle.c_str());
 
   ImGui::SetNextWindowBgAlpha(0.82f);
-  ImGui::SetNextWindowPos(ImVec2(header_max.x - 16.0f, header_min.y + 12.0f),
+  ImGui::SetNextWindowPos(ImVec2(display_size.x - 16.0f, display_size.y - 16.0f),
                           ImGuiCond_Always,
-                          ImVec2(1.0f, 0.0f));
+                          ImVec2(1.0f, 1.0f));
   ImGui::Begin("Display Controls",
                nullptr,
                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
                    ImGuiWindowFlags_NoSavedSettings);
+  ImGui::SetWindowFontScale(1.5f);
+  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 6.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(12.0f, 9.0f));
   bool overlay_enabled = visualization_overlay_enabled();
-  if (ImGui::Checkbox("Detect", &overlay_enabled)) {
+  if (ImGui::Checkbox("Overlay Detection Mask", &overlay_enabled)) {
     set_visualization_overlay_enabled(overlay_enabled);
   }
   ImGui::Separator();
   ImGui::TextColored(ImVec4(0.48f, 0.78f, 1.0f, 1.0f), "%s", state.detector_label.c_str());
+  ImGui::PopStyleVar(2);
   ImGui::End();
 
   const ImVec2 sidebar_min = rect_min(state.sidebar_rect);
@@ -2163,14 +2169,12 @@ void render_visualization_ui_overlay() {
     draw_kv("Det Bin", format_frequency_label(channel.resolution_hz));
     draw_kv("Disp Px", format_frequency_label(channel.display_frequency_bin_hz));
     draw_kv("Time Bin", format_time_bin_label(channel.seconds_per_time_bin));
-    draw_kv("Frames", format_displayed_frame_ratio_label(channel.displayed_frame_ratio,
-                                channel.displayed_frame_stride));
+        draw_kv("Processing Ratio", format_displayed_frame_ratio_label(channel.displayed_frame_ratio,
+                channel.displayed_frame_stride));
     draw_kv("Vis Ratio", format_fft_row_visualization_ratio_label(channel.displayed_fft_rows_per_frame,
                                      channel.fft_rows_per_frame));
     draw_kv("FFT", std::to_string(channel.fft_size));
-    draw_kv("History", std::to_string(channel.history_rows) + " bins");
-    draw_kv("Chunk",
-            std::to_string(channel.dino_chunk_rows) + " x " + std::to_string(channel.dino_chunk_cols));
+        draw_kv("History", std::to_string(channel.history_rows) + " frames");
 
     draw_list->AddLine(ImVec2(sidebar_min.x + 16.0f, sidebar_text_y),
                        ImVec2(rect_max(state.sidebar_rect).x - 16.0f, sidebar_text_y),
@@ -2214,10 +2218,25 @@ void render_visualization_ui_overlay() {
     auto annotate_plot = [&](const VisualizationRect& rect,
                              const char* title,
                              const std::string& y0,
-                             const std::string& y1) {
+                             const std::string& y1,
+                             ImU32 title_color = 0,
+                             float title_scale = 1.0f) {
       const ImVec2 min = rect_min(rect);
       const ImVec2 max = rect_max(rect);
-      draw_list->AddText(ImVec2(min.x + 10.0f, min.y + 8.0f), panel_text, title);
+      if (title != nullptr && title[0] != '\0') {
+        if (title_color == 0) {
+          title_color = panel_text;
+        }
+        if (title_scale <= 1.0f) {
+          draw_list->AddText(ImVec2(min.x + 10.0f, min.y + 8.0f), title_color, title);
+        } else {
+          draw_list->AddText(ImGui::GetFont(),
+                             ImGui::GetFontSize() * title_scale,
+                             ImVec2(min.x + 10.0f, min.y + 8.0f),
+                             title_color,
+                             title);
+        }
+      }
       draw_frequency_grid_labels(rect);
       draw_list->AddText(ImVec2(min.x - 36.0f, min.y - 2.0f), panel_muted, y1.c_str());
       draw_list->AddText(ImVec2(min.x - 28.0f, max.y - 14.0f), panel_muted, y0.c_str());
@@ -2227,14 +2246,16 @@ void render_visualization_ui_overlay() {
                   "PSD / Max Hold",
                   "-100 dB",
                   "0 dB");
-    annotate_plot(channel.waterfall_rect,
-                  "Spectrogram",
-                  "0",
-                  std::to_string(channel.history_rows));
     const bool mask_enabled = state.overlay_enabled;
-    const char* mask_title = mask_enabled ? "Signal Detection Mask Enabled"
-                                          : "Signal Detection Mask Disabled";
-    const ImU32 mask_title_color = mask_enabled ? accent_green : IM_COL32(228, 72, 72, 255);
+    const char* overlay_title = mask_enabled ? "Region of Interest Overlay Enabled"
+                         : "Region of Interest Overlay Disabled";
+    const ImU32 overlay_title_color = mask_enabled ? accent_green : IM_COL32(228, 72, 72, 255);
+    annotate_plot(channel.waterfall_rect,
+            overlay_title,
+                  "0",
+            std::to_string(channel.history_rows),
+            overlay_title_color,
+            2.0f);
     const ImVec2 mask_min = rect_min(channel.mask_rect);
     annotate_plot(channel.mask_rect,
                   "",
@@ -2243,8 +2264,8 @@ void render_visualization_ui_overlay() {
     draw_list->AddText(ImGui::GetFont(),
                        ImGui::GetFontSize() * 2.0f,
                        ImVec2(mask_min.x + 10.0f, mask_min.y + 8.0f),
-                       mask_title_color,
-                       mask_title);
+               panel_text,
+               "Detected Regions of Interest");
   }
 
   if (state.total_frames > 0) {
@@ -2331,6 +2352,16 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
              "Detector Label",
              "Human-readable detector label used in the visualization UI.",
              std::string("Dinov3"));
+  spec.param(demo_title_,
+             "demo_title",
+             "Demo Title",
+             "Large header title rendered across the visualization chrome.",
+             std::string("USRP WIDEBAND"));
+  spec.param(demo_subtitle_,
+             "demo_subtitle",
+             "Demo Subtitle",
+             "Subtitle rendered below the main visualization header title.",
+             std::string("REAL TIME SIGNAL DETECTION"));
   spec.param(center_frequency_hz_, "center_frequency_hz", "Center Frequency", "Center frequency for display in Hz.", 0.0);
   spec.param(span_hz_, "span_hz", "Span Hz", "Frequency span shown on calibrated plot axes in Hz.", 0.0);
   spec.param(fft_size_, "fft_size", "FFT Size", "FFT size shown in analyzer readouts.", 20480);
@@ -2906,6 +2937,8 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
                                          red_limit_.get(),
                                          overlay_alpha_.get(),
                                          visualization_overlay_enabled(),
+                                         demo_title_.get(),
+                                         demo_subtitle_.get(),
                                          output_width_.get(),
                                          output_height_.get(),
                                          composite_width,
@@ -3100,6 +3133,8 @@ void OfflinePgmReplayOp::compute(InputContext&, OutputContext& op_output, Execut
                                             red_limit_.get(),
                                             overlay_alpha_.get(),
                                             visualization_overlay_enabled(),
+                                            state.info.title,
+                                            state.info.subtitle,
                                             width,
                                             std::max(256, height * history_frames_.get()),
                                             composite_width,
@@ -3496,14 +3531,14 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                                float red_limit,
                                                float overlay_alpha,
                                                bool overlay_enabled,
+                                               const std::string& demo_title,
+                                               const std::string& demo_subtitle,
                                                int panel_width,
                                                int panel_height,
                                                int& output_width,
                                                int& output_height,
                                                uint64_t dropped_frames,
                                                uint64_t total_frames) {
-
-  // Channel accent colors — blue for CH0, purple for CH1
   const RgbColor kCh0Accent{84, 196, 255};
   const RgbColor kCh1Accent{200, 124, 255};
   const RgbColor kAccents[2] = {kCh0Accent, kCh1Accent};
@@ -3564,8 +3599,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   ui_state.red_limit = red_limit;
   ui_state.dropped_frames = dropped_frames;
   ui_state.total_frames = total_frames;
-  ui_state.title = "USRP WIDEBAND";
-  ui_state.subtitle = "REAL TIME SIGNAL DETECTION";
+  ui_state.title = demo_title;
+  ui_state.subtitle = demo_subtitle;
   ui_state.header_rect = normalized_rect(0, 0, output_width, kHeaderHeight, output_width, output_height);
   ui_state.content_rect = normalized_rect(content_x,
                                           content_y,
@@ -3594,12 +3629,27 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
 
   // Title + subtitle
   if (render_canvas_chrome) {
-    draw_text(canvas, output_width, output_height, 18, 8, "USRP WIDEBAND", {232, 236, 241}, 2);
-    draw_text(canvas, output_width, output_height, 18, 26, "REAL TIME SIGNAL DETECTION", {124, 198, 255}, 1);
+    const int title_x = std::max(18,
+                                 (output_width - text_pixel_width(ui_state.title, kHeaderTitleScale)) / 2);
+    const int subtitle_x = std::max(18,
+                                    (output_width - text_pixel_width(ui_state.subtitle, kHeaderSubtitleScale)) / 2);
+    draw_text(canvas,
+              output_width,
+              output_height,
+              title_x,
+              10,
+              ui_state.title,
+              {232, 236, 241},
+              kHeaderTitleScale);
+    draw_text(canvas,
+              output_width,
+              output_height,
+              subtitle_x,
+              40,
+              ui_state.subtitle,
+              {124, 198, 255},
+              kHeaderSubtitleScale);
   }
-
-  // Divider after title
-  fill_rect(canvas, output_width, output_height, 210, 10, 1, 30, {30, 45, 62});
 
   // Stat boxes — CH-0 RATE, CH-1 RATE, CF, SPAN, FFT
   auto draw_stat_box = [&](int x, int y, const std::string& label, const std::string& value, const RgbColor& val_color) {
@@ -3614,11 +3664,12 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   std::string ch1_rate = "500.0 MSps";
 
   if (render_canvas_chrome) {
-    draw_stat_box(218, 10, "CH-0 RATE", ch0_rate, kGreen);
-    draw_stat_box(314, 10, "CH-1 RATE", ch1_rate, kGreen);
-    draw_stat_box(410, 10, "CENTER FREQ", "2400.0 MHZ", kYellow);
-    draw_stat_box(506, 10, "SPAN", "500 MHZ", {232, 236, 241});
-    draw_stat_box(602, 10, "FFT SIZE", "20480", {232, 236, 241});
+    constexpr int kHeaderStatY = 56;
+    draw_stat_box(18, kHeaderStatY, "CH-0 RATE", ch0_rate, kGreen);
+    draw_stat_box(114, kHeaderStatY, "CH-1 RATE", ch1_rate, kGreen);
+    draw_stat_box(210, kHeaderStatY, "CENTER FREQ", "2400.0 MHZ", kYellow);
+    draw_stat_box(306, kHeaderStatY, "SPAN", "500 MHZ", {232, 236, 241});
+    draw_stat_box(402, kHeaderStatY, "FFT SIZE", "20480", {232, 236, 241});
   }
 
   std::string active_detector_label = "Dinov3";
@@ -3794,93 +3845,86 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                         overlay_alpha);
     }
 
-              fill_rect(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {14, 18, 28});
-              fill_rect(canvas, output_width, output_height, panel_x - 8, mask_y - 8, 3, channel_mask_height + 16, {232, 236, 241});
-              size_t mask_nonzero = 0;
-              uint8_t mask_max = 0;
-              for (uint8_t value : channel.history_mask) {
-                if (value > 0) {
-                  ++mask_nonzero;
-                  mask_max = std::max(mask_max, value);
-                }
-              }
-              size_t latest_mask_nonzero = 0;
-              uint8_t latest_mask_max = 0;
-              for (uint8_t value : channel.latest_mask.pixels) {
-                if (value > 0) {
-                  ++latest_mask_nonzero;
-                  latest_mask_max = std::max(latest_mask_max, value);
-                }
-              }
-              if (mask_nonzero > 0) {
-                draw_rect_outline(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {80, 200, 120}, 1);
-              }
-              draw_plot_axes(canvas,
-                             output_width,
-                             output_height,
-                             panel_x,
-                             mask_y,
-                             main_width,
-                             channel_mask_height,
-                             freq_min_label,
-                             freq_max_label,
-                             newest_time_label,
-                             oldest_time_label,
-                             render_canvas_chrome ? 1 : 0,
-                             "FREQ",
-                             "TIME BIN");
-              bool showing_latest_fallback = false;
-              if (overlay_enabled) {
-                if (mask_nonzero > 0) {
-                  blit_mask_ring_to_canvas(canvas,
-                                           output_width,
-                                           output_height,
-                                           panel_x,
-                                           mask_y,
-                                           main_width,
-                                           channel_mask_height,
-                                           channel.history_mask,
-                                           history_width,
-                                           history_rows,
-                                           channel.history_valid_rows,
-                                           channel.history_write_row);
-                } else if (!channel.latest_mask.pixels.empty() && channel.latest_mask.width > 0 && channel.latest_mask.height > 0) {
-                  blit_mask_frame_to_canvas(canvas,
-                                            output_width,
-                                            output_height,
-                                            panel_x,
-                                            mask_y,
-                                            main_width,
-                                            channel_mask_height,
-                                            channel.latest_mask);
-                  showing_latest_fallback = true;
-                  draw_rect_outline(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {255, 212, 89}, 1);
-                }
-                draw_grid(canvas, output_width, output_height, panel_x, mask_y, main_width, channel_mask_height);
-              }
-              if (render_canvas_chrome) {
-                const std::string mask_title = overlay_enabled
-                    ? "SIGNAL DETECTION MASK ENABLED"
-                    : "SIGNAL DETECTION MASK DISABLED";
-                const RgbColor mask_title_color = overlay_enabled ? kGreen : RgbColor{228, 72, 72};
-                draw_text(canvas,
-                          output_width,
-                          output_height,
-                          panel_x + 8,
-                          mask_y + 8,
-                          mask_title,
-                          mask_title_color,
-                          2);
-              }
-
-    // Confidence fill — use density trace average as proxy
-    float confidence = 0.0f;
-    if (!channel.density_trace.empty()) {
-      for (float v : channel.density_trace) confidence += v;
-      confidence /= static_cast<float>(channel.density_trace.size());
-      confidence = std::clamp(confidence * 4.0f, 0.0f, 1.0f);
+    fill_rect(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {14, 18, 28});
+    fill_rect(canvas, output_width, output_height, panel_x - 8, mask_y - 8, 3, channel_mask_height + 16, {232, 236, 241});
+    size_t mask_nonzero = 0;
+    uint8_t mask_max = 0;
+    for (uint8_t value : channel.history_mask) {
+      if (value > 0) {
+        ++mask_nonzero;
+        mask_max = std::max(mask_max, value);
+      }
     }
+    size_t latest_mask_nonzero = 0;
+    uint8_t latest_mask_max = 0;
+    for (uint8_t value : channel.latest_mask.pixels) {
+      if (value > 0) {
+        ++latest_mask_nonzero;
+        latest_mask_max = std::max(latest_mask_max, value);
+      }
+    }
+    if (mask_nonzero > 0) {
+      draw_rect_outline(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {80, 200, 120}, 1);
+    }
+    draw_plot_axes(canvas,
+                   output_width,
+                   output_height,
+                   panel_x,
+                   mask_y,
+                   main_width,
+                   channel_mask_height,
+                   freq_min_label,
+                   freq_max_label,
+                   newest_time_label,
+                   oldest_time_label,
+                   render_canvas_chrome ? 1 : 0,
+                   "FREQ",
+                   "TIME BIN");
+
+    bool showing_latest_fallback = false;
+    if (mask_nonzero > 0) {
+      blit_mask_ring_to_canvas(canvas,
+                               output_width,
+                               output_height,
+                               panel_x,
+                               mask_y,
+                               main_width,
+                               channel_mask_height,
+                               channel.history_mask,
+                               history_width,
+                               history_rows,
+                               channel.history_valid_rows,
+                               channel.history_write_row);
+    } else if (!channel.latest_mask.pixels.empty() && channel.latest_mask.width > 0 &&
+               channel.latest_mask.height > 0) {
+      blit_mask_frame_to_canvas(canvas,
+                                output_width,
+                                output_height,
+                                panel_x,
+                                mask_y,
+                                main_width,
+                                channel_mask_height,
+                                channel.latest_mask);
+      showing_latest_fallback = true;
+      draw_rect_outline(canvas,
+                        output_width,
+                        output_height,
+                        panel_x - 8,
+                        mask_y - 8,
+                        main_width + 16,
+                        channel_mask_height + 16,
+                        {255, 212, 89},
+                        1);
+    }
+
+    const float history_confidence = static_cast<float>(mask_max) / 255.0f;
+    const float latest_confidence = static_cast<float>(latest_mask_max) / 255.0f;
+    const float confidence = std::clamp(std::max(history_confidence, latest_confidence), 0.0f, 1.0f);
     channel_ui.confidence = confidence;
+    channel_ui.overlay_available = channel.overlay_available || mask_nonzero > 0 || latest_mask_nonzero > 0;
+    if (showing_latest_fallback) {
+      channel_ui.overlay_available = true;
+    }
     ui_state.channels.push_back(channel_ui);
   }
 
