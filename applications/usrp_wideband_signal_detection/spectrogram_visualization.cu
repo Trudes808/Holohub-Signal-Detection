@@ -285,7 +285,7 @@ constexpr int kHeaderTitleScale = 15;
 constexpr int kHeaderSubtitleScale = 2;
 
 std::atomic<bool>& global_overlay_enabled() {
-  static std::atomic<bool> enabled{true};
+  static std::atomic<bool> enabled{false};
   return enabled;
 }
 
@@ -678,14 +678,15 @@ ChannelPanelHeights compute_channel_panel_heights(int canvas_height, int active_
 
   ChannelPanelHeights heights{};
   heights.psd = std::clamp(static_cast<int>(std::lround(plot_stack_height * 0.22)), 64, 112);
-  heights.mask = std::clamp(static_cast<int>(std::lround(plot_stack_height * 0.18)), 40, 88);
-  heights.heat = plot_stack_height - heights.psd - heights.mask;
+  const int remaining_plot_height = plot_stack_height - heights.psd;
+  heights.mask = std::max(64, remaining_plot_height / 2);
+  heights.heat = remaining_plot_height - heights.mask;
   if (heights.heat < 64) {
     int deficit = 64 - heights.heat;
     const int psd_reduction = std::min(deficit / 2 + deficit % 2, std::max(0, heights.psd - 64));
     heights.psd -= psd_reduction;
     deficit -= psd_reduction;
-    const int mask_reduction = std::min(deficit, std::max(0, heights.mask - 40));
+    const int mask_reduction = std::min(deficit, std::max(0, heights.mask - 64));
     heights.mask -= mask_reduction;
     heights.heat = plot_stack_height - heights.psd - heights.mask;
   }
@@ -1220,18 +1221,21 @@ void draw_plot_axes(std::vector<uint8_t>& canvas,
                     const std::string& x1,
                     const std::string& y0,
                     const std::string& y1,
+                    bool draw_grid_lines = true,
                     int label_scale = 1,
                     const std::string& x_axis_title = {},
                     const std::string& y_axis_title = {}) {
   const RgbColor axis_color{142, 156, 174};
   draw_rect_outline(canvas, width, height, x, y, plot_width, plot_height, axis_color, 1);
-  for (int step = 1; step < 5; ++step) {
-    const int gy = y + static_cast<int>(std::lround((static_cast<double>(plot_height - 1) * step) / 5.0));
-    fill_rect(canvas, width, height, x, gy, plot_width, 1, {48, 58, 76});
-  }
-  for (int step = 1; step < 8; ++step) {
-    const int gx = x + static_cast<int>(std::lround((static_cast<double>(plot_width - 1) * step) / 8.0));
-    fill_rect(canvas, width, height, gx, y, 1, plot_height, {40, 48, 64});
+  if (draw_grid_lines) {
+    for (int step = 1; step < 5; ++step) {
+      const int gy = y + static_cast<int>(std::lround((static_cast<double>(plot_height - 1) * step) / 5.0));
+      fill_rect(canvas, width, height, x, gy, plot_width, 1, {48, 58, 76});
+    }
+    for (int step = 1; step < 8; ++step) {
+      const int gx = x + static_cast<int>(std::lround((static_cast<double>(plot_width - 1) * step) / 8.0));
+      fill_rect(canvas, width, height, gx, y, 1, plot_height, {40, 48, 64});
+    }
   }
   if (label_scale <= 0) {
     return;
@@ -2388,7 +2392,7 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
              "overlay_enable",
              "Overlay Enable",
              "Enable or disable the detection overlay layer in the composed visualization.",
-             true);
+             false);
   spec.param(detector_label_,
              "detector_label",
              "Detector Label",
@@ -3056,7 +3060,7 @@ void OfflinePgmReplayOp::setup(OperatorSpec& spec) {
              "overlay_enable",
              "Overlay Enable",
              "Enable or disable the detection overlay layer in the composed visualization.",
-             true);
+             false);
   spec.param(detector_label_,
              "detector_label",
              "Detector Label",
@@ -3829,6 +3833,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
              freq_max_label,
              "-100",
              "0",
+          false,
                    render_canvas_chrome ? 1 : 0,
              "FREQ",
              "POWER");
@@ -3853,6 +3858,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
              freq_max_label,
              newest_time_label,
              oldest_time_label,
+               false,
                    render_canvas_chrome ? 1 : 0,
                  "FREQ",
                  "TIME BIN");
@@ -3918,6 +3924,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                    freq_max_label,
                    newest_time_label,
                    oldest_time_label,
+                   false,
                    render_canvas_chrome ? 1 : 0,
                    "FREQ",
                    "TIME BIN");
