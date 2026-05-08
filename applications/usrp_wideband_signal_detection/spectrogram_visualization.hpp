@@ -118,6 +118,9 @@ class SpectrogramPreviewStoreOp : public Operator {
 
   void setup(OperatorSpec& spec) override;
   void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
+
+ private:
+  Parameter<bool> allow_backpressure_valve_;
 };
 
 class MaskPreviewStoreOp : public Operator {
@@ -130,6 +133,9 @@ class MaskPreviewStoreOp : public Operator {
 
   void setup(OperatorSpec& spec) override;
   void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override;
+
+ private:
+  Parameter<bool> allow_backpressure_valve_;
 };
 
 struct ChannelVisualizationState;
@@ -174,6 +180,7 @@ class SpectrogramToHolovizOp : public Operator {
   Parameter<bool> timing_summary_enable_;
   Parameter<int> timing_summary_every_n_;
   Parameter<std::shared_ptr<BooleanCondition>> shutdown_scheduling_term_;
+  Parameter<bool> allow_backpressure_valve_;
   Parameter<float> db_floor_;
   Parameter<float> db_ceil_;
   Parameter<int> row_average_n_;

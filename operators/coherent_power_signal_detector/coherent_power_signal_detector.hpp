@@ -268,6 +268,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   std::vector<ChannelTimingStats> timing_stats_;
   std::vector<ChannelBuffers> channel_buffers_;
   std::vector<uint8_t> reset_detector_state_on_next_full_batch_;
+  std::vector<uint64_t> last_seen_chdr_soft_resync_epoch_;
   std::atomic<bool> stop_requested_ {false};
 
   void reset_channel_state(uint16_t channel_number,

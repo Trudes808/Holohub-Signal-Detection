@@ -7153,6 +7153,7 @@ void CoherentPowerSignalDetector::initialize() {
   timing_stats_.assign(num_channels_.get(), ChannelTimingStats {});
   channel_buffers_.assign(num_channels_.get(), ChannelBuffers {});
   reset_detector_state_on_next_full_batch_.assign(num_channels_.get(), 0);
+  last_seen_chdr_soft_resync_epoch_.assign(num_channels_.get(), 0);
 
   auto cuda_result = cudaFree(nullptr);
   if (cuda_result != cudaSuccess) {
@@ -7352,6 +7353,16 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   }
 
   const bool chdr_partial_batch = meta->get<bool>("chdr_partial_batch", false);
+  const uint64_t chdr_soft_resync_epoch = meta->get<uint64_t>("chdr_soft_resync_epoch", 0);
+  if (chdr_soft_resync_epoch > 0 &&
+      chdr_soft_resync_epoch != last_seen_chdr_soft_resync_epoch_[channel_number]) {
+    last_seen_chdr_soft_resync_epoch_[channel_number] = chdr_soft_resync_epoch;
+    reset_detector_state_on_next_full_batch_[channel_number] = 1;
+    HOLOSCAN_LOG_WARN(
+        "Observed CHDR soft resync epoch {} on channel {}; detector state will reset on the next full batch",
+        chdr_soft_resync_epoch,
+        channel_number);
+  }
   const uint32_t chdr_packets_in_batch = meta->get<uint32_t>("chdr_packets_in_batch", 0);
   const uint32_t chdr_expected_packets_in_batch = meta->get<uint32_t>("chdr_expected_packets_in_batch", 0);
   if (chdr_partial_batch) {

@@ -613,9 +613,13 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           Arg("output_width") = from_config("visualization.renderer.output_width").as<int>(),
           Arg("output_height") = from_config("visualization.renderer.rows_per_frame").as<int>()));
         visualSpectrogramStoreOps.push_back(make_operator<ops::SpectrogramPreviewStoreOp>(
-          std::string("visualSpectrogramStoreOpCh") + std::to_string(channel_index)));
+          std::string("visualSpectrogramStoreOpCh") + std::to_string(channel_index),
+          Arg("allow_backpressure_valve") =
+              from_config("visualization.renderer.allow_backpressure_valve").as<bool>()));
         visualMaskStoreOps.push_back(make_operator<ops::MaskPreviewStoreOp>(
-          std::string("visualMaskStoreOpCh") + std::to_string(channel_index)));
+          std::string("visualMaskStoreOpCh") + std::to_string(channel_index),
+          Arg("allow_backpressure_valve") =
+              from_config("visualization.renderer.allow_backpressure_valve").as<bool>()));
       }
         
       holovizOp = make_operator<LoggingHolovizOp>(

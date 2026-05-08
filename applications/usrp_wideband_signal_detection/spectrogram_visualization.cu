@@ -1828,6 +1828,11 @@ void SpectrogramPreviewStoreOp::setup(OperatorSpec& spec) {
   input_port.conditions().emplace_back(
       holoscan::ConditionType::kMessageAvailable,
       std::make_shared<holoscan::MessageAvailableCondition>(size_t{1}));
+  spec.param(allow_backpressure_valve_,
+             "allow_backpressure_valve",
+             "Allow Backpressure Valve",
+             "If true, clamp preview mailbox depth by dropping the oldest buffered previews.",
+             true);
 }
 
 void SpectrogramPreviewStoreOp::compute(InputContext& op_input,
@@ -1845,8 +1850,10 @@ void SpectrogramPreviewStoreOp::compute(InputContext& op_input,
   ensure_preview_mailbox_capacity(static_cast<size_t>(message.channel + 1));
   auto& queue = preview_mailboxes()[static_cast<size_t>(message.channel)].spectrogram_queue;
   queue.push_back(std::move(message));
-  while (queue.size() > kPreviewMailboxMaxDepth) {
-    queue.pop_front();
+  if (allow_backpressure_valve_.get()) {
+    while (queue.size() > kPreviewMailboxMaxDepth) {
+      queue.pop_front();
+    }
   }
 }
 
@@ -1855,6 +1862,11 @@ void MaskPreviewStoreOp::setup(OperatorSpec& spec) {
   input_port.conditions().emplace_back(
       holoscan::ConditionType::kMessageAvailable,
       std::make_shared<holoscan::MessageAvailableCondition>(size_t{1}));
+  spec.param(allow_backpressure_valve_,
+             "allow_backpressure_valve",
+             "Allow Backpressure Valve",
+             "If true, clamp preview mailbox depth by dropping the oldest buffered previews.",
+             true);
 }
 
 void MaskPreviewStoreOp::compute(InputContext& op_input,
@@ -1872,8 +1884,10 @@ void MaskPreviewStoreOp::compute(InputContext& op_input,
   ensure_preview_mailbox_capacity(static_cast<size_t>(message.channel + 1));
   auto& queue = preview_mailboxes()[static_cast<size_t>(message.channel)].mask_queue;
   queue.push_back(std::move(message));
-  while (queue.size() > kPreviewMailboxMaxDepth) {
-    queue.pop_front();
+  if (allow_backpressure_valve_.get()) {
+    while (queue.size() > kPreviewMailboxMaxDepth) {
+      queue.pop_front();
+    }
   }
 }
 
@@ -2343,6 +2357,11 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
              "shutdown_scheduling_term",
              "Shutdown Scheduling Term",
              "Boolean scheduling term used to stop the visualization branch during shutdown.");
+  spec.param(allow_backpressure_valve_,
+             "allow_backpressure_valve",
+             "Allow Backpressure Valve",
+             "If true, clamp preview mailbox depth by dropping older pending previews during live reconciliation.",
+             true);
   spec.param(db_floor_, "db_floor", "dB Floor", "Fixed dB floor for spectrogram normalization.", -100.0f);
   spec.param(db_ceil_,  "db_ceil",  "dB Ceiling", "Fixed dB ceiling for spectrogram normalization.", 0.0f);
   spec.param(row_average_n_, "row_average_n", "Row Average N", "Frames averaged per waterfall row.", 4);
@@ -2868,8 +2887,10 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
         live_masks.push_front(std::move(residual_masks.back()));
         residual_masks.pop_back();
       }
-      while (live_masks.size() > kPreviewMailboxMaxDepth) {
-        live_masks.pop_back();
+      if (allow_backpressure_valve_.get()) {
+        while (live_masks.size() > kPreviewMailboxMaxDepth) {
+          live_masks.pop_back();
+        }
       }
     }
   }

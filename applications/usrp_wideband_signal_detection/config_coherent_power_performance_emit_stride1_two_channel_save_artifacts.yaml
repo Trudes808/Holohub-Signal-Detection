@@ -150,6 +150,7 @@ visualization:
     history_memory_budget_mb: 1024
     rows_per_frame: 16
     mask_frame_offset: 0
+    allow_backpressure_valve: true
     render_every_n_frames: 4
     timing_summary_enable: true
     timing_summary_every_n: 128

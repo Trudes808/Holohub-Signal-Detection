@@ -736,6 +736,7 @@ bool ChdrConverterOpRx::free_bufs_and_emit_arrays(
   meta->clear();
   meta->set("channel_number", channel->channel_num);
   meta->set("chdr_emit_ts_ns", steady_time_ns());
+  meta->set("chdr_soft_resync_epoch", channel->panic_resets);
   if (channel->channel_num < center_frequency_by_channel_.size() &&
       center_frequency_by_channel_[channel->channel_num].has_value()) {
     meta->set("rx_center_frequency_hz", center_frequency_by_channel_[channel->channel_num].value());
