@@ -162,17 +162,17 @@ visualization:
     timing_summary_every_n: 128
     channel_filter: -1
     tensor_name: "spectrogram"
-    demo_title: "Scaling RF AI to 1 GHz in Real Time"
-    demo_subtitle: "A Holoscan pipeline combining signal processing and computer vision models to detect and extract regions of interest from dual 500 MSps streams, reducing RF AI workloads to only the regions that matter."
-    blue_limit: 0.10
-    red_limit: 0.92
+    demo_title: "Enabling RF AI for Ultra Wideband Real Time Applications"
+    demo_subtitle: "Holoscan enables GPU native real time signal processing and computer vision models to detect and extract regions of interest from dual 500 MSps streams, reducing RF AI workloads to only the regions that matter."
+    blue_limit: 0.15
+    red_limit: 0.88
     overlay_alpha: 0.7 #0.38
     center_frequency_hz: 0.0
     fft_size: 20480
     dino_chunk_rows: 256
     dino_chunk_cols: 512
-    db_floor: -22.0
-    db_ceil: 35.0
+    db_floor: -20.0
+    db_ceil: 15.0
     row_average_n: 1
   holoviz:
     width: 1920

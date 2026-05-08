@@ -275,14 +275,14 @@ struct RgbColor {
   uint8_t b;
 };
 
-constexpr int kHeaderHeight = 96;
+constexpr int kHeaderHeight = 138;
 constexpr int kFooterHeight = 40;
 constexpr int kSidebarWidth = 260;
 constexpr int kPsdHeight = 142;
 constexpr int kPanelPadding = 28;
 constexpr size_t kBytesPerMegabyte = 1024 * 1024;
-constexpr int kHeaderTitleScale = 3;
-constexpr int kHeaderSubtitleScale = 1;
+constexpr int kHeaderTitleScale = 15;
+constexpr int kHeaderSubtitleScale = 2;
 
 std::atomic<bool>& global_overlay_enabled() {
   static std::atomic<bool> enabled{true};
@@ -1031,6 +1031,24 @@ std::string format_time_bin_label(double seconds_per_bin) {
     os << std::fixed << std::setprecision(2) << (seconds_per_bin * 1.0e6) << " US";
   } else {
     os << std::fixed << std::setprecision(2) << (seconds_per_bin * 1.0e9) << " NS";
+  }
+  return os.str();
+}
+
+std::string format_sample_rate_label(double sample_rate_hz) {
+  if (!std::isfinite(sample_rate_hz) || sample_rate_hz <= 0.0) {
+    return "N/A";
+  }
+
+  std::ostringstream os;
+  if (sample_rate_hz >= 1.0e9) {
+    os << std::fixed << std::setprecision(3) << (sample_rate_hz / 1.0e9) << " GSPS";
+  } else if (sample_rate_hz >= 1.0e6) {
+    os << std::fixed << std::setprecision(1) << (sample_rate_hz / 1.0e6) << " MSPS";
+  } else if (sample_rate_hz >= 1.0e3) {
+    os << std::fixed << std::setprecision(1) << (sample_rate_hz / 1.0e3) << " KSPS";
+  } else {
+    os << std::fixed << std::setprecision(0) << sample_rate_hz << " SPS";
   }
   return os.str();
 }
@@ -2122,13 +2140,33 @@ void render_visualization_ui_overlay() {
 
   const ImVec2 header_min = rect_min(state.header_rect);
   const ImVec2 header_max = rect_max(state.header_rect);
-  draw_list->AddText(ImVec2(header_min.x + 18.0f, header_min.y + 10.0f), panel_text, state.title.c_str());
-  draw_list->AddText(ImVec2(header_min.x + 18.0f, header_min.y + 30.0f), accent_blue, state.subtitle.c_str());
+    const float title_font_size = ImGui::GetFontSize() * 5.0f;
+    const float subtitle_font_size = ImGui::GetFontSize() * 2.0f;
+    const ImVec2 title_size = ImGui::GetFont()->CalcTextSizeA(title_font_size,
+                      FLT_MAX,
+                      0.0f,
+                      state.title.c_str());
+    const ImVec2 subtitle_size = ImGui::GetFont()->CalcTextSizeA(subtitle_font_size,
+                    FLT_MAX,
+                    0.0f,
+                    state.subtitle.c_str());
+    draw_list->AddText(ImGui::GetFont(),
+        title_font_size,
+        ImVec2(header_min.x + (header_max.x - header_min.x - title_size.x) * 0.5f,
+          header_min.y + 12.0f),
+        panel_text,
+        state.title.c_str());
+    draw_list->AddText(ImGui::GetFont(),
+        subtitle_font_size,
+        ImVec2(header_min.x + (header_max.x - header_min.x - subtitle_size.x) * 0.5f,
+            header_min.y + 78.0f),
+        accent_blue,
+        state.subtitle.c_str());
 
   ImGui::SetNextWindowBgAlpha(0.82f);
-  ImGui::SetNextWindowPos(ImVec2(display_size.x - 16.0f, display_size.y - 16.0f),
+  ImGui::SetNextWindowPos(ImVec2(display_size.x * 0.5f, display_size.y - 16.0f),
                           ImGuiCond_Always,
-                          ImVec2(1.0f, 1.0f));
+                          ImVec2(0.5f, 1.0f));
   ImGui::Begin("Display Controls",
                nullptr,
                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
@@ -2141,8 +2179,6 @@ void render_visualization_ui_overlay() {
   if (ImGui::Checkbox("Overlay Detection Mask", &overlay_enabled)) {
     set_visualization_overlay_enabled(overlay_enabled);
   }
-  ImGui::Separator();
-  ImGui::TextColored(ImVec4(0.48f, 0.78f, 1.0f, 1.0f), "%s", state.detector_label.c_str());
   ImGui::PopStyleVar(2);
   ImGui::End();
 
@@ -2190,8 +2226,15 @@ void render_visualization_ui_overlay() {
 
     draw_panel(channel.header_rect, 12.0f);
     const ImVec2 header_pos = rect_min(channel.header_rect);
-    const std::string channel_title = std::string("CH-") + std::to_string(channel.channel) + "  " + format_frequency_label(channel.center_frequency_hz);
-    draw_list->AddText(ImVec2(header_pos.x + 12.0f, header_pos.y + 10.0f), panel_text, channel_title.c_str());
+    const double channel_sample_rate_hz = resolved_span_hz(channel);
+    const std::string channel_title = std::string("CH-") + std::to_string(channel.channel) + "  " +
+                      format_frequency_label(channel.center_frequency_hz) + "  " +
+                      format_sample_rate_label(channel_sample_rate_hz);
+    draw_list->AddText(ImGui::GetFont(),
+               ImGui::GetFontSize() * 2.0f,
+               ImVec2(header_pos.x + 12.0f, header_pos.y + 8.0f),
+               panel_text,
+               channel_title.c_str());
 
     auto draw_frequency_grid_labels = [&](const VisualizationRect& rect) {
       constexpr int kGridDivisions = 8;
@@ -2246,15 +2289,14 @@ void render_visualization_ui_overlay() {
                   "PSD / Max Hold",
                   "-100 dB",
                   "0 dB");
-    const bool mask_enabled = state.overlay_enabled;
-    const char* overlay_title = mask_enabled ? "Region of Interest Overlay Enabled"
-                         : "Region of Interest Overlay Disabled";
-    const ImU32 overlay_title_color = mask_enabled ? accent_green : IM_COL32(228, 72, 72, 255);
+    const char* waterfall_title = state.overlay_enabled
+                      ? "Spectrogram with Signal Detection Overlay"
+                      : "Raw Spectrogram";
     annotate_plot(channel.waterfall_rect,
-            overlay_title,
-                  "0",
+            waterfall_title,
+            "0",
             std::to_string(channel.history_rows),
-            overlay_title_color,
+            panel_text,
             2.0f);
     const ImVec2 mask_min = rect_min(channel.mask_rect);
     annotate_plot(channel.mask_rect,
@@ -3645,7 +3687,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
               output_width,
               output_height,
               subtitle_x,
-              40,
+              78,
               ui_state.subtitle,
               {124, 198, 255},
               kHeaderSubtitleScale);
@@ -3664,7 +3706,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   std::string ch1_rate = "500.0 MSps";
 
   if (render_canvas_chrome) {
-    constexpr int kHeaderStatY = 56;
+    constexpr int kHeaderStatY = 98;
     draw_stat_box(18, kHeaderStatY, "CH-0 RATE", ch0_rate, kGreen);
     draw_stat_box(114, kHeaderStatY, "CH-1 RATE", ch1_rate, kGreen);
     draw_stat_box(210, kHeaderStatY, "CENTER FREQ", "2400.0 MHZ", kYellow);
@@ -3828,7 +3870,6 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                   channel.history_write_row,
                                   blue_limit,
                                   red_limit);
-    draw_grid(canvas, output_width, output_height, panel_x, heatmap_y, main_width, channel_heat_height);
     if (overlay_enabled) {
       overlay_mask_ring(canvas,
                         output_width,
