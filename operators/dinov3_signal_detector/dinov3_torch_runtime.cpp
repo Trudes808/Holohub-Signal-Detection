@@ -598,12 +598,16 @@ class DinoTorchRuntime::Impl {
           dino_score = derive_dino_score_map(model_output, result.aligned_rows, result.aligned_cols, input.patch_size, input.dst_rows, input.dst_cols);
         });
         if (config.return_patch_features && patch_features.defined()) {
-          auto patch_features_cpu = patch_features.device().is_cuda() ? patch_features.to(torch::kCPU) : patch_features;
           result.patch_rows = std::max(1, result.aligned_rows / std::max(1, input.patch_size));
           result.patch_cols = std::max(1, result.aligned_cols / std::max(1, input.patch_size));
-          result.feature_dim = static_cast<int>(patch_features_cpu.size(1));
-          result.patch_features.resize(static_cast<size_t>(patch_features_cpu.numel()));
-          std::memcpy(result.patch_features.data(), patch_features_cpu.data_ptr<float>(), result.patch_features.size() * sizeof(float));
+          result.feature_dim = static_cast<int>(patch_features.size(1));
+          if (config.return_patch_features_host) {
+            auto patch_features_cpu = patch_features.device().is_cuda() ? patch_features.to(torch::kCPU) : patch_features;
+            result.patch_features.resize(static_cast<size_t>(patch_features_cpu.numel()));
+            std::memcpy(result.patch_features.data(),
+                        patch_features_cpu.data_ptr<float>(),
+                        result.patch_features.size() * sizeof(float));
+          }
         }
         result.backend_used = "torchscript";
       } else {
@@ -842,12 +846,16 @@ class DinoTorchRuntime::Impl {
           auto patch_features_batch_device_owner = std::make_shared<torch::Tensor>(patch_features_batch_device);
           result.patch_features_batch_device = patch_features_batch_device_owner->data_ptr<float>();
           result.patch_features_batch_device_owner = patch_features_batch_device_owner;
-          auto patch_features_cpu = patch_features_batch.device().is_cuda() ? patch_features_batch.to(torch::kCPU) : patch_features_batch;
           result.patch_rows = std::max(1, result.aligned_rows / std::max(1, input.patch_size));
           result.patch_cols = std::max(1, result.aligned_cols / std::max(1, input.patch_size));
-          result.feature_dim = patch_features_cpu.dim() >= 3 ? static_cast<int>(patch_features_cpu.size(2)) : 0;
-          result.patch_features_batch.resize(static_cast<size_t>(patch_features_cpu.numel()));
-          std::memcpy(result.patch_features_batch.data(), patch_features_cpu.data_ptr<float>(), result.patch_features_batch.size() * sizeof(float));
+          result.feature_dim = patch_features_batch.dim() >= 3 ? static_cast<int>(patch_features_batch.size(2)) : 0;
+          if (config.return_patch_features_host) {
+            auto patch_features_cpu = patch_features_batch.device().is_cuda() ? patch_features_batch.to(torch::kCPU) : patch_features_batch;
+            result.patch_features_batch.resize(static_cast<size_t>(patch_features_cpu.numel()));
+            std::memcpy(result.patch_features_batch.data(),
+                        patch_features_cpu.data_ptr<float>(),
+                        result.patch_features_batch.size() * sizeof(float));
+          }
         }
         result.backend_used = "torchscript";
       } else {

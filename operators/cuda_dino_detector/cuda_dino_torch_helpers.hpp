@@ -69,6 +69,15 @@ bool binary_fill_holes_cuda_batch_to_device(const uint8_t* mask_batch_device,
                                             uint8_t* output_mask_batch_device,
                                             cudaStream_t cuda_stream);
 
+bool binary_closing_rect_cuda_batch_to_device(const uint8_t* mask_batch_device,
+                                              int batch_size,
+                                              int rows,
+                                              int cols,
+                                              int kernel_rows,
+                                              int kernel_cols,
+                                              uint8_t* output_mask_batch_device,
+                                              cudaStream_t cuda_stream);
+
 bool keep_large_components_cuda_batch_to_device(const uint8_t* mask_batch_device,
                                                 int batch_size,
                                                 int rows,

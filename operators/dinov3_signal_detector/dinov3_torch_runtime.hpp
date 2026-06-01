@@ -23,6 +23,7 @@ struct DinoTorchRuntimeConfig {
   bool return_final_mask_device = false;
   bool return_pre_model_gray = false;
   bool return_patch_features = false;
+  bool return_patch_features_host = true;
   bool compute_dino_threshold = true;
   bool compute_power_score = true;
   double ignore_sideband_hz = 0.0;

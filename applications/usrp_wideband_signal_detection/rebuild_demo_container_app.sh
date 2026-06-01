@@ -13,10 +13,12 @@ VISUALIZER_NAME=${VISUALIZER_NAME:-offline_spectrogram_visualizer}
 COHERENT_VALIDATOR_NAME=${COHERENT_VALIDATOR_NAME:-offline_coherent_power_validator}
 DINO_VALIDATOR_NAME=${DINO_VALIDATOR_NAME:-offline_dino_validator}
 PERF_DINO_VALIDATOR_NAME=${PERF_DINO_VALIDATOR_NAME:-offline_dino_validator_performance}
+REPLAY_NAME=${REPLAY_NAME:-offline_cuda_dino_operator_replay}
 VISUALIZER_TARGET=${VISUALIZER_TARGET:-applications/${APP_NAME}/${VISUALIZER_NAME}}
 COHERENT_VALIDATOR_TARGET=${COHERENT_VALIDATOR_TARGET:-applications/${APP_NAME}/${COHERENT_VALIDATOR_NAME}}
 DINO_VALIDATOR_TARGET=${DINO_VALIDATOR_TARGET:-applications/${APP_NAME}/${DINO_VALIDATOR_NAME}}
 PERF_DINO_VALIDATOR_TARGET=${PERF_DINO_VALIDATOR_TARGET:-applications/${APP_NAME}/${PERF_DINO_VALIDATOR_NAME}}
+REPLAY_TARGET=${REPLAY_TARGET:-applications/${APP_NAME}/${REPLAY_NAME}}
 MATX_DIR=${MATX_DIR:-/usr/local/lib/cmake/matx}
 BUILD_APP_DIR=${BUILD_APP_DIR:-${WORKSPACE_DIR}/${BUILD_DIR}/applications/${APP_NAME}}
 SOURCE_APP_DIR=${SOURCE_APP_DIR:-${WORKSPACE_DIR}/applications/${APP_NAME}}
@@ -85,6 +87,10 @@ optional_build_targets() {
   fi
 }
 
+compare_build_targets() {
+  echo "${REPLAY_TARGET} ${PERF_DINO_VALIDATOR_TARGET}"
+}
+
 ninja_target_exists() {
   local target=$1
   run_in_container "set -euo pipefail && ninja -C ${WORKSPACE_DIR}/${BUILD_DIR} -t targets all | cut -d: -f1 | grep -Fx -- '${target}' >/dev/null"
@@ -115,6 +121,30 @@ build_auxiliary_targets() {
     return 0
   fi
 
+  run_in_container "set -euo pipefail && ninja -C ${WORKSPACE_DIR}/${BUILD_DIR} ${resolved_targets[*]}"
+}
+
+build_compare_targets() {
+  local targets
+  local resolved_targets=()
+  local target
+
+  targets=$(compare_build_targets)
+
+  for target in ${targets}; do
+    if ninja_target_exists "${target}"; then
+      resolved_targets+=("${target}")
+    else
+      echo "==> Skipping compare target not present in this Ninja graph: ${target}" >&2
+    fi
+  done
+
+  if [[ ${#resolved_targets[@]} -eq 0 ]]; then
+    echo "==> No compare targets were present in the generated build tree" >&2
+    return 0
+  fi
+
+  echo "==> Refreshing compare targets: ${resolved_targets[*]}"
   run_in_container "set -euo pipefail && ninja -C ${WORKSPACE_DIR}/${BUILD_DIR} ${resolved_targets[*]}"
 }
 
@@ -220,6 +250,8 @@ if needs_rebuild; then
     export HOLOHUB_BUILD_LOCAL=1 && \
     ./holohub build ${APP_NAME} --local --configure-args=-Dmatx_DIR=${MATX_DIR}"
 fi
+
+build_compare_targets
 
 build_auxiliary_targets
 

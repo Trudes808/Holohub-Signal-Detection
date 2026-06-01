@@ -243,6 +243,72 @@ cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wid
 
 For the cleanest startup behavior, launch the app before starting the RF transmitter. The advanced-network DPDK workers are started during app initialization, before the Holoscan graph is fully active, so starting the transmitter first can produce a brief burst of startup-only drops even when steady-state throughput is healthy.
 
+### After Reboot
+
+If the host has been rebooted since the last successful run, restore the host-side prerequisites before blaming the app config.
+
+To make the basic host setup survive reboot, persist the pieces that are normally lost:
+
+```bash
+# Load GPUDirect peer memory at boot.
+echo nvidia-peermem | sudo tee /etc/modules-load.d/nvidia-peermem.conf
+
+# Persist the hugepage count. Replace <COUNT> with the value that is known-good on your host.
+printf 'vm.nr_hugepages=<COUNT>\n' | sudo tee /etc/sysctl.d/90-holohub-usrp.conf
+sudo sysctl --system
+
+# Persist the hugetlbfs mount. This example matches the 1G hugepages used on the current host.
+echo 'nodev /dev/hugepages hugetlbfs defaults,pagesize=1G 0 0' | sudo tee -a /etc/fstab
+sudo mkdir -p /dev/hugepages
+sudo mount /dev/hugepages
+```
+```bash
+sudo xhost +local:root
+
+sudo docker exec -it -u 0:0 -e DISPLAY="$DISPLAY" -e XAUTHORITY="$XAUTHORITY" -e PS1='container#' usrp_x410_signal_detection_demo bash
+
+```
+Recommended post-reboot verification:
+
+```bash
+lsmod | grep nvidia_peermem
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+mount | grep hugetlbfs
+ls -ld /dev/hugepages
+```
+
+If DPDK still fails after reboot with mlx5 `DevX create TIS failed`, `TIS allocation failure`, or `Failed to get port number for sdr_data`, reset the dedicated Mellanox ports on the host before relaunching the app:
+
+```bash
+sudo ip link set ens4f0np0 down
+sudo ip link set ens4f1np1 down
+sudo devlink dev reload pci/0000:a2:00.0
+sudo devlink dev reload pci/0000:a2:00.1
+```
+
+Then clear stale DPDK runtime state inside the demo container:
+
+```bash
+sudo docker exec -u 0:0 usrp_x410_signal_detection_demo bash -lc '
+pkill -f "(^|/)usrp_wideband_signal_detection( |$)" || true
+rm -rf /tmp/xdg-runtime-*/dpdk/*
+rm -f /dev/hugepages/nwlrbbmqbh*
+'
+```
+
+That host reload plus container cleanup was the working recovery path for the reboot-induced mlx5 bring-up failure on this setup.
+
+If visualization fails after reboot with `Failed to initialize glfw`, the problem is separate from DPDK: the container was created without usable display forwarding for the current desktop session. In that case, recreate the demo container from the session you want to render through:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+SKIP_IMAGE_BUILD=1 sudo -E ./build_demo_container.sh
+./run_demo_container.sh
+./enter_demo_container.sh
+```
+
+Do not automate the `devlink` reload unless `ens4f0np0` and `ens4f1np1` are dedicated to this workflow. If you do want it at boot, put the four host-side commands above into a small `systemd` oneshot service and enable it only on the machine that owns the USRP capture ports.
+
 ### After Code Changes
 
 When you change code or config files in the repository:
