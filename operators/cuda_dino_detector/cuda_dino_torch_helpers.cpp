@@ -167,6 +167,46 @@ torch::Tensor positional_design_matrix_torch(int patch_rows,
   return cpu.to(device, dtype).contiguous();
 }
 
+struct PositionalSuppressionCache {
+  int patch_rows = 0;
+  int patch_cols = 0;
+  c10::Device device = c10::Device(torch::kCPU);
+  c10::ScalarType dtype = torch::kFloat32;
+  torch::Tensor design;
+  torch::Tensor projection_left;
+};
+
+const PositionalSuppressionCache& positional_suppression_cache_torch(int patch_rows,
+                                                                     int patch_cols,
+                                                                     const c10::Device& device,
+                                                                     c10::ScalarType dtype) {
+  thread_local PositionalSuppressionCache cache;
+
+  const bool cache_valid = cache.design.defined() && cache.projection_left.defined() &&
+                           cache.patch_rows == patch_rows && cache.patch_cols == patch_cols &&
+                           cache.device == device && cache.dtype == dtype;
+  if (cache_valid) {
+    return cache;
+  }
+
+  cache.patch_rows = patch_rows;
+  cache.patch_cols = patch_cols;
+  cache.device = device;
+  cache.dtype = dtype;
+  cache.design = positional_design_matrix_torch(patch_rows, patch_cols, device, dtype);
+
+  if (!cache.design.defined() || cache.design.numel() == 0) {
+    cache.projection_left = torch::Tensor();
+    return cache;
+  }
+
+  auto design_t = cache.design.transpose(0, 1).contiguous();
+  auto ridge = 1.0e-3f * torch::eye(cache.design.size(1),
+                                    torch::TensorOptions().dtype(dtype).device(device));
+  cache.projection_left = torch::linalg_solve(torch::matmul(design_t, cache.design) + ridge, design_t).contiguous();
+  return cache;
+}
+
 torch::Tensor suppress_raw_dino_positional_features_torch_batch(const torch::Tensor& patch_features,
                                                                 int patch_rows,
                                                                 int patch_cols,
@@ -176,19 +216,17 @@ torch::Tensor suppress_raw_dino_positional_features_torch_batch(const torch::Ten
     return patch_features;
   }
 
-  const auto design = positional_design_matrix_torch(patch_rows, patch_cols, patch_features.device(), patch_features.scalar_type());
-  if (design.size(0) != patch_features.size(1)) {
+  const auto& cache = positional_suppression_cache_torch(
+      patch_rows, patch_cols, patch_features.device(), patch_features.scalar_type());
+  if (!cache.design.defined() || !cache.projection_left.defined() || cache.design.size(0) != patch_features.size(1)) {
     return patch_features;
   }
+
   const auto batch_size = patch_features.size(0);
-  auto design_batch = design.unsqueeze(0).expand({batch_size, design.size(0), design.size(1)});
-  auto design_t = design_batch.transpose(1, 2);
-  auto xtx = torch::matmul(design_t, design_batch);
-  auto ridge = 1.0e-3f * torch::eye(design.size(1), torch::TensorOptions().dtype(patch_features.scalar_type()).device(patch_features.device()))
-                             .unsqueeze(0)
-                             .expand({batch_size, design.size(1), design.size(1)});
-  auto xty = torch::matmul(design_t, patch_features);
-  auto beta = torch::linalg_solve(xtx + ridge, xty);
+  auto design_batch = cache.design.unsqueeze(0).expand({batch_size, cache.design.size(0), cache.design.size(1)});
+  auto projection_left_batch =
+      cache.projection_left.unsqueeze(0).expand({batch_size, cache.projection_left.size(0), cache.projection_left.size(1)});
+  auto beta = torch::matmul(projection_left_batch, patch_features);
   auto suppressed = patch_features - torch::matmul(design_batch, beta);
   if (clamped >= 1.0f) {
     return suppressed.contiguous();
@@ -463,47 +501,19 @@ bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_fe
                                                            bool resized_full_chunk,
                                                            float* output_score_device,
                                                            cudaStream_t cuda_stream) {
-  const int patch_count = patch_rows * patch_cols;
-  if (batch_size <= 0 || patch_rows <= 0 || patch_cols <= 0 || feature_dim <= 0 || aligned_rows <= 0 || aligned_cols <= 0 ||
-      output_rows <= 0 || output_cols <= 0 || patch_features_batch_device == nullptr || output_score_device == nullptr || patch_count <= 0) {
-    return false;
-  }
-
-  try {
-    torch::InferenceMode inference_mode_guard(true);
-    const c10::Device compute_device(torch::kCUDA, 0);
-    const auto torch_stream = cuda_stream
-                                  ? c10::cuda::getStreamFromExternal(cuda_stream, compute_device.index())
-                                  : c10::cuda::getDefaultCUDAStream(compute_device.index());
-    c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
-
-    auto patch_features = torch::from_blob(const_cast<float*>(patch_features_batch_device),
-                                           {static_cast<int64_t>(batch_size), static_cast<int64_t>(patch_count), static_cast<int64_t>(feature_dim)},
-                                           torch::TensorOptions().dtype(torch::kFloat32).device(compute_device))
-                              .contiguous();
-    auto energy_features = suppress_raw_dino_positional_features_torch_batch(patch_features,
-                                                                             patch_rows,
-                                                                             patch_cols,
-                                                                             positional_suppression);
-    auto raw_patch = torch::sqrt(torch::clamp_min(torch::mean(energy_features * energy_features, 2), 1.0e-6f));
-    auto raw_patch_n = normalize_map01_quantile_torch_batch(raw_patch.view({batch_size, patch_rows, patch_cols}), 0.05, 0.95);
-    auto aligned_maps = torch::nn::functional::interpolate(
-                           raw_patch_n.unsqueeze(1),
-                           torch::nn::functional::InterpolateFuncOptions()
-                               .size(std::vector<int64_t>{static_cast<int64_t>(aligned_rows), static_cast<int64_t>(aligned_cols)})
-                               .mode(torch::kBilinear)
-                               .align_corners(false))
-                           .squeeze(1)
-                           .contiguous();
-    auto projected = project_aligned_maps_torch_batch(aligned_maps, output_rows, output_cols, resized_full_chunk);
-    return cudaMemcpyAsync(output_score_device,
-                           projected.data_ptr<float>(),
-                           static_cast<size_t>(projected.numel()) * sizeof(float),
-                           cudaMemcpyDeviceToDevice,
-                           cuda_stream) == cudaSuccess;
-  } catch (...) {
-    return false;
-  }
+  return compute_deweighted_raw_dino_score_native_cuda_batch_to_device(patch_features_batch_device,
+                                                                        batch_size,
+                                                                        patch_rows,
+                                                                        patch_cols,
+                                                                        feature_dim,
+                                                                        aligned_rows,
+                                                                        aligned_cols,
+                                                                        output_rows,
+                                                                        output_cols,
+                                                                        positional_suppression,
+                                                                        resized_full_chunk,
+                                                                        output_score_device,
+                                                                        cuda_stream);
 }
 
 bool project_runtime_score_batch_to_device(const float* score_maps_batch_device,
@@ -517,40 +527,17 @@ bool project_runtime_score_batch_to_device(const float* score_maps_batch_device,
                                            bool resized_full_chunk,
                                            float* output_score_device,
                                            cudaStream_t cuda_stream) {
-  if (batch_size <= 0 || runtime_rows <= 0 || runtime_cols <= 0 || aligned_rows <= 0 || aligned_cols <= 0 ||
-      output_rows <= 0 || output_cols <= 0 || score_maps_batch_device == nullptr || output_score_device == nullptr) {
-    return false;
-  }
-
-  try {
-    torch::InferenceMode inference_mode_guard(true);
-    const c10::Device compute_device(torch::kCUDA, 0);
-    const auto torch_stream = cuda_stream
-                                  ? c10::cuda::getStreamFromExternal(cuda_stream, compute_device.index())
-                                  : c10::cuda::getDefaultCUDAStream(compute_device.index());
-    c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
-
-    auto score_maps = torch::from_blob(const_cast<float*>(score_maps_batch_device),
-                                       {static_cast<int64_t>(batch_size), static_cast<int64_t>(runtime_rows), static_cast<int64_t>(runtime_cols)},
-                                       torch::TensorOptions().dtype(torch::kFloat32).device(compute_device))
-                          .contiguous();
-    auto aligned_maps = torch::nn::functional::interpolate(
-                           score_maps.unsqueeze(1),
-                           torch::nn::functional::InterpolateFuncOptions()
-                               .size(std::vector<int64_t>{static_cast<int64_t>(aligned_rows), static_cast<int64_t>(aligned_cols)})
-                               .mode(torch::kBilinear)
-                               .align_corners(false))
-                           .squeeze(1)
-                           .contiguous();
-    auto projected = project_aligned_maps_torch_batch(aligned_maps, output_rows, output_cols, resized_full_chunk);
-    return cudaMemcpyAsync(output_score_device,
-                           projected.data_ptr<float>(),
-                           static_cast<size_t>(projected.numel()) * sizeof(float),
-                           cudaMemcpyDeviceToDevice,
-                           cuda_stream) == cudaSuccess;
-  } catch (...) {
-    return false;
-  }
+  return project_runtime_score_native_cuda_batch_to_device(score_maps_batch_device,
+                                                           batch_size,
+                                                           runtime_rows,
+                                                           runtime_cols,
+                                                           aligned_rows,
+                                                           aligned_cols,
+                                                           output_rows,
+                                                           output_cols,
+                                                           resized_full_chunk,
+                                                           output_score_device,
+                                                           cuda_stream);
 }
 
 bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_batch_device,
@@ -618,20 +605,19 @@ bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_fe
                                                            bool resized_full_chunk,
                                                            float* output_score_device,
                                                            cudaStream_t cuda_stream) {
-  (void)patch_features_batch_device;
-  (void)batch_size;
-  (void)patch_rows;
-  (void)patch_cols;
-  (void)feature_dim;
-  (void)aligned_rows;
-  (void)aligned_cols;
-  (void)output_rows;
-  (void)output_cols;
-  (void)positional_suppression;
-  (void)resized_full_chunk;
-  (void)output_score_device;
-  (void)cuda_stream;
-  return false;
+  return compute_deweighted_raw_dino_score_native_cuda_batch_to_device(patch_features_batch_device,
+                                                                        batch_size,
+                                                                        patch_rows,
+                                                                        patch_cols,
+                                                                        feature_dim,
+                                                                        aligned_rows,
+                                                                        aligned_cols,
+                                                                        output_rows,
+                                                                        output_cols,
+                                                                        positional_suppression,
+                                                                        resized_full_chunk,
+                                                                        output_score_device,
+                                                                        cuda_stream);
 }
 
 bool project_runtime_score_batch_to_device(const float* score_maps_batch_device,
@@ -645,18 +631,17 @@ bool project_runtime_score_batch_to_device(const float* score_maps_batch_device,
                                            bool resized_full_chunk,
                                            float* output_score_device,
                                            cudaStream_t cuda_stream) {
-  (void)score_maps_batch_device;
-  (void)batch_size;
-  (void)runtime_rows;
-  (void)runtime_cols;
-  (void)aligned_rows;
-  (void)aligned_cols;
-  (void)output_rows;
-  (void)output_cols;
-  (void)resized_full_chunk;
-  (void)output_score_device;
-  (void)cuda_stream;
-  return false;
+  return project_runtime_score_native_cuda_batch_to_device(score_maps_batch_device,
+                                                           batch_size,
+                                                           runtime_rows,
+                                                           runtime_cols,
+                                                           aligned_rows,
+                                                           aligned_cols,
+                                                           output_rows,
+                                                           output_cols,
+                                                           resized_full_chunk,
+                                                           output_score_device,
+                                                           cuda_stream);
 }
 
 bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_batch_device,

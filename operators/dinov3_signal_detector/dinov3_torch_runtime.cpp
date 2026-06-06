@@ -116,9 +116,34 @@ torch::Tensor gaussian_filter1d_nearest(const torch::Tensor& input, double sigma
   return filtered.view({-1});
 }
 
+torch::Tensor gaussian_filter1d_nearest_batch(const torch::Tensor& input, double sigma) {
+  if (sigma <= 0.0) {
+    return input.clone();
+  }
+
+  const auto radius = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(3.0 * sigma)));
+  const auto kernel_size = 2 * radius + 1;
+  auto options = torch::TensorOptions().dtype(input.dtype()).device(input.device());
+  auto x = torch::arange(-radius, radius + 1, options);
+  auto kernel = torch::exp(-(x * x) / (2.0 * sigma * sigma));
+  kernel = kernel / kernel.sum();
+
+  auto padded = torch::replication_pad1d(input.unsqueeze(1), {radius, radius});
+  auto filtered = torch::conv1d(padded, kernel.view({1, 1, kernel_size}));
+  return filtered.squeeze(1).contiguous();
+}
+
 torch::Tensor normalize_map01(const torch::Tensor& input, double low_q, double high_q) {
   auto lo = scalar_quantile_tensor(input, low_q);
   auto hi = scalar_quantile_tensor(input, high_q);
+  auto scale = torch::clamp_min(hi - lo, 1e-6);
+  return torch::clamp((input - lo) / scale, 0.0, 1.0);
+}
+
+torch::Tensor normalize_map01_batch(const torch::Tensor& input, double low_q, double high_q) {
+  auto flat = input.reshape({input.size(0), -1});
+  auto lo = select_quantile_along_dim(flat, low_q, 1).view({input.size(0), 1, 1});
+  auto hi = select_quantile_along_dim(flat, high_q, 1).view({input.size(0), 1, 1});
   auto scale = torch::clamp_min(hi - lo, 1e-6);
   return torch::clamp((input - lo) / scale, 0.0, 1.0);
 }
@@ -194,6 +219,20 @@ torch::Tensor uniform_filter_2d_nearest(const torch::Tensor& input, int kernel_r
       .contiguous();
 }
 
+    torch::Tensor uniform_filter_2d_nearest_batch(const torch::Tensor& input, int kernel_rows, int kernel_cols) {
+      const int row_radius = std::max(0, kernel_rows / 2);
+      const int col_radius = std::max(0, kernel_cols / 2);
+      auto padded = torch::replication_pad2d(input.unsqueeze(1), {col_radius, col_radius, row_radius, row_radius});
+      return torch::avg_pool2d(padded,
+               {std::max(1, kernel_rows), std::max(1, kernel_cols)},
+               {1, 1},
+               {0, 0},
+               false,
+               true)
+      .squeeze(1)
+      .contiguous();
+    }
+
 torch::Tensor gaussian_second_derivative_rows_2d(const torch::Tensor& input, double sigma) {
   auto kernel = gaussian_second_derivative_kernel_tensor(sigma, input.device());
   return convolve_rows_2d(input, kernel).contiguous();
@@ -255,8 +294,43 @@ torch::Tensor signal_agnostic_dino_gray(const torch::Tensor& sxx_db_local) {
   return torch::round(torch::clamp(combined, 0.0, 1.0) * 255.0).div(255.0).contiguous();
 }
 
+torch::Tensor signal_agnostic_dino_gray_batch(const torch::Tensor& sxx_db_batch) {
+  auto x_db = sxx_db_batch.to(torch::kFloat32).contiguous();
+
+  const double row_sigma = std::max(1.0, static_cast<double>(x_db.size(1)) / 32.0);
+  const double col_sigma = std::max(1.0, static_cast<double>(x_db.size(2)) / 32.0);
+  auto row_trend = gaussian_filter1d_nearest_batch(x_db.mean(2), row_sigma).unsqueeze(2);
+  auto col_trend = gaussian_filter1d_nearest_batch(x_db.mean(1), col_sigma).unsqueeze(1);
+  auto trend = (row_trend + col_trend - x_db.mean(2, true).mean(1, true)).contiguous();
+
+  auto detrended = (x_db - trend).contiguous();
+  auto local_mean = uniform_filter_2d_nearest_batch(detrended, 7, 7);
+  auto local_resid = (detrended - local_mean).contiguous();
+  auto local_scale = torch::sqrt(uniform_filter_2d_nearest_batch(local_resid * local_resid, 9, 9) + 1e-6);
+  auto local_z = (local_resid / torch::clamp_min(local_scale, 1e-4)).contiguous();
+
+  auto abs_detrended = normalize_map01_batch(detrended, 0.02, 0.98);
+  auto local_abs = torch::abs(local_z).reshape({x_db.size(0), -1});
+  auto scale = select_quantile_along_dim(local_abs, 0.95, 1).view({x_db.size(0), 1, 1});
+  scale = torch::clamp_min(scale, 1e-6);
+  auto local_resid_n = torch::clamp(0.5 + 0.5 * (local_z / scale), 0.0, 1.0);
+
+  auto combined = (0.70 * local_resid_n + 0.30 * abs_detrended).to(torch::kFloat32).contiguous();
+  auto combined_flat = combined.reshape({combined.size(0), -1});
+  auto combined_centered = combined_flat - combined_flat.mean(1, true);
+  auto combined_std = torch::sqrt(torch::mean(combined_centered * combined_centered, 1));
+  auto fallback = normalize_map01_batch(detrended, 0.01, 0.99).to(torch::kFloat32).contiguous();
+  combined = torch::where(combined_std.view({combined.size(0), 1, 1}).lt(0.02), fallback, combined);
+
+  return torch::round(torch::clamp(combined, 0.0, 1.0) * 255.0).div(255.0).contiguous();
+}
+
 torch::Tensor legacy_fast_dino_gray(const torch::Tensor& sxx_db_local) {
   return normalize_map01(sxx_db_local, 0.01, 0.99).to(torch::kFloat32).contiguous();
+}
+
+torch::Tensor legacy_fast_dino_gray_batch(const torch::Tensor& sxx_db_batch) {
+  return normalize_map01_batch(sxx_db_batch, 0.01, 0.99).to(torch::kFloat32).contiguous();
 }
 
 torch::Tensor derive_dino_score_map(torch::Tensor model_output,
@@ -561,9 +635,9 @@ class DinoTorchRuntime::Impl {
                                 .contiguous();
         const auto target_dtype = use_fp16 ? torch::kHalf : torch::kFloat32;
         auto grayscale = grayscale_2d.unsqueeze(0).unsqueeze(0).to(target_dtype);
-        auto rgb = grayscale.expand({1, 3, grayscale.size(2), grayscale.size(3)});
+        auto rgb = grayscale.expand({1, 3, grayscale.size(2), grayscale.size(3)}).contiguous(torch::MemoryFormat::ChannelsLast);
         const auto [mean, std] = get_normalization_tensors(config, compute_device, target_dtype);
-        model_input = ((rgb - mean) / std).contiguous();
+        model_input = ((rgb - mean) / std).contiguous(torch::MemoryFormat::ChannelsLast);
 
         if (config.return_pre_model_gray) {
           auto pre_model_gray_cpu = grayscale_2d.device().is_cuda() ? grayscale_2d.to(torch::kCPU) : grayscale_2d;
@@ -766,19 +840,16 @@ class DinoTorchRuntime::Impl {
       failure_stage = "model_prep";
       torch::Tensor model_input;
       result.timing.model_prep_ms = measure_ms([&] {
-        std::vector<torch::Tensor> grayscale_samples;
-        grayscale_samples.reserve(static_cast<size_t>(input.batch_size));
-        for (int sample_index = 0; sample_index < input.batch_size; ++sample_index) {
-          grayscale_samples.push_back((config.legacy_fast_gray_preprocess
-                                           ? legacy_fast_dino_gray(resized_batch[sample_index])
-                                           : signal_agnostic_dino_gray(resized_batch[sample_index]))
-                                          .contiguous());
-        }
         const auto target_dtype = use_fp16 ? torch::kHalf : torch::kFloat32;
-        auto grayscale_batch = torch::stack(grayscale_samples, 0).unsqueeze(1).to(target_dtype);
-        auto rgb_batch = grayscale_batch.expand({static_cast<int64_t>(input.batch_size), 3, grayscale_batch.size(2), grayscale_batch.size(3)});
+        auto grayscale_batch = (config.legacy_fast_gray_preprocess
+                                    ? legacy_fast_dino_gray_batch(resized_batch)
+                                    : signal_agnostic_dino_gray_batch(resized_batch))
+                                   .unsqueeze(1)
+                                   .to(target_dtype);
+        auto rgb_batch = grayscale_batch.expand({static_cast<int64_t>(input.batch_size), 3, grayscale_batch.size(2), grayscale_batch.size(3)})
+                             .contiguous(torch::MemoryFormat::ChannelsLast);
         const auto [mean, std] = get_normalization_tensors(config, compute_device, target_dtype);
-        model_input = ((rgb_batch - mean) / std).contiguous();
+        model_input = ((rgb_batch - mean) / std).contiguous(torch::MemoryFormat::ChannelsLast);
       });
 
       torch::Tensor score_maps_batch;
@@ -1129,6 +1200,12 @@ class DinoTorchRuntime::Impl {
       }
       if (torchscript_init_runs_eval(init_mode)) {
         torchscript_module_->eval();
+        try {
+          auto frozen_module = torch::jit::freeze(*torchscript_module_);
+          auto optimized_module = torch::jit::optimize_for_inference(frozen_module);
+          torchscript_module_ = std::make_unique<torch::jit::script::Module>(std::move(optimized_module));
+        } catch (const std::exception&) {
+        }
       }
       torchscript_model_loaded_ = true;
       torchscript_load_failed_ = false;

@@ -36,6 +36,32 @@ bool compute_structure_tensor_gate_gpu_batch_to_device(const float* corrected_ba
                                                        float* output_gate_device,
                                                        cudaStream_t cuda_stream);
 
+bool compute_deweighted_raw_dino_score_native_cuda_batch_to_device(const float* patch_features_batch_device,
+                                                                   int batch_size,
+                                                                   int patch_rows,
+                                                                   int patch_cols,
+                                                                   int feature_dim,
+                                                                   int aligned_rows,
+                                                                   int aligned_cols,
+                                                                   int output_rows,
+                                                                   int output_cols,
+                                                                   float positional_suppression,
+                                                                   bool resized_full_chunk,
+                                                                   float* output_score_device,
+                                                                   cudaStream_t cuda_stream);
+
+bool project_runtime_score_native_cuda_batch_to_device(const float* score_maps_batch_device,
+                                                       int batch_size,
+                                                       int runtime_rows,
+                                                       int runtime_cols,
+                                                       int aligned_rows,
+                                                       int aligned_cols,
+                                                       int output_rows,
+                                                       int output_cols,
+                                                       bool resized_full_chunk,
+                                                       float* output_score_device,
+                                                       cudaStream_t cuda_stream);
+
 bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_features_batch_device,
                                                            int batch_size,
                                                            int patch_rows,
@@ -61,6 +87,16 @@ bool project_runtime_score_batch_to_device(const float* score_maps_batch_device,
                                            bool resized_full_chunk,
                                            float* output_score_device,
                                            cudaStream_t cuda_stream);
+
+bool project_aligned_maps_cuda_batch_to_device(const float* aligned_maps_batch_device,
+                                               int batch_size,
+                                               int aligned_rows,
+                                               int aligned_cols,
+                                               int output_rows,
+                                               int output_cols,
+                                               bool resized_full_chunk,
+                                               float* output_score_device,
+                                               cudaStream_t cuda_stream);
 
 bool binary_fill_holes_cuda_batch_to_device(const uint8_t* mask_batch_device,
                                             int batch_size,
