@@ -4303,6 +4303,9 @@ bool keep_large_components_cuda_batch_to_device(const uint8_t* mask_batch_device
 namespace {
 
 constexpr int kHybridThresholdHistogramBins = 256;
+constexpr int kHybridThresholdHistogramMapCount = 3;
+constexpr int kHybridMaskedMinmaxTripletMapCount = 3;
+constexpr int kHybridFp16UnitHistogramPairMapCount = 2;
 constexpr int kHybridFp16UnitHistogramBins = 0x3C00 + 1;
 constexpr int kHybridReductionThreads = 256;
 constexpr int kHybridReductionTileBlocks = 32;
@@ -4419,6 +4422,9 @@ struct ResidualVetoCudaScratch {
   float* batch_a = nullptr;
   float* batch_b = nullptr;
   float* batch_c = nullptr;
+  float* batch_d = nullptr;
+  float* batch_e = nullptr;
+  float* batch_f = nullptr;
   float* reduction_partial_min = nullptr;
   float* reduction_partial_max = nullptr;
   int* reduction_partial_valid = nullptr;
@@ -4455,6 +4461,18 @@ struct ResidualVetoCudaScratch {
     if (batch_c != nullptr) {
       cudaFree(batch_c);
       batch_c = nullptr;
+    }
+    if (batch_d != nullptr) {
+      cudaFree(batch_d);
+      batch_d = nullptr;
+    }
+    if (batch_e != nullptr) {
+      cudaFree(batch_e);
+      batch_e = nullptr;
+    }
+    if (batch_f != nullptr) {
+      cudaFree(batch_f);
+      batch_f = nullptr;
     }
     if (reduction_partial_min != nullptr) {
       cudaFree(reduction_partial_min);
@@ -4533,15 +4551,31 @@ struct ResidualVetoCudaScratch {
         cudaFree(batch_c);
         batch_c = nullptr;
       }
+      if (batch_d != nullptr) {
+        cudaFree(batch_d);
+        batch_d = nullptr;
+      }
+      if (batch_e != nullptr) {
+        cudaFree(batch_e);
+        batch_e = nullptr;
+      }
+      if (batch_f != nullptr) {
+        cudaFree(batch_f);
+        batch_f = nullptr;
+      }
       if (cudaMalloc(reinterpret_cast<void**>(&batch_a), requested_batch_capacity * sizeof(float)) != cudaSuccess ||
           cudaMalloc(reinterpret_cast<void**>(&batch_b), requested_batch_capacity * sizeof(float)) != cudaSuccess ||
-          cudaMalloc(reinterpret_cast<void**>(&batch_c), requested_batch_capacity * sizeof(float)) != cudaSuccess) {
+          cudaMalloc(reinterpret_cast<void**>(&batch_c), requested_batch_capacity * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&batch_d), requested_batch_capacity * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&batch_e), requested_batch_capacity * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&batch_f), requested_batch_capacity * sizeof(float)) != cudaSuccess) {
         release();
         return false;
       }
       batch_capacity = requested_batch_capacity;
     }
-    const size_t requested_reduction_partial_capacity = requested_batch_capacity * static_cast<size_t>(kHybridReductionTileBlocks);
+    const size_t requested_reduction_partial_capacity = requested_batch_capacity * static_cast<size_t>(kHybridReductionTileBlocks) *
+                                                      static_cast<size_t>(kHybridMaskedMinmaxTripletMapCount);
     if (requested_reduction_partial_capacity > reduction_partial_capacity) {
       if (reduction_partial_min != nullptr) {
         cudaFree(reduction_partial_min);
@@ -4564,7 +4598,8 @@ struct ResidualVetoCudaScratch {
       reduction_partial_capacity = requested_reduction_partial_capacity;
     }
     const size_t requested_histogram_capacity =
-        requested_batch_capacity * static_cast<size_t>(std::max(kHybridThresholdHistogramBins, kHybridFp16UnitHistogramBins));
+      requested_batch_capacity * static_cast<size_t>(std::max(kHybridThresholdHistogramMapCount * kHybridThresholdHistogramBins,
+                                  kHybridFp16UnitHistogramPairMapCount * kHybridFp16UnitHistogramBins));
     if (requested_histogram_capacity > histogram_capacity) {
       if (histograms != nullptr) {
         cudaFree(histograms);
@@ -4672,6 +4707,37 @@ __global__ void residual_veto_normalize_quantile_batch_kernel(const float* input
   const float high = high_values[batch_index];
   const float inv_scale = 1.0f / fmaxf(high - low, 1.0e-6f);
   output[idx] = fminf(fmaxf((input[idx] - low) * inv_scale, 0.0f), 1.0f);
+}
+
+__global__ void residual_veto_normalize_quantile_pair_round_fp16_batch_kernel(const float* input_a,
+                                                                               const float* input_b,
+                                                                               int batch_size,
+                                                                               int rows,
+                                                                               int cols,
+                                                                               const float* low_values_a,
+                                                                               const float* high_values_a,
+                                                                               const float* low_values_b,
+                                                                               const float* high_values_b,
+                                                                               float* output_a,
+                                                                               float* output_b) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const float low_a = low_values_a[batch_index];
+  const float high_a = high_values_a[batch_index];
+  const float low_b = low_values_b[batch_index];
+  const float high_b = high_values_b[batch_index];
+  const float inv_scale_a = 1.0f / fmaxf(high_a - low_a, 1.0e-6f);
+  const float inv_scale_b = 1.0f / fmaxf(high_b - low_b, 1.0e-6f);
+  const float value_a = fminf(fmaxf((input_a[idx] - low_a) * inv_scale_a, 0.0f), 1.0f);
+  const float value_b = fminf(fmaxf((input_b[idx] - low_b) * inv_scale_b, 0.0f), 1.0f);
+  output_a[idx] = __half2float(__float2half_rn(value_a));
+  output_b[idx] = __half2float(__float2half_rn(value_b));
 }
 
 __global__ void residual_veto_masked_minmax_reduce_batch_kernel(const float* input,
@@ -4788,6 +4854,97 @@ __global__ void residual_veto_masked_minmax_partial_reduce_batch_kernel(const fl
     partial_min_values[output_index] = shared_min[0];
     partial_max_values[output_index] = shared_max[0];
     partial_valid_values[output_index] = shared_valid[0];
+  }
+}
+
+__global__ void residual_veto_masked_minmax_triplet_partial_reduce_batch_kernel(const float* input_a,
+                                                                                const float* input_b,
+                                                                                const float* input_c,
+                                                                                int batch_size,
+                                                                                int rows,
+                                                                                int cols,
+                                                                                const uint8_t* valid_row_mask,
+                                                                                float* partial_min_values,
+                                                                                float* partial_max_values,
+                                                                                int* partial_valid_values,
+                                                                                int partial_count) {
+  const int partial_index = blockIdx.x;
+  const int batch_index = blockIdx.y;
+  if (batch_index >= batch_size || partial_index >= partial_count) {
+    return;
+  }
+
+  const int tid = threadIdx.x;
+  const int plane = rows * cols;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  __shared__ float shared_min_a[kHybridReductionThreads];
+  __shared__ float shared_max_a[kHybridReductionThreads];
+  __shared__ float shared_min_b[kHybridReductionThreads];
+  __shared__ float shared_max_b[kHybridReductionThreads];
+  __shared__ float shared_min_c[kHybridReductionThreads];
+  __shared__ float shared_max_c[kHybridReductionThreads];
+  __shared__ int shared_valid[kHybridReductionThreads];
+
+  float local_min_a = 1.0e30f;
+  float local_max_a = -1.0e30f;
+  float local_min_b = 1.0e30f;
+  float local_max_b = -1.0e30f;
+  float local_min_c = 1.0e30f;
+  float local_max_c = -1.0e30f;
+  int local_valid = 0;
+  const int stride = partial_count * blockDim.x;
+  for (int local_index = partial_index * blockDim.x + tid; local_index < plane; local_index += stride) {
+    const int row = local_index / cols;
+    if (valid_row_mask[static_cast<size_t>(batch_index) * static_cast<size_t>(rows) + static_cast<size_t>(row)] == 0) {
+      continue;
+    }
+    const size_t source_index = batch_offset + static_cast<size_t>(local_index);
+    const float value_a = input_a[source_index];
+    const float value_b = input_b[source_index];
+    const float value_c = input_c[source_index];
+    local_min_a = fminf(local_min_a, value_a);
+    local_max_a = fmaxf(local_max_a, value_a);
+    local_min_b = fminf(local_min_b, value_b);
+    local_max_b = fmaxf(local_max_b, value_b);
+    local_min_c = fminf(local_min_c, value_c);
+    local_max_c = fmaxf(local_max_c, value_c);
+    local_valid = 1;
+  }
+
+  shared_min_a[tid] = local_min_a;
+  shared_max_a[tid] = local_max_a;
+  shared_min_b[tid] = local_min_b;
+  shared_max_b[tid] = local_max_b;
+  shared_min_c[tid] = local_min_c;
+  shared_max_c[tid] = local_max_c;
+  shared_valid[tid] = local_valid;
+  __syncthreads();
+
+  for (int reduce_stride = blockDim.x / 2; reduce_stride > 0; reduce_stride >>= 1) {
+    if (tid < reduce_stride) {
+      shared_min_a[tid] = fminf(shared_min_a[tid], shared_min_a[tid + reduce_stride]);
+      shared_max_a[tid] = fmaxf(shared_max_a[tid], shared_max_a[tid + reduce_stride]);
+      shared_min_b[tid] = fminf(shared_min_b[tid], shared_min_b[tid + reduce_stride]);
+      shared_max_b[tid] = fmaxf(shared_max_b[tid], shared_max_b[tid + reduce_stride]);
+      shared_min_c[tid] = fminf(shared_min_c[tid], shared_min_c[tid + reduce_stride]);
+      shared_max_c[tid] = fmaxf(shared_max_c[tid], shared_max_c[tid + reduce_stride]);
+      shared_valid[tid] = shared_valid[tid] | shared_valid[tid + reduce_stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const size_t per_map_stride = static_cast<size_t>(batch_size) * static_cast<size_t>(partial_count);
+    const size_t output_index = static_cast<size_t>(batch_index) * static_cast<size_t>(partial_count) + static_cast<size_t>(partial_index);
+    partial_min_values[output_index] = shared_min_a[0];
+    partial_max_values[output_index] = shared_max_a[0];
+    partial_valid_values[output_index] = shared_valid[0];
+    partial_min_values[per_map_stride + output_index] = shared_min_b[0];
+    partial_max_values[per_map_stride + output_index] = shared_max_b[0];
+    partial_valid_values[per_map_stride + output_index] = shared_valid[0];
+    partial_min_values[2 * per_map_stride + output_index] = shared_min_c[0];
+    partial_max_values[2 * per_map_stride + output_index] = shared_max_c[0];
+    partial_valid_values[2 * per_map_stride + output_index] = shared_valid[0];
   }
 }
 
@@ -4918,6 +5075,86 @@ __global__ void residual_veto_combined_input_masked_minmax_partial_reduce_batch_
   }
 }
 
+__global__ void residual_veto_subtract_scaled_masked_minmax_pair_partial_reduce_batch_kernel(const float* lhs,
+                                                                                              const float* rhs_a,
+                                                                                              const float* rhs_b,
+                                                                                              int batch_size,
+                                                                                              int rows,
+                                                                                              int cols,
+                                                                                              const uint8_t* valid_row_mask,
+                                                                                              float rhs_a_scale,
+                                                                                              float rhs_b_scale,
+                                                                                              float* partial_min_values,
+                                                                                              float* partial_max_values,
+                                                                                              int* partial_valid_values,
+                                                                                              int partial_count) {
+  const int partial_index = blockIdx.x;
+  const int batch_index = blockIdx.y;
+  if (batch_index >= batch_size || partial_index >= partial_count) {
+    return;
+  }
+
+  const int tid = threadIdx.x;
+  const int plane = rows * cols;
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(plane);
+  __shared__ float shared_min_a[kHybridReductionThreads];
+  __shared__ float shared_max_a[kHybridReductionThreads];
+  __shared__ float shared_min_b[kHybridReductionThreads];
+  __shared__ float shared_max_b[kHybridReductionThreads];
+  __shared__ int shared_valid[kHybridReductionThreads];
+
+  float local_min_a = 1.0e30f;
+  float local_max_a = -1.0e30f;
+  float local_min_b = 1.0e30f;
+  float local_max_b = -1.0e30f;
+  int local_valid = 0;
+  const int stride = partial_count * blockDim.x;
+  for (int local_index = partial_index * blockDim.x + tid; local_index < plane; local_index += stride) {
+    const int row = local_index / cols;
+    if (valid_row_mask[static_cast<size_t>(batch_index) * static_cast<size_t>(rows) + static_cast<size_t>(row)] == 0) {
+      continue;
+    }
+    const size_t source_index = batch_offset + static_cast<size_t>(local_index);
+    const float lhs_value = lhs[source_index];
+    const float value_a = residual_veto_subtract_scaled_value(lhs_value, rhs_a[source_index], rhs_a_scale);
+    const float value_b = residual_veto_subtract_scaled_value(lhs_value, rhs_b[source_index], rhs_b_scale);
+    local_min_a = fminf(local_min_a, value_a);
+    local_max_a = fmaxf(local_max_a, value_a);
+    local_min_b = fminf(local_min_b, value_b);
+    local_max_b = fmaxf(local_max_b, value_b);
+    local_valid = 1;
+  }
+
+  shared_min_a[tid] = local_min_a;
+  shared_max_a[tid] = local_max_a;
+  shared_min_b[tid] = local_min_b;
+  shared_max_b[tid] = local_max_b;
+  shared_valid[tid] = local_valid;
+  __syncthreads();
+
+  for (int reduce_stride = blockDim.x / 2; reduce_stride > 0; reduce_stride >>= 1) {
+    if (tid < reduce_stride) {
+      shared_min_a[tid] = fminf(shared_min_a[tid], shared_min_a[tid + reduce_stride]);
+      shared_max_a[tid] = fmaxf(shared_max_a[tid], shared_max_a[tid + reduce_stride]);
+      shared_min_b[tid] = fminf(shared_min_b[tid], shared_min_b[tid + reduce_stride]);
+      shared_max_b[tid] = fmaxf(shared_max_b[tid], shared_max_b[tid + reduce_stride]);
+      shared_valid[tid] = shared_valid[tid] | shared_valid[tid + reduce_stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const size_t per_map_stride = static_cast<size_t>(batch_size) * static_cast<size_t>(partial_count);
+    const size_t output_index = static_cast<size_t>(batch_index) * static_cast<size_t>(partial_count) + static_cast<size_t>(partial_index);
+    partial_min_values[output_index] = shared_min_a[0];
+    partial_max_values[output_index] = shared_max_a[0];
+    partial_valid_values[output_index] = shared_valid[0];
+    partial_min_values[per_map_stride + output_index] = shared_min_b[0];
+    partial_max_values[per_map_stride + output_index] = shared_max_b[0];
+    partial_valid_values[per_map_stride + output_index] = shared_valid[0];
+  }
+}
+
 __global__ void residual_veto_masked_minmax_finalize_batch_kernel(const float* partial_min_values,
                                                                   const float* partial_max_values,
                                                                   const int* partial_valid_values,
@@ -5003,6 +5240,53 @@ __global__ void residual_veto_normalize_masked_minmax_batch_kernel(const float* 
   output[idx] = fminf(fmaxf((input[idx] - low) * inv_scale, 0.0f), 1.0f);
 }
 
+__global__ void residual_veto_normalize_masked_minmax_triplet_batch_kernel(const float* input_a,
+                                                                           const float* input_b,
+                                                                           const float* input_c,
+                                                                           int batch_size,
+                                                                           int rows,
+                                                                           int cols,
+                                                                           const uint8_t* valid_row_mask,
+                                                                           const float* min_values_a,
+                                                                           const float* max_values_a,
+                                                                           const float* min_values_b,
+                                                                           const float* max_values_b,
+                                                                           const float* min_values_c,
+                                                                           const float* max_values_c,
+                                                                           float* output_a,
+                                                                           float* output_b,
+                                                                           float* output_c) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / cols;
+  if (valid_row_mask[static_cast<size_t>(batch_index) * static_cast<size_t>(rows) + static_cast<size_t>(row)] == 0) {
+    output_a[idx] = 0.0f;
+    output_b[idx] = 0.0f;
+    output_c[idx] = 0.0f;
+    return;
+  }
+
+  const float low_a = min_values_a[batch_index];
+  const float high_a = max_values_a[batch_index];
+  const float low_b = min_values_b[batch_index];
+  const float high_b = max_values_b[batch_index];
+  const float low_c = min_values_c[batch_index];
+  const float high_c = max_values_c[batch_index];
+  const float inv_scale_a = 1.0f / fmaxf(high_a - low_a, 1.0e-6f);
+  const float inv_scale_b = 1.0f / fmaxf(high_b - low_b, 1.0e-6f);
+  const float inv_scale_c = 1.0f / fmaxf(high_c - low_c, 1.0e-6f);
+  output_a[idx] = fminf(fmaxf((input_a[idx] - low_a) * inv_scale_a, 0.0f), 1.0f);
+  output_b[idx] = fminf(fmaxf((input_b[idx] - low_b) * inv_scale_b, 0.0f), 1.0f);
+  output_c[idx] = fminf(fmaxf((input_c[idx] - low_c) * inv_scale_c, 0.0f), 1.0f);
+}
+
 __global__ void residual_veto_subtract_scaled_normalize_masked_minmax_batch_kernel(const float* lhs,
                                                                                     const float* rhs,
                                                                                     int batch_size,
@@ -5033,6 +5317,50 @@ __global__ void residual_veto_subtract_scaled_normalize_masked_minmax_batch_kern
   const float inv_scale = 1.0f / fmaxf(high - low, 1.0e-6f);
   const float value = residual_veto_subtract_scaled_value(lhs[idx], rhs[idx], rhs_scale);
   output[idx] = fminf(fmaxf((value - low) * inv_scale, 0.0f), 1.0f);
+}
+
+__global__ void residual_veto_subtract_scaled_normalize_masked_minmax_pair_batch_kernel(const float* lhs,
+                                                                                         const float* rhs_a,
+                                                                                         const float* rhs_b,
+                                                                                         int batch_size,
+                                                                                         int rows,
+                                                                                         int cols,
+                                                                                         const uint8_t* valid_row_mask,
+                                                                                         const float* min_values_a,
+                                                                                         const float* max_values_a,
+                                                                                         const float* min_values_b,
+                                                                                         const float* max_values_b,
+                                                                                         float rhs_a_scale,
+                                                                                         float rhs_b_scale,
+                                                                                         float* output_a,
+                                                                                         float* output_b) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / cols;
+  if (valid_row_mask[static_cast<size_t>(batch_index) * static_cast<size_t>(rows) + static_cast<size_t>(row)] == 0) {
+    output_a[idx] = 0.0f;
+    output_b[idx] = 0.0f;
+    return;
+  }
+
+  const float low_a = min_values_a[batch_index];
+  const float high_a = max_values_a[batch_index];
+  const float low_b = min_values_b[batch_index];
+  const float high_b = max_values_b[batch_index];
+  const float inv_scale_a = 1.0f / fmaxf(high_a - low_a, 1.0e-6f);
+  const float inv_scale_b = 1.0f / fmaxf(high_b - low_b, 1.0e-6f);
+  const float lhs_value = lhs[idx];
+  const float value_a = residual_veto_subtract_scaled_value(lhs_value, rhs_a[idx], rhs_a_scale);
+  const float value_b = residual_veto_subtract_scaled_value(lhs_value, rhs_b[idx], rhs_b_scale);
+  output_a[idx] = fminf(fmaxf((value_a - low_a) * inv_scale_a, 0.0f), 1.0f);
+  output_b[idx] = fminf(fmaxf((value_b - low_b) * inv_scale_b, 0.0f), 1.0f);
 }
 
 __global__ void residual_veto_combined_input_normalize_masked_minmax_batch_kernel(const float* keep_freq,
@@ -5366,6 +5694,45 @@ __global__ void residual_veto_histogram_valid_rows_batch_kernel(const float* inp
   atomicAdd(histograms + static_cast<size_t>(batch_index) * static_cast<size_t>(histogram_bins) + static_cast<size_t>(bin), 1U);
 }
 
+__global__ void residual_veto_histogram_valid_rows_triplet_batch_kernel(const float* input_a,
+                                                                        const float* input_b,
+                                                                        const float* input_c,
+                                                                        int batch_size,
+                                                                        int rows,
+                                                                        int cols,
+                                                                        const uint8_t* valid_row_mask,
+                                                                        unsigned int* histograms,
+                                                                        int histogram_bins) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / cols;
+  if (valid_row_mask[static_cast<size_t>(batch_index) * static_cast<size_t>(rows) + static_cast<size_t>(row)] == 0) {
+    return;
+  }
+
+  const size_t histogram_base = static_cast<size_t>(batch_index) * static_cast<size_t>(kHybridThresholdHistogramMapCount) *
+                                static_cast<size_t>(histogram_bins);
+  const float clamped_a = fminf(fmaxf(input_a[idx], 0.0f), 1.0f);
+  const float clamped_b = fminf(fmaxf(input_b[idx], 0.0f), 1.0f);
+  const float clamped_c = fminf(fmaxf(input_c[idx], 0.0f), 1.0f);
+  const int bin_a = min(histogram_bins - 1,
+                        max(0, __float2int_rn(clamped_a * static_cast<float>(histogram_bins - 1))));
+  const int bin_b = min(histogram_bins - 1,
+                        max(0, __float2int_rn(clamped_b * static_cast<float>(histogram_bins - 1))));
+  const int bin_c = min(histogram_bins - 1,
+                        max(0, __float2int_rn(clamped_c * static_cast<float>(histogram_bins - 1))));
+  atomicAdd(histograms + histogram_base + static_cast<size_t>(bin_a), 1U);
+  atomicAdd(histograms + histogram_base + static_cast<size_t>(histogram_bins) + static_cast<size_t>(bin_b), 1U);
+  atomicAdd(histograms + histogram_base + 2U * static_cast<size_t>(histogram_bins) + static_cast<size_t>(bin_c), 1U);
+}
+
 __global__ void residual_veto_histogram_valid_rows_sampled_batch_kernel(const float* input,
                                                                         int batch_size,
                                                                         int rows,
@@ -5398,6 +5765,50 @@ __global__ void residual_veto_histogram_valid_rows_sampled_batch_kernel(const fl
   atomicAdd(histograms + static_cast<size_t>(batch_index) * static_cast<size_t>(histogram_bins) + static_cast<size_t>(bin), 1U);
 }
 
+__global__ void residual_veto_histogram_valid_rows_sampled_triplet_batch_kernel(const float* input_a,
+                                                                                const float* input_b,
+                                                                                const float* input_c,
+                                                                                int batch_size,
+                                                                                int rows,
+                                                                                int cols,
+                                                                                const uint8_t* valid_row_mask,
+                                                                                int row_stride,
+                                                                                int col_stride,
+                                                                                unsigned int* histograms,
+                                                                                int histogram_bins) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const int local_index = idx - batch_index * plane;
+  const int row = local_index / cols;
+  const int col = local_index % cols;
+  if (valid_row_mask[static_cast<size_t>(batch_index) * static_cast<size_t>(rows) + static_cast<size_t>(row)] == 0 ||
+      (row % row_stride) != 0 ||
+      (col % col_stride) != 0) {
+    return;
+  }
+
+  const size_t histogram_base = static_cast<size_t>(batch_index) * static_cast<size_t>(kHybridThresholdHistogramMapCount) *
+                                static_cast<size_t>(histogram_bins);
+  const float clamped_a = fminf(fmaxf(input_a[idx], 0.0f), 1.0f);
+  const float clamped_b = fminf(fmaxf(input_b[idx], 0.0f), 1.0f);
+  const float clamped_c = fminf(fmaxf(input_c[idx], 0.0f), 1.0f);
+  const int bin_a = min(histogram_bins - 1,
+                        max(0, __float2int_rn(clamped_a * static_cast<float>(histogram_bins - 1))));
+  const int bin_b = min(histogram_bins - 1,
+                        max(0, __float2int_rn(clamped_b * static_cast<float>(histogram_bins - 1))));
+  const int bin_c = min(histogram_bins - 1,
+                        max(0, __float2int_rn(clamped_c * static_cast<float>(histogram_bins - 1))));
+  atomicAdd(histograms + histogram_base + static_cast<size_t>(bin_a), 1U);
+  atomicAdd(histograms + histogram_base + static_cast<size_t>(histogram_bins) + static_cast<size_t>(bin_b), 1U);
+  atomicAdd(histograms + histogram_base + 2U * static_cast<size_t>(histogram_bins) + static_cast<size_t>(bin_c), 1U);
+}
+
 __global__ void residual_veto_histogram_fp16_unit_batch_kernel(const float* input,
                                                                int batch_size,
                                                                int plane,
@@ -5413,6 +5824,30 @@ __global__ void residual_veto_histogram_fp16_unit_batch_kernel(const float* inpu
   const unsigned short bin = min(static_cast<unsigned short>(kHybridFp16UnitHistogramBins - 1),
                                  __half_as_ushort(__float2half_rn(clamped)));
   atomicAdd(histograms + static_cast<size_t>(batch_index) * static_cast<size_t>(kHybridFp16UnitHistogramBins) + static_cast<size_t>(bin), 1U);
+}
+
+__global__ void residual_veto_histogram_fp16_unit_pair_batch_kernel(const float* input_a,
+                                                                    const float* input_b,
+                                                                    int batch_size,
+                                                                    int plane,
+                                                                    unsigned int* histograms) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+
+  const int batch_index = idx / plane;
+  const size_t histogram_stride = static_cast<size_t>(batch_size) * static_cast<size_t>(kHybridFp16UnitHistogramBins);
+  const size_t batch_offset = static_cast<size_t>(batch_index) * static_cast<size_t>(kHybridFp16UnitHistogramBins);
+  const float clamped_a = fminf(fmaxf(input_a[idx], 0.0f), 1.0f);
+  const float clamped_b = fminf(fmaxf(input_b[idx], 0.0f), 1.0f);
+  const unsigned short bin_a = min(static_cast<unsigned short>(kHybridFp16UnitHistogramBins - 1),
+                                   __half_as_ushort(__float2half_rn(clamped_a)));
+  const unsigned short bin_b = min(static_cast<unsigned short>(kHybridFp16UnitHistogramBins - 1),
+                                   __half_as_ushort(__float2half_rn(clamped_b)));
+  atomicAdd(histograms + batch_offset + static_cast<size_t>(bin_a), 1U);
+  atomicAdd(histograms + histogram_stride + batch_offset + static_cast<size_t>(bin_b), 1U);
 }
 
 __global__ void residual_veto_histogram_quantile_batch_kernel(const unsigned int* histograms,
@@ -5448,6 +5883,93 @@ __global__ void residual_veto_histogram_quantile_batch_kernel(const unsigned int
     }
   }
   output[batch_index] = static_cast<float>(selected_bin) / static_cast<float>(max(histogram_bins - 1, 1));
+}
+
+__global__ void residual_veto_histogram_quantile_triplet_batch_kernel(const unsigned int* histograms,
+                                                                      int batch_size,
+                                                                      int histogram_bins,
+                                                                      float q_a,
+                                                                      float fallback_a,
+                                                                      float q_b,
+                                                                      float fallback_b,
+                                                                      float q_c,
+                                                                      float fallback_c,
+                                                                      float* output_a,
+                                                                      float* output_b,
+                                                                      float* output_c) {
+  const int batch_index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (batch_index >= batch_size) {
+    return;
+  }
+
+  const size_t histogram_base = static_cast<size_t>(batch_index) * static_cast<size_t>(kHybridThresholdHistogramMapCount) *
+                                static_cast<size_t>(histogram_bins);
+  const unsigned int* histogram_a = histograms + histogram_base;
+  const unsigned int* histogram_b = histogram_a + static_cast<size_t>(histogram_bins);
+  const unsigned int* histogram_c = histogram_b + static_cast<size_t>(histogram_bins);
+  uint64_t total_count = 0;
+  for (int index = 0; index < histogram_bins; ++index) {
+    total_count += histogram_a[index];
+  }
+  if (total_count == 0) {
+    output_a[batch_index] = fallback_a;
+  } else {
+    const float clamped_q = fminf(fmaxf(q_a, 0.0f), 1.0f);
+    const uint64_t target = static_cast<uint64_t>(floorf((static_cast<float>(total_count) - 1.0f) * clamped_q + 0.5f)) + 1ULL;
+    uint64_t cumulative = 0;
+    int selected_bin = histogram_bins - 1;
+    for (int index = 0; index < histogram_bins; ++index) {
+      cumulative += histogram_a[index];
+      if (cumulative >= target) {
+        selected_bin = index;
+        break;
+      }
+    }
+    output_a[batch_index] = static_cast<float>(selected_bin) / static_cast<float>(max(histogram_bins - 1, 1));
+  }
+
+  total_count = 0;
+  for (int index = 0; index < histogram_bins; ++index) {
+    total_count += histogram_b[index];
+  }
+  if (total_count == 0) {
+    output_b[batch_index] = fallback_b;
+  } else {
+    const float clamped_q = fminf(fmaxf(q_b, 0.0f), 1.0f);
+    const uint64_t target = static_cast<uint64_t>(floorf((static_cast<float>(total_count) - 1.0f) * clamped_q + 0.5f)) + 1ULL;
+    uint64_t cumulative = 0;
+    int selected_bin = histogram_bins - 1;
+    for (int index = 0; index < histogram_bins; ++index) {
+      cumulative += histogram_b[index];
+      if (cumulative >= target) {
+        selected_bin = index;
+        break;
+      }
+    }
+    output_b[batch_index] = static_cast<float>(selected_bin) / static_cast<float>(max(histogram_bins - 1, 1));
+  }
+
+  total_count = 0;
+  for (int index = 0; index < histogram_bins; ++index) {
+    total_count += histogram_c[index];
+  }
+  if (total_count == 0) {
+    output_c[batch_index] = fallback_c;
+    return;
+  }
+
+  const float clamped_q = fminf(fmaxf(q_c, 0.0f), 1.0f);
+  const uint64_t target = static_cast<uint64_t>(floorf((static_cast<float>(total_count) - 1.0f) * clamped_q + 0.5f)) + 1ULL;
+  uint64_t cumulative = 0;
+  int selected_bin = histogram_bins - 1;
+  for (int index = 0; index < histogram_bins; ++index) {
+    cumulative += histogram_c[index];
+    if (cumulative >= target) {
+      selected_bin = index;
+      break;
+    }
+  }
+  output_c[batch_index] = static_cast<float>(selected_bin) / static_cast<float>(max(histogram_bins - 1, 1));
 }
 
 __global__ void residual_veto_histogram_fp16_unit_quantiles_batch_kernel(const unsigned int* histograms,
@@ -5734,6 +6256,94 @@ bool normalize_map01_masked_minmax_cuda_batch_to_device(const float* input_batch
   return cudaGetLastError() == cudaSuccess;
 }
 
+bool normalize_map01_masked_minmax_triplet_cuda_batch_to_device(const float* input_a_batch_device,
+                                                                const float* input_b_batch_device,
+                                                                const float* input_c_batch_device,
+                                                                int batch_size,
+                                                                int rows,
+                                                                int cols,
+                                                                const uint8_t* valid_row_mask_device,
+                                                                float* min_values_a_device,
+                                                                float* max_values_a_device,
+                                                                float* min_values_b_device,
+                                                                float* max_values_b_device,
+                                                                float* min_values_c_device,
+                                                                float* max_values_c_device,
+                                                                float* partial_min_values_device,
+                                                                float* partial_max_values_device,
+                                                                int* partial_valid_values_device,
+                                                                float* output_a_batch_device,
+                                                                float* output_b_batch_device,
+                                                                float* output_c_batch_device,
+                                                                cudaStream_t stream) {
+  const size_t plane = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  const size_t total_values = static_cast<size_t>(batch_size) * plane;
+  const int partial_count = std::max(1, std::min(kHybridReductionTileBlocks,
+                                                 static_cast<int>((plane + static_cast<size_t>(kHybridReductionThreads) - 1) /
+                                                                  static_cast<size_t>(kHybridReductionThreads))));
+  const dim3 partial_grid(partial_count, batch_size);
+  residual_veto_masked_minmax_triplet_partial_reduce_batch_kernel<<<partial_grid, kHybridReductionThreads, 0, stream>>>(input_a_batch_device,
+                                                                                                                         input_b_batch_device,
+                                                                                                                         input_c_batch_device,
+                                                                                                                         batch_size,
+                                                                                                                         rows,
+                                                                                                                         cols,
+                                                                                                                         valid_row_mask_device,
+                                                                                                                         partial_min_values_device,
+                                                                                                                         partial_max_values_device,
+                                                                                                                         partial_valid_values_device,
+                                                                                                                         partial_count);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  const size_t partial_map_stride = static_cast<size_t>(batch_size) * static_cast<size_t>(partial_count);
+  residual_veto_masked_minmax_finalize_batch_kernel<<<batch_size, kHybridReductionThreads, 0, stream>>>(partial_min_values_device,
+                                                                                                          partial_max_values_device,
+                                                                                                          partial_valid_values_device,
+                                                                                                          batch_size,
+                                                                                                          partial_count,
+                                                                                                          min_values_a_device,
+                                                                                                          max_values_a_device);
+  residual_veto_masked_minmax_finalize_batch_kernel<<<batch_size, kHybridReductionThreads, 0, stream>>>(partial_min_values_device + partial_map_stride,
+                                                                                                          partial_max_values_device + partial_map_stride,
+                                                                                                          partial_valid_values_device + partial_map_stride,
+                                                                                                          batch_size,
+                                                                                                          partial_count,
+                                                                                                          min_values_b_device,
+                                                                                                          max_values_b_device);
+  residual_veto_masked_minmax_finalize_batch_kernel<<<batch_size, kHybridReductionThreads, 0, stream>>>(partial_min_values_device + 2 * partial_map_stride,
+                                                                                                          partial_max_values_device + 2 * partial_map_stride,
+                                                                                                          partial_valid_values_device + 2 * partial_map_stride,
+                                                                                                          batch_size,
+                                                                                                          partial_count,
+                                                                                                          min_values_c_device,
+                                                                                                          max_values_c_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  const int threads = 256;
+  const int blocks = static_cast<int>((total_values + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+  residual_veto_normalize_masked_minmax_triplet_batch_kernel<<<blocks, threads, 0, stream>>>(input_a_batch_device,
+                                                                                               input_b_batch_device,
+                                                                                               input_c_batch_device,
+                                                                                               batch_size,
+                                                                                               rows,
+                                                                                               cols,
+                                                                                               valid_row_mask_device,
+                                                                                               min_values_a_device,
+                                                                                               max_values_a_device,
+                                                                                               min_values_b_device,
+                                                                                               max_values_b_device,
+                                                                                               min_values_c_device,
+                                                                                               max_values_c_device,
+                                                                                               output_a_batch_device,
+                                                                                               output_b_batch_device,
+                                                                                               output_c_batch_device);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool normalize_subtract_scaled_masked_minmax_cuda_batch_to_device(const float* lhs_batch_device,
                                                                   const float* rhs_batch_device,
                                                                   int batch_size,
@@ -5791,6 +6401,87 @@ bool normalize_subtract_scaled_masked_minmax_cuda_batch_to_device(const float* l
                                                                                                       max_values_device,
                                                                                                       rhs_scale,
                                                                                                       output_batch_device);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool normalize_subtract_scaled_masked_minmax_pair_cuda_batch_to_device(const float* lhs_batch_device,
+                                                                       const float* rhs_a_batch_device,
+                                                                       float rhs_a_scale,
+                                                                       const float* rhs_b_batch_device,
+                                                                       float rhs_b_scale,
+                                                                       int batch_size,
+                                                                       int rows,
+                                                                       int cols,
+                                                                       const uint8_t* valid_row_mask_device,
+                                                                       float* min_values_a_device,
+                                                                       float* max_values_a_device,
+                                                                       float* min_values_b_device,
+                                                                       float* max_values_b_device,
+                                                                       float* partial_min_values_device,
+                                                                       float* partial_max_values_device,
+                                                                       int* partial_valid_values_device,
+                                                                       float* output_a_batch_device,
+                                                                       float* output_b_batch_device,
+                                                                       cudaStream_t stream) {
+  const size_t plane = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  const size_t total_values = static_cast<size_t>(batch_size) * plane;
+  const int partial_count = std::max(1, std::min(kHybridReductionTileBlocks,
+                                                 static_cast<int>((plane + static_cast<size_t>(kHybridReductionThreads) - 1) /
+                                                                  static_cast<size_t>(kHybridReductionThreads))));
+  const dim3 partial_grid(partial_count, batch_size);
+  residual_veto_subtract_scaled_masked_minmax_pair_partial_reduce_batch_kernel<<<partial_grid, kHybridReductionThreads, 0, stream>>>(lhs_batch_device,
+                                                                                                                                       rhs_a_batch_device,
+                                                                                                                                       rhs_b_batch_device,
+                                                                                                                                       batch_size,
+                                                                                                                                       rows,
+                                                                                                                                       cols,
+                                                                                                                                       valid_row_mask_device,
+                                                                                                                                       rhs_a_scale,
+                                                                                                                                       rhs_b_scale,
+                                                                                                                                       partial_min_values_device,
+                                                                                                                                       partial_max_values_device,
+                                                                                                                                       partial_valid_values_device,
+                                                                                                                                       partial_count);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  const size_t partial_map_stride = static_cast<size_t>(batch_size) * static_cast<size_t>(partial_count);
+  residual_veto_masked_minmax_finalize_batch_kernel<<<batch_size, kHybridReductionThreads, 0, stream>>>(partial_min_values_device,
+                                                                                                          partial_max_values_device,
+                                                                                                          partial_valid_values_device,
+                                                                                                          batch_size,
+                                                                                                          partial_count,
+                                                                                                          min_values_a_device,
+                                                                                                          max_values_a_device);
+  residual_veto_masked_minmax_finalize_batch_kernel<<<batch_size, kHybridReductionThreads, 0, stream>>>(partial_min_values_device + partial_map_stride,
+                                                                                                          partial_max_values_device + partial_map_stride,
+                                                                                                          partial_valid_values_device + partial_map_stride,
+                                                                                                          batch_size,
+                                                                                                          partial_count,
+                                                                                                          min_values_b_device,
+                                                                                                          max_values_b_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  const int threads = 256;
+  const int blocks = static_cast<int>((total_values + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+  residual_veto_subtract_scaled_normalize_masked_minmax_pair_batch_kernel<<<blocks, threads, 0, stream>>>(lhs_batch_device,
+                                                                                                            rhs_a_batch_device,
+                                                                                                            rhs_b_batch_device,
+                                                                                                            batch_size,
+                                                                                                            rows,
+                                                                                                            cols,
+                                                                                                            valid_row_mask_device,
+                                                                                                            min_values_a_device,
+                                                                                                            max_values_a_device,
+                                                                                                            min_values_b_device,
+                                                                                                            max_values_b_device,
+                                                                                                            rhs_a_scale,
+                                                                                                            rhs_b_scale,
+                                                                                                            output_a_batch_device,
+                                                                                                            output_b_batch_device);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -6038,6 +6729,83 @@ bool masked_histogram_quantile_cuda_batch_to_device(const float* input_batch_dev
   return cudaGetLastError() == cudaSuccess;
 }
 
+bool masked_histogram_quantile_triplet_cuda_batch_to_device(const float* input_a_batch_device,
+                                                            const float* input_b_batch_device,
+                                                            const float* input_c_batch_device,
+                                                            int batch_size,
+                                                            int rows,
+                                                            int cols,
+                                                            const uint8_t* valid_row_mask_device,
+                                                            float q_a,
+                                                            float fallback_a,
+                                                            float q_b,
+                                                            float fallback_b,
+                                                            float q_c,
+                                                            float fallback_c,
+                                                            bool use_sampled_histogram,
+                                                            unsigned int* histograms_device,
+                                                            float* output_a_device,
+                                                            float* output_b_device,
+                                                            float* output_c_device,
+                                                            cudaStream_t stream) {
+  if (input_a_batch_device == nullptr || input_b_batch_device == nullptr || input_c_batch_device == nullptr ||
+      valid_row_mask_device == nullptr || histograms_device == nullptr || output_a_device == nullptr || output_b_device == nullptr ||
+      output_c_device == nullptr || batch_size <= 0 || rows <= 0 || cols <= 0) {
+    return false;
+  }
+
+  const size_t histogram_values = static_cast<size_t>(batch_size) * static_cast<size_t>(kHybridThresholdHistogramMapCount) *
+                                  static_cast<size_t>(kHybridThresholdHistogramBins);
+  if (cudaMemsetAsync(histograms_device, 0, histogram_values * sizeof(unsigned int), stream) != cudaSuccess) {
+    return false;
+  }
+
+  const size_t total_values = static_cast<size_t>(batch_size) * static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  const int threads = 256;
+  const int blocks = static_cast<int>((total_values + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+  if (use_sampled_histogram) {
+    residual_veto_histogram_valid_rows_sampled_triplet_batch_kernel<<<blocks, threads, 0, stream>>>(input_a_batch_device,
+                                                                                                     input_b_batch_device,
+                                                                                                     input_c_batch_device,
+                                                                                                     batch_size,
+                                                                                                     rows,
+                                                                                                     cols,
+                                                                                                     valid_row_mask_device,
+                                                                                                     kHybridThresholdHistogramSampleStride,
+                                                                                                     kHybridThresholdHistogramSampleStride,
+                                                                                                     histograms_device,
+                                                                                                     kHybridThresholdHistogramBins);
+  } else {
+    residual_veto_histogram_valid_rows_triplet_batch_kernel<<<blocks, threads, 0, stream>>>(input_a_batch_device,
+                                                                                             input_b_batch_device,
+                                                                                             input_c_batch_device,
+                                                                                             batch_size,
+                                                                                             rows,
+                                                                                             cols,
+                                                                                             valid_row_mask_device,
+                                                                                             histograms_device,
+                                                                                             kHybridThresholdHistogramBins);
+  }
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  const int quantile_blocks = (batch_size + threads - 1) / threads;
+  residual_veto_histogram_quantile_triplet_batch_kernel<<<quantile_blocks, threads, 0, stream>>>(histograms_device,
+                                                                                                   batch_size,
+                                                                                                   kHybridThresholdHistogramBins,
+                                                                                                   q_a,
+                                                                                                   fallback_a,
+                                                                                                   q_b,
+                                                                                                   fallback_b,
+                                                                                                   q_c,
+                                                                                                   fallback_c,
+                                                                                                   output_a_device,
+                                                                                                   output_b_device,
+                                                                                                   output_c_device);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool normalize_map01_quantile_exact_fp16_unit_cuda_batch_to_device(const float* input_batch_device,
                                                                    int batch_size,
                                                                    int rows,
@@ -6092,6 +6860,79 @@ bool normalize_map01_quantile_exact_fp16_unit_cuda_batch_to_device(const float* 
   return cudaGetLastError() == cudaSuccess;
 }
 
+bool normalize_map01_quantile_exact_fp16_unit_pair_cuda_batch_to_device(const float* input_a_batch_device,
+                                                                        const float* input_b_batch_device,
+                                                                        int batch_size,
+                                                                        int rows,
+                                                                        int cols,
+                                                                        float low_q_a,
+                                                                        float high_q_a,
+                                                                        float low_q_b,
+                                                                        float high_q_b,
+                                                                        unsigned int* histograms_device,
+                                                                        float* low_values_a_device,
+                                                                        float* high_values_a_device,
+                                                                        float* low_values_b_device,
+                                                                        float* high_values_b_device,
+                                                                        float* output_a_batch_device,
+                                                                        float* output_b_batch_device,
+                                                                        cudaStream_t stream) {
+  if (input_a_batch_device == nullptr || input_b_batch_device == nullptr || histograms_device == nullptr ||
+      low_values_a_device == nullptr || high_values_a_device == nullptr || low_values_b_device == nullptr || high_values_b_device == nullptr ||
+      output_a_batch_device == nullptr || output_b_batch_device == nullptr || batch_size <= 0 || rows <= 0 || cols <= 0) {
+    return false;
+  }
+
+  const size_t histogram_stride = static_cast<size_t>(batch_size) * static_cast<size_t>(kHybridFp16UnitHistogramBins);
+  const size_t histogram_values = histogram_stride * static_cast<size_t>(kHybridFp16UnitHistogramPairMapCount);
+  if (cudaMemsetAsync(histograms_device, 0, histogram_values * sizeof(unsigned int), stream) != cudaSuccess) {
+    return false;
+  }
+
+  const int plane = rows * cols;
+  const size_t total_values = static_cast<size_t>(batch_size) * static_cast<size_t>(plane);
+  const int threads = 256;
+  const int blocks = static_cast<int>((total_values + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+  residual_veto_histogram_fp16_unit_pair_batch_kernel<<<blocks, threads, 0, stream>>>(input_a_batch_device,
+                                                                                       input_b_batch_device,
+                                                                                       batch_size,
+                                                                                       plane,
+                                                                                       histograms_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  const int quantile_blocks = (batch_size + threads - 1) / threads;
+  residual_veto_histogram_fp16_unit_quantiles_batch_kernel<<<quantile_blocks, threads, 0, stream>>>(histograms_device,
+                                                                                                     batch_size,
+                                                                                                     low_q_a,
+                                                                                                     high_q_a,
+                                                                                                     low_values_a_device,
+                                                                                                     high_values_a_device);
+  residual_veto_histogram_fp16_unit_quantiles_batch_kernel<<<quantile_blocks, threads, 0, stream>>>(histograms_device + histogram_stride,
+                                                                                                     batch_size,
+                                                                                                     low_q_b,
+                                                                                                     high_q_b,
+                                                                                                     low_values_b_device,
+                                                                                                     high_values_b_device);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  residual_veto_normalize_quantile_pair_round_fp16_batch_kernel<<<blocks, threads, 0, stream>>>(input_a_batch_device,
+                                                                                                 input_b_batch_device,
+                                                                                                 batch_size,
+                                                                                                 rows,
+                                                                                                 cols,
+                                                                                                 low_values_a_device,
+                                                                                                 high_values_a_device,
+                                                                                                 low_values_b_device,
+                                                                                                 high_values_b_device,
+                                                                                                 output_a_batch_device,
+                                                                                                 output_b_batch_device);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 }  // namespace
 
 bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_batch_device,
@@ -6109,7 +6950,7 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
                                                        cudaStream_t cuda_stream,
                                                        CudaHybridStageTiming* stage_timing) {
   if (batch_size <= 0 || rows <= 0 || cols <= 0 || dino_score_batch_device == nullptr || coherence_batch_device == nullptr ||
-      output_combined_score_device == nullptr || output_final_mask_device == nullptr ||
+      output_combined_score_device == nullptr ||
       valid_row_mask_batch.size() != static_cast<size_t>(batch_size) * static_cast<size_t>(rows)) {
     return false;
   }
@@ -6152,52 +6993,47 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
         !copy_or_round_fp16_cuda_batch_to_device(coherence_batch_device, total_values, use_fp16, scratch.values_b, stream)) {
       return false;
     }
-    if (!(use_fp16 ? normalize_map01_quantile_exact_fp16_unit_cuda_batch_to_device(scratch.values_a,
-                                                                                    batch_size,
-                                                                                    rows,
-                                                                                    cols,
-                                                                                    0.05f,
-                                                                                    0.95f,
-                                                                                    scratch.histograms,
-                                                                                    scratch.batch_a,
-                                                                                    scratch.batch_b,
-                                                                                    scratch.values_a,
-                                                                                    stream)
-                   : normalize_map01_quantile_exact_cuda_batch_to_device(scratch.values_a,
-                                                                         batch_size,
-                                                                         rows,
-                                                                         cols,
-                                                                         0.05f,
-                                                                         0.95f,
-                                                                         scratch.temp_plane,
-                                                                         scratch.batch_a,
-                                                                         scratch.batch_b,
-                                                                         scratch.values_a,
-                                                                         stream)) ||
-        !(use_fp16 ? normalize_map01_quantile_exact_fp16_unit_cuda_batch_to_device(scratch.values_b,
-                                                                                    batch_size,
-                                                                                    rows,
-                                                                                    cols,
-                                                                                    0.05f,
-                                                                                    0.99f,
-                                                                                    scratch.histograms,
-                                                                                    scratch.batch_a,
-                                                                                    scratch.batch_b,
-                                                                                    scratch.values_b,
-                                                                                    stream)
-                   : normalize_map01_quantile_exact_cuda_batch_to_device(scratch.values_b,
-                                                                         batch_size,
-                                                                         rows,
-                                                                         cols,
-                                                                         0.05f,
-                                                                         0.99f,
-                                                                         scratch.temp_plane,
-                                                                         scratch.batch_a,
-                                                                         scratch.batch_b,
-                                                                         scratch.values_b,
-                                                                         stream)) ||
-        !maybe_round_fp16_cuda_batch_inplace(scratch.values_a, total_values, use_fp16, stream) ||
-        !maybe_round_fp16_cuda_batch_inplace(scratch.values_b, total_values, use_fp16, stream)) {
+    const bool normalization_ready = use_fp16
+                                         ? normalize_map01_quantile_exact_fp16_unit_pair_cuda_batch_to_device(scratch.values_a,
+                                                                                                              scratch.values_b,
+                                                                                                              batch_size,
+                                                                                                              rows,
+                                                                                                              cols,
+                                                                                                              0.05f,
+                                                                                                              0.95f,
+                                                                                                              0.05f,
+                                                                                                              0.99f,
+                                                                                                              scratch.histograms,
+                                                                                                              scratch.batch_a,
+                                                                                                              scratch.batch_b,
+                                                                                                              scratch.batch_c,
+                                                                                                              scratch.batch_d,
+                                                                                                              scratch.values_a,
+                                                                                                              scratch.values_b,
+                                                                                                              stream)
+                                         : (normalize_map01_quantile_exact_cuda_batch_to_device(scratch.values_a,
+                                                                                                batch_size,
+                                                                                                rows,
+                                                                                                cols,
+                                                                                                0.05f,
+                                                                                                0.95f,
+                                                                                                scratch.temp_plane,
+                                                                                                scratch.batch_a,
+                                                                                                scratch.batch_b,
+                                                                                                scratch.values_a,
+                                                                                                stream) &&
+                                            normalize_map01_quantile_exact_cuda_batch_to_device(scratch.values_b,
+                                                                                                batch_size,
+                                                                                                rows,
+                                                                                                cols,
+                                                                                                0.05f,
+                                                                                                0.99f,
+                                                                                                scratch.temp_plane,
+                                                                                                scratch.batch_a,
+                                                                                                scratch.batch_b,
+                                                                                                scratch.values_b,
+                                                                                                stream));
+    if (!normalization_ready) {
       return false;
     }
     residual_veto_multiply_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.values_a,
@@ -6243,18 +7079,6 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
                                                 scratch.values_c,
                                                 kernel_cache.gaussian_cols_1,
                                                 scratch.values_e,
-                                                stream) ||
-        !normalize_map01_masked_minmax_cuda_batch_to_device(scratch.values_c,
-                                                            batch_size,
-                                                            rows,
-                                                            cols,
-                                                            scratch.valid_row_mask,
-                                                            scratch.batch_a,
-                                                            scratch.batch_b,
-                                                            scratch.reduction_partial_min,
-                                                            scratch.reduction_partial_max,
-                                                            scratch.reduction_partial_valid,
-                                                            scratch.values_c,
                                                             stream)) {
       return false;
     }
@@ -6289,50 +7113,47 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
     residual_veto_abs_inplace_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.values_d,
                                                                             static_cast<int>(total_values));
     if (cudaGetLastError() != cudaSuccess ||
-        !normalize_map01_masked_minmax_cuda_batch_to_device(scratch.values_d,
-                                                            batch_size,
-                                                            rows,
-                                                            cols,
-                                                            scratch.valid_row_mask,
-                                                            scratch.batch_a,
-                                                            scratch.batch_b,
-                                                            scratch.reduction_partial_min,
-                                                            scratch.reduction_partial_max,
-                                                            scratch.reduction_partial_valid,
-                                                            scratch.values_d,
-                                                            stream)) {
+        !normalize_map01_masked_minmax_triplet_cuda_batch_to_device(scratch.values_c,
+                                                                    scratch.values_b,
+                                                                    scratch.values_d,
+                                                                    batch_size,
+                                                                    rows,
+                                                                    cols,
+                                                                    scratch.valid_row_mask,
+                                                                    scratch.batch_a,
+                                                                    scratch.batch_d,
+                                                                    scratch.batch_b,
+                                                                    scratch.batch_e,
+                                                                    scratch.batch_c,
+                                                                    scratch.batch_f,
+                                                                    scratch.reduction_partial_min,
+                                                                    scratch.reduction_partial_max,
+                                                                    scratch.reduction_partial_valid,
+                                                                    scratch.values_c,
+                                                                    scratch.values_b,
+                                                                    scratch.values_d,
+                                                                    stream)) {
       return false;
     }
-    if (!normalize_subtract_scaled_masked_minmax_cuda_batch_to_device(scratch.values_c,
-                                                                      scratch.values_d,
-                                                                      batch_size,
-                                                                      rows,
-                                                                      cols,
-                                                                      scratch.valid_row_mask,
-                                                                      0.90f,
-                                                                      scratch.batch_a,
-                                                                      scratch.batch_b,
-                                                                      scratch.reduction_partial_min,
-                                                                      scratch.reduction_partial_max,
-                                                                      scratch.reduction_partial_valid,
-                                                                      scratch.values_a,
-                                                                      stream)) {
-      return false;
-    }
-    if (!normalize_subtract_scaled_masked_minmax_cuda_batch_to_device(scratch.values_c,
-                                                                      scratch.values_b,
-                                                                      batch_size,
-                                                                      rows,
-                                                                      cols,
-                                                                      scratch.valid_row_mask,
-                                                                      1.0f,
-                                                                      scratch.batch_a,
-                                                                      scratch.batch_b,
-                                                                      scratch.reduction_partial_min,
-                                                                      scratch.reduction_partial_max,
-                                                                      scratch.reduction_partial_valid,
-                                                                      scratch.values_d,
-                                                                      stream)) {
+    if (!normalize_subtract_scaled_masked_minmax_pair_cuda_batch_to_device(scratch.values_c,
+                                                                           scratch.values_d,
+                                                                           0.90f,
+                                                                           scratch.values_b,
+                                                                           1.0f,
+                                                                           batch_size,
+                                                                           rows,
+                                                                           cols,
+                                                                           scratch.valid_row_mask,
+                                                                           scratch.batch_a,
+                                                                           scratch.batch_b,
+                                                                           scratch.batch_c,
+                                                                           scratch.batch_d,
+                                                                           scratch.reduction_partial_min,
+                                                                           scratch.reduction_partial_max,
+                                                                           scratch.reduction_partial_valid,
+                                                                           scratch.values_a,
+                                                                           scratch.values_d,
+                                                                           stream)) {
       return false;
     }
     if (!normalize_combined_input_masked_minmax_cuda_batch_to_device(scratch.values_a,
@@ -6354,39 +7175,25 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
 
     const auto threshold_extract_start = std::chrono::steady_clock::now();
     const bool use_sampled_threshold_histograms = rows >= 128 && cols >= 256;
-    if (!masked_histogram_quantile_cuda_batch_to_device(scratch.values_a,
-                                                        batch_size,
-                                                        rows,
-                                                        cols,
-                                                        scratch.valid_row_mask,
-                                                        0.90f,
-                                                        1.0f,
-                              use_sampled_threshold_histograms,
-                                                        scratch.histograms,
-                                                        scratch.batch_a,
-                                                        stream) ||
-        !masked_histogram_quantile_cuda_batch_to_device(scratch.values_d,
-                                                        batch_size,
-                                                        rows,
-                                                        cols,
-                                                        scratch.valid_row_mask,
-                                                        0.82f,
-                                                        1.0f,
-                              use_sampled_threshold_histograms,
-                                                        scratch.histograms,
-                                                        scratch.batch_b,
-                                                        stream) ||
-        !masked_histogram_quantile_cuda_batch_to_device(output_combined_score_device,
-                                                        batch_size,
-                                                        rows,
-                                                        cols,
-                                                        scratch.valid_row_mask,
-                                                        0.78f,
-                                                        1.0f,
-                              use_sampled_threshold_histograms,
-                                                        scratch.histograms,
-                                                        scratch.batch_c,
-                                                        stream) ||
+    if (!masked_histogram_quantile_triplet_cuda_batch_to_device(scratch.values_a,
+                                                                scratch.values_d,
+                                                                output_combined_score_device,
+                                                                batch_size,
+                                                                rows,
+                                                                cols,
+                                                                scratch.valid_row_mask,
+                                                                0.90f,
+                                                                1.0f,
+                                                                0.82f,
+                                                                1.0f,
+                                                                0.78f,
+                                                                1.0f,
+                                                                use_sampled_threshold_histograms,
+                                                                scratch.histograms,
+                                                                scratch.batch_a,
+                                                                scratch.batch_b,
+                                                                scratch.batch_c,
+                                                                stream) ||
         !finish_stage(threshold_extract_start, stage_timing != nullptr ? &stage_timing->threshold_extract_ms : nullptr)) {
       return false;
     }
@@ -6464,13 +7271,17 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
       return false;
     }
 
-    const auto output_copy_start = std::chrono::steady_clock::now();
-    residual_veto_uint8_to_float_batch_kernel<<<blocks, threads, 0, stream>>>(filtered_mask_output,
-                                                                               static_cast<int>(total_values),
-                                                                               output_final_mask_device);
-    if (cudaGetLastError() != cudaSuccess ||
-        !finish_stage(output_copy_start, stage_timing != nullptr ? &stage_timing->output_copy_ms : nullptr)) {
-      return false;
+    if (output_final_mask_device != nullptr) {
+      const auto output_copy_start = std::chrono::steady_clock::now();
+      residual_veto_uint8_to_float_batch_kernel<<<blocks, threads, 0, stream>>>(filtered_mask_output,
+                                                                                 static_cast<int>(total_values),
+                                                                                 output_final_mask_device);
+      if (cudaGetLastError() != cudaSuccess ||
+          !finish_stage(output_copy_start, stage_timing != nullptr ? &stage_timing->output_copy_ms : nullptr)) {
+        return false;
+      }
+    } else if (stage_timing != nullptr) {
+      stage_timing->output_copy_ms = 0.0;
     }
 
     return true;
@@ -6955,6 +7766,14 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     throw_if_cuda_error(cudaStreamCreateWithFlags(&buffers.processing_stream, cudaStreamNonBlocking),
                         "cuda_dino_detector processing stream creation failed");
   }
+  if (buffers.coherence_start_event == nullptr) {
+    throw_if_cuda_error(cudaEventCreate(&buffers.coherence_start_event),
+                        "cuda_dino_detector coherence-start event creation failed");
+  }
+  if (buffers.coherence_end_event == nullptr) {
+    throw_if_cuda_error(cudaEventCreate(&buffers.coherence_end_event),
+                        "cuda_dino_detector coherence-end event creation failed");
+  }
 
   if (buffers.frame_elements != frame_elements) {
     if (buffers.analysis_tensor_device != nullptr) {
@@ -7245,20 +8064,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       }
     }
 
-    const auto coherence_start_time = std::chrono::steady_clock::now();
-    const bool coherence_ready = compute_structure_tensor_gate_gpu_batch_to_device(buffers.corrected_batch_device,
-                                                                                   chunk_count,
-                                                                                   uniform_chunk_rows,
-                                                                                   src_cols,
-                                                                                   chunk_valid_rows_batch,
-                                                                                   buffers.coherence_gate_batch_device,
-                                                                                   buffers.processing_stream);
-    if (capture_operator_timing) {
-      throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
-                          "cuda_dino_detector coherence timing synchronization failed");
-      timing_profile.coherence_batch_ms = elapsed_ms_since(coherence_start_time);
-    }
-
+    bool coherence_ready = false;
     bool raw_score_ready = false;
     std::string raw_score_source = "none";
     const float* debug_patch_features_batch_device = nullptr;
@@ -7373,6 +8179,33 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                    "[cuda_dino_detector] WARN: raw DINO stage skipped because model_script_path is empty\n");
     }
 
+    if (capture_operator_timing) {
+      throw_if_cuda_error(cudaEventRecord(buffers.coherence_start_event, buffers.processing_stream),
+                          "cuda_dino_detector coherence-start event record failed");
+    }
+    coherence_ready = compute_structure_tensor_gate_gpu_batch_to_device(buffers.corrected_batch_device,
+                                                                        chunk_count,
+                                                                        uniform_chunk_rows,
+                                                                        src_cols,
+                                                                        chunk_valid_rows_batch,
+                                                                        buffers.coherence_gate_batch_device,
+                                                                        buffers.processing_stream);
+    if (coherence_ready && capture_operator_timing) {
+      throw_if_cuda_error(cudaEventRecord(buffers.coherence_end_event, buffers.processing_stream),
+                          "cuda_dino_detector coherence-end event record failed");
+    }
+
+    if (capture_operator_timing && coherence_ready) {
+      throw_if_cuda_error(cudaEventSynchronize(buffers.coherence_end_event),
+                          "cuda_dino_detector coherence timing synchronization failed");
+      float coherence_batch_ms = 0.0f;
+      throw_if_cuda_error(cudaEventElapsedTime(&coherence_batch_ms,
+                                               buffers.coherence_start_event,
+                                               buffers.coherence_end_event),
+                          "cuda_dino_detector coherence timing elapsed failed");
+      timing_profile.coherence_batch_ms = static_cast<double>(coherence_batch_ms);
+    }
+
     if (meta) {
       meta->set("cuda_dino_coherence_ready", coherence_ready);
       meta->set("cuda_dino_raw_score_ready", raw_score_ready);
@@ -7380,6 +8213,8 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     }
 
     bool hybrid_ready = false;
+    const bool preserve_hybrid_debug_outputs = debug_mode_.get() && enable_debug_artifact_host_copy_.get();
+    const bool preserve_hybrid_operator_artifacts = preserve_hybrid_debug_outputs && !debug_artifact_output_dir_.get().empty();
     if (coherence_ready && raw_score_ready) {
       const auto hybrid_start_time = std::chrono::steady_clock::now();
       CudaHybridStageTiming hybrid_stage_timing;
@@ -7392,9 +8227,9 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                       use_fp16_precision(hybrid_torch_dtype_.get()),
                                                                       hybrid_component_min_size_.get(),
                                                                       buffers.hybrid_combined_score_batch_device,
-                                                                      buffers.hybrid_final_mask_batch_device,
-                                                                      buffers.hybrid_filled_mask_batch_device,
-                                                                      buffers.hybrid_component_filtered_mask_batch_device,
+                                                                      preserve_hybrid_debug_outputs ? buffers.hybrid_final_mask_batch_device : nullptr,
+                                                                      preserve_hybrid_operator_artifacts ? buffers.hybrid_filled_mask_batch_device : nullptr,
+                                                                      preserve_hybrid_operator_artifacts ? buffers.hybrid_component_filtered_mask_batch_device : nullptr,
                                                                       buffers.processing_stream,
                                                                       &hybrid_stage_timing);
       if (capture_operator_timing) {
@@ -7770,6 +8605,14 @@ void CudaDinoDetector::release_channel_buffers() {
     if (buffers.chunk_row_starts_device != nullptr) {
       cudaFree(buffers.chunk_row_starts_device);
       buffers.chunk_row_starts_device = nullptr;
+    }
+    if (buffers.coherence_start_event != nullptr) {
+      cudaEventDestroy(buffers.coherence_start_event);
+      buffers.coherence_start_event = nullptr;
+    }
+    if (buffers.coherence_end_event != nullptr) {
+      cudaEventDestroy(buffers.coherence_end_event);
+      buffers.coherence_end_event = nullptr;
     }
     if (buffers.processing_stream != nullptr) {
       cudaStreamDestroy(buffers.processing_stream);

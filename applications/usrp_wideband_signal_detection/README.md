@@ -132,20 +132,23 @@ Practical guidance:
 ## Stream Alignment
 
 This app does not currently receive `sample_rate_hz` metadata from `rx_to_remote_udp.py`.
-In practice, the receive side falls back to the local FFT config, so the sender and receiver settings must match.
+In practice, the receive side derives its runtime FFT sizing from `chdr_converter.channel_sample_rates_hz` when that config is set consistently across channels, and otherwise falls back to the local FFT config, so the sender and receiver settings must match.
 
 For the current X410 flow, keep these aligned:
 
 - sender `rx_to_remote_udp.py --rate 500e6`
 - receiver `fft.span: 500000000` in the selected `config*.yaml`
 - receiver `fft.transform_points: 20480`
+- receiver `fft.reference_span_hz: 500000000` and `fft.reference_fft_size: 20480` if you want to pin a different baseline explicitly
 
 Notes:
 
 - `master_clock_rate=500e6` in the USRP device args does not propagate into Holoscan operator metadata.
+- The live app now derives a runtime FFT width from the 500 MHz / 20480 reference pair by snapping the span ratio to the nearest factor-of-two step, then quantizing to the CHDR packet width. With the current `num_complex_samples_per_packet: 1024`, live FFT sizes move in 1024-sample increments.
+- Set `fft.override_fft_bin_size` to request an exact target bin width instead of the default factor-of-two scaling. The resulting live FFT size is still quantized to the packet width, so the final bin size is the nearest feasible value.
 - The FFT operator will use upstream metadata only if some earlier operator explicitly sets `sample_rate_hz` or `bandwidth_hz`.
-- If no upstream rate metadata exists, the FFT operator derives downstream `span` and `resolution` from the selected config file.
-- With `transform_points: 20480` and `span: 500000000`, the effective FFT bin width is about `24414 Hz`, so the fallback `resolution` values in the configs are set to `24414` for consistency.
+- If no upstream rate metadata exists, the FFT operator derives downstream `span` and `resolution` from the selected config file or the configured CHDR sample rate fallback.
+- With `transform_points: 20480` and `span: 500000000`, the effective reference FFT bin width is about `24414 Hz`, so the fallback `resolution` values in the configs are set to `24414` for consistency.
 
 If these values do not match, saved spectrograms, detector metadata, notebook validation, and offline replay can all appear frequency-calibrated while still being calibrated to the wrong span.
 

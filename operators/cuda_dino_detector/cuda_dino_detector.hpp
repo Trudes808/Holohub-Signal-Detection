@@ -49,6 +49,8 @@ class CudaDinoDetector : public holoscan::Operator {
     float* frontend_reference_device = nullptr;
     int* chunk_row_starts_device = nullptr;
     cudaStream_t processing_stream = nullptr;
+    cudaEvent_t coherence_start_event = nullptr;
+    cudaEvent_t coherence_end_event = nullptr;
     size_t frame_elements = 0;
     size_t batch_elements = 0;
     size_t chunk_row_start_capacity = 0;

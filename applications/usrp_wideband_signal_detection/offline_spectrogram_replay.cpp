@@ -1,3 +1,4 @@
+#include "fft_runtime_config.hpp"
 #include "spectrogram_visualization.hpp"
 
 #include <getopt.h>
@@ -66,7 +67,10 @@ std::string resolve_screenshot_path(const std::string& requested_path) {
 
 int export_first_frame_png(const std::string& directory,
                            const std::string& mask_directory,
-                           const std::string& output_path) {
+                           const std::string& output_path,
+                           double center_frequency_hz,
+                           double span_hz,
+                           int fft_size) {
   const auto frames = holoscan::ops::list_offline_pgm_frames(directory, -1);
   if (frames.empty()) {
     HOLOSCAN_LOG_ERROR("No .pgm spectrogram frames found in '{}'", directory);
@@ -123,8 +127,12 @@ int export_first_frame_png(const std::string& directory,
     state.active = true;
     state.info.channel = channel;
     state.info.frame_number = static_cast<int64_t>(frame_number);
-    state.info.center_frequency_hz = 0.0;
-    state.info.fft_size = 20480;
+    state.info.center_frequency_hz = center_frequency_hz;
+    state.info.span_hz = span_hz;
+    state.info.resolution_hz = span_hz > 0.0
+      ? span_hz / static_cast<double>(std::max(1, frame.width))
+      : 0.0;
+    state.info.fft_size = fft_size;
     state.info.dino_chunk_rows = frame.height;
     state.info.dino_chunk_cols = frame.width;
     state.info.overlay_available = has_mask;
@@ -244,12 +252,13 @@ class OfflineSpectrogramReplayApp : public holoscan::Application {
 
     ops::set_visualization_full_ui_enabled(true);
 
+    const auto fft_runtime = usrp_wideband::resolve_fft_runtime_config(*this);
     const auto tensor_name = from_config("offline_replay.tensor_name").as<std::string>();
     const auto directory = overrides_.offline_dir.empty() ? from_config("offline_replay.directory").as<std::string>()
                                                           : overrides_.offline_dir;
     const auto frame_rate = overrides_.frame_rate > 0.0 ? overrides_.frame_rate
                                                         : from_config("offline_replay.frame_rate").as<double>();
-    const auto fft_span_hz = from_config("fft.span").as<double>();
+    const auto fft_span_hz = fft_runtime.active_span_hz;
     const auto center_frequency_hz = from_config("visualization.renderer.center_frequency_hz").as<double>();
     const auto detector_type = from_config("pipeline.detector_type").as<std::string>();
     const std::string detector_label = detector_type == "coherent_power" ? "Coherent Power" : "Dinov3";
@@ -263,6 +272,7 @@ class OfflineSpectrogramReplayApp : public holoscan::Application {
                                Arg("frame_rate") = frame_rate,
                                Arg("center_frequency_hz") = center_frequency_hz,
                                Arg("span_hz") = fft_span_hz,
+                               Arg("fft_size") = fft_runtime.actual_fft_size,
                                Arg("detector_label") = detector_label);
 
     auto holoviz = make_operator<ops::HolovizOp>("holoviz",
@@ -287,11 +297,6 @@ int main(int argc, char** argv) {
   auto overrides = parse_arguments(argc, argv);
   overrides.screenshot_path = resolve_screenshot_path(overrides.screenshot_path);
 
-  if (!overrides.screenshot_path.empty()) {
-    const auto directory = overrides.offline_dir.empty() ? kHostMountedSpectrogramDir : overrides.offline_dir;
-    return export_first_frame_png(directory, overrides.mask_dir, overrides.screenshot_path);
-  }
-
   auto app = holoscan::make_application<OfflineSpectrogramReplayApp>();
   app->set_overrides(overrides);
 
@@ -302,6 +307,20 @@ int main(int argc, char** argv) {
   }
 
   app->config(config_path);
+
+  if (!overrides.screenshot_path.empty()) {
+    const auto fft_runtime = usrp_wideband::resolve_fft_runtime_config(*app);
+    const auto center_frequency_hz =
+        usrp_wideband::from_config_or<double>(*app, "visualization.renderer.center_frequency_hz", 0.0);
+    const auto directory = overrides.offline_dir.empty() ? kHostMountedSpectrogramDir : overrides.offline_dir;
+    return export_first_frame_png(directory,
+                                  overrides.mask_dir,
+                                  overrides.screenshot_path,
+                                  center_frequency_hz,
+                                  fft_runtime.active_span_hz,
+                                  fft_runtime.actual_fft_size);
+  }
+
   app->scheduler(app->make_scheduler<holoscan::EventBasedScheduler>("event-based-scheduler",
                                                                     app->from_config("scheduler")));
   app->run();

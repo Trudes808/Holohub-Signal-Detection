@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 #include "../usrp_freq_detection/CHDR_converter/chdr_rx.h"
+#include "fft_runtime_config.hpp"
 #include "spectrogram_visualization.hpp"
 #include "advanced_network/common.h"
 #include <algorithm>
@@ -408,8 +409,14 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     g_pipeline_shutdown_term = pipeline_shutdown_term;
     HOLOSCAN_LOG_INFO("Configured pipeline_shutdown_term for chdrConverterOp");
 
+    const auto fft_runtime = usrp_wideband::resolve_fft_runtime_config(*this);
+    const auto fft_span_hz = fft_runtime.active_span_hz;
+    const auto fft_span_metadata_hz = static_cast<uint64_t>(std::llround(fft_runtime.active_span_hz));
     auto chdrConverterOp = make_operator<ops::ChdrConverterOpRx>(
-      "chdrConverterOp", pipeline_shutdown_term, from_config("chdr_converter"));
+      "chdrConverterOp",
+      pipeline_shutdown_term,
+      from_config("chdr_converter"),
+      Arg("num_packets_per_fft") = fft_runtime.num_packets_per_fft);
     const int pipeline_channels = std::max(1, from_config("chdr_converter.num_channels").as<int>());
 
     const bool enable_spectrogram = from_config("pipeline.enable_spectrogram").as<bool>();
@@ -461,6 +468,13 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       fftOps.push_back(make_operator<ops::FFT>(
         std::string("fftOpCh") + std::to_string(channel_index),
         from_config("fft"),
+        holoscan::Arg("burst_size") = fft_runtime.actual_fft_size,
+        holoscan::Arg("transform_points") = static_cast<uint32_t>(fft_runtime.actual_fft_size),
+        holoscan::Arg("window_points") = static_cast<uint32_t>(fft_runtime.actual_fft_size),
+        holoscan::Arg("resolution") = fft_runtime.resolution_hz,
+        holoscan::Arg("span") = fft_span_metadata_hz,
+        holoscan::Arg("f1_index") = fft_runtime.f1_index,
+        holoscan::Arg("f2_index") = fft_runtime.f2_index,
         holoscan::Arg("emit_stride") = (enable_fft_emit_stride ? configured_dino_emit_stride : 1)));
     }
 
@@ -500,6 +514,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           dinoDetectorOps.push_back(make_operator<ops::DinoV3SignalDetector>(
               std::string("dinoV3SignalDetectorOpCh") + std::to_string(channel_index),
               from_config("dinov3_signal_detector"),
+            holoscan::Arg("fft_size") = fft_runtime.actual_fft_size,
               holoscan::Arg("channel_filter") = channel_index,
               holoscan::Arg("emit_stride") = (enable_fft_emit_stride ? 1 : configured_dino_emit_stride)));
         }
@@ -572,7 +587,6 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         HOLOSCAN_LOG_INFO("Sharing pipeline_shutdown_term with visualization shutdown handling");
       ops::set_visualization_full_ui_enabled(true);
       const auto tensor_name = from_config("visualization.renderer.tensor_name").as<std::string>();
-      const auto fft_span_hz = from_config("fft.span").as<double>();
       const auto center_frequency_hz = from_config("visualization.renderer.center_frequency_hz").as<double>();
         const auto visualization_channel_filter =
           from_config("visualization.renderer.channel_filter").as<int>();
@@ -586,6 +600,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         make_condition<PeriodicCondition>("periodic-condition",
                                           Arg("recess_period") = std::string("30hz")),
         from_config("visualization.renderer"),
+        Arg("fft_size") = fft_runtime.actual_fft_size,
         Arg("num_channels") = pipeline_channels,
         Arg("channel_filter") = visualization_channel_filter,
         Arg("center_frequency_hz") = center_frequency_hz,
