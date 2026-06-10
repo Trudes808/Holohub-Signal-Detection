@@ -129,6 +129,7 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                       int cols,
                                                       const std::vector<uint8_t>& valid_row_mask_batch,
                                                       bool use_fp16,
+                                                      bool enable_mask_post_processing,
                                                       int min_component_size,
                                                       float* output_combined_score_device,
                                                       float* output_final_mask_device,

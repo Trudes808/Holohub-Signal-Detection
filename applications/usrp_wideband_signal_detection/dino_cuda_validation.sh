@@ -7,6 +7,7 @@ WORKING_DIR=$(pwd -P)
 CUDA_VALIDATOR_SCRIPT=${CUDA_VALIDATOR_SCRIPT:-${SCRIPT_DIR}/run_offline_cuda_dino_operator_replay.sh}
 REFERENCE_VALIDATOR_SCRIPT=${REFERENCE_VALIDATOR_SCRIPT:-${SCRIPT_DIR}/run_offline_dino_validator_performance.sh}
 PLOT_SCRIPT=${PLOT_SCRIPT:-${SCRIPT_DIR}/plot_offline_dino_cuda_artifact_compare.py}
+HYBRID_PLOT_SCRIPT=${HYBRID_PLOT_SCRIPT:-${SCRIPT_DIR}/plot_hybrid_support_components.py}
 
 absolutize_host_path() {
   local raw_path=$1
@@ -33,6 +34,7 @@ Options:
   --cuda-output-dir DIR         CUDA operator output directory
   --reference-output-dir DIR    Reference validator output directory
   --plot-output PATH            Output PNG path for the comparison plot
+  --hybrid-plot-output PATH     Output PNG path for the hybrid support plot
   --debug-chunk-index N         Debug chunk index for both validators
   --stages K1 K2 ...            Explicit stage keys to pass to the plot script
   --skip-cuda                   Do not run the replayed CUDA operator
@@ -53,6 +55,7 @@ reference_config=
 cuda_output_dir=
 reference_output_dir=
 plot_output=
+hybrid_plot_output=
 debug_chunk_index=13
 verbose=0
 skip_cuda=0
@@ -86,6 +89,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --plot-output)
       plot_output=${2:-}
+      shift 2
+      ;;
+    --hybrid-plot-output)
+      hybrid_plot_output=${2:-}
       shift 2
       ;;
     --debug-chunk-index)
@@ -154,6 +161,9 @@ fi
 if [[ -n "$plot_output" ]]; then
   plot_output=$(absolutize_host_path "$plot_output")
 fi
+if [[ -n "$hybrid_plot_output" ]]; then
+  hybrid_plot_output=$(absolutize_host_path "$hybrid_plot_output")
+fi
 
 tensor_basename=$(basename "$tensor_path")
 tensor_stem=${tensor_basename%.npy}
@@ -173,6 +183,13 @@ if [[ "$plot_output_base" == "$plot_output" ]]; then
   timing_plot_output="${plot_output}_timing"
 else
   timing_plot_output="${plot_output_base}_timing.${plot_output_ext}"
+fi
+if [[ -z "$hybrid_plot_output" ]]; then
+  if [[ "$plot_output_base" == "$plot_output" ]]; then
+    hybrid_plot_output="${plot_output}_hybrid_support"
+  else
+    hybrid_plot_output="${plot_output_base}_hybrid_support.${plot_output_ext}"
+  fi
 fi
 
 if [[ "$plot_only" == "1" ]]; then
@@ -241,9 +258,22 @@ printf '  %q' "${plot_cmd[@]}" >&2
 printf '\n' >&2
 "${plot_cmd[@]}"
 
+hybrid_summary_path="${cuda_output_dir}/chunk_debug/chunk_debug_summary.json"
+hybrid_plot_status="not generated"
+if [[ -f "$hybrid_summary_path" ]]; then
+  hybrid_plot_cmd=(python3 "$HYBRID_PLOT_SCRIPT" "$hybrid_summary_path" --output "$hybrid_plot_output")
+  echo "Generating hybrid support plot:" >&2
+  printf '  %q' "${hybrid_plot_cmd[@]}" >&2
+  printf '\n' >&2
+  hybrid_plot_status="$("${hybrid_plot_cmd[@]}")"
+else
+  hybrid_plot_status="missing summary: $hybrid_summary_path"
+fi
+
 cat <<EOF
 CUDA output dir: $cuda_output_dir
 Reference output dir: $reference_output_dir
 Comparison plot: $plot_output
 Timing plot: $timing_plot_output
+Hybrid support plot: $hybrid_plot_status
 EOF

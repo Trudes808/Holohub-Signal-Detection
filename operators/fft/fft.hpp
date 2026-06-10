@@ -57,6 +57,9 @@ class FFT : public Operator {
      Parameter<uint32_t> window_points;
      Parameter<uint64_t> resolution;
      Parameter<uint64_t> span;
+    Parameter<double> reference_span_hz;
+    Parameter<int> reference_fft_size;
+    Parameter<double> override_fft_bin_size;
      Parameter<float> weighting_factor;
      Parameter<int32_t> f1_index;
      Parameter<int32_t> f2_index;

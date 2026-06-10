@@ -112,6 +112,21 @@ void FFT::setup(OperatorSpec& spec) {
         "span",
         "Span",
         "VITA 49.2 span to pass along in metadata");
+    spec.param(reference_span_hz,
+        "reference_span_hz",
+        "Reference span Hz",
+        "App-level FFT runtime scaling reference span in Hz. The FFT operator does not use this directly.",
+        500000000.0);
+    spec.param(reference_fft_size,
+        "reference_fft_size",
+        "Reference FFT size",
+        "App-level FFT runtime scaling reference FFT size. The FFT operator does not use this directly.",
+        20480);
+    spec.param(override_fft_bin_size,
+        "override_fft_bin_size",
+        "Override FFT bin size",
+        "App-level FFT runtime bin-size override in Hz. The FFT operator does not use this directly.",
+        0.0);
     spec.param(weighting_factor,
         "weighting_factor",
         "Weighting factory",

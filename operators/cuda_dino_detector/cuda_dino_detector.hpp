@@ -94,6 +94,7 @@ class CudaDinoDetector : public holoscan::Operator {
   holoscan::Parameter<float> raw_dino_positional_deweight_;
   holoscan::Parameter<double> power_q_;
   holoscan::Parameter<std::string> hybrid_torch_dtype_;
+  holoscan::Parameter<bool> enable_mask_post_processing_;
   holoscan::Parameter<int> hybrid_component_min_size_;
   holoscan::Parameter<int> grouping_bridge_freq_px_;
   holoscan::Parameter<int> grouping_bridge_time_px_;

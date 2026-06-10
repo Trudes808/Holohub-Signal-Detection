@@ -412,11 +412,16 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     const auto fft_runtime = usrp_wideband::resolve_fft_runtime_config(*this);
     const auto fft_span_hz = fft_runtime.active_span_hz;
     const auto fft_span_metadata_hz = static_cast<uint64_t>(std::llround(fft_runtime.active_span_hz));
+    if (fft_runtime.num_packets_per_fft > std::numeric_limits<uint16_t>::max()) {
+      HOLOSCAN_LOG_ERROR("Derived num_packets_per_fft={} exceeds uint16_t limit for chdr_converter.num_packets_per_fft",
+                         fft_runtime.num_packets_per_fft);
+      exit(1);
+    }
     auto chdrConverterOp = make_operator<ops::ChdrConverterOpRx>(
       "chdrConverterOp",
       pipeline_shutdown_term,
       from_config("chdr_converter"),
-      Arg("num_packets_per_fft") = fft_runtime.num_packets_per_fft);
+      Arg("num_packets_per_fft") = static_cast<uint16_t>(fft_runtime.num_packets_per_fft));
     const int pipeline_channels = std::max(1, from_config("chdr_converter.num_channels").as<int>());
 
     const bool enable_spectrogram = from_config("pipeline.enable_spectrogram").as<bool>();
@@ -775,11 +780,19 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     if (enable_visualization) {
       add_flow(spectrogramVisualizerOp, holovizOp, {{"outputs", "receivers"}});
     }
-    if (enable_visualization && enable_detector && detector_type == "coherent_power") {
+    if (enable_visualization && enable_detector) {
       for (int ch = 0; ch < pipeline_channels; ++ch) {
-        add_flow(coherentDetectorOps[static_cast<size_t>(ch)],
-                 visualMaskGateOps[static_cast<size_t>(ch)],
-                 {{"mask_out", "in"}});
+        if (detector_type == "coherent_power") {
+          add_flow(coherentDetectorOps[static_cast<size_t>(ch)],
+                   visualMaskGateOps[static_cast<size_t>(ch)],
+                   {{"mask_out", "in"}});
+        } else if (detector_type == "cuda_dino") {
+          add_flow(cudaDinoDetectorOps[static_cast<size_t>(ch)],
+                   visualMaskGateOps[static_cast<size_t>(ch)],
+                   {{"mask_out", "in"}});
+        } else {
+          continue;
+        }
         add_flow(visualMaskGateOps[static_cast<size_t>(ch)],
                  visualMaskStoreOps[static_cast<size_t>(ch)],
                  {{"out", "in"}});

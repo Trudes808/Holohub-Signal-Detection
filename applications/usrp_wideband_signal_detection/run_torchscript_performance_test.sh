@@ -6,6 +6,9 @@ CONTAINER_NAME=${CONTAINER_NAME:-usrp_x410_signal_detection_demo}
 BUILD_APP_DIR=${BUILD_APP_DIR:-/workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection}
 SOURCE_APP_DIR=${SOURCE_APP_DIR:-/workspace/holohub/applications/usrp_wideband_signal_detection}
 REBUILD_DEMO_CONTAINER_APP=${REBUILD_DEMO_CONTAINER_APP:-${SCRIPT_DIR}/rebuild_demo_container_app.sh}
+DISPLAY_VALUE=${DISPLAY:-}
+XAUTHORITY_VALUE=${XAUTHORITY:-}
+XDG_RUNTIME_DIR_VALUE=${XDG_RUNTIME_DIR:-/tmp/xdg-runtime-root}
 
 if [[ $# -gt 1 ]]; then
 	echo "Usage: $0 [config-name.yaml]" >&2
@@ -34,4 +37,10 @@ if [[ -n "${existing_processes}" ]]; then
 	exit 1
 fi
 
-exec sudo docker exec -it "${CONTAINER_NAME}" bash -lc "cd ${BUILD_APP_DIR} && ./usrp_wideband_signal_detection ${CONFIG_NAME}"
+sudo docker exec -u 0:0 "${CONTAINER_NAME}" bash -lc "mkdir -p '${XDG_RUNTIME_DIR_VALUE}' && chown 0:0 '${XDG_RUNTIME_DIR_VALUE}' && chmod 700 '${XDG_RUNTIME_DIR_VALUE}'"
+
+exec sudo docker exec -it \
+	-e DISPLAY="${DISPLAY_VALUE}" \
+	-e XAUTHORITY="${XAUTHORITY_VALUE}" \
+	-e XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR_VALUE}" \
+	"${CONTAINER_NAME}" bash -lc "cd ${BUILD_APP_DIR} && ./usrp_wideband_signal_detection ${CONFIG_NAME}"

@@ -138,6 +138,7 @@ run_case() {
   local cuda_output_dir="${case_root}/cuda"
   local reference_output_dir="${case_root}/reference"
   local plot_output="${case_root}/${label}_cuda_vs_reference.png"
+  local hybrid_plot_output="${case_root}/${label}_hybrid_support_components.png"
   local cmd=(
     "$VALIDATION_SCRIPT"
     --tensor-npy "$tensor_path"
@@ -146,6 +147,7 @@ run_case() {
     --cuda-output-dir "$cuda_output_dir"
     --reference-output-dir "$reference_output_dir"
     --plot-output "$plot_output"
+    --hybrid-plot-output "$hybrid_plot_output"
     --debug-chunk-index "$debug_chunk_index"
   )
 
@@ -170,4 +172,6 @@ run_case "$experiment_label" "$experiment_config" "$experiment_debug_chunk_index
 echo >&2
 echo "Chunk-count comparison outputs:" >&2
 echo "  baseline plot:   ${output_root}/baseline_25_chunks/baseline_25_chunks_cuda_vs_reference.png" >&2
+echo "  baseline hybrid: ${output_root}/baseline_25_chunks/baseline_25_chunks_hybrid_support_components.png" >&2
 echo "  experiment plot: ${output_root}/${experiment_label}/${experiment_label}_cuda_vs_reference.png" >&2
+echo "  experiment hybrid: ${output_root}/${experiment_label}/${experiment_label}_hybrid_support_components.png" >&2
