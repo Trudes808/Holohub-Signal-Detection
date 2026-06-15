@@ -593,6 +593,13 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       ops::set_visualization_full_ui_enabled(true);
       const auto tensor_name = from_config("visualization.renderer.tensor_name").as<std::string>();
       const auto center_frequency_hz = from_config("visualization.renderer.center_frequency_hz").as<double>();
+      int visualization_refresh_hz = 30;
+      try {
+        visualization_refresh_hz =
+            std::max(1, from_config("visualization.renderer.refresh_hz").as<int>());
+      } catch (const std::exception&) {
+      }
+      const std::string visualization_recess_period = std::to_string(visualization_refresh_hz) + "hz";
         const auto visualization_channel_filter =
           from_config("visualization.renderer.channel_filter").as<int>();
       const std::string detector_label =
@@ -603,7 +610,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         "spectrogramVisualizerOp",
         Arg("shutdown_scheduling_term") = visualization_shutdown_term,
         make_condition<PeriodicCondition>("periodic-condition",
-                                          Arg("recess_period") = std::string("30hz")),
+                                          Arg("recess_period") = visualization_recess_period),
         from_config("visualization.renderer"),
         Arg("fft_size") = fft_runtime.actual_fft_size,
         Arg("num_channels") = pipeline_channels,

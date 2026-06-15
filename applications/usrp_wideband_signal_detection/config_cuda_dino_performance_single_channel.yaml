@@ -127,9 +127,10 @@ visualization:
     display_time_rows: 2048
     display_freq_bins: 20480
     history_memory_budget_mb: 1024
-    rows_per_frame: 8
+    rows_per_frame: 2
     mask_frame_offset: 0
     allow_backpressure_valve: true
+    refresh_hz: 60
     render_every_n_frames: 1
     timing_summary_enable: false
     timing_summary_every_n: 128
