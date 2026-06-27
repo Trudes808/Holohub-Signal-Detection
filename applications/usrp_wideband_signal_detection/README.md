@@ -250,6 +250,31 @@ For the cleanest startup behavior, launch the app before starting the RF transmi
 
 If the host has been rebooted since the last successful run, restore the host-side prerequisites before blaming the app config.
 
+For the common reboot-recovery path, run this from the host checkout first:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+./after_reboot.sh
+```
+
+That script restores the pieces this demo is sensitive to after reboot: it reloads `nvidia-peermem`, ensures hugepages are reserved and mounted, fixes `/dev/hugepages` permissions so the non-root container shell can launch DPDK again, resets the dedicated Mellanox ports used by this workflow, starts the demo container if needed, and clears stale DPDK runtime state.
+
+On this setup, the helper defaults to `3` hugepages if no usable persisted value is present. Override that with `HUGEPAGES_COUNT` if your host needs a different reservation.
+
+If your host loses hugepage reservation on reboot and you have not already persisted it, provide the known-good count explicitly the first time:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+HUGEPAGES_COUNT=<COUNT> ./after_reboot.sh
+```
+
+To persist those host-side settings for future boots through the same helper:
+
+```bash
+cd applications/usrp_wideband_signal_detection
+PERSIST_BOOT_CONFIG=1 HUGEPAGES_COUNT=<COUNT> ./after_reboot.sh
+```
+
 To make the basic host setup survive reboot, persist the pieces that are normally lost:
 
 ```bash
@@ -257,11 +282,12 @@ To make the basic host setup survive reboot, persist the pieces that are normall
 echo nvidia-peermem | sudo tee /etc/modules-load.d/nvidia-peermem.conf
 
 # Persist the hugepage count. Replace <COUNT> with the value that is known-good on your host.
+# Do not leave the literal placeholder in the file.
 printf 'vm.nr_hugepages=<COUNT>\n' | sudo tee /etc/sysctl.d/90-holohub-usrp.conf
 sudo sysctl --system
 
 # Persist the hugetlbfs mount. This example matches the 1G hugepages used on the current host.
-echo 'nodev /dev/hugepages hugetlbfs defaults,pagesize=1G 0 0' | sudo tee -a /etc/fstab
+echo 'nodev /dev/hugepages hugetlbfs defaults,pagesize=1G,mode=1777 0 0' | sudo tee -a /etc/fstab
 sudo mkdir -p /dev/hugepages
 sudo mount /dev/hugepages
 ```
@@ -280,7 +306,7 @@ mount | grep hugetlbfs
 ls -ld /dev/hugepages
 ```
 
-If DPDK still fails after reboot with mlx5 `DevX create TIS failed`, `TIS allocation failure`, or `Failed to get port number for sdr_data`, reset the dedicated Mellanox ports on the host before relaunching the app:
+If DPDK still fails after reboot with mlx5 `DevX create TIS failed`, `TIS allocation failure`, or `Failed to get port number for sdr_data`, the helper already resets the dedicated Mellanox ports by default. The equivalent manual host-side sequence is:
 
 ```bash
 sudo ip link set ens4f0np0 down
@@ -310,7 +336,7 @@ SKIP_IMAGE_BUILD=1 sudo -E ./build_demo_container.sh
 ./enter_demo_container.sh
 ```
 
-Do not automate the `devlink` reload unless `ens4f0np0` and `ens4f1np1` are dedicated to this workflow. If you do want it at boot, put the four host-side commands above into a small `systemd` oneshot service and enable it only on the machine that owns the USRP capture ports.
+This repository now assumes `ens4f0np0` and `ens4f1np1` are dedicated to this workflow on this machine, so `after_reboot.sh` performs that reset by default. If you need to skip it on a different host, run `RESET_MLX_PORTS=0 ./after_reboot.sh`.
 
 ### After Code Changes
 

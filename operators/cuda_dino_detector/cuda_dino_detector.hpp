@@ -49,6 +49,7 @@ class CudaDinoDetector : public holoscan::Operator {
     float* frontend_reference_device = nullptr;
     int* chunk_row_starts_device = nullptr;
     cudaStream_t processing_stream = nullptr;
+    cudaEvent_t copy_complete_event = nullptr;
     cudaEvent_t coherence_start_event = nullptr;
     cudaEvent_t coherence_end_event = nullptr;
     size_t frame_elements = 0;
@@ -118,6 +119,9 @@ class CudaDinoDetector : public holoscan::Operator {
   uint64_t compute_count_ = 0;
   bool startup_log_emitted_ = false;
   uint64_t artifact_dump_count_ = 0;
+  std::vector<uint64_t> frame_count_;
+  std::vector<uint64_t> skipped_partial_batches_;
+  std::vector<uint64_t> skipped_stride_frames_;
   std::vector<ChannelBuffers> channel_buffers_;
   std::vector<ChannelTimingStats> timing_stats_;
   std::shared_ptr<DinoTorchRuntime> runtime_;

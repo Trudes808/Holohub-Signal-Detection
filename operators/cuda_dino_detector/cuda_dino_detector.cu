@@ -8220,6 +8220,9 @@ void CudaDinoDetector::initialize() {
   release_channel_buffers();
   channel_buffers_.assign(static_cast<size_t>(std::max(1, num_channels_.get())), ChannelBuffers{});
   timing_stats_.assign(static_cast<size_t>(std::max(1, num_channels_.get())), ChannelTimingStats{});
+  frame_count_.assign(static_cast<size_t>(std::max(1, num_channels_.get())), 0);
+  skipped_partial_batches_.assign(static_cast<size_t>(std::max(1, num_channels_.get())), 0);
+  skipped_stride_frames_.assign(static_cast<size_t>(std::max(1, num_channels_.get())), 0);
   if (!runtime_) {
     runtime_ = std::make_shared<DinoTorchRuntime>();
   }
@@ -8262,6 +8265,16 @@ void CudaDinoDetector::initialize() {
 }
 
 void CudaDinoDetector::stop() {
+  for (size_t channel_index = 0; channel_index < frame_count_.size(); ++channel_index) {
+    if (skipped_partial_batches_[channel_index] == 0 && skipped_stride_frames_[channel_index] == 0) {
+      continue;
+    }
+    std::fprintf(stderr,
+                 "[cuda_dino_detector] INFO: channel %zu skipped_partial_batches=%llu skipped_stride_frames=%llu\n",
+                 channel_index,
+                 static_cast<unsigned long long>(skipped_partial_batches_[channel_index]),
+                 static_cast<unsigned long long>(skipped_stride_frames_[channel_index]));
+  }
   release_channel_buffers();
   Operator::stop();
 }
@@ -8281,11 +8294,50 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
   const auto compute_start_time = std::chrono::steady_clock::now();
   auto meta = metadata();
   const uint16_t channel_number = meta ? meta->get<uint16_t>("channel_number", 0) : 0;
-  const uint64_t frame_number = (meta && meta->has_key("fft_emitted_frame_number"))
-                                    ? meta->get<uint64_t>("fft_emitted_frame_number", compute_count_ + 1)
-                                    : (compute_count_ + 1);
   const int channel_filter = channel_filter_.get();
   if (channel_filter >= 0 && channel_number != static_cast<uint16_t>(channel_filter)) {
+    return;
+  }
+
+  const size_t local_channel_index = channel_filter >= 0 ? 0u : static_cast<size_t>(channel_number);
+  if (local_channel_index >= channel_buffers_.size()) {
+    std::fprintf(stderr,
+                 "[cuda_dino_detector] WARN: received out-of-range channel %u (configured channels: %zu)\n",
+                 static_cast<unsigned>(channel_number),
+                 channel_buffers_.size());
+    return;
+  }
+
+  uint64_t frame_number = 0;
+  if (meta && meta->has_key("fft_emitted_frame_number")) {
+    frame_number = meta->get<uint64_t>("fft_emitted_frame_number", frame_count_[local_channel_index] + 1);
+    if (frame_number == 0) {
+      frame_number = frame_count_[local_channel_index] + 1;
+    }
+    frame_count_[local_channel_index] = std::max(frame_count_[local_channel_index], frame_number);
+  } else {
+    frame_number = ++frame_count_[local_channel_index];
+  }
+
+  if (meta) {
+    meta->set("cuda_dino_frame_number", frame_number);
+    meta->set("cuda_dino_skipped_partial_batch", false);
+    meta->set("cuda_dino_skipped_emit_stride", false);
+    meta->set("cuda_dino_mask_emitted", false);
+  }
+
+  if (meta && meta->get<bool>("chdr_partial_batch", false)) {
+    skipped_partial_batches_[local_channel_index]++;
+    meta->set("cuda_dino_skipped_partial_batch", true);
+    return;
+  }
+
+  const int stride = std::max(1, emit_stride_.get());
+  if ((frame_number % static_cast<uint64_t>(stride)) != 0) {
+    skipped_stride_frames_[local_channel_index]++;
+    if (meta) {
+      meta->set("cuda_dino_skipped_emit_stride", true);
+    }
     return;
   }
 
@@ -8299,14 +8351,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     return;
   }
 
-  const size_t local_channel_index = channel_filter >= 0 ? 0u : static_cast<size_t>(channel_number);
-  if (local_channel_index >= channel_buffers_.size()) {
-    std::fprintf(stderr,
-                 "[cuda_dino_detector] WARN: received out-of-range channel %u (configured channels: %zu)\n",
-                 static_cast<unsigned>(channel_number),
-                 channel_buffers_.size());
-    return;
-  }
   auto& buffers = channel_buffers_[local_channel_index];
   const size_t frame_elements = static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols);
   const bool capture_operator_timing =
@@ -8324,6 +8368,10 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
   if (buffers.coherence_end_event == nullptr) {
     throw_if_cuda_error(cudaEventCreate(&buffers.coherence_end_event),
                         "cuda_dino_detector coherence-end event creation failed");
+  }
+  if (buffers.copy_complete_event == nullptr) {
+    throw_if_cuda_error(cudaEventCreateWithFlags(&buffers.copy_complete_event, cudaEventDisableTiming),
+                        "cuda_dino_detector copy-complete event creation failed");
   }
 
   if (buffers.frame_elements != frame_elements) {
@@ -8412,16 +8460,12 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                  static_cast<long>(fft_tensor.Size(1)));
   }
 
-  const int stride = std::max(1, emit_stride_.get());
   constexpr int threads = 256;
   const int blocks = static_cast<int>((frame_elements + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
 
-  cudaEvent_t copy_complete_event = nullptr;
-  throw_if_cuda_error(cudaEventCreateWithFlags(&copy_complete_event, cudaEventDisableTiming),
-                      "cuda_dino_detector copy-complete event creation failed");
-  throw_if_cuda_error(cudaEventRecord(copy_complete_event, fft_stream),
+  throw_if_cuda_error(cudaEventRecord(buffers.copy_complete_event, fft_stream),
                       "cuda_dino_detector copy-complete event record failed");
-  throw_if_cuda_error(cudaStreamWaitEvent(buffers.processing_stream, copy_complete_event, 0),
+  throw_if_cuda_error(cudaStreamWaitEvent(buffers.processing_stream, buffers.copy_complete_event, 0),
                       "cuda_dino_detector processing stream wait failed");
 
   const auto power_db_start_time = std::chrono::steady_clock::now();
@@ -9234,11 +9278,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
 
   timing_profile.total_compute_ms = elapsed_ms_since(compute_start_time);
 
-  if (copy_complete_event != nullptr) {
-    cudaEventDestroy(copy_complete_event);
-  }
-
-  if (timing_summary_enable_.get() && (compute_count_ % static_cast<uint64_t>(stride) == 0) &&
+  if (timing_summary_enable_.get() &&
       (compute_count_ % static_cast<uint64_t>(std::max(1, timing_summary_every_n_.get())) == 0)) {
     std::fprintf(stderr,
                  "[cuda_dino_detector] INFO: processed %llu tensors with GPU-resident power_db/frontend correction in backend_mode='%s' strategy='%s'\n",
@@ -9305,6 +9345,10 @@ void CudaDinoDetector::release_channel_buffers() {
     if (buffers.chunk_row_starts_device != nullptr) {
       cudaFree(buffers.chunk_row_starts_device);
       buffers.chunk_row_starts_device = nullptr;
+    }
+    if (buffers.copy_complete_event != nullptr) {
+      cudaEventDestroy(buffers.copy_complete_event);
+      buffers.copy_complete_event = nullptr;
     }
     if (buffers.coherence_start_event != nullptr) {
       cudaEventDestroy(buffers.coherence_start_event);
