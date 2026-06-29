@@ -1657,6 +1657,11 @@ void SpectrogramPreviewOp::compute(InputContext& op_input,
       message.channel = metadata_channel;
     }
     message.frame_number = meta->get<uint64_t>("fft_emitted_frame_number", frame_number);
+    message.file_offset_complex = meta->get<uint64_t>("offline_source_file_offset_complex", 0);
+    message.data_end_complex = meta->get<uint64_t>("offline_source_data_end_complex", 0);
+    message.frame_end_complex = meta->get<uint64_t>("offline_source_frame_end_complex", 0);
+    message.complex_samples_read = meta->get<uint64_t>("offline_source_complex_samples_read", 0);
+    message.complex_samples_padded = meta->get<uint64_t>("offline_source_complex_samples_padded", 0);
     message.fft_emit_ts_ns = meta->get<uint64_t>("fft_emit_ts_ns", 0);
     message.preview_enter_ts_ns = preview_enter_ns;
     message.preview_emit_ts_ns = preview_emit_ns;
@@ -1808,6 +1813,11 @@ void MaskPreviewOp::compute(InputContext& op_input,
   DetectorMaskMessage reduced_mask;
   reduced_mask.channel = configured_channel >= 0 ? configured_channel : mask.channel;
   reduced_mask.frame_number = frame_number;
+  reduced_mask.file_offset_complex = mask.file_offset_complex;
+  reduced_mask.data_end_complex = mask.data_end_complex;
+  reduced_mask.frame_end_complex = mask.frame_end_complex;
+  reduced_mask.complex_samples_read = mask.complex_samples_read;
+  reduced_mask.complex_samples_padded = mask.complex_samples_padded;
   reduced_mask.width = preview_width;
   reduced_mask.height = preview_height;
   if (mask.device_pixels) {

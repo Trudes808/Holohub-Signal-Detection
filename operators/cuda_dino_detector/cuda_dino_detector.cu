@@ -248,6 +248,109 @@ bool write_npy_2d(const std::filesystem::path& path,
   return true;
 }
 
+bool write_pgm(const std::filesystem::path& path,
+               const std::vector<uint8_t>& image,
+               int width,
+               int height) {
+  const auto tmp_path = path.string() + ".tmp";
+  std::ofstream out(tmp_path, std::ios::binary);
+  if (!out.is_open()) {
+    return false;
+  }
+  out << "P5\n" << width << " " << height << "\n255\n";
+  out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(image.size()));
+  out.close();
+  if (!out.good()) {
+    std::error_code cleanup_error;
+    std::filesystem::remove(tmp_path, cleanup_error);
+    return false;
+  }
+  std::error_code remove_error;
+  std::filesystem::remove(path, remove_error);
+  std::error_code rename_error;
+  std::filesystem::rename(tmp_path, path, rename_error);
+  if (rename_error) {
+    std::error_code cleanup_error;
+    std::filesystem::remove(tmp_path, cleanup_error);
+    return false;
+  }
+  return true;
+}
+
+std::vector<uint8_t> build_spectrogram_preview(const std::vector<cuda_dino_complex>& host_fft,
+                                               int src_rows,
+                                               int src_cols,
+                                               int dst_rows,
+                                               int dst_cols) {
+  std::vector<float> reduced(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols), -120.0f);
+  for (int r = 0; r < dst_rows; ++r) {
+    const int r0 = (r * src_rows) / dst_rows;
+    const int r1 = ((r + 1) * src_rows) / dst_rows;
+    for (int c = 0; c < dst_cols; ++c) {
+      const int c0 = (c * src_cols) / dst_cols;
+      const int c1 = ((c + 1) * src_cols) / dst_cols;
+
+      double accum = 0.0;
+      int count = 0;
+      for (int rr = r0; rr < std::max(r0 + 1, r1); ++rr) {
+        for (int cc = c0; cc < std::max(c0 + 1, c1); ++cc) {
+          const auto& value = host_fft[static_cast<size_t>(rr) * static_cast<size_t>(src_cols) +
+                                       static_cast<size_t>(cc)];
+          const float power = value.real() * value.real() + value.imag() * value.imag() + 1.0e-12f;
+          accum += 10.0 * std::log10(power);
+          ++count;
+        }
+      }
+      reduced[static_cast<size_t>(r) * static_cast<size_t>(dst_cols) + static_cast<size_t>(c)] =
+          static_cast<float>(accum / static_cast<double>(std::max(1, count)));
+    }
+  }
+
+  float min_value = std::numeric_limits<float>::infinity();
+  float max_value = -std::numeric_limits<float>::infinity();
+  for (const float value : reduced) {
+    min_value = std::min(min_value, value);
+    max_value = std::max(max_value, value);
+  }
+  const float denom = std::max(1.0e-6f, max_value - min_value);
+
+  std::vector<uint8_t> image(static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols), 0);
+  for (size_t index = 0; index < reduced.size(); ++index) {
+    const float normalized = (reduced[index] - min_value) / denom;
+    image[index] = static_cast<uint8_t>(std::clamp(normalized * 255.0f, 0.0f, 255.0f));
+  }
+  return image;
+}
+
+template <typename T>
+std::vector<T> transpose_host_row_major_matrix(const std::vector<T>& input, int rows, int cols) {
+  if (rows <= 0 || cols <= 0 || input.size() != static_cast<size_t>(rows) * static_cast<size_t>(cols)) {
+    return {};
+  }
+
+  std::vector<T> output(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+  for (int row = 0; row < rows; ++row) {
+    for (int col = 0; col < cols; ++col) {
+      output[static_cast<size_t>(col) * static_cast<size_t>(rows) + static_cast<size_t>(row)] =
+          input[static_cast<size_t>(row) * static_cast<size_t>(cols) + static_cast<size_t>(col)];
+    }
+  }
+  return output;
+}
+
+std::filesystem::path make_aligned_spectrogram_path(const std::filesystem::path& root,
+                                                    const std::string& subdir,
+                                                    const std::string& prefix,
+                                                    int channel,
+                                                    uint64_t frame_number,
+                                                    int rows,
+                                                    int cols,
+                                                    const std::string& extension) {
+  std::ostringstream filename;
+  filename << prefix << "_ch" << channel << "_f" << frame_number << "_" << rows << "x" << cols << extension;
+  return root / subdir / filename.str();
+}
+
 std::vector<float> mask_to_float(const std::vector<uint8_t>& input) {
   std::vector<float> output(input.size(), 0.0f);
   for (size_t index = 0; index < input.size(); ++index) {
@@ -374,6 +477,32 @@ struct PlannedIgnoreSidebandSelection {
 
 __host__ __device__ __forceinline__ size_t flat_index(int cols, int row, int col) {
   return static_cast<size_t>(row) * static_cast<size_t>(cols) + static_cast<size_t>(col);
+}
+
+__global__ void transpose_complex_matrix_kernel(const cuda_dino_complex* input,
+                                                int input_rows,
+                                                int input_cols,
+                                                cuda_dino_complex* output) {
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= input_rows || col >= input_cols) {
+    return;
+  }
+
+  output[flat_index(input_rows, col, row)] = input[flat_index(input_cols, row, col)];
+}
+
+__global__ void transpose_u8_matrix_kernel(const uint8_t* input,
+                                           int input_rows,
+                                           int input_cols,
+                                           uint8_t* output) {
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= input_rows || col >= input_cols) {
+    return;
+  }
+
+  output[flat_index(input_rows, col, row)] = input[flat_index(input_cols, row, col)];
 }
 
 template <typename T>
@@ -8008,6 +8137,31 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Debug artifact output dir",
              "When set, write a validator-style offline artifact bundle for the selected debug chunk.",
              std::string(""));
+  spec.param(save_aligned_spectrogram_preview_,
+             "save_aligned_spectrogram_preview",
+             "Save aligned spectrogram preview",
+             "Save the exact detector-input spectrogram preview used for this frame.",
+             false);
+  spec.param(save_aligned_spectrogram_tensor_,
+             "save_aligned_spectrogram_tensor",
+             "Save aligned spectrogram tensor",
+             "Save the exact detector-input spectrogram tensor used for this frame.",
+             false);
+  spec.param(aligned_spectrogram_output_height_,
+             "aligned_spectrogram_output_height",
+             "Aligned spectrogram output height",
+             "Saved preview height for detector-aligned spectrogram artifacts.",
+             256);
+  spec.param(aligned_spectrogram_output_width_,
+             "aligned_spectrogram_output_width",
+             "Aligned spectrogram output width",
+             "Saved preview width for detector-aligned spectrogram artifacts.",
+             512);
+  spec.param(aligned_spectrogram_output_dir_,
+             "aligned_spectrogram_output_dir",
+             "Aligned spectrogram output dir",
+             "Root directory where detector-aligned spectrogram artifacts are written.",
+             std::string(""));
   spec.param(execution_strategy_,
              "execution_strategy",
              "Execution strategy",
@@ -8158,6 +8312,11 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Filter detection mask",
              "Apply reference-style grouped region filtering before final box merge.",
              true);
+  spec.param(emit_grouped_merged_mask_,
+             "emit_grouped_merged_mask",
+             "Emit grouped merged mask",
+             "Emit the grouped and merged detector box mask instead of the raw stitched threshold mask.",
+             false);
   spec.param(grouping_time_continuity_ratio_,
              "grouping_time_continuity_ratio",
              "Grouping time continuity ratio",
@@ -8321,14 +8480,21 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
 
   if (meta) {
     meta->set("cuda_dino_frame_number", frame_number);
+  }
+
+  if (meta && meta->get<bool>("offline_source_drain_frame", false)) {
     meta->set("cuda_dino_skipped_partial_batch", false);
     meta->set("cuda_dino_skipped_emit_stride", false);
+    meta->set("cuda_dino_skipped_offline_drain_frame", true);
     meta->set("cuda_dino_mask_emitted", false);
+    return;
   }
 
   if (meta && meta->get<bool>("chdr_partial_batch", false)) {
     skipped_partial_batches_[local_channel_index]++;
     meta->set("cuda_dino_skipped_partial_batch", true);
+    meta->set("cuda_dino_skipped_emit_stride", false);
+    meta->set("cuda_dino_mask_emitted", false);
     return;
   }
 
@@ -8336,19 +8502,37 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
   if ((frame_number % static_cast<uint64_t>(stride)) != 0) {
     skipped_stride_frames_[local_channel_index]++;
     if (meta) {
+      meta->set("cuda_dino_skipped_partial_batch", false);
       meta->set("cuda_dino_skipped_emit_stride", true);
+      meta->set("cuda_dino_mask_emitted", false);
     }
     return;
   }
 
-  const int src_rows = static_cast<int>(fft_tensor.Size(0));
-  const int src_cols = static_cast<int>(fft_tensor.Size(1));
-  if (src_rows <= 0 || src_cols <= 0) {
+  const int input_rows = static_cast<int>(fft_tensor.Size(0));
+  const int input_cols = static_cast<int>(fft_tensor.Size(1));
+  if (input_rows <= 0 || input_cols <= 0) {
     std::fprintf(stderr,
                  "[cuda_dino_detector] WARN: received empty tensor shape %dx%d\n",
-                 src_rows,
-                 src_cols);
+                 input_rows,
+                 input_cols);
+    if (meta) {
+      meta->set("cuda_dino_skipped_partial_batch", false);
+      meta->set("cuda_dino_skipped_emit_stride", false);
+      meta->set("cuda_dino_mask_emitted", false);
+    }
     return;
+  }
+
+  // FFT/spectrogram emits time x frequency, while the detector chunking path expects frequency x time.
+  const int src_rows = input_cols;
+  const int src_cols = input_rows;
+
+  if (meta) {
+    meta->set("cuda_dino_skipped_partial_batch", false);
+    meta->set("cuda_dino_skipped_emit_stride", false);
+    meta->set("cuda_dino_mask_height", static_cast<uint32_t>(input_rows));
+    meta->set("cuda_dino_mask_width", static_cast<uint32_t>(input_cols));
   }
 
   auto& buffers = channel_buffers_[local_channel_index];
@@ -8444,13 +8628,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     buffers.row_elements = static_cast<size_t>(src_rows);
   }
 
-  throw_if_cuda_error(cudaMemcpyAsync(buffers.analysis_tensor_device,
-                                      fft_tensor.Data(),
-                                      frame_elements * sizeof(cuda_dino_complex),
-                                      cudaMemcpyDeviceToDevice,
-                                      fft_stream),
-                      "cuda_dino_detector analysis tensor copy failed");
-
   ++compute_count_;
   if (!startup_log_emitted_) {
     startup_log_emitted_ = true;
@@ -8467,6 +8644,91 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                       "cuda_dino_detector copy-complete event record failed");
   throw_if_cuda_error(cudaStreamWaitEvent(buffers.processing_stream, buffers.copy_complete_event, 0),
                       "cuda_dino_detector processing stream wait failed");
+
+  {
+    constexpr int transpose_block_dim = 16;
+    const dim3 transpose_block(transpose_block_dim, transpose_block_dim);
+    const dim3 transpose_grid((input_cols + transpose_block_dim - 1) / transpose_block_dim,
+                              (input_rows + transpose_block_dim - 1) / transpose_block_dim);
+    transpose_complex_matrix_kernel<<<transpose_grid, transpose_block, 0, buffers.processing_stream>>>(
+        static_cast<const cuda_dino_complex*>(fft_tensor.Data()),
+        input_rows,
+        input_cols,
+        static_cast<cuda_dino_complex*>(buffers.analysis_tensor_device));
+    throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector analysis tensor transpose failed");
+  }
+
+  const bool save_aligned_preview =
+      save_aligned_spectrogram_preview_.get() && !aligned_spectrogram_output_dir_.get().empty();
+  const bool save_aligned_tensor =
+      save_aligned_spectrogram_tensor_.get() && !aligned_spectrogram_output_dir_.get().empty();
+  if (save_aligned_preview || save_aligned_tensor) {
+    const auto artifact_root = std::filesystem::path(aligned_spectrogram_output_dir_.get());
+    std::filesystem::create_directories(artifact_root / "aligned_spectrograms");
+    std::filesystem::create_directories(artifact_root / "aligned_spectrogram_tensors");
+
+    std::vector<cuda_dino_complex> host_analysis(frame_elements);
+    throw_if_cuda_error(cudaMemcpyAsync(host_analysis.data(),
+                                        buffers.analysis_tensor_device,
+                                        frame_elements * sizeof(cuda_dino_complex),
+                                        cudaMemcpyDeviceToHost,
+                                        buffers.processing_stream),
+                        "cuda_dino_detector aligned spectrogram host copy failed");
+    throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                        "cuda_dino_detector aligned spectrogram synchronization failed");
+
+    const auto host_analysis_display = transpose_host_row_major_matrix(host_analysis, src_rows, src_cols);
+    if (host_analysis_display.size() != frame_elements) {
+      throw std::runtime_error("failed to transpose detector-aligned spectrogram back to display space");
+    }
+
+    if (save_aligned_tensor) {
+      const auto tensor_path = make_aligned_spectrogram_path(artifact_root,
+                                                             "aligned_spectrogram_tensors",
+                                                             "aligned_spectrogram_tensor",
+                                                             static_cast<int>(channel_number),
+                                                             frame_number,
+                                                             input_rows,
+                                                             input_cols,
+                                                             ".npy");
+      if (!write_npy_2d(tensor_path,
+                        host_analysis_display.data(),
+                        host_analysis_display.size() * sizeof(cuda_dino_complex),
+                        input_rows,
+                        input_cols,
+                        "<c8")) {
+        throw std::runtime_error("failed to write detector-aligned spectrogram tensor: " + tensor_path.string());
+      }
+      if (meta) {
+        meta->set("cuda_dino_aligned_spectrogram_tensor_path", tensor_path.string());
+        meta->set("cuda_dino_aligned_spectrogram_rows", input_rows);
+        meta->set("cuda_dino_aligned_spectrogram_cols", input_cols);
+      }
+    }
+
+    if (save_aligned_preview) {
+      const int preview_rows = std::max(1, aligned_spectrogram_output_height_.get());
+      const int preview_cols = std::max(1, aligned_spectrogram_output_width_.get());
+      const auto preview_image =
+          build_spectrogram_preview(host_analysis_display, input_rows, input_cols, preview_rows, preview_cols);
+      const auto preview_path = make_aligned_spectrogram_path(artifact_root,
+                                                              "aligned_spectrograms",
+                                                              "aligned_spectrogram",
+                                                              static_cast<int>(channel_number),
+                                                              frame_number,
+                                                              preview_rows,
+                                                              preview_cols,
+                                                              ".pgm");
+      if (!write_pgm(preview_path, preview_image, preview_cols, preview_rows)) {
+        throw std::runtime_error("failed to write detector-aligned spectrogram preview: " + preview_path.string());
+      }
+      if (meta) {
+        meta->set("cuda_dino_aligned_spectrogram_preview_path", preview_path.string());
+        meta->set("cuda_dino_aligned_spectrogram_preview_rows", preview_rows);
+        meta->set("cuda_dino_aligned_spectrogram_preview_cols", preview_cols);
+      }
+    }
+  }
 
   const auto power_db_start_time = std::chrono::steady_clock::now();
   cuda_dino_power_db_kernel<<<blocks, threads, 0, buffers.processing_stream>>>(
@@ -8854,48 +9116,16 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                     : std::string("none"));
     }
 
-    if (hybrid_ready) {
-      const size_t emitted_mask_bytes = frame_elements * sizeof(uint8_t);
-      auto emitted_mask_device = acquire_pooled_u8_buffer(emitted_mask_bytes);
-      throw_if_cuda_error(cudaMemsetAsync(emitted_mask_device.get(),
-                                          0,
-                                          emitted_mask_bytes,
-                                          buffers.processing_stream),
-                          "cuda_dino_detector emitted mask reset failed");
-      const int emit_total = chunk_count * uniform_chunk_rows * src_cols;
-      const int emit_blocks = (emit_total + threads - 1) / threads;
-      cuda_dino_stitch_reference_chunk_mask_kernel<<<emit_blocks, threads, 0, buffers.processing_stream>>>(
-          buffers.hybrid_final_mask_batch_device,
-          src_rows,
-          src_cols,
-          buffers.chunk_row_starts_device,
-          uniform_chunk_rows,
-          chunk_count,
-          emitted_mask_device.get());
-      throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector emitted mask stitch kernel launch failed");
-      throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
-                          "cuda_dino_detector emitted mask synchronization failed");
-
-      holoscan::ops::DetectorMaskMessage mask_msg;
-      mask_msg.device_pixels = std::move(emitted_mask_device);
-      mask_msg.width = src_cols;
-      mask_msg.height = src_rows;
-      mask_msg.channel = channel_number;
-      mask_msg.frame_number = frame_number;
-      op_output.emit(mask_msg, "mask_out");
-
-      if (meta) {
-        meta->set("cuda_dino_mask_emitted", true);
-        meta->set("cuda_dino_mask_height", static_cast<uint32_t>(src_rows));
-        meta->set("cuda_dino_mask_width", static_cast<uint32_t>(src_cols));
-        meta->set("cuda_dino_frame_number", frame_number);
-      }
-    } else if (meta) {
-      meta->set("cuda_dino_mask_emitted", false);
+    const bool emit_grouped_merged_mask = emit_grouped_merged_mask_.get();
+    if (meta) {
+      meta->set("cuda_dino_emit_grouped_merged_mask_requested", emit_grouped_merged_mask);
     }
 
-    const bool debug_projection_merge_enabled = write_operator_artifacts;
-    if (debug_projection_merge_enabled) {
+    std::vector<uint8_t> emitted_mask_detector_host;
+    bool emitted_mask_from_host_merge = false;
+
+    const bool host_projection_merge_enabled = hybrid_ready && (write_operator_artifacts || emit_grouped_merged_mask);
+    if (host_projection_merge_enabled) {
       const auto debug_device_to_host_start_time = std::chrono::steady_clock::now();
       std::vector<float> corrected_batch;
       std::vector<float> coherence_gate_batch;
@@ -9195,14 +9425,18 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       const auto source_valid_mask = expand_row_valid_mask(planned_selection.valid_row_mask, src_cols);
       if (meta) {
         meta->set("cuda_dino_group_merge_ready", true);
-        meta->set("cuda_dino_frame_number", frame_number);
-        meta->set("cuda_dino_mask_height", static_cast<uint32_t>(src_rows));
-        meta->set("cuda_dino_mask_width", static_cast<uint32_t>(src_cols));
         meta->set("cuda_dino_debug_projected_box_count", static_cast<uint32_t>(global_merged.projected_boxes.size()));
         meta->set("cuda_dino_debug_merged_box_count", static_cast<uint32_t>(global_merged.merged_boxes.size()));
         meta->set("cuda_dino_debug_projected_fraction", static_cast<double>(mean_mask_value(global_merged.projected_grouped_mask)));
         meta->set("cuda_dino_debug_final_fraction", static_cast<double>(mean_mask_value(global_merged.merged_box_mask)));
         meta->set("cuda_dino_debug_connected_fraction", static_cast<double>(connected_fraction(global_merged.merged_box_mask, source_valid_mask)));
+      }
+      if (emit_grouped_merged_mask) {
+        emitted_mask_detector_host.assign(global_merged.merged_box_mask.size(), static_cast<uint8_t>(0));
+        for (size_t index = 0; index < global_merged.merged_box_mask.size(); ++index) {
+          emitted_mask_detector_host[index] = global_merged.merged_box_mask[index] ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
+        }
+        emitted_mask_from_host_merge = !emitted_mask_detector_host.empty();
       }
       if (write_operator_artifacts && !live_chunk_results.empty()) {
         const int selected_batch_index = clamp_value(debug_chunk_index_.get(), 0, chunk_count - 1);
@@ -9264,6 +9498,80 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       }
     } else if (meta) {
       meta->set("cuda_dino_group_merge_ready", false);
+    }
+
+    if (meta) {
+      meta->set("cuda_dino_emit_grouped_merged_mask_applied", emitted_mask_from_host_merge);
+    }
+
+    if (hybrid_ready) {
+      const size_t emitted_mask_bytes = frame_elements * sizeof(uint8_t);
+      auto emitted_mask_device = acquire_pooled_u8_buffer(emitted_mask_bytes);
+      if (emitted_mask_from_host_merge) {
+        if (emitted_mask_detector_host.size() != frame_elements) {
+          throw std::runtime_error("cuda_dino_detector grouped merged mask size does not match emitted frame shape");
+        }
+        throw_if_cuda_error(cudaMemcpyAsync(emitted_mask_device.get(),
+                                            emitted_mask_detector_host.data(),
+                                            emitted_mask_bytes,
+                                            cudaMemcpyHostToDevice,
+                                            buffers.processing_stream),
+                            "cuda_dino_detector emitted grouped mask upload failed");
+      } else {
+        throw_if_cuda_error(cudaMemsetAsync(emitted_mask_device.get(),
+                                            0,
+                                            emitted_mask_bytes,
+                                            buffers.processing_stream),
+                            "cuda_dino_detector emitted mask reset failed");
+        const int emit_total = chunk_count * uniform_chunk_rows * src_cols;
+        const int emit_blocks = (emit_total + threads - 1) / threads;
+        cuda_dino_stitch_reference_chunk_mask_kernel<<<emit_blocks, threads, 0, buffers.processing_stream>>>(
+            buffers.hybrid_final_mask_batch_device,
+            src_rows,
+            src_cols,
+            buffers.chunk_row_starts_device,
+            uniform_chunk_rows,
+            chunk_count,
+            emitted_mask_device.get());
+        throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector emitted mask stitch kernel launch failed");
+      }
+
+      auto emitted_mask_display_device = acquire_pooled_u8_buffer(emitted_mask_bytes);
+      {
+        constexpr int transpose_block_dim = 16;
+        const dim3 transpose_block(transpose_block_dim, transpose_block_dim);
+        const dim3 transpose_grid((src_cols + transpose_block_dim - 1) / transpose_block_dim,
+                                  (src_rows + transpose_block_dim - 1) / transpose_block_dim);
+        transpose_u8_matrix_kernel<<<transpose_grid, transpose_block, 0, buffers.processing_stream>>>(
+            emitted_mask_device.get(),
+            src_rows,
+            src_cols,
+            emitted_mask_display_device.get());
+        throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector emitted mask transpose failed");
+      }
+      throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                          "cuda_dino_detector emitted mask synchronization failed");
+
+      holoscan::ops::DetectorMaskMessage mask_msg;
+      mask_msg.device_pixels = std::move(emitted_mask_display_device);
+      mask_msg.width = input_cols;
+      mask_msg.height = input_rows;
+      mask_msg.channel = channel_number;
+      mask_msg.frame_number = frame_number;
+      if (meta) {
+        mask_msg.file_offset_complex = meta->get<uint64_t>("offline_source_file_offset_complex", 0);
+        mask_msg.data_end_complex = meta->get<uint64_t>("offline_source_data_end_complex", 0);
+        mask_msg.frame_end_complex = meta->get<uint64_t>("offline_source_frame_end_complex", 0);
+        mask_msg.complex_samples_read = meta->get<uint64_t>("offline_source_complex_samples_read", 0);
+        mask_msg.complex_samples_padded = meta->get<uint64_t>("offline_source_complex_samples_padded", 0);
+      }
+      op_output.emit(mask_msg, "mask_out");
+
+      if (meta) {
+        meta->set("cuda_dino_mask_emitted", true);
+      }
+    } else if (meta) {
+      meta->set("cuda_dino_mask_emitted", false);
     }
   }
 

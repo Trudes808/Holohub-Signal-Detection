@@ -31,6 +31,11 @@ struct VisualSpectrogramMessage {
   int source_rows = 0;
   int channel = 0;
   uint64_t frame_number = 0;
+  uint64_t file_offset_complex = 0;
+  uint64_t data_end_complex = 0;
+  uint64_t frame_end_complex = 0;
+  uint64_t complex_samples_read = 0;
+  uint64_t complex_samples_padded = 0;
   uint64_t fft_emit_ts_ns = 0;
   uint64_t preview_enter_ts_ns = 0;
   uint64_t preview_emit_ts_ns = 0;
@@ -342,6 +347,11 @@ struct DetectorMaskMessage {
   int height = 0;
   int channel = 0;
   uint64_t frame_number = 0;
+  uint64_t file_offset_complex = 0;
+  uint64_t data_end_complex = 0;
+  uint64_t frame_end_complex = 0;
+  uint64_t complex_samples_read = 0;
+  uint64_t complex_samples_padded = 0;
 };
 
 struct VisualizationFrameInfo {

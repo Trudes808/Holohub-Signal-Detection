@@ -167,13 +167,20 @@ void Spectrogram::compute(holoscan::InputContext& op_input,
     return;
   }
 
-  const uint64_t frame_number = ++frame_count_[channel_number];
-
-  op_output.emit(out_t {tensor, stream}, "out");
+  uint64_t frame_number = 0;
+  if (meta && meta->has_key("fft_emitted_frame_number")) {
+    frame_number = meta->get<uint64_t>("fft_emitted_frame_number", frame_count_[channel_number] + 1);
+  }
+  if (frame_number == 0) {
+    frame_number = ++frame_count_[channel_number];
+  } else {
+    frame_count_[channel_number] = std::max(frame_count_[channel_number], frame_number);
+  }
 
   const bool save_image = enable_save_.get();
   const bool save_tensor = enable_tensor_save_.get();
   if (!save_image && !save_tensor) {
+    op_output.emit(out_t {tensor, stream}, "out");
     return;
   }
 
@@ -225,6 +232,11 @@ void Spectrogram::compute(holoscan::InputContext& op_input,
       HOLOSCAN_LOG_ERROR("Failed to write spectrogram tensor snapshot: {}", tensor_path);
     } else {
       artifact_saved = true;
+      if (meta) {
+        meta->set("spectrogram_saved_tensor_path", tensor_path);
+        meta->set("spectrogram_saved_tensor_rows", src_rows);
+        meta->set("spectrogram_saved_tensor_cols", src_cols);
+      }
       HOLOSCAN_LOG_INFO("Saved spectrogram tensor for channel {} to {}", channel_number, tensor_path);
     }
   }
@@ -285,9 +297,20 @@ void Spectrogram::compute(holoscan::InputContext& op_input,
       HOLOSCAN_LOG_ERROR("Failed to write spectrogram image: {}", path);
     } else {
       artifact_saved = true;
+      if (meta) {
+        meta->set("spectrogram_saved_preview_path", path);
+        meta->set("spectrogram_saved_preview_rows", dst_rows);
+        meta->set("spectrogram_saved_preview_cols", dst_cols);
+      }
       HOLOSCAN_LOG_INFO("Saved spectrogram image for channel {} to {}", channel_number, path);
     }
   }
+
+  if (meta) {
+    meta->set("spectrogram_saved_frame_number", frame_number);
+  }
+
+  op_output.emit(out_t {tensor, stream}, "out");
 
   if (!artifact_saved) {
     return;

@@ -96,7 +96,8 @@ inline std::optional<double> resolve_common_channel_sample_rate_hz(holoscan::App
   return first_value;
 }
 
-inline FftRuntimeConfig resolve_fft_runtime_config(holoscan::Application& app) {
+inline FftRuntimeConfig resolve_fft_runtime_config(holoscan::Application& app,
+                                                   std::optional<double> explicit_span_hz = std::nullopt) {
   FftRuntimeConfig config;
 
   config.reference_span_hz = std::max(
@@ -115,18 +116,25 @@ inline FftRuntimeConfig resolve_fft_runtime_config(holoscan::Application& app) {
   const double configured_span_hz = std::max(
       1.0,
       from_config_or<double>(app, "fft.span", config.reference_span_hz));
-  bool conflicting_channel_sample_rates = false;
-  const auto common_channel_sample_rate_hz =
-      resolve_common_channel_sample_rate_hz(app, conflicting_channel_sample_rates);
-  if (common_channel_sample_rate_hz.has_value()) {
-    config.active_span_hz = common_channel_sample_rate_hz.value();
-    config.used_channel_sample_rate = true;
+  std::string span_source = "fft.span";
+  if (explicit_span_hz.has_value() && std::isfinite(explicit_span_hz.value()) && explicit_span_hz.value() > 0.0) {
+    config.active_span_hz = explicit_span_hz.value();
+    span_source = "explicit_input_sample_rate_hz";
   } else {
-    config.active_span_hz = configured_span_hz;
-    if (conflicting_channel_sample_rates) {
-      HOLOSCAN_LOG_WARN(
-          "Configured channel_sample_rates_hz values differ across channels, so FFT scaling is falling back to fft.span={} Hz",
-          configured_span_hz);
+    bool conflicting_channel_sample_rates = false;
+    const auto common_channel_sample_rate_hz =
+        resolve_common_channel_sample_rate_hz(app, conflicting_channel_sample_rates);
+    if (common_channel_sample_rate_hz.has_value()) {
+      config.active_span_hz = common_channel_sample_rate_hz.value();
+      config.used_channel_sample_rate = true;
+      span_source = "chdr_converter.channel_sample_rates_hz";
+    } else {
+      config.active_span_hz = configured_span_hz;
+      if (conflicting_channel_sample_rates) {
+        HOLOSCAN_LOG_WARN(
+            "Configured channel_sample_rates_hz values differ across channels, so FFT scaling is falling back to fft.span={} Hz",
+            configured_span_hz);
+      }
     }
   }
 
@@ -158,9 +166,6 @@ inline FftRuntimeConfig resolve_fft_runtime_config(holoscan::Application& app) {
   config.resolution_hz = static_cast<uint64_t>(std::llround(
       config.active_span_hz / static_cast<double>(std::max(1, config.actual_fft_size))));
 
-  const char* span_source = config.used_channel_sample_rate
-      ? "chdr_converter.channel_sample_rates_hz"
-      : "fft.span";
   HOLOSCAN_LOG_INFO(
       "Derived runtime FFT config span_hz={} source={} reference_span_hz={} reference_fft_size={} requested_fft_size={} actual_fft_size={} packet_samples={} packets_per_fft={} resolution_hz={} override_fft_bin_size={}",
       config.active_span_hz,

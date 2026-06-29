@@ -74,6 +74,11 @@ class CudaDinoDetector : public holoscan::Operator {
   holoscan::Parameter<bool> enable_debug_artifact_host_copy_;
   holoscan::Parameter<int> debug_chunk_index_;
   holoscan::Parameter<std::string> debug_artifact_output_dir_;
+  holoscan::Parameter<bool> save_aligned_spectrogram_preview_;
+  holoscan::Parameter<bool> save_aligned_spectrogram_tensor_;
+  holoscan::Parameter<int> aligned_spectrogram_output_height_;
+  holoscan::Parameter<int> aligned_spectrogram_output_width_;
+  holoscan::Parameter<std::string> aligned_spectrogram_output_dir_;
   holoscan::Parameter<std::string> execution_strategy_;
   holoscan::Parameter<int> max_tokens_per_inference_;
   holoscan::Parameter<double> chunk_bandwidth_hz_;
@@ -104,6 +109,7 @@ class CudaDinoDetector : public holoscan::Operator {
   holoscan::Parameter<int> grouping_min_time_span_px_;
   holoscan::Parameter<double> grouping_min_density_;
   holoscan::Parameter<bool> filter_detection_mask_;
+  holoscan::Parameter<bool> emit_grouped_merged_mask_;
   holoscan::Parameter<double> grouping_time_continuity_ratio_;
   holoscan::Parameter<std::string> backend_mode_;
   holoscan::Parameter<std::string> inference_backend_;
