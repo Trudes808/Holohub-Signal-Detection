@@ -886,9 +886,15 @@ std::pair<double, double> annotation_frequency_for_baseband(const SigmfAnnotatio
 }
 
 void reset_artifact_registry(const std::filesystem::path& output_root) {
+  std::fprintf(stderr,
+               "[offline_cuda_detector_eval] reset_artifact_registry: begin root='%s'\n",
+               output_root.string().c_str());
+  std::fflush(stderr);
   std::lock_guard<std::mutex> lock(artifact_registry_mutex());
   artifact_registry().clear();
   artifact_registry_root() = output_root;
+  std::fprintf(stderr, "[offline_cuda_detector_eval] reset_artifact_registry: end\n");
+  std::fflush(stderr);
 }
 
 void clear_output_root(const std::filesystem::path& output_root) {
@@ -902,8 +908,27 @@ void clear_output_root(const std::filesystem::path& output_root) {
   }
 
   if (std::filesystem::exists(normalized)) {
-    HOLOSCAN_LOG_INFO("Clearing offline eval output root '{}'", normalized.string());
-    std::filesystem::remove_all(normalized);
+    const auto parent = normalized.parent_path();
+    const auto stem = normalized.filename().string();
+    std::filesystem::path archived_path;
+    std::error_code rename_error;
+    for (int suffix = 1; suffix <= 1024; ++suffix) {
+      archived_path = parent / (stem + ".stale_" + std::to_string(suffix));
+      if (std::filesystem::exists(archived_path)) {
+        continue;
+      }
+      std::filesystem::rename(normalized, archived_path, rename_error);
+      if (!rename_error) {
+        HOLOSCAN_LOG_INFO("Archived previous offline eval output root '{}' -> '{}'",
+                          normalized.string(),
+                          archived_path.string());
+        return;
+      }
+      break;
+    }
+
+    throw std::runtime_error("failed to archive offline output root '" + normalized.string() +
+                             "': " + rename_error.message());
   }
 }
 
@@ -1987,6 +2012,13 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
   void compose() override {
     using namespace holoscan;
 
+    std::fprintf(stderr,
+                 "[offline_cuda_detector_eval] compose: total_frames=%llu drain_frames=%llu output_root='%s' debug_artifacts=%d\n",
+                 static_cast<unsigned long long>(overrides_.total_frames),
+                 static_cast<unsigned long long>(overrides_.drain_frame_count),
+                 overrides_.output_root.string().c_str(),
+                 overrides_.save_detector_debug_artifacts ? 1 : 0);
+
     auto source = make_operator<OfflineSc16FileSourceOp>(
         "offlineSc16FileSourceOp",
         make_condition<CountCondition>("offline_frame_count",
@@ -2034,6 +2066,12 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
         Arg("output_height") = overrides_.spectrogram_output_height,
         Arg("output_width") = overrides_.spectrogram_output_width);
 
+    std::fprintf(stderr,
+           "[offline_cuda_detector_eval] compose: creating detector debug_artifacts=%d aligned_preview=%d aligned_tensor=%d\n",
+           overrides_.save_detector_debug_artifacts ? 1 : 0,
+           overrides_.save_spectrogram_preview ? 1 : 0,
+           overrides_.save_spectrogram_tensor ? 1 : 0);
+
     auto detector = make_operator<holoscan::ops::CudaDinoDetector>(
         "cudaDinoDetectorOpCh0",
         from_config("cuda_dino_detector"),
@@ -2060,6 +2098,8 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
         Arg("output_width") = overrides_.spectrogram_output_width,
         Arg("total_frames") = static_cast<int64_t>(overrides_.total_frames),
         Arg("progress_every_n_frames") = overrides_.progress_every_n_frames);
+
+      std::fprintf(stderr, "[offline_cuda_detector_eval] compose: wiring flows\n");
 
     add_flow(source, fft);
     add_flow(fft, spectrogram);
@@ -2183,9 +2223,17 @@ int main(int argc, char** argv) {
     app->config(config_path);
 
     const auto overrides = load_overrides(*app, config_path, cli_options);
+    std::fprintf(stderr, "[offline_cuda_detector_eval] main: loaded overrides\n");
+    std::fflush(stderr);
     clear_output_root(overrides.output_root);
+    std::fprintf(stderr, "[offline_cuda_detector_eval] main: cleared output root\n");
+    std::fflush(stderr);
     reset_artifact_registry(overrides.output_root);
+    std::fprintf(stderr, "[offline_cuda_detector_eval] main: applying overrides\n");
+    std::fflush(stderr);
     app->set_overrides(overrides);
+    std::fprintf(stderr, "[offline_cuda_detector_eval] main: creating scheduler\n");
+    std::fflush(stderr);
     app->scheduler(app->make_scheduler<holoscan::EventBasedScheduler>("event-based-scheduler",
                                       app->from_config("scheduler")));
 
@@ -2216,7 +2264,11 @@ int main(int argc, char** argv) {
                 overrides.total_frames,
                 overrides.drain_frame_count);
 
+    std::fprintf(stderr, "[offline_cuda_detector_eval] main: entering app->run()\n");
+    std::fflush(stderr);
     app->run();
+    std::fprintf(stderr, "[offline_cuda_detector_eval] main: app->run() returned\n");
+    std::fflush(stderr);
     write_manifest(overrides);
 
     HOLOSCAN_LOG_INFO("Offline CUDA detector eval complete. Wrote manifest '{}'",

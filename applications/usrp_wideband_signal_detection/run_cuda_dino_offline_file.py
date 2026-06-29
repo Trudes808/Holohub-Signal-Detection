@@ -22,6 +22,68 @@ CONTAINER_BINARY_CANDIDATES = (
     CONTAINER_REPO_ROOT / "build/usrp_wideband_signal_detection/run_offline_cuda_detector_eval",
 )
 DEFAULT_OUTPUT_ROOT = HOST_SCRATCH_ROOT / "offline_cuda_dino"
+TWO_CHUNK_CHUNK_BANDWIDTH_HZ = 253000000.0
+TWO_CHUNK_CHUNK_OVERLAP_HZ = 20019531.25
+
+
+def _format_yaml_scalar(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.12g}"
+    text = str(value)
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def set_block_scalar_values(config_text: str, block_name: str, values: dict[str, object]) -> str:
+    lines = config_text.splitlines()
+    block_start = None
+    block_end = len(lines)
+    for index, line in enumerate(lines):
+        if line.strip() == f"{block_name}:" and not line[:1].isspace():
+            block_start = index
+            break
+
+    if block_start is None:
+        raise ValueError(f"Missing top-level YAML block: {block_name}")
+
+    for index in range(block_start + 1, len(lines)):
+        stripped = lines[index].strip()
+        if stripped and not lines[index][:1].isspace():
+            block_end = index
+            break
+
+    indent = "  "
+    for key, value in values.items():
+        replacement = f"{indent}{key}: {_format_yaml_scalar(value)}"
+        key_prefix = f"{key}:"
+        replaced = False
+        for index in range(block_start + 1, block_end):
+            stripped = lines[index].strip()
+            if stripped.startswith(key_prefix):
+                lines[index] = replacement
+                replaced = True
+                break
+        if not replaced:
+            lines.insert(block_end, replacement)
+            block_end += 1
+
+    return "\n".join(lines) + "\n"
+
+
+def detector_chunk_overrides(target_chunk_count: int | None, debug_chunk_index: int | None) -> dict[str, object]:
+    overrides: dict[str, object] = {}
+    if target_chunk_count is not None:
+        if target_chunk_count != 2:
+            raise ValueError(f"Unsupported target chunk count: {target_chunk_count}. Only 2 is currently supported.")
+        overrides["chunk_bandwidth_hz"] = TWO_CHUNK_CHUNK_BANDWIDTH_HZ
+        overrides["chunk_overlap_hz"] = TWO_CHUNK_CHUNK_OVERLAP_HZ
+    if debug_chunk_index is not None:
+        overrides["debug_chunk_index"] = int(debug_chunk_index)
+    return overrides
 
 
 def expected_binary_path(explicit_binary: str | None) -> Path:
@@ -77,33 +139,46 @@ def ensure_offline_eval_config(
     input_file_path: Path,
     output_root: Path,
     progress_every: int | None,
+    target_chunk_count: int | None,
+    debug_chunk_index: int | None,
 ) -> Path:
     config_text = config_path.read_text(encoding="utf-8")
-    if has_top_level_key(config_text, "offline_eval"):
-        return config_path
 
     GENERATED_CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
     generated_path = GENERATED_CONFIG_ROOT / f"{config_path.stem}_{input_file_path.stem}_offline_eval.yaml"
-    progress_value = progress_every if progress_every is not None and progress_every > 0 else 0
-    offline_eval_block = "\n".join(
-        [
-            "",
-            "offline_eval:",
-            "  run_offline_on_file: true",
-            f"  input_file_path: \"{input_file_path}\"",
-            f"  output_root: \"{output_root}\"",
-            "  save_detector_debug_artifacts: true",
-            "  save_spectrogram_preview: true",
-            "  save_spectrogram_tensor: true",
-            "  save_mask_preview: true",
-            "  save_mask_npy: true",
-            f"  progress_every_n_frames: {progress_value}",
-            "  drain_frame_count: 32",
-            "  channel_number: 0",
-            "",
-        ]
+    config_text = set_block_scalar_values(
+        config_text,
+        "cuda_dino_detector",
+        detector_chunk_overrides(target_chunk_count, debug_chunk_index),
     )
-    generated_path.write_text(config_text.rstrip() + "\n" + offline_eval_block, encoding="utf-8")
+    progress_value = progress_every if progress_every is not None and progress_every > 0 else 0
+    offline_eval_values = {
+        "run_offline_on_file": True,
+        "input_file_path": str(input_file_path),
+        "output_root": str(output_root),
+        "save_detector_debug_artifacts": True,
+        "save_spectrogram_preview": True,
+        "save_spectrogram_tensor": True,
+        "save_mask_preview": True,
+        "save_mask_npy": True,
+        "progress_every_n_frames": progress_value,
+        "drain_frame_count": 32,
+        "channel_number": 0,
+    }
+    if has_top_level_key(config_text, "offline_eval"):
+        config_text = set_block_scalar_values(config_text, "offline_eval", offline_eval_values)
+    else:
+        offline_eval_block = "\n".join(
+            [
+                "",
+                "offline_eval:",
+                *[f"  {key}: {_format_yaml_scalar(value)}" for key, value in offline_eval_values.items()],
+                "",
+            ]
+        )
+        config_text = config_text.rstrip() + "\n" + offline_eval_block
+
+    generated_path.write_text(config_text, encoding="utf-8")
     return generated_path
 
 
@@ -191,6 +266,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the resolved command without executing it.",
     )
+    parser.add_argument(
+        "--target-chunk-count",
+        type=int,
+        default=None,
+        help="Optional detector chunk-count preset. Currently only 2 is supported.",
+    )
+    parser.add_argument(
+        "--debug-chunk-index",
+        type=int,
+        default=None,
+        help="Optional detector debug chunk index override.",
+    )
     return parser.parse_args()
 
 
@@ -218,6 +305,8 @@ def main() -> int:
         input_file_path=input_file_path,
         output_root=output_root,
         progress_every=args.progress_every,
+        target_chunk_count=args.target_chunk_count,
+        debug_chunk_index=args.debug_chunk_index,
     )
 
     staged_dir = HOST_SCRATCH_ROOT / "offline_inputs" / input_file_path.stem

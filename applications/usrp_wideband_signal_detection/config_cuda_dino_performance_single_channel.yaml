@@ -164,8 +164,8 @@ spectrogram:
 
 dinov3_signal_detector:
   num_channels: 1
-  input_height: 256
-  input_width: 512
+  input_height: 1024
+  input_width: 1024
   patch_size: 16
   emit_stride: 1
   mask_threshold_db: -20.0
@@ -219,14 +219,14 @@ dinov3_signal_detector:
 
 cuda_dino_detector:
   num_channels: 1
-  input_height: 256
-  input_width: 512
+  input_height: 1024
+  input_width: 1024
   patch_size: 16
   emit_stride: 1
   channel_filter: -1
   debug_mode: false
   enable_debug_artifact_host_copy: false
-  debug_chunk_index: 13
+  debug_chunk_index: 0
   backend_mode: "cuda_partial"
   inference_backend: "torchscript"
   model_script_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"
@@ -236,8 +236,8 @@ cuda_dino_detector:
   imagenet_std: [0.229, 0.224, 0.225]
   execution_strategy: "reference_chunks"
   max_tokens_per_inference: 8192
-  chunk_bandwidth_hz: 25000000.0
-  chunk_overlap_hz: 6250000.0
+  chunk_bandwidth_hz: 231744000.0
+  chunk_overlap_hz: 0.0
   uncalibrated_chunk_fraction: 0.40
   uncalibrated_overlap_fraction: 0.20
   ignore_sideband_hz: 7000000.0

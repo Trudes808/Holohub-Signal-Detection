@@ -31,6 +31,8 @@ DEFAULT_OFFLINE_WRAPPER_PATH = Path(
     "/home/sat3737/holohub-dev/applications/usrp_wideband_signal_detection/run_cuda_dino_offline_file.py"
 )
 DEFAULT_OFFLINE_OUTPUT_ROOT = Path("/tmp/usrp_spectrograms/offline_cuda_dino")
+HOST_SCRATCH_ROOT = Path("/tmp/usrp_spectrograms")
+CONTAINER_SCRATCH_ROOT = Path("/workspace/spectrograms")
 DEFAULT_WINDOWED_SIGMF_ROOT = Path(
     "/home/sat3737/holohub-dev/applications/usrp_wideband_signal_detection/generated_inputs"
 )
@@ -89,6 +91,15 @@ class OfflineFrameMatch:
     overlap_samples: int
     frame_start_sample: int
     frame_stop_sample: int
+
+
+@dataclass(frozen=True)
+class OfflineDetectorDebugArtifacts:
+    output_root: Path
+    chunk_summary: dict[str, Any]
+    validation_summary: dict[str, Any]
+    chunk_arrays: dict[str, np.ndarray]
+    global_arrays: dict[str, np.ndarray]
 
 
 def resolve_notebook_dir(start_dir: Path | None = None) -> Path:
@@ -355,6 +366,170 @@ def show_offline_saved_binary_masks(
         "saved_detector_mask_pixels": 0
         if resolved_detector_mask is None
         else int(np.count_nonzero(np.asarray(resolved_detector_mask) > 0)),
+    }
+    return fig, axes, context
+
+
+def resolve_offline_artifact_path(path: str | Path) -> Path:
+    resolved = Path(path).expanduser()
+    if resolved.exists():
+        return resolved.resolve()
+    try:
+        relative = resolved.relative_to(CONTAINER_SCRATCH_ROOT)
+    except ValueError:
+        return resolved.resolve()
+    candidate = HOST_SCRATCH_ROOT / relative
+    return candidate.resolve()
+
+
+def load_json_artifact(path: str | Path) -> dict[str, Any]:
+    resolved_path = resolve_offline_artifact_path(path)
+    return json.loads(resolved_path.read_text(encoding="utf-8"))
+
+
+def build_missing_debug_artifacts_message(output_root: Path) -> str:
+    validation_summary_path = output_root / "offline_validation_summary.json"
+    return (
+        "Offline detector debug artifacts were not found under "
+        f"{output_root}. Expected file: {validation_summary_path}. "
+        "This usually means the offline run was executed before the debug-artifact config update was regenerated. "
+        "Rerun notebook cell 8 so the wrapper regenerates the offline config and prints fresh manual commands, "
+        "then rerun the printed sudo/docker command, and finally rerun notebook cell 10."
+    )
+
+
+def load_offline_detector_debug_artifacts(output_root: str | Path) -> OfflineDetectorDebugArtifacts:
+    resolved_output_root = Path(output_root).expanduser().resolve()
+    validation_summary_path = resolved_output_root / "offline_validation_summary.json"
+    if not validation_summary_path.exists():
+        raise FileNotFoundError(build_missing_debug_artifacts_message(resolved_output_root))
+
+    validation_summary = load_json_artifact(validation_summary_path)
+    chunk_summary = load_json_artifact(validation_summary["chunk_debug_summary_json"])
+
+    chunk_array_keys = [
+        "corrected_resized_npy",
+        "dino_score_raw_npy",
+        "dino_score_raw_deweighted_npy",
+        "coherence_gate_npy",
+        "combined_score_npy",
+        "hybrid_keep_freq_npy",
+        "hybrid_keep_res_npy",
+        "hybrid_seed_mask_npy",
+        "hybrid_closed_mask_npy",
+        "hybrid_filled_mask_npy",
+        "hybrid_component_filtered_mask_npy",
+        "grouped_mask_npy",
+        "final_mask_npy",
+        "final_mask_source_npy",
+        "final_mask_projected_npy",
+    ]
+    global_array_keys = [
+        "projected_grouped_mask_npy",
+        "projected_grouped_score_npy",
+        "merged_box_mask_npy",
+        "final_mask_npy",
+    ]
+
+    chunk_arrays = {
+        key: np.asarray(np.load(resolve_offline_artifact_path(chunk_summary[key]))) for key in chunk_array_keys
+    }
+    global_arrays = {
+        key: np.asarray(np.load(resolve_offline_artifact_path(validation_summary[key]))) for key in global_array_keys
+    }
+    return OfflineDetectorDebugArtifacts(
+        output_root=resolved_output_root,
+        chunk_summary=chunk_summary,
+        validation_summary=validation_summary,
+        chunk_arrays=chunk_arrays,
+        global_arrays=global_arrays,
+    )
+
+
+def _show_stage_image(
+    ax: Any,
+    image: np.ndarray,
+    title: str,
+    cmap: str,
+    binary: bool = False,
+) -> None:
+    data = np.asarray(image)
+    if binary:
+        display = (data > 0).astype(np.uint8)
+        ax.imshow(display.T if display.shape[0] > display.shape[1] else display, origin="lower", aspect="auto", cmap=cmap, vmin=0, vmax=1)
+    else:
+        finite = np.asarray(data, dtype=np.float32)
+        vmin, vmax = np.percentile(finite, [5.0, 99.5]) if finite.size else (0.0, 1.0)
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+            vmin, vmax = float(np.nanmin(finite)), float(np.nanmax(finite))
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+                vmin, vmax = 0.0, 1.0
+        ax.imshow(finite.T if finite.shape[0] > finite.shape[1] else finite, origin="lower", aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    ax.set_xlabel("Time bins")
+    ax.set_ylabel("Freq bins")
+
+
+def show_offline_detector_debug_pathways(
+    debug_artifacts: OfflineDetectorDebugArtifacts,
+    figsize: tuple[float, float] = (18.0, 10.0),
+) -> tuple[Any, Any, dict[str, Any]]:
+    fig, axes = plt.subplots(2, 4, figsize=figsize, constrained_layout=True)
+    panels = [
+        ("corrected_resized_npy", "Corrected Spectrogram", "magma", False),
+        ("dino_score_raw_npy", "DINO Raw Score", "viridis", False),
+        ("dino_score_raw_deweighted_npy", "DINO Deweighted Score", "viridis", False),
+        ("coherence_gate_npy", "Coherence Gate", "cividis", False),
+        ("hybrid_keep_freq_npy", "Pathway A: Keep Freq", "plasma", False),
+        ("hybrid_keep_res_npy", "Pathway B: Keep Residual", "plasma", False),
+        ("combined_score_npy", "Combined Score", "inferno", False),
+        ("projected_grouped_score_npy", "Projected Combined Score", "inferno", False),
+    ]
+    for ax, (key, title, cmap, binary) in zip(axes.flat, panels):
+        source = debug_artifacts.chunk_arrays if key in debug_artifacts.chunk_arrays else debug_artifacts.global_arrays
+        _show_stage_image(ax, source[key], title, cmap, binary=binary)
+
+    context = {
+        "selected_chunk_index": int(debug_artifacts.validation_summary["selected_chunk_index"]),
+        "chunk_count": int(debug_artifacts.validation_summary["chunk_count"]),
+        "chunk_thresholds": dict(debug_artifacts.chunk_summary.get("hybrid_thresholds", {})),
+        "operator_timing_ms": dict(debug_artifacts.validation_summary.get("operator_timing_ms", {})),
+    }
+    return fig, axes, context
+
+
+def show_offline_detector_debug_postprocess(
+    debug_artifacts: OfflineDetectorDebugArtifacts,
+    saved_detector_mask: np.ndarray | None = None,
+    saved_gt_mask: np.ndarray | None = None,
+    figsize: tuple[float, float] = (18.0, 10.0),
+) -> tuple[Any, Any, dict[str, Any]]:
+    fig, axes = plt.subplots(2, 4, figsize=figsize, constrained_layout=True)
+    panels: list[tuple[str, str, str, bool, str]] = [
+        ("hybrid_seed_mask_npy", "Seed Mask", "Blues", True, "chunk"),
+        ("hybrid_closed_mask_npy", "Closed Mask", "Blues", True, "chunk"),
+        ("hybrid_filled_mask_npy", "Filled Mask", "Blues", True, "chunk"),
+        ("hybrid_component_filtered_mask_npy", "Component Filtered", "Blues", True, "chunk"),
+        ("grouped_mask_npy", "Grouped Mask", "Greens", True, "chunk"),
+        ("final_mask_npy", "Global Final Mask", "Greens", True, "global"),
+        ("merged_box_mask_npy", "Merged Box Mask", "Greens", True, "global"),
+        ("projected_grouped_mask_npy", "Projected Grouped Mask", "Greens", True, "global"),
+    ]
+    for ax, (key, title, cmap, binary, source_name) in zip(axes.flat, panels):
+        source = debug_artifacts.chunk_arrays if source_name == "chunk" else debug_artifacts.global_arrays
+        _show_stage_image(ax, source[key], title, cmap, binary=binary)
+
+    detector_pixels = None if saved_detector_mask is None else int(np.count_nonzero(np.asarray(saved_detector_mask) > 0))
+    gt_pixels = None if saved_gt_mask is None else int(np.count_nonzero(np.asarray(saved_gt_mask) > 0))
+    context = {
+        "selected_chunk_index": int(debug_artifacts.validation_summary["selected_chunk_index"]),
+        "detector_mask_pixels": detector_pixels,
+        "ground_truth_mask_pixels": gt_pixels,
+        "postprocess_timing_ms": {
+            key: value
+            for key, value in dict(debug_artifacts.validation_summary.get("operator_timing_ms", {})).items()
+            if key.startswith("hybrid_") or key in {"global_merge", "artifact_serialization"}
+        },
     }
     return fig, axes, context
 def normalize_annotation_index(bundle: SigMFBundle, annotation_index: int | None) -> int | None:
@@ -870,6 +1045,8 @@ def build_offline_wrapper_command(
     config_path: str | Path = DEFAULT_REPLAY_CONFIG_PATH,
     output_root: str | Path | None = None,
     wrapper_path: str | Path = DEFAULT_OFFLINE_WRAPPER_PATH,
+    target_chunk_count: int | None = None,
+    debug_chunk_index: int | None = None,
     dry_run: bool = False,
 ) -> list[str]:
     resolved_data_path = Path(data_path).expanduser().resolve()
@@ -887,6 +1064,10 @@ def build_offline_wrapper_command(
         "--output-root",
         str(resolved_output_root),
     ]
+    if target_chunk_count is not None:
+        command.extend(["--target-chunk-count", str(int(target_chunk_count))])
+    if debug_chunk_index is not None:
+        command.extend(["--debug-chunk-index", str(int(debug_chunk_index))])
     if dry_run:
         command.append("--dry-run")
     return command
@@ -900,6 +1081,8 @@ def run_offline_cuda_dino_file(
     bundle: SigMFBundle | None = None,
     window: SampleWindow | None = None,
     windowed_sigmf_root: str | Path | None = None,
+    target_chunk_count: int | None = None,
+    debug_chunk_index: int | None = None,
     dry_run: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     resolved_data_path = Path(data_path).expanduser().resolve()
@@ -917,6 +1100,8 @@ def run_offline_cuda_dino_file(
         config_path=config_path,
         output_root=output_root,
         wrapper_path=wrapper_path,
+        target_chunk_count=target_chunk_count,
+        debug_chunk_index=debug_chunk_index,
         dry_run=dry_run,
     )
     completed = subprocess.run(command, capture_output=True, text=True, check=False)

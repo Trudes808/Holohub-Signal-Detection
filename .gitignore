@@ -58,4 +58,6 @@ rti_license.dat
 
 # Notebook-generated validator artifacts
 notebooks/validator_artifacts/
-applications/usrp_wideband_signal_detection/chunk_compare_artifacts
+applications/usrp_wideband_signal_detection/chunk_compare_artifacts/
+applications/usrp_wideband_signal_detection/generated_inputs/
+applications/usrp_wideband_signal_detection/generated_configs/

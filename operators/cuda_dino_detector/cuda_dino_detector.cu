@@ -1985,6 +1985,10 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
                                     int selected_chunk_index,
                                     int src_rows,
                                     int src_cols,
+                                    int aligned_rows,
+                                    int aligned_cols,
+                                    bool runtime_resized_full_chunk,
+                                    bool projected_full_chunk,
                                     const ChunkPlanEntry& selected_chunk,
                                     const std::vector<float>& corrected_resized,
                                     const std::vector<float>& raw_score_resized,
@@ -2175,8 +2179,14 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   chunk_debug_summary << "  \"row_stop\": " << selected_chunk.row_stop << ",\n";
   chunk_debug_summary << "  \"src_rows\": " << selected_debug_chunk.src_rows << ",\n";
   chunk_debug_summary << "  \"src_cols\": " << selected_debug_chunk.src_cols << ",\n";
+  chunk_debug_summary << "  \"aligned_rows\": " << aligned_rows << ",\n";
+  chunk_debug_summary << "  \"aligned_cols\": " << aligned_cols << ",\n";
   chunk_debug_summary << "  \"dst_rows\": " << selected_debug_chunk.dst_rows << ",\n";
   chunk_debug_summary << "  \"dst_cols\": " << selected_debug_chunk.dst_cols << ",\n";
+  chunk_debug_summary << "  \"runtime_resized_full_chunk\": "
+                      << (runtime_resized_full_chunk ? "true" : "false") << ",\n";
+  chunk_debug_summary << "  \"projected_full_chunk\": "
+                      << (projected_full_chunk ? "true" : "false") << ",\n";
   chunk_debug_summary << "  \"grouped_box_count\": " << selected_debug_chunk.grouped_boxes.size() << ",\n";
   chunk_debug_summary << "  \"operator_timing_ms\": {\n";
   chunk_debug_summary << "    \"total_compute\": " << timing_profile.total_compute_ms << ",\n";
@@ -8930,6 +8940,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     int debug_feature_dim = 0;
     int debug_aligned_rows = 0;
     int debug_aligned_cols = 0;
+    bool debug_runtime_resized_full_chunk = false;
     bool debug_resized_full_chunk = false;
     if (is_truthy_backend_mode(backend_mode_.get()) && !model_script_path_.get().empty()) {
       DinoTorchRuntimeConfig runtime_config;
@@ -8969,14 +8980,18 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         timing_profile.runtime_model_prep_ms = runtime_result.timing.model_prep_ms;
         timing_profile.runtime_torch_forward_ms = runtime_result.timing.torch_forward_ms;
         timing_profile.runtime_dino_score_ms = runtime_result.timing.dino_score_ms;
-        const bool resized_full_chunk = runtime_result.input_resized_to_target;
+        const bool runtime_resized_full_chunk = runtime_result.input_resized_to_target;
+        const bool project_full_chunk =
+          runtime_resized_full_chunk ||
+          (execution_strategy_.get() == "reference_chunks" && uniform_chunk_rows > runtime_result.aligned_rows);
         debug_patch_features_batch_device = runtime_result.patch_features_batch_device;
         debug_patch_rows = runtime_result.patch_rows;
         debug_patch_cols = runtime_result.patch_cols;
         debug_feature_dim = runtime_result.feature_dim;
         debug_aligned_rows = runtime_result.aligned_rows;
         debug_aligned_cols = runtime_result.aligned_cols;
-        debug_resized_full_chunk = resized_full_chunk;
+        debug_runtime_resized_full_chunk = runtime_resized_full_chunk;
+        debug_resized_full_chunk = project_full_chunk;
         if (runtime_result.patch_features_batch_device != nullptr && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 &&
             runtime_result.feature_dim > 0) {
           const auto raw_score_start_time = std::chrono::steady_clock::now();
@@ -8990,7 +9005,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                   uniform_chunk_rows,
                                                                                   src_cols,
                                                                                   raw_dino_positional_deweight_.get(),
-                                                                                  resized_full_chunk,
+                                                                                  project_full_chunk,
                                                                                   buffers.raw_dino_score_batch_device,
                                                                                   buffers.processing_stream);
           if (capture_operator_timing) {
@@ -9009,7 +9024,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                   runtime_result.aligned_cols,
                                                                   uniform_chunk_rows,
                                                                   src_cols,
-                                                                  resized_full_chunk,
+                                                                  project_full_chunk,
                                                                   buffers.raw_dino_score_batch_device,
                                                                   buffers.processing_stream);
           if (capture_operator_timing) {
@@ -9481,6 +9496,10 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                        selected_batch_index,
                                        src_rows,
                                        src_cols,
+                                       debug_aligned_rows,
+                                       debug_aligned_cols,
+                                       debug_runtime_resized_full_chunk,
+                                       debug_resized_full_chunk,
                                        selected_chunk,
                                        corrected_resized,
                                        raw_score_resized,
