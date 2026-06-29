@@ -10,6 +10,12 @@
 
 namespace holoscan::ops {
 
+enum class RawDinoPositionalDebiasMode : uint8_t {
+    kLegacyTrend = 0,
+    kInsid3OrthogonalComplement = 1,
+    kHybridInsid3PlusLegacy = 2,
+};
+
 struct CudaHybridStageTiming {
     double normalization_ms = 0.0;
     double residual_stack_ms = 0.0;
@@ -72,6 +78,10 @@ bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_fe
                                                            int output_rows,
                                                            int output_cols,
                                                            float positional_suppression,
+                                                           RawDinoPositionalDebiasMode positional_debias_mode,
+                                                           float legacy_cleanup_weight,
+                                                           int insid3_svd_components,
+                                                           const float* insid3_basis_source_patch_features_device,
                                                            bool resized_full_chunk,
                                                            float* output_score_device,
                                                            cudaStream_t cuda_stream);

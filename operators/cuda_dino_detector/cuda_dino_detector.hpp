@@ -98,6 +98,9 @@ class CudaDinoDetector : public holoscan::Operator {
   holoscan::Parameter<double> dino_coherence_gate_floor_;
   holoscan::Parameter<double> dino_coherence_gate_span_db_;
   holoscan::Parameter<float> raw_dino_positional_deweight_;
+  holoscan::Parameter<std::string> raw_dino_positional_debias_mode_;
+  holoscan::Parameter<float> raw_dino_legacy_cleanup_weight_;
+  holoscan::Parameter<int> raw_dino_insid3_svd_components_;
   holoscan::Parameter<double> power_q_;
   holoscan::Parameter<std::string> hybrid_torch_dtype_;
   holoscan::Parameter<bool> enable_mask_post_processing_;
@@ -131,6 +134,11 @@ class CudaDinoDetector : public holoscan::Operator {
   std::vector<ChannelBuffers> channel_buffers_;
   std::vector<ChannelTimingStats> timing_stats_;
   std::shared_ptr<DinoTorchRuntime> runtime_;
+  const float* raw_dino_insid3_basis_source_patch_features_device_ = nullptr;
+  std::shared_ptr<void> raw_dino_insid3_basis_source_patch_features_device_owner_;
+  int raw_dino_insid3_basis_source_patch_rows_ = 0;
+  int raw_dino_insid3_basis_source_patch_cols_ = 0;
+  int raw_dino_insid3_basis_source_feature_dim_ = 0;
 
   void release_channel_buffers();
 };

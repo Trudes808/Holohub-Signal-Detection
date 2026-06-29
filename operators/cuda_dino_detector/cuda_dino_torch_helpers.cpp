@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <memory>
 
 namespace holoscan::ops {
 
@@ -233,6 +234,177 @@ torch::Tensor suppress_raw_dino_positional_features_torch_batch(const torch::Ten
     return suppressed.contiguous();
   }
   return ((1.0f - clamped) * patch_features + clamped * suppressed).contiguous();
+}
+
+torch::Tensor normalize_feature_vectors_torch_batch(const torch::Tensor& patch_features) {
+  if (patch_features.dim() != 3) {
+    return torch::zeros_like(patch_features);
+  }
+  auto input = patch_features.to(torch::kFloat32).contiguous();
+  auto norms = torch::sqrt(torch::sum(input * input, 2, true) + 1.0e-6f);
+  return (input / torch::clamp_min(norms, 1.0e-6f)).contiguous();
+}
+
+torch::Tensor rms_feature_energy_torch_batch(const torch::Tensor& patch_features) {
+  if (patch_features.dim() != 3) {
+    return torch::zeros({0, 0, 0}, patch_features.options().dtype(torch::kFloat32));
+  }
+  auto energy = torch::sqrt(torch::mean(patch_features * patch_features, 2) + 1.0e-6f);
+  return energy.contiguous();
+}
+
+struct Insid3PositionalBasisCache {
+  int patch_rows = 0;
+  int patch_cols = 0;
+  int feature_dim = 0;
+  int svd_components = 0;
+  c10::Device device = c10::Device(torch::kCPU);
+  torch::Tensor basis;
+};
+
+torch::Tensor project_aligned_maps_torch_batch(const torch::Tensor& aligned_maps,
+                                               int output_rows,
+                                               int output_cols,
+                                               bool resized_full_chunk);
+
+torch::Tensor insid3_positional_basis_torch(const torch::Tensor& zero_patch_features,
+                                            int patch_rows,
+                                            int patch_cols,
+                                            int feature_dim,
+                                            int svd_components) {
+  thread_local Insid3PositionalBasisCache cache;
+
+  const auto device = zero_patch_features.device();
+  const bool cache_valid = cache.basis.defined() && cache.patch_rows == patch_rows &&
+                           cache.patch_cols == patch_cols && cache.feature_dim == feature_dim &&
+                           cache.svd_components == svd_components && cache.device == device;
+  if (cache_valid) {
+    return cache.basis;
+  }
+
+  auto zero_features = zero_patch_features;
+  if (zero_features.dim() == 2) {
+    zero_features = zero_features.unsqueeze(0);
+  }
+  if (zero_features.dim() != 3 || zero_features.size(1) != patch_rows * patch_cols || zero_features.size(2) != feature_dim) {
+    return torch::Tensor();
+  }
+
+  auto normalized_zero = normalize_feature_vectors_torch_batch(zero_features);
+  auto feature_matrix = normalized_zero[0].transpose(0, 1).contiguous();
+  feature_matrix = (feature_matrix - feature_matrix.mean(1, true)).contiguous();
+
+  auto svd = torch::linalg_svd(feature_matrix, false);
+  auto U = std::get<0>(svd).contiguous();
+  const auto max_components = std::min<int64_t>(U.size(0), U.size(1));
+  const auto component_count = std::max<int64_t>(1, std::min<int64_t>(svd_components, max_components));
+  cache.patch_rows = patch_rows;
+  cache.patch_cols = patch_cols;
+  cache.feature_dim = feature_dim;
+  cache.svd_components = static_cast<int>(component_count);
+  cache.device = device;
+  cache.basis = U.index({torch::indexing::Slice(), torch::indexing::Slice(0, component_count)}).contiguous();
+  return cache.basis;
+}
+
+bool compute_insid3_raw_dino_score_torch_batch_to_device(const float* patch_features_batch_device,
+                                                         int batch_size,
+                                                         int patch_rows,
+                                                         int patch_cols,
+                                                         int feature_dim,
+                                                         int aligned_rows,
+                                                         int aligned_cols,
+                                                         int output_rows,
+                                                         int output_cols,
+                                                         float positional_suppression,
+                                                         RawDinoPositionalDebiasMode positional_debias_mode,
+                                                         float legacy_cleanup_weight,
+                                                         int insid3_svd_components,
+                                                         const float* insid3_basis_source_patch_features_device,
+                                                         bool resized_full_chunk,
+                                                         float* output_score_device,
+                                                         cudaStream_t cuda_stream) {
+  if (patch_features_batch_device == nullptr || output_score_device == nullptr || insid3_basis_source_patch_features_device == nullptr ||
+      batch_size <= 0 || patch_rows <= 0 || patch_cols <= 0 || feature_dim <= 0 ||
+      aligned_rows <= 0 || aligned_cols <= 0 || output_rows <= 0 || output_cols <= 0) {
+    return false;
+  }
+
+  const int patch_count = patch_rows * patch_cols;
+  c10::Device compute_device(torch::kCUDA, 0);
+  std::unique_ptr<c10::cuda::CUDAStreamGuard> stream_guard;
+  const auto torch_stream = cuda_stream
+      ? c10::cuda::getStreamFromExternal(cuda_stream, compute_device.index())
+      : c10::cuda::getDefaultCUDAStream(compute_device.index());
+  stream_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(torch_stream);
+
+  auto options = torch::TensorOptions().dtype(torch::kFloat32).device(compute_device);
+  auto patch_features = torch::from_blob(const_cast<float*>(patch_features_batch_device),
+                                         {static_cast<int64_t>(batch_size), static_cast<int64_t>(patch_count), static_cast<int64_t>(feature_dim)},
+                                         options);
+  auto zero_patch_features = torch::from_blob(const_cast<float*>(insid3_basis_source_patch_features_device),
+                                              {1, static_cast<int64_t>(patch_count), static_cast<int64_t>(feature_dim)},
+                                              options);
+
+  auto basis = insid3_positional_basis_torch(zero_patch_features,
+                                             patch_rows,
+                                             patch_cols,
+                                             feature_dim,
+                                             std::max(insid3_svd_components, 1));
+  if (!basis.defined() || basis.dim() != 2 || basis.size(0) != feature_dim) {
+    return false;
+  }
+
+  const float clamped_suppression = std::clamp(positional_suppression, 0.0f, 1.0f);
+  const float clamped_legacy_cleanup = std::clamp(legacy_cleanup_weight, 0.0f, 1.0f);
+  torch::Tensor patch_scores;
+  auto normalized_patch_features = normalize_feature_vectors_torch_batch(patch_features);
+  auto debiased = normalized_patch_features;
+  if (clamped_suppression > 0.0f) {
+    auto coefficients = torch::matmul(normalized_patch_features, basis);
+    auto projected = torch::matmul(coefficients, basis.transpose(0, 1)).contiguous();
+    debiased = (normalized_patch_features - clamped_suppression * projected).contiguous();
+  }
+
+  if (positional_debias_mode == RawDinoPositionalDebiasMode::kHybridInsid3PlusLegacy && clamped_legacy_cleanup > 0.0f) {
+    debiased = suppress_raw_dino_positional_features_torch_batch(debiased,
+                                                                 patch_rows,
+                                                                 patch_cols,
+                                                                 clamped_legacy_cleanup);
+  }
+
+  patch_scores = rms_feature_energy_torch_batch(
+      (clamped_suppression > 0.0f || positional_debias_mode == RawDinoPositionalDebiasMode::kHybridInsid3PlusLegacy)
+          ? debiased
+          : patch_features);
+
+  patch_scores = normalize_map01_quantile_torch_batch(
+      patch_scores.view({static_cast<int64_t>(batch_size), static_cast<int64_t>(patch_rows), static_cast<int64_t>(patch_cols)}),
+      0.05,
+      0.95);
+
+  torch::Tensor aligned_scores = patch_scores;
+  if (patch_rows != aligned_rows || patch_cols != aligned_cols) {
+    aligned_scores = torch::nn::functional::interpolate(
+                         patch_scores.unsqueeze(1),
+                         torch::nn::functional::InterpolateFuncOptions()
+                             .size(std::vector<int64_t>{static_cast<int64_t>(aligned_rows), static_cast<int64_t>(aligned_cols)})
+                             .mode(torch::kBilinear)
+                             .align_corners(false))
+                         .squeeze(1)
+                         .contiguous();
+  }
+
+  auto projected_scores = project_aligned_maps_torch_batch(aligned_scores,
+                                                           output_rows,
+                                                           output_cols,
+                                                           resized_full_chunk);
+  const size_t output_values = static_cast<size_t>(batch_size) * static_cast<size_t>(output_rows) * static_cast<size_t>(output_cols);
+  return cudaMemcpyAsync(output_score_device,
+                         projected_scores.data_ptr<float>(),
+                         output_values * sizeof(float),
+                         cudaMemcpyDeviceToDevice,
+                         cuda_stream != nullptr ? cuda_stream : cudaStreamPerThread) == cudaSuccess;
 }
 
 torch::Tensor project_aligned_maps_torch_batch(const torch::Tensor& aligned_maps,
@@ -499,9 +671,33 @@ bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_fe
                                                            int output_rows,
                                                            int output_cols,
                                                            float positional_suppression,
+                                                           RawDinoPositionalDebiasMode positional_debias_mode,
+                                                           float legacy_cleanup_weight,
+                                                           int insid3_svd_components,
+                                                           const float* insid3_basis_source_patch_features_device,
                                                            bool resized_full_chunk,
                                                            float* output_score_device,
                                                            cudaStream_t cuda_stream) {
+  if (positional_debias_mode == RawDinoPositionalDebiasMode::kInsid3OrthogonalComplement ||
+      positional_debias_mode == RawDinoPositionalDebiasMode::kHybridInsid3PlusLegacy) {
+    return compute_insid3_raw_dino_score_torch_batch_to_device(patch_features_batch_device,
+                                                               batch_size,
+                                                               patch_rows,
+                                                               patch_cols,
+                                                               feature_dim,
+                                                               aligned_rows,
+                                                               aligned_cols,
+                                                               output_rows,
+                                                               output_cols,
+                                                               positional_suppression,
+                                                               positional_debias_mode,
+                                                               legacy_cleanup_weight,
+                                                               insid3_svd_components,
+                                                               insid3_basis_source_patch_features_device,
+                                                               resized_full_chunk,
+                                                               output_score_device,
+                                                               cuda_stream);
+  }
   return compute_deweighted_raw_dino_score_native_cuda_batch_to_device(patch_features_batch_device,
                                                                         batch_size,
                                                                         patch_rows,
@@ -605,9 +801,33 @@ bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_fe
                                                            int output_rows,
                                                            int output_cols,
                                                            float positional_suppression,
+                                                           RawDinoPositionalDebiasMode positional_debias_mode,
+                                                           float legacy_cleanup_weight,
+                                                           int insid3_svd_components,
+                                                           const float* insid3_basis_source_patch_features_device,
                                                            bool resized_full_chunk,
                                                            float* output_score_device,
                                                            cudaStream_t cuda_stream) {
+  if (positional_debias_mode == RawDinoPositionalDebiasMode::kInsid3OrthogonalComplement ||
+      positional_debias_mode == RawDinoPositionalDebiasMode::kHybridInsid3PlusLegacy) {
+    return compute_insid3_raw_dino_score_torch_batch_to_device(patch_features_batch_device,
+                                                               batch_size,
+                                                               patch_rows,
+                                                               patch_cols,
+                                                               feature_dim,
+                                                               aligned_rows,
+                                                               aligned_cols,
+                                                               output_rows,
+                                                               output_cols,
+                                                               positional_suppression,
+                                                               positional_debias_mode,
+                                                               legacy_cleanup_weight,
+                                                               insid3_svd_components,
+                                                               insid3_basis_source_patch_features_device,
+                                                               resized_full_chunk,
+                                                               output_score_device,
+                                                               cuda_stream);
+  }
   return compute_deweighted_raw_dino_score_native_cuda_batch_to_device(patch_features_batch_device,
                                                                         batch_size,
                                                                         patch_rows,

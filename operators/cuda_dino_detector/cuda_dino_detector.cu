@@ -43,6 +43,32 @@ bool use_fp16_precision(const std::string& dtype_text) {
   return lowered == "fp16" || lowered == "half" || lowered == "float16";
 }
 
+RawDinoPositionalDebiasMode parse_raw_dino_positional_debias_mode(const std::string& mode_text) {
+  std::string lowered = mode_text;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  if (lowered == "hybrid" || lowered == "hybrid_insid3_plus_legacy" || lowered == "insid3_plus_legacy") {
+    return RawDinoPositionalDebiasMode::kHybridInsid3PlusLegacy;
+  }
+  if (lowered == "insid3" || lowered == "insid3_orthogonal_complement" || lowered == "orthogonal_complement") {
+    return RawDinoPositionalDebiasMode::kInsid3OrthogonalComplement;
+  }
+  return RawDinoPositionalDebiasMode::kLegacyTrend;
+}
+
+const char* raw_dino_positional_debias_mode_name(RawDinoPositionalDebiasMode mode) {
+  switch (mode) {
+    case RawDinoPositionalDebiasMode::kHybridInsid3PlusLegacy:
+      return "hybrid_insid3_plus_legacy";
+    case RawDinoPositionalDebiasMode::kInsid3OrthogonalComplement:
+      return "insid3_orthogonal_complement";
+    case RawDinoPositionalDebiasMode::kLegacyTrend:
+    default:
+      return "legacy_trend";
+  }
+}
+
 std::mutex& mask_output_buffer_pool_mutex() {
   static std::mutex mutex;
   return mutex;
@@ -8267,6 +8293,21 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Raw DINO positional deweight",
              "Trend-only positional suppression weight for raw patch-energy scoring.",
              0.75f);
+  spec.param(raw_dino_positional_debias_mode_,
+             "raw_dino_positional_debias_mode",
+             "Raw DINO positional debias mode",
+             "Positional debias mode for raw patch-energy scoring. Supported values: legacy_trend, insid3_orthogonal_complement, hybrid_insid3_plus_legacy.",
+             std::string("legacy_trend"));
+  spec.param(raw_dino_legacy_cleanup_weight_,
+             "raw_dino_legacy_cleanup_weight",
+             "Raw DINO legacy cleanup weight",
+             "Residual legacy spatial cleanup weight applied after INSID3 projection in hybrid mode.",
+             0.15f);
+  spec.param(raw_dino_insid3_svd_components_,
+             "raw_dino_insid3_svd_components",
+             "Raw DINO INSID3 SVD components",
+             "Number of positional basis vectors retained for the INSID3 orthogonal-complement experiment.",
+             64);
   spec.param(power_q_,
              "power_q",
              "Power quantile",
@@ -8386,6 +8427,7 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
 
 void CudaDinoDetector::initialize() {
   Operator::initialize();
+  const auto positional_debias_mode = parse_raw_dino_positional_debias_mode(raw_dino_positional_debias_mode_.get());
   release_channel_buffers();
   channel_buffers_.assign(static_cast<size_t>(std::max(1, num_channels_.get())), ChannelBuffers{});
   timing_stats_.assign(static_cast<size_t>(std::max(1, num_channels_.get())), ChannelTimingStats{});
@@ -8417,7 +8459,7 @@ void CudaDinoDetector::initialize() {
                      std::max(1, patch_size_.get()));
   }
   std::fprintf(stderr,
-               "[cuda_dino_detector] INFO: initialized backend_mode='%s' execution_strategy='%s' debug_mode=%d host_copy_debug_only=%d max_tokens_per_inference=%d input=%dx%d patch_size=%d emit_stride=%d chunk_bw_hz=%.3f overlap_hz=%.3f frontend_correction_enable=%d enable_mask_post_processing=%d\n",
+               "[cuda_dino_detector] INFO: initialized backend_mode='%s' execution_strategy='%s' debug_mode=%d host_copy_debug_only=%d max_tokens_per_inference=%d input=%dx%d patch_size=%d emit_stride=%d chunk_bw_hz=%.3f overlap_hz=%.3f frontend_correction_enable=%d enable_mask_post_processing=%d raw_dino_positional_debias_mode='%s' raw_dino_positional_deweight=%.3f raw_dino_legacy_cleanup_weight=%.3f raw_dino_insid3_svd_components=%d\n",
                backend_mode_.get().c_str(),
                execution_strategy_.get().c_str(),
                debug_mode_.get() ? 1 : 0,
@@ -8430,7 +8472,11 @@ void CudaDinoDetector::initialize() {
                chunk_bandwidth_hz_.get(),
                chunk_overlap_hz_.get(),
                frontend_correction_enable_.get() ? 1 : 0,
-               enable_mask_post_processing_.get() ? 1 : 0);
+               enable_mask_post_processing_.get() ? 1 : 0,
+               raw_dino_positional_debias_mode_name(positional_debias_mode),
+               raw_dino_positional_deweight_.get(),
+               raw_dino_legacy_cleanup_weight_.get(),
+               raw_dino_insid3_svd_components_.get());
 }
 
 void CudaDinoDetector::stop() {
@@ -8942,6 +8988,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     int debug_aligned_cols = 0;
     bool debug_runtime_resized_full_chunk = false;
     bool debug_resized_full_chunk = false;
+    const auto positional_debias_mode = parse_raw_dino_positional_debias_mode(raw_dino_positional_debias_mode_.get());
     if (is_truthy_backend_mode(backend_mode_.get()) && !model_script_path_.get().empty()) {
       DinoTorchRuntimeConfig runtime_config;
       runtime_config.inference_backend = inference_backend_.get();
@@ -8992,6 +9039,42 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         debug_aligned_cols = runtime_result.aligned_cols;
         debug_runtime_resized_full_chunk = runtime_resized_full_chunk;
         debug_resized_full_chunk = project_full_chunk;
+           if ((positional_debias_mode == RawDinoPositionalDebiasMode::kInsid3OrthogonalComplement ||
+             positional_debias_mode == RawDinoPositionalDebiasMode::kHybridInsid3PlusLegacy) &&
+            runtime_result.patch_features_batch_device != nullptr && runtime_result.patch_rows > 0 &&
+            runtime_result.patch_cols > 0 && runtime_result.feature_dim > 0) {
+          const bool basis_source_ready = raw_dino_insid3_basis_source_patch_features_device_ != nullptr &&
+                                          raw_dino_insid3_basis_source_patch_rows_ == runtime_result.patch_rows &&
+                                          raw_dino_insid3_basis_source_patch_cols_ == runtime_result.patch_cols &&
+                                          raw_dino_insid3_basis_source_feature_dim_ == runtime_result.feature_dim;
+          if (!basis_source_ready) {
+            const size_t zero_values = static_cast<size_t>(uniform_chunk_rows) * static_cast<size_t>(src_cols);
+            auto zero_chunk_owner = acquire_pooled_u8_buffer(zero_values * sizeof(float));
+            auto* zero_chunk_device = reinterpret_cast<float*>(zero_chunk_owner.get());
+            throw_if_cuda_error(cudaMemsetAsync(zero_chunk_device,
+                                               0,
+                                               zero_values * sizeof(float),
+                                               buffers.processing_stream),
+                                "cuda_dino_detector INSID3 zero-input memset failed");
+
+            DinoTorchRuntimeBatchInput zero_runtime_input = runtime_input;
+            zero_runtime_input.batch_size = 1;
+            zero_runtime_input.corrected_db_batch_device = zero_chunk_device;
+            auto zero_runtime_result = runtime_->run_batch(runtime_config, zero_runtime_input);
+            if (!zero_runtime_result.success || zero_runtime_result.patch_features_batch_device == nullptr ||
+                zero_runtime_result.patch_rows != runtime_result.patch_rows ||
+                zero_runtime_result.patch_cols != runtime_result.patch_cols ||
+                zero_runtime_result.feature_dim != runtime_result.feature_dim) {
+              throw std::runtime_error(std::string("INSID3 zero-input positional basis generation failed: ") +
+                                       zero_runtime_result.error_stage + " " + zero_runtime_result.error_message);
+            }
+            raw_dino_insid3_basis_source_patch_features_device_ = zero_runtime_result.patch_features_batch_device;
+            raw_dino_insid3_basis_source_patch_features_device_owner_ = zero_runtime_result.patch_features_batch_device_owner;
+            raw_dino_insid3_basis_source_patch_rows_ = zero_runtime_result.patch_rows;
+            raw_dino_insid3_basis_source_patch_cols_ = zero_runtime_result.patch_cols;
+            raw_dino_insid3_basis_source_feature_dim_ = zero_runtime_result.feature_dim;
+          }
+        }
         if (runtime_result.patch_features_batch_device != nullptr && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 &&
             runtime_result.feature_dim > 0) {
           const auto raw_score_start_time = std::chrono::steady_clock::now();
@@ -9005,6 +9088,10 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                   uniform_chunk_rows,
                                                                                   src_cols,
                                                                                   raw_dino_positional_deweight_.get(),
+                                                                                  positional_debias_mode,
+                                                                                  raw_dino_legacy_cleanup_weight_.get(),
+                                                                                  raw_dino_insid3_svd_components_.get(),
+                                                                                  raw_dino_insid3_basis_source_patch_features_device_,
                                                                                   project_full_chunk,
                                                                                   buffers.raw_dino_score_batch_device,
                                                                                   buffers.processing_stream);
@@ -9254,6 +9341,10 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                               uniform_chunk_rows,
                                                                                               src_cols,
                                                                                               0.0f,
+                                                                                              positional_debias_mode,
+                                                                                              raw_dino_legacy_cleanup_weight_.get(),
+                                                                                              raw_dino_insid3_svd_components_.get(),
+                                                                                              raw_dino_insid3_basis_source_patch_features_device_,
                                                                                               debug_resized_full_chunk,
                                                                                               raw_score_debug_device,
                                                                                               buffers.processing_stream);

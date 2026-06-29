@@ -252,7 +252,10 @@ cuda_dino_detector:
   frontend_correction_edge_target_drop_db: 2.5
   dino_coherence_gate_floor: 0.25
   dino_coherence_gate_span_db: 3.0
-  raw_dino_positional_deweight: 0.75
+  raw_dino_positional_deweight: 1.0
+  raw_dino_positional_debias_mode: "insid3_orthogonal_complement"
+  raw_dino_legacy_cleanup_weight: 0.0
+  raw_dino_insid3_svd_components: 64
   power_q: 0.90
   hybrid_torch_dtype: "fp16"
   enable_mask_post_processing: false
