@@ -7,6 +7,7 @@
 #include "fft_runtime_config.hpp"
 #include "spectrogram_visualization.hpp"
 
+#include <coherent_power_signal_detector.hpp>
 #include <cuda_dino_detector.hpp>
 #include <fft.hpp>
 #include <holoscan/holoscan.hpp>
@@ -23,6 +24,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <memory>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -557,6 +560,7 @@ struct CliOptions {
       "infocom_evals/signal_detection_experiments/config_cuda_dino_performance_single_channel_offline_eval.yaml";
   std::string input_file_path;
   std::string output_root;
+  std::string detector_type;  // empty => fall back to offline_eval.detector_type / default
   int progress_every_n_frames = -1;
 };
 
@@ -566,6 +570,10 @@ struct EvalOverrides {
   std::filesystem::path output_root;
   std::filesystem::path input_sigmf_meta_path;
   bool run_offline_on_file = true;
+  std::string detector_type = "cuda_dino";
+  int source_ring_size = 8;
+  bool trace_frames = false;
+  bool require_full_mask_coverage = false;
   bool save_detector_debug_artifacts = false;
   bool save_spectrogram_preview = true;
   bool save_spectrogram_tensor = true;
@@ -753,7 +761,8 @@ uint64_t ceil_div(uint64_t numerator, uint64_t denominator) {
 
 void usage(const char* argv0) {
   HOLOSCAN_LOG_INFO(
-      "Usage: {} [--config FILE] [--input-file FILE.sc16] [--output-root DIR] [--progress-every N]",
+      "Usage: {} [--config FILE] [--input-file FILE.sigmf-data] [--output-root DIR] "
+      "[--detector cuda_dino|coherent_power] [--progress-every N]",
       argv0);
 }
 
@@ -763,11 +772,12 @@ CliOptions parse_arguments(int argc, char** argv) {
                                   {"input-file", required_argument, nullptr, 'i'},
                                   {"output-root", required_argument, nullptr, 'o'},
                                   {"progress-every", required_argument, nullptr, 'p'},
+                                  {"detector", required_argument, nullptr, 'd'},
                                   {"help", no_argument, nullptr, 'h'},
                                   {0, 0, 0, 0}};
 
   while (true) {
-    const int opt = getopt_long(argc, argv, "c:i:o:p:h", long_options, nullptr);
+    const int opt = getopt_long(argc, argv, "c:i:o:p:d:h", long_options, nullptr);
     if (opt == -1) {
       break;
     }
@@ -783,6 +793,9 @@ CliOptions parse_arguments(int argc, char** argv) {
         break;
       case 'p':
         options.progress_every_n_frames = std::stoi(optarg);
+        break;
+      case 'd':
+        options.detector_type = optarg;
         break;
       case 'h':
         usage(argv[0]);
@@ -1492,10 +1505,21 @@ void write_manifest(const EvalOverrides& overrides) {
                              "; offline eval now emits complete frames only");
       }
     }
-  } catch (...) {
-    std::filesystem::remove(summary_path);
-    std::filesystem::remove(manifest_path);
-    throw;
+  } catch (const std::exception& coverage_error) {
+    // Different detectors have different emission semantics (e.g. coherent_power can
+    // drop a few tail frames to pipeline drain). Unless the caller explicitly requires
+    // full coverage, treat a coverage shortfall as a non-fatal warning and KEEP the
+    // manifest + summary (manifest_complete already reflects the shortfall). Downstream
+    // metrics handle maskless frames explicitly.
+    if (overrides.require_full_mask_coverage) {
+      std::filesystem::remove(summary_path);
+      std::filesystem::remove(manifest_path);
+      throw;
+    }
+    HOLOSCAN_LOG_WARN(
+        "Offline eval coverage check failed but require_full_mask_coverage=false; keeping "
+        "partial manifest/summary. Detail: {}",
+        coverage_error.what());
   }
 }
 
@@ -1543,6 +1567,13 @@ class OfflineSc16FileSourceOp : public holoscan::Operator {
     }
 
     input_format_ = make_input_format_from_datatype(input_datatype_.get());
+    // Fast path: cf32_le on a little-endian host is byte-identical to the device
+    // Complex (interleaved float32 I,Q), so we can memcpy the raw frame straight
+    // into host_complex_ and skip the per-sample scalar decode loop. This is the
+    // dominant cost when streaming ~1.7e9 samples/file, and is value-identical.
+    fast_copy_cf32_ = input_format_.scalar_kind == InputScalarKind::kFloat &&
+                      input_format_.scalar_bits == 32 &&
+                      input_format_.little_endian == host_is_little_endian();
     samples_per_frame_ = static_cast<uint64_t>(std::max(1, num_bursts_.get())) *
                          static_cast<uint64_t>(std::max(1, burst_size_.get()));
     real_frame_count_limit_ = static_cast<uint64_t>(std::max<int64_t>(0, real_frame_count_.get()));
@@ -1552,27 +1583,24 @@ class OfflineSc16FileSourceOp : public holoscan::Operator {
     host_input_bytes_.assign(static_cast<size_t>(samples_per_frame_) * input_format_.bytes_per_complex, 0U);
     host_complex_.assign(static_cast<size_t>(samples_per_frame_), Complex {0.0f, 0.0f});
 
-    const int ring_size = std::max(1, ring_size_.get());
-    slots_.resize(static_cast<size_t>(ring_size));
-    for (auto& slot : slots_) {
-      make_tensor(slot.device_tensor,
-                  {static_cast<matx::index_t>(num_bursts_.get()),
-                   static_cast<matx::index_t>(burst_size_.get())},
-                  MATX_DEVICE_MEMORY);
-      if (cudaStreamCreateWithFlags(&slot.stream, cudaStreamNonBlocking) != cudaSuccess) {
-        throw std::runtime_error("failed to create offline source CUDA stream");
-      }
+    // Correctness fix (was a wrong-frame bug): we allocate a FRESH device tensor per frame in
+    // compute() rather than cycling a fixed ring of reusable slots. The old ring reused a slot's
+    // device memory ring_size frames later, but the already-emitted message (queued upstream of
+    // the detector) still pointed at that same memory. So by the time a detector read "frame N",
+    // the slot had been overwritten with frame N+ring_size's samples -> masks were exactly
+    // ring_size frames stale (empirically confirmed: mask_f_N best-matched GT_f_(N+8) with
+    // ring_size=8, for BOTH detectors). matx tensors are reference-counted, so a fresh per-frame
+    // tensor is released once the sink drops the message; peak VRAM scales with the (small,
+    // backpressure-bounded) in-flight frame count, not the total frame count. One reused upload
+    // stream is safe now because no device memory is ever shared between frames.
+    if (cudaStreamCreateWithFlags(&upload_stream_, cudaStreamNonBlocking) != cudaSuccess) {
+      throw std::runtime_error("failed to create offline source CUDA stream");
     }
   }
 
   void compute(holoscan::InputContext&, holoscan::OutputContext& op_output, holoscan::ExecutionContext&) override {
     const uint64_t frame_number = emitted_frames_ + 1;
     const bool drain_frame = emitted_frames_ >= real_frame_count_limit_;
-    auto& slot = slots_[static_cast<size_t>(emitted_frames_ % slots_.size())];
-    const auto sync_result = cudaStreamSynchronize(slot.stream);
-    if (sync_result != cudaSuccess) {
-      throw std::runtime_error("offline source failed to synchronize reusable CUDA stream");
-    }
 
     size_t complex_samples_read = 0;
     if (drain_frame) {
@@ -1600,22 +1628,35 @@ class OfflineSc16FileSourceOp : public holoscan::Operator {
                                  std::to_string(samples_per_frame_) +
                                  ". Short tail samples must be dropped before scheduling frames.");
       }
-      for (size_t index = 0; index < complex_samples_read; ++index) {
-        const auto* raw_sample = host_input_bytes_.data() + (index * input_format_.bytes_per_complex);
-        host_complex_[index] = decode_complex_sample(raw_sample, input_format_);
+      if (fast_copy_cf32_) {
+        std::memcpy(host_complex_.data(),
+                    host_input_bytes_.data(),
+                    complex_samples_read * sizeof(Complex));
+      } else {
+        for (size_t index = 0; index < complex_samples_read; ++index) {
+          const auto* raw_sample = host_input_bytes_.data() + (index * input_format_.bytes_per_complex);
+          host_complex_[index] = decode_complex_sample(raw_sample, input_format_);
+        }
       }
     }
 
-    const auto copy_result = cudaMemcpyAsync(slot.device_tensor.Data(),
+    // Fresh per-frame device tensor (reference-counted); freed once the sink drops the message.
+    // No slot reuse => the emitted handle always holds THIS frame's samples.
+    matx::tensor_t<Complex, 2> device_tensor;
+    make_tensor(device_tensor,
+                {static_cast<matx::index_t>(num_bursts_.get()),
+                 static_cast<matx::index_t>(burst_size_.get())},
+                MATX_DEVICE_MEMORY);
+    const auto copy_result = cudaMemcpyAsync(device_tensor.Data(),
                                              host_complex_.data(),
                                              host_complex_.size() * sizeof(Complex),
                                              cudaMemcpyHostToDevice,
-                                             slot.stream);
+                                             upload_stream_);
     if (copy_result != cudaSuccess) {
       throw std::runtime_error("offline source failed to upload IQ batch to device");
     }
 
-    const auto upload_sync_result = cudaStreamSynchronize(slot.stream);
+    const auto upload_sync_result = cudaStreamSynchronize(upload_stream_);
     if (upload_sync_result != cudaSuccess) {
       throw std::runtime_error("offline source failed to synchronize uploaded IQ batch");
     }
@@ -1656,19 +1697,16 @@ class OfflineSc16FileSourceOp : public holoscan::Operator {
       meta->set("offline_source_partial_frame", false);
     }
 
-    op_output.emit(FftInputMessage {slot.device_tensor, slot.stream}, "out");
+    op_output.emit(FftInputMessage {device_tensor, upload_stream_}, "out");
     emitted_frames_++;
   }
 
   void stop() override {
-    for (auto& slot : slots_) {
-      if (slot.stream != nullptr) {
-        cudaStreamSynchronize(slot.stream);
-        cudaStreamDestroy(slot.stream);
-        slot.stream = nullptr;
-      }
+    if (upload_stream_ != nullptr) {
+      cudaStreamSynchronize(upload_stream_);
+      cudaStreamDestroy(upload_stream_);
+      upload_stream_ = nullptr;
     }
-    slots_.clear();
     if (input_.is_open()) {
       input_.close();
     }
@@ -1676,11 +1714,6 @@ class OfflineSc16FileSourceOp : public holoscan::Operator {
   }
 
  private:
-  struct Slot {
-    matx::tensor_t<Complex, 2> device_tensor;
-    cudaStream_t stream = nullptr;
-  };
-
   holoscan::Parameter<std::string> input_file_path_;
   holoscan::Parameter<std::string> input_datatype_;
   holoscan::Parameter<int> num_bursts_;
@@ -1691,16 +1724,19 @@ class OfflineSc16FileSourceOp : public holoscan::Operator {
   holoscan::Parameter<int64_t> total_complex_samples_;
   holoscan::Parameter<int64_t> real_frame_count_;
   holoscan::Parameter<int64_t> drain_frame_count_;
-  holoscan::Parameter<int> ring_size_;
+  holoscan::Parameter<int> ring_size_;  // DEPRECATED/ignored: kept only so the existing
+                                        // Arg("ring_size") stays valid. Frames now use a fresh
+                                        // per-frame device tensor (no reusable ring).
 
   std::ifstream input_;
+  cudaStream_t upload_stream_ = nullptr;
   uint64_t emitted_frames_ = 0;
   uint64_t samples_per_frame_ = 0;
   uint64_t real_frame_count_limit_ = 0;
+  bool fast_copy_cf32_ = false;
   OfflineInputFormat input_format_;
   std::vector<uint8_t> host_input_bytes_;
   std::vector<Complex> host_complex_;
-  std::vector<Slot> slots_;
 };
 
 class SpectrogramArtifactSinkOp : public holoscan::Operator {
@@ -1860,6 +1896,11 @@ class MaskArtifactSinkOp : public holoscan::Operator {
                "Progress Every N Frames",
                "Log progress every N processed masks.",
                1);
+    spec.param(trace_frames_,
+               "trace_frames",
+               "Trace Frames",
+               "Emit one structured per-frame trace line (source offsets + mask non-zero count).",
+               false);
   }
 
   void initialize() override {
@@ -1950,6 +1991,24 @@ class MaskArtifactSinkOp : public holoscan::Operator {
                             mask,
                             meta);
 
+    if (trace_frames_.get()) {
+      uint64_t mask_nonzero = 0;
+      for (const uint8_t value : host_mask) {
+        mask_nonzero += (value != 0) ? 1U : 0U;
+      }
+      HOLOSCAN_LOG_INFO(
+          "[trace] ch={} frame={} file_offset={} data_end={} read={} padded={} mask={}x{} mask_nonzero={}",
+          mask.channel,
+          mask.frame_number,
+          meta ? meta->get<uint64_t>("offline_source_file_offset_complex", 0) : 0,
+          meta ? meta->get<uint64_t>("offline_source_data_end_complex", 0) : 0,
+          meta ? meta->get<uint64_t>("offline_source_complex_samples_read", 0) : 0,
+          meta ? meta->get<uint64_t>("offline_source_complex_samples_padded", 0) : 0,
+          mask.height,
+          mask.width,
+          mask_nonzero);
+    }
+
     processed_frames_++;
     const uint64_t complex_samples_read =
       mask.complex_samples_read != 0
@@ -1999,9 +2058,81 @@ class MaskArtifactSinkOp : public holoscan::Operator {
   holoscan::Parameter<int> output_width_;
   holoscan::Parameter<int64_t> total_frames_;
   holoscan::Parameter<int> progress_every_n_frames_;
+  holoscan::Parameter<bool> trace_frames_;
   uint64_t processed_frames_ = 0;
   uint64_t processed_complex_samples_ = 0;
 };
+
+// ---------------------------------------------------------------------------
+// Detector abstraction
+//
+// The offline eval graph is identical for every detector: the source frames the
+// SigMF file, FFT + (pass-through) Spectrogram produce the shared
+// {num_bursts, fft_bins} complex tensor, and the detector consumes it on port
+// "in" and emits a DetectorMaskMessage on "mask_out". The ONLY detector-specific
+// part is how the operator is constructed, so each detector is registered as a
+// small adapter. Adding a new detector = link its operator lib + add one entry
+// to detector_adapter_table() + ensure its config block exists.
+// ---------------------------------------------------------------------------
+struct DetectorAdapter {
+  std::string name;  // matches offline_eval.detector_type and the config block key
+  std::function<std::shared_ptr<holoscan::Operator>(holoscan::Application&, const EvalOverrides&)> make_op;
+};
+
+const std::vector<DetectorAdapter>& detector_adapter_table() {
+  static const std::vector<DetectorAdapter> table = {
+      DetectorAdapter {
+          "cuda_dino",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::CudaDinoDetector>(
+                "cudaDinoDetectorOpCh0",
+                app.from_config("cuda_dino_detector"),
+                holoscan::Arg("num_channels") = 1,
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1,
+                holoscan::Arg("debug_mode") = overrides.save_detector_debug_artifacts,
+                holoscan::Arg("enable_debug_artifact_host_copy") = overrides.save_detector_debug_artifacts,
+                holoscan::Arg("debug_artifact_output_dir") =
+                    (overrides.save_detector_debug_artifacts ? overrides.output_root.string() : std::string {}),
+                holoscan::Arg("save_aligned_spectrogram_preview") = overrides.save_spectrogram_preview,
+                holoscan::Arg("save_aligned_spectrogram_tensor") = overrides.save_spectrogram_tensor,
+                holoscan::Arg("aligned_spectrogram_output_height") = overrides.spectrogram_output_height,
+                holoscan::Arg("aligned_spectrogram_output_width") = overrides.spectrogram_output_width,
+                holoscan::Arg("aligned_spectrogram_output_dir") = overrides.output_root.string());
+          }},
+      DetectorAdapter {
+          "coherent_power",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::CoherentPowerSignalDetector>(
+                "coherentPowerSignalDetectorOpCh0",
+                app.from_config("coherent_power_signal_detector"),
+                holoscan::Arg("num_channels") = 1,
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          }},
+  };
+  return table;
+}
+
+const DetectorAdapter* find_detector_adapter(const std::string& detector_type) {
+  for (const auto& adapter : detector_adapter_table()) {
+    if (adapter.name == detector_type) {
+      return &adapter;
+    }
+  }
+  return nullptr;
+}
+
+std::string detector_adapter_names() {
+  std::string names;
+  for (const auto& adapter : detector_adapter_table()) {
+    if (!names.empty()) {
+      names += ", ";
+    }
+    names += adapter.name;
+  }
+  return names;
+}
 
 class OfflineCudaDetectorEvalApp : public holoscan::Application {
  public:
@@ -2035,7 +2166,7 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
         Arg("total_complex_samples") = static_cast<int64_t>(overrides_.total_complex_samples),
         Arg("real_frame_count") = static_cast<int64_t>(overrides_.total_frames),
         Arg("drain_frame_count") = static_cast<int64_t>(overrides_.drain_frame_count),
-        Arg("ring_size") = static_cast<int>(std::max<uint64_t>(1, overrides_.total_frames + overrides_.drain_frame_count)));
+        Arg("ring_size") = std::max(2, overrides_.source_ring_size));
 
     auto fft = make_operator<holoscan::ops::FFT>(
         "fftOpCh0",
@@ -2067,26 +2198,18 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
         Arg("output_width") = overrides_.spectrogram_output_width);
 
     std::fprintf(stderr,
-           "[offline_cuda_detector_eval] compose: creating detector debug_artifacts=%d aligned_preview=%d aligned_tensor=%d\n",
+           "[offline_cuda_detector_eval] compose: creating detector='%s' debug_artifacts=%d aligned_preview=%d aligned_tensor=%d\n",
+           overrides_.detector_type.c_str(),
            overrides_.save_detector_debug_artifacts ? 1 : 0,
            overrides_.save_spectrogram_preview ? 1 : 0,
            overrides_.save_spectrogram_tensor ? 1 : 0);
 
-    auto detector = make_operator<holoscan::ops::CudaDinoDetector>(
-        "cudaDinoDetectorOpCh0",
-        from_config("cuda_dino_detector"),
-        Arg("num_channels") = 1,
-        Arg("channel_filter") = overrides_.channel_number,
-        Arg("emit_stride") = 1,
-      Arg("debug_mode") = overrides_.save_detector_debug_artifacts,
-      Arg("enable_debug_artifact_host_copy") = overrides_.save_detector_debug_artifacts,
-      Arg("debug_artifact_output_dir") =
-        (overrides_.save_detector_debug_artifacts ? overrides_.output_root.string() : std::string {}),
-        Arg("save_aligned_spectrogram_preview") = overrides_.save_spectrogram_preview,
-        Arg("save_aligned_spectrogram_tensor") = overrides_.save_spectrogram_tensor,
-        Arg("aligned_spectrogram_output_height") = overrides_.spectrogram_output_height,
-        Arg("aligned_spectrogram_output_width") = overrides_.spectrogram_output_width,
-        Arg("aligned_spectrogram_output_dir") = overrides_.output_root.string());
+    const auto* detector_adapter = find_detector_adapter(overrides_.detector_type);
+    if (detector_adapter == nullptr) {
+      throw std::runtime_error("unknown offline_eval.detector_type '" + overrides_.detector_type +
+                               "'; known detectors: " + detector_adapter_names());
+    }
+    auto detector = detector_adapter->make_op(*this, overrides_);
 
     auto mask_sink = make_operator<MaskArtifactSinkOp>(
         "maskArtifactSinkOp",
@@ -2097,7 +2220,8 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
         Arg("output_height") = overrides_.spectrogram_output_height,
         Arg("output_width") = overrides_.spectrogram_output_width,
         Arg("total_frames") = static_cast<int64_t>(overrides_.total_frames),
-        Arg("progress_every_n_frames") = overrides_.progress_every_n_frames);
+        Arg("progress_every_n_frames") = overrides_.progress_every_n_frames,
+        Arg("trace_frames") = overrides_.trace_frames);
 
       std::fprintf(stderr, "[offline_cuda_detector_eval] compose: wiring flows\n");
 
@@ -2119,6 +2243,16 @@ EvalOverrides load_overrides(holoscan::Application& app,
   overrides.config_path = config_path;
   overrides.run_offline_on_file =
       usrp_wideband::from_config_or<bool>(app, "offline_eval.run_offline_on_file", true);
+  overrides.detector_type =
+      cli_options.detector_type.empty()
+          ? usrp_wideband::from_config_or<std::string>(app, "offline_eval.detector_type", std::string("cuda_dino"))
+          : cli_options.detector_type;
+  overrides.source_ring_size =
+      std::max(2, usrp_wideband::from_config_or<int>(app, "offline_eval.source_ring_size", 8));
+  overrides.trace_frames =
+      usrp_wideband::from_config_or<bool>(app, "offline_eval.trace_frames", false);
+  overrides.require_full_mask_coverage =
+      usrp_wideband::from_config_or<bool>(app, "offline_eval.require_full_mask_coverage", false);
   overrides.input_file_path = resolve_runtime_path(
       config_path,
       cli_options.input_file_path.empty()
@@ -2178,6 +2312,10 @@ EvalOverrides load_overrides(holoscan::Application& app,
   if (!overrides.run_offline_on_file) {
     throw std::runtime_error("offline_eval.run_offline_on_file must be true for run_offline_cuda_detector_eval");
   }
+  if (find_detector_adapter(overrides.detector_type) == nullptr) {
+    throw std::runtime_error("unknown offline_eval.detector_type '" + overrides.detector_type +
+                             "'; known detectors: " + detector_adapter_names());
+  }
   if (overrides.input_file_path.empty()) {
     throw std::runtime_error("offline_eval.input_file_path is required or pass --input-file");
   }
@@ -2234,8 +2372,15 @@ int main(int argc, char** argv) {
     app->set_overrides(overrides);
     std::fprintf(stderr, "[offline_cuda_detector_eval] main: creating scheduler\n");
     std::fflush(stderr);
-    app->scheduler(app->make_scheduler<holoscan::EventBasedScheduler>("event-based-scheduler",
-                                      app->from_config("scheduler")));
+    // Synchronous GreedyScheduler for offline eval. Correctness of the frame<->mask mapping
+    // is guaranteed by the fresh-per-frame device tensor in the source (no buffer aliasing);
+    // Greedy is chosen because it keeps the number of in-flight frames small and deterministic,
+    // which bounds peak VRAM (fresh per-frame tensors are freed once the sink drops each message)
+    // and gives reproducible ordering. Throughput is lower; offline eval doesn't care.
+    app->scheduler(app->make_scheduler<holoscan::GreedyScheduler>(
+        "greedy-scheduler",
+        holoscan::Arg("stop_on_deadlock") = true,
+        holoscan::Arg("stop_on_deadlock_timeout") = static_cast<int64_t>(10000)));
 
     if (!overrides.input_sigmf_meta_path.empty()) {
       HOLOSCAN_LOG_INFO("Using SigMF metadata '{}' datatype='{}' sample_rate_hz={}",

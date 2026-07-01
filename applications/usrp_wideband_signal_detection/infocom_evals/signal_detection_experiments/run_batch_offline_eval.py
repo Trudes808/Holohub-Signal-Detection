@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Batch orchestrator: run every capture through every detector, offline.
+
+Drives ``run_cuda_dino_offline_file.py`` (the docker-exec offline wrapper) over the
+cross-product of {captures} x {detectors}, one GPU job at a time (single GPU, so the
+detectors serialise), with resume/skip-completed, lazy per-file staging cleanup, and
+optional per-job metrics + mask repacking.
+
+Layout produced::
+
+    <output-root>/<detector>/<file_stem>/   (frame_manifest.csv, mask_arrays/, gt_masks/, ...)
+    <state-dir>/batch_state.json            (resume state)
+
+Typical run (masks only, both detectors, all 15 captures)::
+
+    python3 run_batch_offline_eval.py \
+        --captures-dir /home/bqn82/captures \
+        --run-id sweep_2026_06_30 \
+        --progress-every 25
+
+Because each GPU job is a ``sudo docker exec`` into the demo container, this script
+must run where ``sudo docker`` works (i.e. the user's shell, not a sandbox).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+APP_DIR = Path(__file__).resolve().parents[2]
+OFFLINE_WRAPPER = APP_DIR / "run_cuda_dino_offline_file.py"
+DEFAULT_CAPTURES_DIR = Path("/home/bqn82/captures")
+HOST_SCRATCH_ROOT = Path("/tmp/usrp_spectrograms")
+DEFAULT_OUTPUT_ROOT = HOST_SCRATCH_ROOT / "batch_eval"
+DEFAULT_DETECTORS = ["cuda_dino", "coherent_power"]
+
+
+def discover_captures(captures_dir: Path, only: Optional[list[str]]) -> list[Path]:
+    """Return sorted *.sigmf-data files, optionally filtered to a list of stems."""
+    files = sorted(captures_dir.glob("*.sigmf-data"))
+    if only:
+        wanted = set(only)
+        files = [f for f in files if _stem(f) in wanted]
+    return files
+
+
+def _stem(data_path: Path) -> str:
+    name = data_path.name
+    return name[: -len(".sigmf-data")] if name.endswith(".sigmf-data") else data_path.stem
+
+
+def run_dir_complete(run_dir: Path) -> bool:
+    """A run is complete if its summary says manifest_complete and the manifest exists."""
+    summary = run_dir / "offline_eval_summary.json"
+    manifest = run_dir / "frame_manifest.csv"
+    if not summary.exists() or not manifest.exists():
+        return False
+    try:
+        return bool(json.loads(summary.read_text()).get("manifest_complete", False))
+    except Exception:
+        return False
+
+
+def staged_input_dir(file_stem: str) -> Path:
+    return HOST_SCRATCH_ROOT / "offline_inputs" / file_stem
+
+
+def cleanup_staged_input(file_stem: str) -> None:
+    staged = staged_input_dir(file_stem)
+    if staged.exists():
+        # staged via `sudo cp`, so removal also needs sudo
+        subprocess.run(["sudo", "rm", "-rf", str(staged)], check=False)
+
+
+def repack_masks(run_dir: Path) -> None:
+    """Compress mask_arrays/ and gt_masks/ .npy into packbits .npz, removing raw .npy.
+
+    Saves ~8x on binary masks. The metrics loader transparently reads either form.
+    """
+    import numpy as np
+
+    for subdir in ("mask_arrays", "gt_masks"):
+        d = run_dir / subdir
+        if not d.exists():
+            continue
+        for npy in d.glob("*.npy"):
+            arr = (np.load(npy) != 0)
+            packed = np.packbits(arr.reshape(-1))
+            np.savez_compressed(
+                npy.with_suffix(".packed.npz"),
+                packed=packed, rows=arr.shape[0], cols=arr.shape[1],
+            )
+            npy.unlink()
+
+
+def run_one(
+    data_path: Path,
+    detector: str,
+    output_root: Path,
+    progress_every: int,
+    save_tensors: bool,
+    trace_frames: bool,
+    dry_run: bool,
+) -> int:
+    file_stem = _stem(data_path)
+    run_dir = output_root / detector / file_stem
+    cmd = [
+        sys.executable, str(OFFLINE_WRAPPER), str(data_path),
+        "--detector", detector,
+        "--output-root", str(run_dir),
+        "--progress-every", str(progress_every),
+    ]
+    if not save_tensors:
+        cmd.append("--no-tensors")
+    if trace_frames:
+        cmd.append("--trace-frames")
+    if dry_run:
+        cmd.append("--dry-run")
+    print(f"  $ {' '.join(cmd)}", flush=True)
+    completed = subprocess.run(cmd, cwd=str(APP_DIR))
+    return completed.returncode
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--captures-dir", default=str(DEFAULT_CAPTURES_DIR),
+                        help="Directory of *.sigmf-data + *.sigmf-meta captures.")
+    parser.add_argument("--detectors", nargs="+", default=DEFAULT_DETECTORS,
+                        help="Detectors to run (default: cuda_dino coherent_power).")
+    parser.add_argument("--only", nargs="+", default=None,
+                        help="Restrict to these capture stems (e.g. attenuation_dB_0).")
+    parser.add_argument("--run-id", required=True, help="Identifier for this batch run.")
+    parser.add_argument("--output-root", default=None,
+                        help="Mask/GT output root (default /tmp/usrp_spectrograms/batch_eval/<run_id>).")
+    parser.add_argument("--state-dir", default=None,
+                        help="Where batch_state.json lives (default ./batch_runs/<run_id>).")
+    parser.add_argument("--progress-every", type=int, default=25)
+    parser.add_argument("--save-tensors", action="store_true",
+                        help="Also save spectrogram tensors/previews (huge; off by default).")
+    parser.add_argument("--trace-frames", action="store_true")
+    parser.add_argument("--repack-masks", action="store_true",
+                        help="After each job, packbits-compress masks and delete raw .npy.")
+    parser.add_argument("--keep-staged", action="store_true",
+                        help="Do not delete the staged input copy after each job.")
+    parser.add_argument("--force", action="store_true", help="Re-run even if a run looks complete.")
+    parser.add_argument("--dry-run", action="store_true", help="Print commands only.")
+    args = parser.parse_args()
+
+    captures_dir = Path(args.captures_dir).expanduser().resolve()
+    output_root = Path(args.output_root) if args.output_root else DEFAULT_OUTPUT_ROOT / args.run_id
+    state_dir = Path(args.state_dir) if args.state_dir else (Path(__file__).resolve().parent / "batch_runs" / args.run_id)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / "batch_state.json"
+
+    captures = discover_captures(captures_dir, args.only)
+    if not captures:
+        print(f"No captures found under {captures_dir}")
+        return 1
+
+    jobs = [(det, cap) for det in args.detectors for cap in captures]
+    print(f"Batch '{args.run_id}': {len(captures)} captures x {len(args.detectors)} detectors "
+          f"= {len(jobs)} jobs -> {output_root}")
+
+    state = {"run_id": args.run_id, "jobs": {}}
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text())
+            state.setdefault("jobs", {})
+        except Exception:
+            pass
+
+    def save_state():
+        state_path.write_text(json.dumps(state, indent=2))
+
+    completed = skipped = failed = misaligned = 0
+    for index, (detector, data_path) in enumerate(jobs, start=1):
+        file_stem = _stem(data_path)
+        run_dir = output_root / detector / file_stem
+        job_key = f"{detector}/{file_stem}"
+        print(f"\n[{index}/{len(jobs)}] {job_key}")
+
+        if not args.force and run_dir_complete(run_dir):
+            print("  already complete -> skip")
+            state["jobs"][job_key] = {"status": "complete", "run_dir": str(run_dir)}
+            skipped += 1
+            save_state()
+            continue
+
+        meta = data_path.with_name(file_stem + ".sigmf-meta")
+        if not meta.exists():
+            print(f"  MISSING meta {meta} -> skip")
+            state["jobs"][job_key] = {"status": "missing_meta"}
+            failed += 1
+            save_state()
+            continue
+
+        state["jobs"][job_key] = {"status": "running", "run_dir": str(run_dir),
+                                  "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        save_state()
+
+        start = time.time()
+        rc = run_one(data_path, detector, output_root, args.progress_every,
+                     args.save_tensors, args.trace_frames, args.dry_run)
+        elapsed = time.time() - start
+
+        if args.dry_run:
+            state["jobs"][job_key] = {"status": "dry_run"}
+            save_state()
+            continue
+
+        ok = rc == 0 and run_dir_complete(run_dir)
+
+        # Self-check for the ring-aliasing frame<->mask desync: masks should align at
+        # frame offset k=0. A non-zero offset (e.g. +ring_size) means a stale/buggy binary.
+        alignment_k = None
+        if ok:
+            try:
+                from check_mask_alignment import measure_offset
+                alignment_k, _corr, _curve = measure_offset(run_dir)
+                if alignment_k not in (0, None):
+                    misaligned += 1
+                    print(f"  !! ALIGNMENT WARNING: masks lead GT by {alignment_k} frames "
+                          f"(ring-aliasing / stale binary) — REBUILD and re-run.")
+            except Exception as exc:
+                print(f"  alignment check warning: {exc}")
+
+        if ok and args.repack_masks:
+            try:
+                repack_masks(run_dir)
+            except Exception as exc:  # repack failure shouldn't fail the job
+                print(f"  repack warning: {exc}")
+        if not args.keep_staged:
+            cleanup_staged_input(file_stem)
+
+        state["jobs"][job_key] = {
+            "status": "complete" if ok else "failed",
+            "run_dir": str(run_dir),
+            "returncode": rc,
+            "elapsed_sec": round(elapsed, 1),
+            "alignment_frame_offset": alignment_k,
+            "finished": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        save_state()
+        if ok:
+            completed += 1
+            print(f"  done in {elapsed:.0f}s")
+        else:
+            failed += 1
+            print(f"  FAILED rc={rc} (see logs above)")
+
+    print(f"\nBatch '{args.run_id}' summary: {completed} done, {skipped} skipped, {failed} failed.")
+    if misaligned:
+        print(f"  !! {misaligned} run(s) had FRAME-MISALIGNED masks (ring-aliasing / stale binary). "
+              f"Rebuild the container and re-run those before trusting results.")
+    print(f"State: {state_path}")
+    print(f"Next: python3 eval_detector_masks.py --batch-root {output_root} "
+          f"--captures-dir {captures_dir} --out-dir {state_dir}")
+    return 0 if failed == 0 else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

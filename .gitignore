@@ -52,6 +52,8 @@ tmp/
 .wget-hsts
 .viminfo
 .lesshst
+CLAUDE.local.md
+.claude/settings.local.json
 
 # Licenses
 rti_license.dat

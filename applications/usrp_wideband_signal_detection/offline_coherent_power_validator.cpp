@@ -161,6 +161,7 @@ SnapshotMetadata load_snapshot_metadata(const std::filesystem::path& metadata_pa
   metadata.config.frontend_reference_q = extract_number<double>(text, "frontend_reference_q").value_or(metadata.config.frontend_reference_q);
   metadata.config.frontend_smooth_sigma = extract_number<double>(text, "frontend_smooth_sigma").value_or(metadata.config.frontend_smooth_sigma);
   metadata.config.frontend_max_boost_db = extract_number<double>(text, "frontend_max_boost_db").value_or(metadata.config.frontend_max_boost_db);
+  metadata.config.frontend_signal_cap_db = extract_number<double>(text, "frontend_signal_cap_db").value_or(metadata.config.frontend_signal_cap_db);
   metadata.config.coherence_weight = extract_number<double>(text, "coherence_weight").value_or(metadata.config.coherence_weight);
   metadata.config.power_weight = extract_number<double>(text, "power_weight").value_or(metadata.config.power_weight);
   metadata.config.power_assist_mode = extract_string(text, "power_assist_mode").value_or(metadata.config.power_assist_mode);
@@ -556,16 +557,46 @@ int main(int argc, char** argv) {
       log_stage("[offline_coherent_power_validator] writing validator artifacts...");
     }
 
+    const auto power_db_npy = options.output_dir / "offline_power_db.npy";
     const auto corrected_npy = options.output_dir / "offline_corrected_sxx_db.npy";
+    const auto merged_coherence_npy = options.output_dir / "offline_merged_coherence.npy";
+    const auto merged_power_npy = options.output_dir / "offline_merged_power.npy";
+    const auto merged_score_npy = options.output_dir / "offline_merged_score.npy";
     const auto raw_projected_mask_npy = options.output_dir / "offline_raw_projected_mask.npy";
     const auto mask_npy = options.output_dir / "offline_final_mask.npy";
+    const auto power_db_pgm = options.output_dir / "offline_power_db_preview.pgm";
     const auto corrected_pgm = options.output_dir / "offline_corrected_preview.pgm";
     const auto raw_projected_mask_pgm = options.output_dir / "offline_raw_projected_mask.pgm";
     const auto mask_pgm = options.output_dir / "offline_final_mask.pgm";
     const auto overlay_pgm = options.output_dir / "offline_mask_overlay.pgm";
     const auto summary_json = options.output_dir / "offline_validation_summary.json";
 
+    write_npy_2d(power_db_npy, result.power_db.data(), result.power_db.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
     write_npy_2d(corrected_npy, result.corrected_sxx_db.data(), result.corrected_sxx_db.size() * sizeof(float), result.src_rows, result.src_cols, "<f4");
+    if (!result.merged_coherence.empty()) {
+      write_npy_2d(merged_coherence_npy,
+                   result.merged_coherence.data(),
+                   result.merged_coherence.size() * sizeof(float),
+                   result.src_rows,
+                   result.src_cols,
+                   "<f4");
+    }
+    if (!result.merged_power.empty()) {
+      write_npy_2d(merged_power_npy,
+                   result.merged_power.data(),
+                   result.merged_power.size() * sizeof(float),
+                   result.src_rows,
+                   result.src_cols,
+                   "<f4");
+    }
+    if (!result.merged_score.empty()) {
+      write_npy_2d(merged_score_npy,
+                   result.merged_score.data(),
+                   result.merged_score.size() * sizeof(float),
+                   result.src_rows,
+                   result.src_cols,
+                   "<f4");
+    }
     if (!result.raw_projected_mask.empty()) {
       write_npy_2d(raw_projected_mask_npy,
                    result.raw_projected_mask.data(),
@@ -576,6 +607,7 @@ int main(int argc, char** argv) {
     }
     write_npy_2d(mask_npy, result.final_mask.data(), result.final_mask.size() * sizeof(float), result.dst_rows, result.dst_cols, "<f4");
 
+    const auto power_db_preview = normalize_to_u8(result.power_db);
     const auto corrected_preview = normalize_to_u8(result.corrected_sxx_db);
     const auto raw_projected_mask_preview = normalize_to_u8(result.raw_projected_mask);
     const auto final_mask_preview = normalize_to_u8(result.final_mask);
@@ -593,6 +625,7 @@ int main(int argc, char** argv) {
       return result.grouped_boxes[lhs].filled_area > result.grouped_boxes[rhs].filled_area;
     });
     const size_t grouped_box_debug_count = std::min<size_t>(5, grouped_box_order.size());
+    write_pgm(power_db_pgm, power_db_preview, result.src_cols, result.src_rows);
     write_pgm(corrected_pgm, corrected_preview, result.src_cols, result.src_rows);
     if (!raw_projected_mask_preview.empty()) {
       write_pgm(raw_projected_mask_pgm, raw_projected_mask_preview, result.src_cols, result.src_rows);
@@ -625,6 +658,22 @@ int main(int argc, char** argv) {
         summary << "  \"final_mask_fill_ratio\": " << final_mask_fill_ratio << ",\n";
     summary << "  \"merged_threshold\": " << result.merged_threshold << ",\n";
     summary << "  \"seed_threshold\": " << result.seed_threshold << ",\n";
+        summary << "  \"power_db_npy\": \"" << power_db_npy.string() << "\",\n";
+        if (!result.merged_coherence.empty()) {
+          summary << "  \"merged_coherence_npy\": \"" << merged_coherence_npy.string() << "\",\n";
+        } else {
+          summary << "  \"merged_coherence_npy\": null,\n";
+        }
+        if (!result.merged_power.empty()) {
+          summary << "  \"merged_power_npy\": \"" << merged_power_npy.string() << "\",\n";
+        } else {
+          summary << "  \"merged_power_npy\": null,\n";
+        }
+        if (!result.merged_score.empty()) {
+          summary << "  \"merged_score_npy\": \"" << merged_score_npy.string() << "\",\n";
+        } else {
+          summary << "  \"merged_score_npy\": null,\n";
+        }
         if (!result.raw_projected_mask.empty()) {
           summary << "  \"raw_projected_mask_npy\": \"" << raw_projected_mask_npy.string() << "\",\n";
           summary << "  \"raw_projected_mask_pgm\": \"" << raw_projected_mask_pgm.string() << "\",\n";
@@ -653,6 +702,7 @@ int main(int argc, char** argv) {
         summary << "  ],\n";
     summary << "  \"corrected_sxx_db_npy\": \"" << corrected_npy.string() << "\",\n";
     summary << "  \"final_mask_npy\": \"" << mask_npy.string() << "\",\n";
+    summary << "  \"power_db_preview_pgm\": \"" << power_db_pgm.string() << "\",\n";
     summary << "  \"corrected_preview_pgm\": \"" << corrected_pgm.string() << "\",\n";
     summary << "  \"final_mask_pgm\": \"" << mask_pgm.string() << "\",\n";
     summary << "  \"overlay_pgm\": \"" << overlay_pgm.string() << "\"\n";

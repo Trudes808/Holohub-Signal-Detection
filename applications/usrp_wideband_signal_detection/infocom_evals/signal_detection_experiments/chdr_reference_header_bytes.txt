@@ -1,0 +1,29 @@
+# CHDR reference capture (X410 UC_200, 245.76 MSps, --keep-hdr, single channel)
+# Captured 2026-06-30T17:05:10Z via config_coherent_power_capture_chdr_single_channel.yaml on port 0000:a2:00.0
+
+## Segment lengths (eth/ip/udp | CHDR header line | payload):
+[[32minfo[m] [chdr_rx.cu:971] Segment 0 length: 42, Segment 1 length: 64, Segment 2 length: 4064
+[[32minfo[m] [chdr_rx.cu:971] Segment 0 length: 42, Segment 1 length: 64, Segment 2 length: 4064
+[[32minfo[m] [chdr_rx.cu:971] Segment 0 length: 42, Segment 1 length: 64, Segment 2 length: 4064
+
+## Segment 1 (64-byte CHDR header line) samples:
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb 95 e0 00 b0 45 a3 36 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 2c 00 e7 ff 1c 00 f5 ff d4 ff c9 ff 06 00 03 00 e7 ff ef ff da ff e7 ff f6 ff 08 00 f8 ff ca ff 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb 99 e0 00 b0 45 b3 36 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10 00 28 00 f6 ff 28 00 32 00 d4 ff 4d 00 0a 00 e9 ff 0d 00 33 00 e6 ff 0e 00 ed ff f3 ff fc ff 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb 9d e0 00 b0 45 c3 36 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 d4 ff 16 00 e1 ff d9 ff e4 ff 0a 00 ed ff 02 00 fe ff ed ff ef ff ed ff 04 00 c2 ff 01 00 25 00 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb a1 e0 00 b0 45 d3 36 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 fd ff 1c 00 3c 00 06 00 e8 ff d4 ff 22 00 16 00 f0 ff 12 00 f5 ff 1a 00 d5 ff 0e 00 e6 ff f5 ff 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb a5 e0 00 b0 45 e3 36 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 37 00 f1 ff f9 ff 05 00 30 00 10 00 0c 00 64 00 e3 ff 33 00 12 00 0b 00 03 00 ef ff fd ff e9 ff 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb a9 e0 00 b0 45 f3 36 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 e4 ff 10 00 c0 ff f4 ff f9 ff fd ff e9 ff ff ff db ff fd ff 0e 00 42 00 3b 00 07 00 d0 ff 0c 00 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb ad e0 00 b0 45 03 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 03 00 05 00 f7 ff 04 00 04 00 f5 ff fb ff cf ff 01 00 d3 ff 07 00 fa ff 23 00 eb ff 02 00 32 00 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb b1 e0 00 b0 45 13 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 f5 ff 3c 00 00 00 53 00 17 00 e3 ff b5 ff b4 ff f8 ff e2 ff 2c 00 43 00 1c 00 28 00 3d 00 1b 00 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb b5 e0 00 b0 45 23 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 d2 ff 37 00 e6 ff e7 ff 1f 00 dd ff c9 ff c4 ff 01 00 eb ff 05 00 f2 ff 18 00 2d 00 fc ff 11 00 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb b9 e0 00 b0 45 33 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 fd ff 16 00 ea ff 18 00 11 00 03 00 19 00 19 00 16 00 eb ff 26 00 df ff 1c 00 fa ff 24 00 f3 ff 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb bd e0 00 b0 45 43 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 fe ff 2a 00 d6 ff 16 00 1c 00 16 00 17 00 0d 00 20 00 0e 00 1a 00 2d 00 f3 ff fd ff 23 00 d6 ff 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb c1 e0 00 b0 45 53 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0a 00 1a 00 13 00 f4 ff 03 00 df ff 14 00 ed ff 13 00 e8 ff f9 ff ec ff e9 ff e8 ff 06 00 26 00 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb c5 e0 00 b0 45 63 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 28 00 ea ff c8 ff df ff e1 ff 11 00 32 00 d1 ff 11 00 f5 ff ff ff 0a 00 e7 ff c7 ff db ff 07 00 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb c9 e0 00 b0 45 73 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 16 00 27 00 fe ff e2 ff f9 ff 02 00 36 00 35 00 2d 00 1b 00 25 00 19 00 60 00 d8 ff d2 ff ef ff 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb cd e0 00 b0 45 83 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 f8 ff ed ff c3 ff 09 00 da ff 05 00 de ff ed ff ff ff 2d 00 db ff 33 00 e0 ff 15 00 f4 ff c6 ff 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb d1 e0 00 b0 45 93 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 22 00 0f 00 43 00 f5 ff 1f 00 16 00 03 00 bd ff ea ff fc ff ee ff d9 ff 13 00 07 00 ca ff 31 00 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb d5 e0 00 b0 45 a3 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 06 00 ec ff 00 00 39 00 d1 ff 1a 00 2e 00 01 00 12 00 f5 ff f8 ff 29 00 1f 00 04 00 d7 ff ea ff 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb d9 e0 00 b0 45 b3 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 e7 ff 0c 00 bd ff 13 00 d2 ff 35 00 d8 ff f9 ff d2 ff e0 ff 30 00 0f 00 f9 ff df ff 25 00 24 00 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb dd e0 00 b0 45 c3 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1f 00 ea ff e4 ff f2 ff f5 ff 16 00 1e 00 1b 00 d7 ff f5 ff 02 00 2e 00 27 00 fa ff f1 ff 0d 00 
+[[32minfo[m] [chdr_rx.cu:992] Segment '1' bytes: 03 00 20 10 fb e1 e0 00 b0 45 d3 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 f7 ff 1c 00 e6 ff 03 00 de ff 29 00 fe ff 20 00 20 00 fd ff 11 00 eb ff 00 00 24 00 f1 ff 09 00 
