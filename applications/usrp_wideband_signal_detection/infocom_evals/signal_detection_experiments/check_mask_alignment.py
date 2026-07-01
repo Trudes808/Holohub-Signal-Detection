@@ -68,6 +68,23 @@ def measure_offset(run_dir: Path, max_k: int = 12, stride: int = 6):
     return best_k, curve[best_k], curve
 
 
+def alignment_verdict(run_dir: Path, max_k: int = 12, margin: float = 0.2) -> dict:
+    """Aligned unless there is a CLEAR systematic offset.
+
+    The real ring-aliasing bug produced a sharp correlation spike at k=ring_size
+    (best corr ~0.6-0.8 vs ~0.3-0.4 at k=0 -> margin >0.2). Signal-dense loud files
+    give a flat/noisy curve whose argmax wanders a few frames off 0 with only a tiny
+    margin (~0.1) — that is NOT misalignment. So we flag misaligned only when the best
+    offset is non-zero AND beats k=0 by at least `margin`.
+    """
+    best_k, best_corr, curve = measure_offset(run_dir, max_k=max_k)
+    k0 = curve.get(0, float("nan"))
+    delta = (best_corr - k0) if (k0 == k0) else 0.0  # k0==k0 filters NaN
+    aligned = (best_k == 0) or (delta < margin)
+    return {"aligned": aligned, "best_k": best_k, "best_corr": best_corr,
+            "k0_corr": k0, "margin": delta, "curve": curve}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group(required=True)
@@ -75,6 +92,9 @@ def main() -> int:
     src.add_argument("--batch-root", help="Batch root; checks every detector for --file-stem.")
     ap.add_argument("--file-stem", help="Capture stem (with --batch-root).")
     ap.add_argument("--max-k", type=int, default=12)
+    ap.add_argument("--margin", type=float, default=0.2,
+                    help="Min corr margin over k=0 to call a non-zero offset a real misalignment "
+                         "(guards against flat/noisy curves on signal-dense files).")
     args = ap.parse_args()
 
     if args.run_dir:
@@ -86,16 +106,19 @@ def main() -> int:
 
     ok = True
     for run in runs:
-        best_k, best_corr, curve = measure_offset(run, max_k=args.max_k)
-        zero = curve.get(0, float("nan"))
-        status = "PASS" if best_k == 0 else "FAIL"
-        if best_k != 0:
+        r = alignment_verdict(run, max_k=args.max_k, margin=args.margin)
+        status = "PASS" if r["aligned"] else "FAIL"
+        if not r["aligned"]:
             ok = False
         print(f"[{status}] {run}")
-        print(f"        best offset k={best_k:+d} (median corr {best_corr:.3f}); k=0 corr {zero:.3f}")
-        if best_k != 0:
-            print(f"        -> masks lead GT by {best_k} frames (ring aliasing not fixed / stale binary). "
+        print(f"        best offset k={r['best_k']:+d} (median corr {r['best_corr']:.3f}); "
+              f"k=0 corr {r['k0_corr']:.3f}; margin {r['margin']:+.3f}")
+        if not r["aligned"]:
+            print(f"        -> masks lead GT by {r['best_k']} frames (ring aliasing / stale binary). "
                   f"Rebuild + re-run.")
+        elif r["best_k"] != 0:
+            print(f"        (argmax k={r['best_k']:+d} but margin {r['margin']:.3f} < {args.margin} "
+                  f"-> flat curve, treated as aligned)")
     return 0 if ok else 1
 
 

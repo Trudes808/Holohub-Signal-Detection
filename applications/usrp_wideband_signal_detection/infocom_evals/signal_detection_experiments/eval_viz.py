@@ -431,3 +431,83 @@ def sample_review_frames(batch_root: Path, file_stem: str, n_annotated: int = 5,
         "noise_frames": picked_noise,
         "review_frames": picked_ann + picked_noise,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Filtered frame selection (by signal class / bandwidth / pulse-length buckets)
+# Uses the region_metrics.csv table (has the re-joined per-annotation attributes),
+# so it can pick example frames containing a given signal type / bandwidth / duration.
+# --------------------------------------------------------------------------- #
+def load_region_table(region_csv: Path) -> list[dict]:
+    """Load region_metrics.csv (from eval_detector_masks.py) as a list of dict rows."""
+    import csv
+    with open(Path(region_csv), newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def filter_options(region_rows: list[dict], file_stem: str) -> dict:
+    """Available {signal_class, bandwidth, pulse_length} bucket values (with counts)
+    for a given capture stem — the menu of what you can filter on."""
+    from collections import Counter
+    rows = [r for r in region_rows if r.get("file_stem") == file_stem]
+
+    def counts(col):
+        return dict(Counter(r.get(col, "") for r in rows))
+
+    return {
+        "file_stem": file_stem,
+        "n_annotation_rows": len(rows),
+        "signal_class": counts("bucket_signal_class"),
+        "bandwidth": counts("bucket_bandwidth"),
+        "pulse_length": counts("bucket_pulse_length"),
+    }
+
+
+def frames_matching(region_rows: list[dict], file_stem: str,
+                    signal_class: Optional[str] = None,
+                    bandwidth: Optional[str] = None,
+                    pulse_length: Optional[str] = None,
+                    detector: Optional[str] = None) -> list[int]:
+    """Sorted, de-duplicated frame numbers for `file_stem` whose annotations match the
+    given bucket filters (any of which may be None = 'any'). GT is detector-independent,
+    so `detector` only limits which run's rows are scanned (defaults to any)."""
+    out = set()
+    for r in region_rows:
+        if r.get("file_stem") != file_stem:
+            continue
+        if detector and r.get("detector") != detector:
+            continue
+        if signal_class and r.get("bucket_signal_class") != signal_class:
+            continue
+        if bandwidth and r.get("bucket_bandwidth") != bandwidth:
+            continue
+        if pulse_length and r.get("bucket_pulse_length") != pulse_length:
+            continue
+        try:
+            out.add(int(r["frame_number"]))
+        except (KeyError, ValueError):
+            continue
+    return sorted(out)
+
+
+def pick_spread(items: list, n: int) -> list:
+    """Evenly-spaced subset of up to `n` items (first/…/last) for varied examples."""
+    if len(items) <= n:
+        return list(items)
+    idx = [round(i * (len(items) - 1) / (n - 1)) for i in range(n)] if n > 1 else [0]
+    return [items[i] for i in sorted(set(idx))]
+
+
+def select_frames(batch_root: Path, region_rows: list[dict], file_stem: str,
+                  signal_class: Optional[str] = None, bandwidth: Optional[str] = None,
+                  pulse_length: Optional[str] = None) -> list[int]:
+    """Frames to visualize for the filter cell.
+
+    The special class ``'noise'`` returns **blank / noise-only** frames (no GT annotations),
+    ignoring the bandwidth/duration filters. Any other class delegates to ``frames_matching``.
+    """
+    if signal_class and signal_class.lower() == "noise":
+        _annotated, noise = classify_frames(batch_root, file_stem)
+        return noise
+    return frames_matching(region_rows, file_stem, signal_class=signal_class,
+                           bandwidth=bandwidth, pulse_length=pulse_length)

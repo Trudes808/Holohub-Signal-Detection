@@ -33,10 +33,14 @@ from pathlib import Path
 from typing import Optional
 
 APP_DIR = Path(__file__).resolve().parents[2]
+EXPERIMENTS_DIR = Path(__file__).resolve().parent
 OFFLINE_WRAPPER = APP_DIR / "run_cuda_dino_offline_file.py"
 DEFAULT_CAPTURES_DIR = Path("/home/bqn82/captures")
 HOST_SCRATCH_ROOT = Path("/tmp/usrp_spectrograms")
-DEFAULT_OUTPUT_ROOT = HOST_SCRATCH_ROOT / "batch_eval"
+# Outputs (masks/GT/manifests + state + metrics) live under the in-repo, git-ignored
+# batch_runs/ dir. The repo is bind-mounted read-write at /workspace/holohub in the demo
+# container, so the binary can write here; the wrapper maps the path into the container.
+DEFAULT_OUTPUT_ROOT = EXPERIMENTS_DIR / "batch_runs"
 DEFAULT_DETECTORS = ["cuda_dino", "coherent_power"]
 
 
@@ -126,6 +130,55 @@ def run_one(
     return completed.returncode
 
 
+def run_post_pipeline(output_root: Path, captures_dir: Path, tables_dir: Path,
+                      det_threshold: float) -> bool:
+    """Run metrics (eval_detector_masks) then plots (plot_eval_results) in series.
+
+    Uses this run's own resolved paths so it stays consistent regardless of --output-root.
+    Returns True if both succeeded.
+    """
+    py = sys.executable
+    eval_cmd = [py, str(EXPERIMENTS_DIR / "eval_detector_masks.py"),
+                "--batch-root", str(output_root), "--captures-dir", str(captures_dir),
+                "--out-dir", str(tables_dir)]
+    print(f"\n[post] metrics: {' '.join(eval_cmd)}", flush=True)
+    if subprocess.run(eval_cmd, cwd=str(EXPERIMENTS_DIR)).returncode != 0:
+        print("[post] eval_detector_masks.py FAILED; skipping plots.")
+        return False
+    plot_cmd = [py, str(EXPERIMENTS_DIR / "plot_eval_results.py"),
+                "--tables-dir", str(tables_dir), "--det-threshold", str(det_threshold)]
+    print(f"[post] plots: {' '.join(plot_cmd)}", flush=True)
+    if subprocess.run(plot_cmd, cwd=str(EXPERIMENTS_DIR)).returncode != 0:
+        print("[post] plot_eval_results.py FAILED.")
+        return False
+    return True
+
+
+def print_notebook_setup(output_root: Path, tables_dir: Path, det_threshold: float,
+                         file_stem: str, post_ok: bool) -> None:
+    """Tell the user exactly which notebook cells to edit so all viz lives in the notebook."""
+    nb = EXPERIMENTS_DIR / "batch_eval_review.ipynb"
+    bar = "=" * 78
+    print(f"\n{bar}")
+    print("VISUALIZE IN THE NOTEBOOK")
+    print(f"  Open: {nb}")
+    print("  Restart the kernel, edit the two cells below, then Run All:")
+    print()
+    print("  [Parameters cell — the FIRST code cell]:")
+    print(f"      BATCH_ROOT = Path('{output_root}')")
+    print(f"      FILE_STEM  = '{file_stem}'")
+    print()
+    print("  ['Aggregate performance plots' cell — near the BOTTOM]:")
+    print(f"      TABLES_DIR    = Path('{tables_dir}')")
+    print(f"      DET_THRESHOLD = {det_threshold}")
+    print()
+    if post_ok:
+        print(f"  Static PNGs already written to: {tables_dir / 'plots'}")
+    else:
+        print("  (Post pipeline did not complete — run eval_detector_masks.py + plot_eval_results.py manually.)")
+    print(bar)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -137,9 +190,9 @@ def main() -> int:
                         help="Restrict to these capture stems (e.g. attenuation_dB_0).")
     parser.add_argument("--run-id", required=True, help="Identifier for this batch run.")
     parser.add_argument("--output-root", default=None,
-                        help="Mask/GT output root (default /tmp/usrp_spectrograms/batch_eval/<run_id>).")
+                        help="Mask/GT output root (default ./batch_runs/<run_id>, git-ignored).")
     parser.add_argument("--state-dir", default=None,
-                        help="Where batch_state.json lives (default ./batch_runs/<run_id>).")
+                        help="Where batch_state.json + metrics live (default ./batch_runs/<run_id>).")
     parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--save-tensors", action="store_true",
                         help="Also save spectrogram tensors/previews (huge; off by default).")
@@ -150,11 +203,15 @@ def main() -> int:
                         help="Do not delete the staged input copy after each job.")
     parser.add_argument("--force", action="store_true", help="Re-run even if a run looks complete.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands only.")
+    parser.add_argument("--no-post", action="store_true",
+                        help="Skip the post-sweep metrics + plots pipeline (just run the detectors).")
+    parser.add_argument("--det-threshold", type=float, default=0.1,
+                        help="Coverage threshold passed to plot_eval_results.py (default 0.1).")
     args = parser.parse_args()
 
     captures_dir = Path(args.captures_dir).expanduser().resolve()
     output_root = Path(args.output_root) if args.output_root else DEFAULT_OUTPUT_ROOT / args.run_id
-    state_dir = Path(args.state_dir) if args.state_dir else (Path(__file__).resolve().parent / "batch_runs" / args.run_id)
+    state_dir = Path(args.state_dir) if args.state_dir else DEFAULT_OUTPUT_ROOT / args.run_id
     state_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / "batch_state.json"
 
@@ -221,12 +278,13 @@ def main() -> int:
         alignment_k = None
         if ok:
             try:
-                from check_mask_alignment import measure_offset
-                alignment_k, _corr, _curve = measure_offset(run_dir)
-                if alignment_k not in (0, None):
+                from check_mask_alignment import alignment_verdict
+                verdict = alignment_verdict(run_dir)
+                alignment_k = verdict["best_k"]
+                if not verdict["aligned"]:
                     misaligned += 1
                     print(f"  !! ALIGNMENT WARNING: masks lead GT by {alignment_k} frames "
-                          f"(ring-aliasing / stale binary) — REBUILD and re-run.")
+                          f"(margin {verdict['margin']:.3f}; ring-aliasing / stale binary) — REBUILD and re-run.")
             except Exception as exc:
                 print(f"  alignment check warning: {exc}")
 
@@ -259,8 +317,26 @@ def main() -> int:
         print(f"  !! {misaligned} run(s) had FRAME-MISALIGNED masks (ring-aliasing / stale binary). "
               f"Rebuild the container and re-run those before trusting results.")
     print(f"State: {state_path}")
-    print(f"Next: python3 eval_detector_masks.py --batch-root {output_root} "
-          f"--captures-dir {captures_dir} --out-dir {state_dir}")
+
+    # Post-sweep pipeline: metrics -> plots, in series, using this run's own paths.
+    post_ok = False
+    have_runs = (completed + skipped) > 0
+    if args.dry_run:
+        print("(dry-run: skipping metrics + plots)")
+    elif args.no_post:
+        print("(--no-post: skipping metrics + plots)")
+        print(f"Run manually: python3 eval_detector_masks.py --batch-root {output_root} "
+              f"--captures-dir {captures_dir} --out-dir {state_dir}")
+    elif not have_runs:
+        print("(no completed runs -> skipping metrics + plots)")
+    else:
+        post_ok = run_post_pipeline(output_root, captures_dir, state_dir, args.det_threshold)
+
+    # representative capture stem for the notebook's frame-review cell
+    stems = [_stem(c) for c in captures]
+    file_stem = "attenuation_dB_25" if "attenuation_dB_25" in stems else stems[len(stems) // 2]
+    print_notebook_setup(output_root, state_dir, args.det_threshold, file_stem, post_ok)
+
     return 0 if failed == 0 else 2
 
 

@@ -63,3 +63,6 @@ notebooks/validator_artifacts/
 applications/usrp_wideband_signal_detection/chunk_compare_artifacts/
 applications/usrp_wideband_signal_detection/generated_inputs/
 applications/usrp_wideband_signal_detection/generated_configs/
+
+# Batch offline-eval outputs (masks/GT/manifests + state + metrics tables) — large, regenerable
+applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_experiments/batch_runs/

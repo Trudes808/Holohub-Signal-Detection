@@ -17,6 +17,8 @@ See the full design in `REPLAY_INGEST_PLAN.md` and `/home/sat3737/.claude/plans/
 | `mask_eval_metrics.py` | Metrics library: pixel P/R/F1/IoU + FP-area, per-annotation coverage/detection, breakdown attrs re-joined from source `.sigmf-meta`, `BUCKETERS` registry. CSV (+Parquet if pandas) fact tables. |
 | `eval_detector_masks.py` | Driver: walk a batch tree → combined `frame_pixel_metrics` + `region_metrics` tables. |
 | `report_eval.py` | Stdlib Markdown report: pixel summary + detection-rate tables per breakdown. |
+| `plot_eval_results.py` | Comparison figures from the tidy tables: perf vs power (faceted by class/bandwidth/pulse-length), perf vs bandwidth, perf vs pulse length, and frame-level precision/recall/F1/pixel-IoU + false-positive area vs power. `--tables-dir <dir> [--det-threshold 0.1]`. Stdlib+matplotlib. |
+| `check_mask_alignment.py` | Frame↔mask alignment gate (systematic offset via median column-profile correlation, margin-gated). PASS=k≈0. |
 | `eval_viz.py` | Visualization helpers: reconstruct the spectrogram from SigMF (matches the binary's saved tensor to ~1e-5 dB), load a frame bundle (spectrogram + GT + each detector's mask), render the (N+1)-panel comparison. |
 | `batch_eval_review.ipynb` | Thin notebook driver: point at a batch run, pick a file + frame, render `[GT | detector_1 | … | detector_N]` panels, show per-frame metrics. |
 
@@ -59,7 +61,12 @@ python3 run_batch_offline_eval.py \
 ```
 Resumable: re-running skips jobs whose `manifest_complete` is already true.
 
-### 3. Metrics + report
+The sweep **auto-chains** metrics + plots after the detectors finish (unless `--no-post`), all into
+`batch_runs/<run_id>/` (masks, `region_metrics.csv`/`frame_pixel_metrics.csv`, `plots/`, `batch_state.json`).
+It ends by printing exactly which `batch_eval_review.ipynb` cells to edit (BATCH_ROOT / FILE_STEM /
+TABLES_DIR) so all visualization lives in the notebook. `--det-threshold` tunes the plot detection cutoff.
+
+### 3. Metrics + report (only needed if you used `--no-post`, or want the markdown report)
 ```
 python3 eval_detector_masks.py \
     --batch-root /tmp/usrp_spectrograms/batch_eval/<run_id> \
