@@ -1,0 +1,61 @@
+{
+  "artifact": "coherent_power_fast_threshold_calibration_v1",
+  "base_config": "config_coherent_power_performance_single_channel.yaml",
+  "output_config": "config_coherent_power_calibrated_single_channel.yaml",
+  "src_rows": 10240,
+  "src_cols": 512,
+  "ignore_bins_per_side": 292,
+  "noise_run_dir": "/tmp/usrp_spectrograms/coherent_power_cal/noise",
+  "signal_run_dir": "/tmp/usrp_spectrograms/coherent_power_cal/signal",
+  "policy": {
+    "noise_false_positive_rate": 0.001,
+    "floor_quantile": 0.9,
+    "signal_quantile": 0.9,
+    "signal_support_target": 0.9,
+    "threshold_margin_db": 0.0,
+    "min_span_db": 1.0,
+    "span_mode": "fixed",
+    "operating_range_db": 40.0,
+    "per_freq_fp": 0.02,
+    "per_freq_offset_db": 2.0
+  },
+  "per_freq_floor": {
+    "path": "calibration/coherent_power_per_freq_floor.npy",
+    "container_path": "/workspace/holohub/applications/usrp_wideband_signal_detection/calibration/coherent_power_per_freq_floor.npy",
+    "rows": 10240,
+    "quantile": 0.98,
+    "offset_db": 2.0,
+    "valid_row_median_db": -14.693601608276367,
+    "valid_row_min_db": -16.742069244384766,
+    "valid_row_max_db": 6.036149024963379
+  },
+  "span_candidates": {
+    "fixed": {
+      "span_db": 40.0,
+      "threshold": 0.2389,
+      "expected_signal_support": 0.0
+    }
+  },
+  "measured": {
+    "noise_support_db_q": {
+      "p50": 0.0,
+      "p90": 0.0,
+      "p99": 6.836762266159056,
+      "p99.9": 9.554096221923828
+    },
+    "effective_threshold_db": 9.554096221923828,
+    "signal_level_db": 0.0,
+    "expected_signal_support": 0.0
+  },
+  "calibrated": {
+    "fast_power_floor_db": 0.0,
+    "fast_power_span_db": 40.0,
+    "fast_score_threshold": 0.2389
+  },
+  "previous": {
+    "fast_power_floor_db": 0.5,
+    "fast_power_span_db": 3,
+    "fast_score_threshold": 0.4
+  },
+  "created": "2026-07-06T13:56:06"
+}

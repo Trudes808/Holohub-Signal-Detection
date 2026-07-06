@@ -824,6 +824,76 @@ bool write_npy_2d(const std::string& path,
   return out.good();
 }
 
+// Minimal reader for a 1-D little-endian float32 (.npy v1.0) array, used to load the
+// calibrated per-frequency noise floor. Returns the flattened element count regardless of
+// 1-D (rows,) or 2-D (rows,1) shape. Sets ok=false on any parse/type mismatch.
+std::vector<float> read_npy_float32(const std::string& path, bool& ok) {
+  ok = false;
+  std::vector<float> values;
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open()) {
+    return values;
+  }
+  char magic[6];
+  in.read(magic, 6);
+  if (!in.good() || std::string(magic, 6) != std::string("\x93NUMPY", 6)) {
+    return values;
+  }
+  unsigned char version[2];
+  in.read(reinterpret_cast<char*>(version), 2);
+  unsigned char header_len_le[2];
+  in.read(reinterpret_cast<char*>(header_len_le), 2);
+  const size_t header_len = static_cast<size_t>(header_len_le[0]) |
+                            (static_cast<size_t>(header_len_le[1]) << 8);
+  std::string header(header_len, '\0');
+  in.read(header.data(), static_cast<std::streamsize>(header_len));
+  if (!in.good()) {
+    return values;
+  }
+  // dtype must be little-endian / not-byte-order float32.
+  if (header.find("'<f4'") == std::string::npos && header.find("'|f4'") == std::string::npos) {
+    return values;
+  }
+  // Parse the shape tuple and multiply its dims to get the element count.
+  const auto shape_pos = header.find("'shape':");
+  const auto open_paren = header.find('(', shape_pos);
+  const auto close_paren = header.find(')', open_paren);
+  if (shape_pos == std::string::npos || open_paren == std::string::npos ||
+      close_paren == std::string::npos) {
+    return values;
+  }
+  size_t count = 1;
+  bool any_dim = false;
+  const std::string dims = header.substr(open_paren + 1, close_paren - open_paren - 1);
+  size_t cursor = 0;
+  while (cursor < dims.size()) {
+    while (cursor < dims.size() && !std::isdigit(static_cast<unsigned char>(dims[cursor]))) {
+      ++cursor;
+    }
+    if (cursor >= dims.size()) {
+      break;
+    }
+    size_t value = 0;
+    while (cursor < dims.size() && std::isdigit(static_cast<unsigned char>(dims[cursor]))) {
+      value = value * 10 + static_cast<size_t>(dims[cursor] - '0');
+      ++cursor;
+    }
+    count *= value;
+    any_dim = true;
+  }
+  if (!any_dim || count == 0) {
+    return values;
+  }
+  values.resize(count);
+  in.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(count * sizeof(float)));
+  if (!in.good() && !in.eof()) {
+    values.clear();
+    return values;
+  }
+  ok = true;
+  return values;
+}
+
 std::vector<uint8_t> float_unit_map_to_u8(const std::vector<float>& values) {
   std::vector<uint8_t> image(values.size(), 0);
   for (size_t index = 0; index < values.size(); ++index) {
@@ -1243,6 +1313,37 @@ __global__ void coherent_power_fast_power_assist_score_kernel(const float* corre
   const float support = fminf(fmaxf((support_db - power_floor_db) / fmaxf(power_span_db, 1e-6f), 0.0f), 1.0f);
   score[idx] = support;
   mask[idx] = (support >= score_threshold && support > 0.0f) ? 1 : 0;
+}
+
+// Calibrated per-frequency noise-floor fill: OR a pixel into the mask when its absolute
+// corrected power exceeds the per-row floor by offset_db. Unlike the local box-mean support
+// (which hollows out the interior of signals wider than the box), this uses the per-row noise
+// floor, so a strong steady/wideband signal fills in solidly. Runs AFTER the box score kernel
+// and only raises the score, never lowers it.
+__global__ void coherent_power_per_freq_fill_kernel(const float* corrected,
+                                                    const float* per_freq_floor_db,
+                                                    int rows,
+                                                    int cols,
+                                                    int ignore_bins_per_side,
+                                                    float offset_db,
+                                                    float span_db,
+                                                    float* score,
+                                                    uint8_t* mask) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+  const int row = idx / cols;
+  if (row < ignore_bins_per_side || row >= (rows - ignore_bins_per_side)) {
+    return;
+  }
+  const float floor_db = per_freq_floor_db[row];
+  if (corrected[idx] > floor_db + offset_db) {
+    mask[idx] = 1;
+    const float grade = fminf(fmaxf((corrected[idx] - floor_db) / fmaxf(span_db, 1e-6f), 0.0f), 1.0f);
+    score[idx] = fmaxf(score[idx], grade);
+  }
 }
 
 __global__ void coherent_power_majority_smooth_kernel(const uint8_t* input,
@@ -6976,6 +7077,8 @@ CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
 
     buffers = ChannelBuffers {};
   }
+  cudaFree(per_freq_threshold_device_);
+  per_freq_threshold_device_ = nullptr;
 }
 
 void CoherentPowerSignalDetector::reset_channel_state(uint16_t channel_number,
@@ -7028,6 +7131,11 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(output_dir_, "output_dir", "Output directory", "Directory where detector masks are written.", std::string("/workspace/coherent_power_masks"));
   spec.param(tensor_snapshot_dir_, "tensor_snapshot_dir", "Tensor snapshot directory", "Directory where frozen detector input snapshots are written.", std::string("/workspace/coherent_power_snapshots"));
   spec.param(save_power_db_snapshot_, "save_power_db_snapshot", "Save power dB snapshot", "If true, also saves the post power_db frame alongside the complex tensor snapshot.", true);
+  spec.param(save_coherent_power_stats_, "save_coherent_power_stats", "Save fast-path stats", "If true, dump per-frame corrected_db and local background maps for offline fast-path threshold calibration.", false);
+  spec.param(coherent_power_stats_dir_, "coherent_power_stats_dir", "Coherent power stats directory", "Directory where fast-path calibration stats (corrected_db + background) are written.", std::string("/tmp/usrp_spectrograms/coherent_power_cal"));
+  spec.param(per_freq_threshold_enable_, "per_freq_threshold_enable", "Per-frequency threshold enable", "If true, OR a per-frequency noise-floor detection into the fast mask so strong signals broader than the local box fill in.", false);
+  spec.param(per_freq_threshold_path_, "per_freq_threshold_path", "Per-frequency floor path", "Path to a calibrated per-row noise-floor .npy (length src_rows, float32 dB). Empty disables the per-frequency fill.", std::string(""));
+  spec.param(per_freq_threshold_offset_db_, "per_freq_threshold_offset_db", "Per-frequency threshold offset", "dB above the calibrated per-row floor required to fire the per-frequency fill.", 2.0);
   spec.param(chunk_bandwidth_hz_, "chunk_bandwidth_hz", "Chunk bandwidth", "Chunk bandwidth in Hz.", 25.0e6);
   spec.param(chunk_overlap_hz_, "chunk_overlap_hz", "Chunk overlap", "Chunk overlap in Hz.", 6.25e6);
   spec.param(uncalibrated_chunk_fraction_, "uncalibrated_chunk_fraction", "Uncalibrated chunk fraction", "Fractional chunk span for uncalibrated inputs.", 0.40);
@@ -7501,10 +7609,14 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   const bool should_save_tensor_snapshot = enable_tensor_snapshot_save_.get() && should_save_snapshot_bundle;
   const bool should_save_reference_debug_artifacts = false;
   const bool should_save_power_db_snapshot = should_save_tensor_snapshot && save_power_db_snapshot_.get();
+  const bool should_save_coherent_power_stats =
+      save_coherent_power_stats_.get() &&
+      (frame_number % static_cast<uint64_t>(std::max(1, save_every_n_frames_.get())) == 0);
   const bool should_run_debug_save_stage = should_write_mask_image ||
                                            should_save_tensor_snapshot ||
                                            should_save_reference_debug_artifacts ||
-                                           should_save_path_artifacts;
+                                           should_save_path_artifacts ||
+                                           should_save_coherent_power_stats;
   const bool frequency_axis_calibrated = resolution_hz > 0.0;
   const int emitted_mask_rows = input_rows;
   const int emitted_mask_cols = input_cols;
@@ -7961,6 +8073,54 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       throw std::runtime_error(std::string("fast_score kernel launch failed: ") + cudaGetErrorString(kernel_result));
     }
 
+    // Calibrated per-frequency noise-floor fill (OR-ed into the box mask). Loaded once,
+    // shared across channels; a length/shape mismatch or unreadable file disables it.
+    if (per_freq_threshold_enable_.get() && !per_freq_threshold_ready_ && !per_freq_threshold_failed_) {
+      bool loaded_ok = false;
+      const std::string floor_path = per_freq_threshold_path_.get();
+      std::vector<float> floor_host = floor_path.empty()
+                                          ? std::vector<float>{}
+                                          : read_npy_float32(floor_path, loaded_ok);
+      if (loaded_ok && static_cast<int>(floor_host.size()) == src_rows) {
+        const auto alloc_result = cudaMalloc(reinterpret_cast<void**>(&per_freq_threshold_device_),
+                                             floor_host.size() * sizeof(float));
+        if (alloc_result == cudaSuccess &&
+            cudaMemcpy(per_freq_threshold_device_, floor_host.data(),
+                       floor_host.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess) {
+          per_freq_threshold_len_ = static_cast<int>(floor_host.size());
+          per_freq_threshold_ready_ = true;
+          HOLOSCAN_LOG_INFO("Loaded per-frequency noise floor ({} rows) from {}",
+                            per_freq_threshold_len_, floor_path);
+        } else {
+          per_freq_threshold_failed_ = true;
+          cudaFree(per_freq_threshold_device_);
+          per_freq_threshold_device_ = nullptr;
+          HOLOSCAN_LOG_ERROR("Failed to upload per-frequency noise floor; per-frequency fill disabled.");
+        }
+      } else {
+        per_freq_threshold_failed_ = true;
+        HOLOSCAN_LOG_ERROR("Per-frequency floor '{}' unreadable or wrong length (got {}, need {}); "
+                           "per-frequency fill disabled.",
+                           floor_path, floor_host.size(), src_rows);
+      }
+    }
+    if (per_freq_threshold_enable_.get() && per_freq_threshold_ready_) {
+      coherent_power_per_freq_fill_kernel<<<blocks, threads, 0, stream>>>(
+          buffers.corrected_db_device,
+          per_freq_threshold_device_,
+          src_rows,
+          src_cols,
+          ignore_bins_per_side,
+          static_cast<float>(per_freq_threshold_offset_db_.get()),
+          static_cast<float>(fast_power_span_db_.get()),
+          buffers.score_device,
+          buffers.mask_device);
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("per_freq_fill kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+    }
+
     if (live_emit_always_on_enable_.get()) {
       auto& scratch = chunk_cuda_scratch();
       if (!scratch.ensure_capacity(static_cast<size_t>(total_bins))) {
@@ -8066,6 +8226,53 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   stage_ms[kDeviceCopyStage] = 0.0;
 
   auto maybe_save_debug_artifacts = [&] {
+    if (should_save_coherent_power_stats && !use_reference_backend) {
+      // Offline fast-path threshold calibration dump: corrected_db and the local box-mean
+      // background so support_db = corrected - background can be reconstructed per pixel.
+      std::vector<float> corrected_stats_host(static_cast<size_t>(total_bins), 0.0f);
+      std::vector<float> background_stats_host(static_cast<size_t>(total_bins), 0.0f);
+      cudaMemcpyAsync(corrected_stats_host.data(), buffers.corrected_db_device, power_db_bytes,
+                      cudaMemcpyDeviceToHost, stream);
+      cudaMemcpyAsync(background_stats_host.data(), buffers.background_device, power_db_bytes,
+                      cudaMemcpyDeviceToHost, stream);
+      const auto stats_sync = cudaStreamSynchronize(stream);
+      if (stats_sync != cudaSuccess) {
+        throw std::runtime_error(std::string("coherent power stats synchronization failed: ") +
+                                 cudaGetErrorString(stats_sync));
+      }
+      const std::string stats_dir = coherent_power_stats_dir_.get();
+      std::error_code stats_dir_ec;
+      std::filesystem::create_directories(stats_dir, stats_dir_ec);
+      std::ostringstream stem;
+      stem << stats_dir << "/coherent_power_stats_ch" << channel_number << "_f" << frame_number
+           << "_" << src_rows << "x" << src_cols;
+      const std::string corrected_stats_path = stem.str() + "_corrected_sxx_db.npy";
+      const std::string background_stats_path = stem.str() + "_background_db.npy";
+      if (!write_npy_2d(corrected_stats_path, corrected_stats_host.data(),
+                        corrected_stats_host.size() * sizeof(float), src_rows, src_cols, "<f4") ||
+          !write_npy_2d(background_stats_path, background_stats_host.data(),
+                        background_stats_host.size() * sizeof(float), src_rows, src_cols, "<f4")) {
+        HOLOSCAN_LOG_ERROR("Failed to write coherent power calibration stats under {}", stats_dir);
+      } else {
+        std::ofstream meta_out(stats_dir + "/meta.json", std::ios::trunc);
+        if (meta_out.is_open()) {
+          meta_out << "{\n"
+                   << "  \"artifact_contract\": \"coherent_power_fast_stats_v1\",\n"
+                   << "  \"src_rows\": " << src_rows << ",\n"
+                   << "  \"src_cols\": " << src_cols << ",\n"
+                   << "  \"ignore_bins_per_side\": " << ignore_bins_per_side << ",\n"
+                   << "  \"fast_power_floor_db\": " << fast_power_floor_db_.get() << ",\n"
+                   << "  \"fast_power_span_db\": " << fast_power_span_db_.get() << ",\n"
+                   << "  \"fast_score_threshold\": " << fast_score_threshold_.get() << ",\n"
+                   << "  \"fast_background_freq_radius\": " << fast_background_freq_radius_.get() << ",\n"
+                   << "  \"fast_background_time_radius\": " << fast_background_time_radius_.get() << ",\n"
+                   << "  \"frontend_max_boost_db\": " << frontend_max_boost_db_.get() << ",\n"
+                   << "  \"frontend_signal_cap_db\": " << frontend_signal_cap_db_.get() << "\n"
+                   << "}\n";
+        }
+      }
+    }
+
     std::string mask_path;
     if (should_write_mask_image) {
       std::vector<uint8_t> image;

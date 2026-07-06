@@ -201,6 +201,11 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<std::string> output_dir_;
   holoscan::Parameter<std::string> tensor_snapshot_dir_;
   holoscan::Parameter<bool> save_power_db_snapshot_;
+  holoscan::Parameter<bool> save_coherent_power_stats_;
+  holoscan::Parameter<std::string> coherent_power_stats_dir_;
+  holoscan::Parameter<bool> per_freq_threshold_enable_;
+  holoscan::Parameter<std::string> per_freq_threshold_path_;
+  holoscan::Parameter<double> per_freq_threshold_offset_db_;
   holoscan::Parameter<double> chunk_bandwidth_hz_;
   holoscan::Parameter<double> chunk_overlap_hz_;
   holoscan::Parameter<double> uncalibrated_chunk_fraction_;
@@ -270,6 +275,14 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   std::vector<uint8_t> reset_detector_state_on_next_full_batch_;
   std::vector<uint64_t> last_seen_chdr_soft_resync_epoch_;
   std::atomic<bool> stop_requested_ {false};
+
+  // Calibrated per-frequency (per-row) noise floor in dB, shared across channels. A pixel
+  // is OR-ed into the mask when corrected_db > per_freq_floor[row] + offset, letting strong
+  // signals broader than the local box (whose interior the box-mean hollows out) fill in.
+  float* per_freq_threshold_device_ = nullptr;
+  int per_freq_threshold_len_ = 0;
+  bool per_freq_threshold_ready_ = false;
+  bool per_freq_threshold_failed_ = false;
 
   void reset_channel_state(uint16_t channel_number,
                            size_t row_elements,
