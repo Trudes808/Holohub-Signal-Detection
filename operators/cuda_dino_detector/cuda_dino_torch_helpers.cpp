@@ -32,7 +32,11 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
                                                        uint8_t* output_filled_mask_batch_device,
                                                        uint8_t* output_component_filtered_mask_batch_device,
                                                        cudaStream_t cuda_stream,
-                                                       CudaHybridStageTiming* stage_timing);
+                                                       CudaHybridStageTiming* stage_timing,
+                                                       const CoherenceRescueConfig* rescue,
+                                                       float* debug_initial_product_device,
+                                                       bool combine_scores_with_max,
+                                                       float dino_contribution_strength);
 
 namespace {
 
@@ -501,7 +505,11 @@ bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_fe
                                                            float positional_suppression,
                                                            bool resized_full_chunk,
                                                            float* output_score_device,
-                                                           cudaStream_t cuda_stream) {
+                                                           cudaStream_t cuda_stream,
+                                                           float* output_patch_qnorm_device,
+                                                           float* output_patch_prenorm_device,
+                                                           const float* positional_template_device,
+                                                           float positional_template_strength) {
   return compute_deweighted_raw_dino_score_native_cuda_batch_to_device(patch_features_batch_device,
                                                                         batch_size,
                                                                         patch_rows,
@@ -514,7 +522,11 @@ bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_fe
                                                                         positional_suppression,
                                                                         resized_full_chunk,
                                                                         output_score_device,
-                                                                        cuda_stream);
+                                                                        cuda_stream,
+                                                                        output_patch_qnorm_device,
+                                                                        output_patch_prenorm_device,
+                                                                        positional_template_device,
+                                                                        positional_template_strength);
 }
 
 bool project_runtime_score_batch_to_device(const float* score_maps_batch_device,
@@ -555,7 +567,11 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                       uint8_t* output_filled_mask_batch_device,
                                                       uint8_t* output_component_filtered_mask_batch_device,
                                                       cudaStream_t cuda_stream,
-                                                      CudaHybridStageTiming* stage_timing) {
+                                                      CudaHybridStageTiming* stage_timing,
+                                                      const CoherenceRescueConfig* rescue,
+                                                      float* debug_initial_product_device,
+                                                      bool combine_scores_with_max,
+                                                      float dino_contribution_strength) {
   return compute_residual_veto_native_cuda_batch_to_device(dino_score_batch_device,
                                                            coherence_batch_device,
                                                            batch_size,
@@ -570,7 +586,11 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                            output_filled_mask_batch_device,
                                                            output_component_filtered_mask_batch_device,
                                                            cuda_stream,
-                                                           stage_timing);
+                                                           stage_timing,
+                                                           rescue,
+                                                           debug_initial_product_device,
+                                                           combine_scores_with_max,
+                                                           dino_contribution_strength);
 }
 
 }  // namespace holoscan::ops
@@ -578,6 +598,26 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
 #else
 
 namespace holoscan::ops {
+
+bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_batch_device,
+                                                       const float* coherence_batch_device,
+                                                       int batch_size,
+                                                       int rows,
+                                                       int cols,
+                                                       const std::vector<uint8_t>& valid_row_mask_batch,
+                                                       bool use_fp16,
+                                                       bool enable_mask_post_processing,
+                                                       int min_component_size,
+                                                       float* output_combined_score_device,
+                                                       float* output_final_mask_device,
+                                                       uint8_t* output_filled_mask_batch_device,
+                                                       uint8_t* output_component_filtered_mask_batch_device,
+                                                       cudaStream_t cuda_stream,
+                                                       CudaHybridStageTiming* stage_timing,
+                                                       const CoherenceRescueConfig* rescue,
+                                                       float* debug_initial_product_device,
+                                                       bool combine_scores_with_max,
+                                                       float dino_contribution_strength);
 
 bool compute_structure_tensor_gate_gpu_batch_to_device(const float* corrected_batch_device,
                                                        int batch_size,
@@ -607,7 +647,11 @@ bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_fe
                                                            float positional_suppression,
                                                            bool resized_full_chunk,
                                                            float* output_score_device,
-                                                           cudaStream_t cuda_stream) {
+                                                           cudaStream_t cuda_stream,
+                                                           float* output_patch_qnorm_device,
+                                                           float* output_patch_prenorm_device,
+                                                           const float* positional_template_device,
+                                                           float positional_template_strength) {
   return compute_deweighted_raw_dino_score_native_cuda_batch_to_device(patch_features_batch_device,
                                                                         batch_size,
                                                                         patch_rows,
@@ -620,7 +664,11 @@ bool compute_deweighted_raw_dino_score_gpu_batch_to_device(const float* patch_fe
                                                                         positional_suppression,
                                                                         resized_full_chunk,
                                                                         output_score_device,
-                                                                        cuda_stream);
+                                                                        cuda_stream,
+                                                                        output_patch_qnorm_device,
+                                                                        output_patch_prenorm_device,
+                                                                        positional_template_device,
+                                                                        positional_template_strength);
 }
 
 bool project_runtime_score_batch_to_device(const float* score_maps_batch_device,
@@ -661,7 +709,11 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                       uint8_t* output_filled_mask_batch_device,
                                                       uint8_t* output_component_filtered_mask_batch_device,
                                                       cudaStream_t cuda_stream,
-                                                      CudaHybridStageTiming* stage_timing) {
+                                                      CudaHybridStageTiming* stage_timing,
+                                                      const CoherenceRescueConfig* rescue,
+                                                      float* debug_initial_product_device,
+                                                      bool combine_scores_with_max,
+                                                      float dino_contribution_strength) {
   return compute_residual_veto_native_cuda_batch_to_device(dino_score_batch_device,
                                                            coherence_batch_device,
                                                            batch_size,
@@ -676,7 +728,11 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                            output_filled_mask_batch_device,
                                                            output_component_filtered_mask_batch_device,
                                                            cuda_stream,
-                                                           stage_timing);
+                                                           stage_timing,
+                                                           rescue,
+                                                           debug_initial_product_device,
+                                                           combine_scores_with_max,
+                                                           dino_contribution_strength);
 }
 
 }  // namespace holoscan::ops

@@ -69,13 +69,17 @@ def existing_component_specs(summary: dict) -> list[tuple[str, str, str]]:
     specs = [
         ("DINO Raw Deweighted", "dino_score_raw_deweighted_npy", "magma"),
         ("Coherence Gate", "coherence_gate_npy", "viridis"),
+        ("Veto Input Score", "initial_product_npy", "magma"),
         ("Keep Freq", "hybrid_keep_freq_npy", "magma"),
         ("Keep Res", "hybrid_keep_res_npy", "magma"),
         ("Combined Score", "combined_score_npy", "magma"),
+        ("Coherence Band", "coherence_band_mask_npy", "gray"),
+        ("DINO Structure", "dino_structure_mask_npy", "gray"),
         ("Seed Mask", "hybrid_seed_mask_npy", "gray"),
         ("Closed Mask", "hybrid_closed_mask_npy", "gray"),
         ("Filled Mask", "hybrid_filled_mask_npy", "gray"),
         ("Component Filtered", "hybrid_component_filtered_mask_npy", "gray"),
+        ("Coherence Rescue", "coherence_rescue_mask_npy", "gray"),
         ("Final Mask", "final_mask_npy", "gray"),
     ]
     return [spec for spec in specs if summary.get(spec[1])]

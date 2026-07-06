@@ -110,6 +110,7 @@ def run_one(
     save_tensors: bool,
     trace_frames: bool,
     dry_run: bool,
+    config: Optional[str] = None,
 ) -> int:
     file_stem = _stem(data_path)
     run_dir = output_root / detector / file_stem
@@ -119,6 +120,8 @@ def run_one(
         "--output-root", str(run_dir),
         "--progress-every", str(progress_every),
     ]
+    if config:
+        cmd.extend(["--config", config])
     if not save_tensors:
         cmd.append("--no-tensors")
     if trace_frames:
@@ -186,6 +189,9 @@ def main() -> int:
                         help="Directory of *.sigmf-data + *.sigmf-meta captures.")
     parser.add_argument("--detectors", nargs="+", default=DEFAULT_DETECTORS,
                         help="Detectors to run (default: cuda_dino coherent_power).")
+    parser.add_argument("--config", default=None,
+                        help="Override the per-detector base config for ALL jobs (passed through "
+                             "to run_cuda_dino_offline_file.py --config). Use with a single detector.")
     parser.add_argument("--only", nargs="+", default=None,
                         help="Restrict to these capture stems (e.g. attenuation_dB_0).")
     parser.add_argument("--run-id", required=True, help="Identifier for this batch run.")
@@ -263,7 +269,7 @@ def main() -> int:
 
         start = time.time()
         rc = run_one(data_path, detector, output_root, args.progress_every,
-                     args.save_tensors, args.trace_frames, args.dry_run)
+                     args.save_tensors, args.trace_frames, args.dry_run, args.config)
         elapsed = time.time() - start
 
         if args.dry_run:

@@ -1,0 +1,343 @@
+# SPDX-FileCopyrightText: 2026 National Instruments Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+num_runs: -1
+
+pipeline:
+  enable_spectrogram: true
+  enable_detector: true
+  detector_type: "cuda_dino"
+  log_from_spectrogram: false
+
+scheduler:
+  worker_thread_number: 4
+  stop_on_deadlock: true
+  stop_on_deadlock_timeout: 500
+
+advanced_network:
+  cfg:
+    version: 1
+    manager: "dpdk"
+    master_core: 9
+    debug: false
+    log_level: "info"
+
+    memory_regions:
+      - name: "Headers_RX_CPU"
+        kind: "huge"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 131072
+        buf_size: 42
+      - name: "CH1_CHDR_Headers_RX_CPU"
+        kind: "huge"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 131072
+        buf_size: 64
+      - name: "CH1_Data_RX_GPU"
+        kind: "device"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 131072
+        buf_size: 4096
+
+    interfaces:
+      - name: sdr_data
+        address: 0000:a2:00.1
+        rx:
+          flow_isolation: true
+          queues:
+            - name: "Channel 1 data"
+              id: 0
+              cpu_core: 10
+              batch_size: 1024
+              memory_regions:
+                - "Headers_RX_CPU"
+                - "CH1_CHDR_Headers_RX_CPU"
+                - "CH1_Data_RX_GPU"
+
+          flows:
+            - name: "Channel 1 data packets"
+              id: 0
+              action:
+                type: queue
+                id: 0
+              match:
+                udp_src: 49153
+                udp_dst: 1234
+
+chdr_converter:
+  interface_name: sdr_data
+  channel_center_frequencies_hz: "2400e6"
+  channel_sample_rates_hz: "500e6"
+  num_complex_samples_per_packet: 1024
+  num_packets_per_fft: 20
+  num_ffts_per_batch: 512
+  num_simul_batches: 4
+  num_channels: 1
+  log_packets: false
+  log_data: false
+  partial_batch_drop_timeout_ms: 250
+  degraded_reset_on_rx_queue_warning: false
+  degraded_shutdown_on_rx_queue_warning_threshold: 0
+  degraded_shutdown_force_exit_timeout_ms: 2000
+  degraded_reset_partial_flush_threshold: 0
+  degraded_reset_cooldown_ms: 1000
+
+fft:
+  burst_size: 20480
+  num_bursts: 512
+  num_channels: 1
+  spectrum_type: 1
+  averaging_type: 1
+  window_time: 0
+  window_type: 0
+  reference_span_hz: 500000000
+  reference_fft_size: 20480
+  override_fft_bin_size: 0
+  # FFT length in bins. For this path it should stay aligned with burst_size.
+  transform_points: 20480
+  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
+  window_points: 20480
+  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
+  resolution: 24414
+  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
+  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
+  span: 500000000
+  weighting_factor: 0
+  f1_index: -10240
+  f2_index: 10239
+  window_time_delta: 0
+
+logger:
+  num_channels: 1
+  log_interval: 5
+
+visualization:
+  enable: true
+  renderer:
+    num_channels: 1
+    history_frames: 1
+    output_height: 512
+    output_width: 1024
+    display_time_rows: 2048
+    display_freq_bins: 20480
+    history_memory_budget_mb: 1024
+    rows_per_frame: 2
+    mask_frame_offset: 0
+    allow_backpressure_valve: true
+    refresh_hz: 60
+    render_every_n_frames: 1
+    timing_summary_enable: false
+    timing_summary_every_n: 128
+    channel_filter: 0
+    tensor_name: "spectrogram"
+    blue_limit: 0.10
+    red_limit: 0.92
+    overlay_alpha: 0.7 #0.38
+    center_frequency_hz: 0.0
+    fft_size: 20480
+    dino_chunk_rows: 256
+    dino_chunk_cols: 512
+    db_floor: -22.0
+    db_ceil: 35.0
+    row_average_n: 1
+  holoviz:
+    width: 1280
+    height: 720
+    window_title: "USRP Wideband Spectrogram"
+    fullscreen: false
+
+spectrogram:
+  num_channels: 1
+  enable_save: false
+  enable_tensor_save: false
+  save_every_n_frames: 100
+  max_images_per_channel: 0
+  output_height: 256
+  output_width: 512
+  output_dir: "/workspace/spectrograms"
+
+dinov3_signal_detector:
+  num_channels: 1
+  input_height: 1024
+  input_width: 1024
+  patch_size: 16
+  emit_stride: 1
+  mask_threshold_db: -20.0
+  log_detections: false
+  enable_mask_save: false
+  max_masks_per_channel: 0
+  output_dir: "/workspace/dino_masks"
+  use_pytorch_backend: true
+  inference_backend: "torchscript"
+  model_name: "dinov3_vitb16"
+  model_repo_path: "/workspace/models/dinov3"
+  weights_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
+  model_script_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"
+  torchscript_init_mode: "load_cuda_eval"
+  strict_model_forward: true
+  imagenet_mean: [0.485, 0.456, 0.406]
+  imagenet_std: [0.229, 0.224, 0.225]
+  fft_size: 20480
+  noverlap: 256
+  ignore_sideband_hz: 7000000.0
+  frontend_correction_enable: true
+  frontend_correction_row_q: 25.0
+  frontend_correction_smooth_sigma: 12.0
+  frontend_correction_reference_q: 75.0
+  frontend_correction_max_boost_db: 12.0
+  frontend_correction_soft_knee_db: 4.0
+  frontend_correction_edge_taper_fraction: 0.10
+  frontend_correction_edge_taper_sigma: 6.0
+  frontend_correction_edge_target_drop_db: 2.5
+  frontend_edge_guard_floor: 0.35
+  dino_coherence_gate_floor: 0.25
+  texture_q: 0.90
+  texture_k: 6
+  power_q: 0.90
+  dino_group_k: 8
+  dino_group_spatial_weight: 0.35
+  dino_group_score_q: 0.60
+  pipeline_final_threshold: 0.20
+  pipeline_final_threshold_no_speckle: 0.10
+  pipeline_gap_floor: 0.10
+  pipeline_component_min_size: 5
+  pipeline_component_min_size_no_speckle: 2
+  pipeline_power_rescue_floor: 0.10
+  pipeline_power_rescue_gain: 2.0
+  pipeline_strong_speckle_min_component: 10
+  pipeline_texture_speckle_clean_threshold: 0.85
+  pipeline_texture_speckle_strong_threshold: 0.20
+  timing_summary_enable: false
+  timing_summary_every_n: 64
+  timing_summary_window: 64
+
+cuda_dino_detector:
+  num_channels: 1
+  input_height: 1024
+  input_width: 1024
+  patch_size: 16
+  emit_stride: 1
+  channel_filter: -1
+  debug_mode: false
+  enable_debug_artifact_host_copy: false
+  debug_chunk_index: 0
+  backend_mode: "cuda_partial"
+  inference_backend: "torchscript"
+  model_script_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"
+  torchscript_init_mode: "load_cuda_eval"
+  torch_dtype: "fp32"
+  imagenet_mean: [0.485, 0.456, 0.406]
+  imagenet_std: [0.229, 0.224, 0.225]
+  execution_strategy: "reference_chunks"
+  max_tokens_per_inference: 8192
+  chunk_bandwidth_hz: 231744000.0
+  chunk_overlap_hz: 0.0
+  uncalibrated_chunk_fraction: 0.40
+  uncalibrated_overlap_fraction: 0.20
+  ignore_sideband_hz: 7000000.0
+  frontend_correction_enable: true
+  frontend_correction_row_q: 25.0
+  frontend_correction_smooth_sigma: 12.0
+  frontend_correction_reference_q: 75.0
+  frontend_correction_max_boost_db: 12.0
+  frontend_correction_soft_knee_db: 4.0
+  frontend_correction_edge_taper_fraction: 0.10
+  frontend_correction_edge_taper_sigma: 6.0
+  frontend_correction_edge_target_drop_db: 2.5
+  dino_coherence_gate_floor: 0.0
+  dino_coherence_gate_span_db: 3.0
+  # Coherence-rescue floor (monotonic OR). When enabled, large + confident
+  # coherence regions are unioned into the final mask so a weak DINO/residual
+  # response cannot suppress a strong wideband coherence detection. Disabled
+  # by default => byte-identical to prior behavior (narrowband unaffected).
+  dino_coherence_rescue_enable: false
+  dino_coherence_rescue_min_area_px: 256
+  dino_coherence_rescue_threshold: -1   # <0 => derive from gate_floor * 10^(gate_span_db/20)
+  dino_coherence_rescue_floor_strength: 0.0
+  # ---- Fusion v2 (coherence-primary + DINO structure gate, optional scout) ----
+  # "legacy" reproduces the product+residual-veto path exactly. "coherence_primary"
+  # builds the final mask as: coherence-band union DINO-structure [union legacy].
+  hybrid_fusion_mode: "coherence_primary"
+  coherence_band_threshold: 0.05          # absolute threshold on the raw coherence gate (~0.1 scale)
+  coherence_band_threshold_quantile: -1.0 # >=0 => per-chunk max(absolute, quantile)
+  coherence_band_open_time_px: 5          # 1xk time-continuity opening (kills noise speckle)
+  coherence_band_close_freq_px: 0
+  coherence_band_close_time_px: 0
+  coherence_band_min_area_px: 256
+  dino_structure_threshold_quantile: 0.90 # per-chunk quantile on patch scores
+  dino_structure_open_len: 3              # >=N patches in a row (time OR freq)
+  coherence_primary_include_legacy_mask: true
+  coherence_primary_legacy_score: "max"   # veto stack runs on max(coh, dino); "product" = verbatim legacy sub-mask
+  dino_contribution_strength: 0.50        # scale normalized DINO before the combine: max(qnorm_coh, 0.70*qnorm_dino)
+  dino_scout_enable: false                # Method 3: DINO only on unexplained chunks
+  dino_scout_coverage_threshold: 0.65
+  raw_dino_positional_deweight: 0.75
+  # Empirical per-position (RoPE) noise calibration. Enable the prenorm dumps only for
+  # calibration runs (see config_cuda_dino_calibration_dump_single_channel.yaml); set the
+  # template path (empty = disabled) after building the template with calibrate_dino_positional_template.py.
+  save_raw_dino_patch_prenorm: true         # CALIBRATION DUMP CONFIG: dump pre-qnorm patch scores per frame
+  save_raw_dino_patch_features: false       # set true only for Stage-D mean-embedding (large, ~50 MB/frame)
+  raw_dino_positional_template_path: ""     # MUST stay empty during calibration (no double-correction)
+  raw_dino_positional_template_strength: 1.0
+  raw_dino_positional_mu_path: ""           # Stage-D hook (not yet wired)
+  power_q: 0.90
+  hybrid_torch_dtype: "fp16"
+  enable_mask_post_processing: true
+  hybrid_component_min_size: 60
+  grouping_bridge_freq_px: 33
+  grouping_bridge_time_px: 5
+  grouping_min_component_size: 60
+  grouping_min_freq_span_px: 5
+  grouping_min_time_span_px: 12
+  grouping_min_density: 0.06
+  filter_detection_mask: true
+  grouping_time_continuity_ratio: 0.85
+  timing_summary_enable: false
+  timing_summary_every_n: 64
+  timing_summary_window: 8
+
+coherent_power_signal_detector:
+  num_channels: 1
+  input_height: 250 #256
+  input_width: 20480 #512
+  # Full-rate aggressive profile matching the active two-channel fast path,
+  # restricted to channel 0 only.
+  fast_power_floor_db: 0.5
+  fast_power_span_db: 3.0
+  fast_score_threshold: 0.4
+  live_emit_mask_rows: 16
+  live_emit_mask_cols: 20480
+  live_emit_freq_persistence_window: 45
+  live_emit_freq_persistence_min_hits: 11
+  emit_stride: 1
+  log_detections: true
+  save_performance_path_artifacts: false
+  enable_mask_save: false
+  save_every_n_frames: 100
+  max_masks_per_channel: 0
+  output_dir: "/workspace/coherent_power_masks"
+  ignore_sideband_percent: 0.0
+  ignore_sideband_hz: 7000000.0
+  frontend_row_q: 25.0
+  frontend_reference_q: 75.0
+  frontend_smooth_sigma: 12.0
+  frontend_max_boost_db: 0.0
+  frontend_signal_cap_db: 0.0
+  min_component_size: 1
+  filter_detection_mask: true
+  grouping_bridge_freq_px: 33
+  grouping_bridge_time_px: 5
+  grouping_min_component_size: 1
+  grouping_min_freq_span_px: 1
+  grouping_min_time_span_px: 1
+  grouping_min_density: 0.0
+  grouping_time_continuity_ratio: 0.85
+  timing_summary_enable: true
+  timing_summary_every_n: 512
+  timing_summary_window: 512

@@ -1,0 +1,16 @@
+{
+  "artifact": "dino_positional_sigma_template_v1",
+  "patch_rows": 64,
+  "patch_cols": 64,
+  "expect_deweight": 0.75,
+  "model_script_path": "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts",
+  "aligned_rows": 1024,
+  "aligned_cols": 1024,
+  "source_runs": [
+    "/tmp/usrp_spectrograms/offline_cuda_dino/cal_noise_concat"
+  ],
+  "total_samples": 8,
+  "edge_interior_ratio": 1.0729833389680814,
+  "ring_cv": 0.04633329084456355,
+  "created": "2026-07-03T11:40:14"
+}

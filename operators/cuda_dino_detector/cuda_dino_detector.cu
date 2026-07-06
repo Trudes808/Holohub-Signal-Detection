@@ -155,6 +155,10 @@ struct DebugChunkResult {
   std::vector<uint8_t> hybrid_closed_mask;
   std::vector<uint8_t> hybrid_component_filtered_mask;
   std::vector<uint8_t> hybrid_component_filtered_mask_source;
+  std::vector<uint8_t> hybrid_coherence_rescue_mask;
+  std::vector<uint8_t> coherence_band_mask;
+  std::vector<uint8_t> dino_structure_mask;
+  std::vector<float> initial_product;
   std::vector<uint8_t> final_mask;
   std::vector<uint8_t> final_mask_source;
   std::vector<float> combined_score;
@@ -246,6 +250,63 @@ bool write_npy_2d(const std::filesystem::path& path,
     return false;
   }
   return true;
+}
+
+// Minimal reader for the little-endian float32 2D .npy files this operator writes
+// (and that the calibration script emits). Returns false on any parse/shape/dtype
+// mismatch so callers can fall back to disabled behavior.
+bool read_npy_2d_float(const std::filesystem::path& path, std::vector<float>& out_values, int& out_rows, int& out_cols) {
+  std::ifstream in(path.string(), std::ios::binary);
+  if (!in.is_open()) {
+    return false;
+  }
+  char magic[6] = {};
+  in.read(magic, 6);
+  if (std::string(magic, 6) != std::string("\x93NUMPY", 6)) {
+    return false;
+  }
+  unsigned char version[2] = {};
+  in.read(reinterpret_cast<char*>(version), 2);
+  uint32_t header_len = 0;
+  if (version[0] == 1) {
+    unsigned char bytes[2] = {};
+    in.read(reinterpret_cast<char*>(bytes), 2);
+    header_len = static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8U);
+  } else {
+    unsigned char bytes[4] = {};
+    in.read(reinterpret_cast<char*>(bytes), 4);
+    header_len = static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8U) |
+                 (static_cast<uint32_t>(bytes[2]) << 16U) | (static_cast<uint32_t>(bytes[3]) << 24U);
+  }
+  std::string header(header_len, '\0');
+  in.read(header.data(), static_cast<std::streamsize>(header.size()));
+  if (!in) {
+    return false;
+  }
+  if (header.find("<f4") == std::string::npos || header.find("'fortran_order': False") == std::string::npos) {
+    return false;
+  }
+  const auto shape_pos = header.find("'shape':");
+  const auto open_paren = header.find('(', shape_pos);
+  const auto comma = header.find(',', open_paren);
+  const auto close_paren = header.find(')', open_paren);
+  if (shape_pos == std::string::npos || open_paren == std::string::npos || comma == std::string::npos ||
+      close_paren == std::string::npos) {
+    return false;
+  }
+  try {
+    out_rows = std::stoi(header.substr(open_paren + 1, comma - open_paren - 1));
+    out_cols = std::stoi(header.substr(comma + 1, close_paren - comma - 1));
+  } catch (...) {
+    return false;
+  }
+  if (out_rows <= 0 || out_cols <= 0) {
+    return false;
+  }
+  const size_t count = static_cast<size_t>(out_rows) * static_cast<size_t>(out_cols);
+  out_values.resize(count);
+  in.read(reinterpret_cast<char*>(out_values.data()), static_cast<std::streamsize>(count * sizeof(float)));
+  return static_cast<bool>(in);
 }
 
 bool write_pgm(const std::filesystem::path& path,
@@ -866,6 +927,91 @@ struct PositionalSuppressionCudaCache {
 
 PositionalSuppressionCudaCache& positional_suppression_cuda_cache() {
   static thread_local PositionalSuppressionCudaCache cache;
+  return cache;
+}
+
+// Empirical per-position (RoPE) noise template loaded from an .npy calibration file.
+// Renormalized to mean 1.0 and clamped so the score-space division is scale-preserving.
+struct PositionalTemplateCudaCache {
+  std::string path;
+  int patch_rows = 0;
+  int patch_cols = 0;
+  float* data = nullptr;
+  bool warned = false;
+
+  ~PositionalTemplateCudaCache() { release(); }
+
+  void release() {
+    if (data != nullptr) {
+      cudaFree(data);
+      data = nullptr;
+    }
+    patch_rows = 0;
+    patch_cols = 0;
+    path.clear();
+  }
+
+  // Returns true and sets `data` when the template for (path, patch_rows, patch_cols)
+  // is resident; false (with a one-time warning) on any load/shape failure.
+  bool ensure(const std::string& requested_path, int requested_patch_rows, int requested_patch_cols, cudaStream_t stream) {
+    if (requested_path.empty() || requested_patch_rows <= 0 || requested_patch_cols <= 0) {
+      return false;
+    }
+    if (data != nullptr && path == requested_path && patch_rows == requested_patch_rows && patch_cols == requested_patch_cols) {
+      return true;
+    }
+
+    std::vector<float> host_values;
+    int rows = 0;
+    int cols = 0;
+    if (!read_npy_2d_float(requested_path, host_values, rows, cols)) {
+      if (!warned) {
+        std::fprintf(stderr, "[cuda_dino_detector] WARN: could not read positional template '%s'; disabling template division\n",
+                     requested_path.c_str());
+        warned = true;
+      }
+      return false;
+    }
+    if (rows != requested_patch_rows || cols != requested_patch_cols) {
+      if (!warned) {
+        std::fprintf(stderr,
+                     "[cuda_dino_detector] WARN: positional template shape %dx%d != patch grid %dx%d; disabling template division\n",
+                     rows, cols, requested_patch_rows, requested_patch_cols);
+        warned = true;
+      }
+      return false;
+    }
+
+    // Renormalize to mean 1.0 and clamp to keep the division well-conditioned.
+    double sum = 0.0;
+    for (float v : host_values) {
+      sum += static_cast<double>(v);
+    }
+    const double mean = host_values.empty() ? 1.0 : sum / static_cast<double>(host_values.size());
+    const float inv_mean = mean > 1.0e-9 ? static_cast<float>(1.0 / mean) : 1.0f;
+    for (float& v : host_values) {
+      v = std::min(std::max(v * inv_mean, 0.05f), 20.0f);
+    }
+
+    release();
+    const size_t count = host_values.size();
+    if (cudaMalloc(reinterpret_cast<void**>(&data), count * sizeof(float)) != cudaSuccess) {
+      data = nullptr;
+      return false;
+    }
+    if (cudaMemcpyAsync(data, host_values.data(), count * sizeof(float), cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+      release();
+      return false;
+    }
+    path = requested_path;
+    patch_rows = requested_patch_rows;
+    patch_cols = requested_patch_cols;
+    return true;
+  }
+};
+
+PositionalTemplateCudaCache& positional_template_cuda_cache() {
+  static thread_local PositionalTemplateCudaCache cache;
   return cache;
 }
 
@@ -1672,6 +1818,8 @@ __global__ void raw_dino_rms_energy_batch_kernel(const float* patch_features,
                                                  int batch_size,
                                                  int patch_count,
                                                  int feature_dim,
+                                                 const float* positional_template,
+                                                 float template_strength,
                                                  float* output_patch_scores) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = batch_size * patch_count;
@@ -1685,7 +1833,14 @@ __global__ void raw_dino_rms_energy_batch_kernel(const float* patch_features,
     const float value = patch_features[feature_offset + static_cast<size_t>(feature)];
     sum_sq += value * value;
   }
-  output_patch_scores[idx] = sqrtf(fmaxf(sum_sq / static_cast<float>(max(feature_dim, 1)), 1.0e-6f));
+  float score = sqrtf(fmaxf(sum_sq / static_cast<float>(max(feature_dim, 1)), 1.0e-6f));
+  // Empirical per-position (RoPE) noise calibration: divide by a mean-1 template so
+  // it is scale-preserving; strength 0 (or null template) is a no-op.
+  if (positional_template != nullptr) {
+    const int patch_index = idx - (idx / patch_count) * patch_count;
+    score /= fmaxf(1.0f + template_strength * (positional_template[patch_index] - 1.0f), 1.0e-3f);
+  }
+  output_patch_scores[idx] = score;
 }
 
 __global__ void raw_dino_beta_batch_kernel(const float* patch_features,
@@ -1754,6 +1909,8 @@ __global__ void raw_dino_project_energy_batch_kernel(const float* patch_features
                                                      const float* design,
                                                      const float* beta,
                                                      float suppression,
+                                                     const float* positional_template,
+                                                     float template_strength,
                                                      float* output_patch_scores) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = batch_size * patch_count;
@@ -1779,7 +1936,11 @@ __global__ void raw_dino_project_energy_batch_kernel(const float* patch_features
     const float value = patch_features[feature_offset + static_cast<size_t>(feature)] - suppression * fitted;
     sum_sq += value * value;
   }
-  output_patch_scores[idx] = sqrtf(fmaxf(sum_sq / static_cast<float>(max(feature_dim, 1)), 1.0e-6f));
+  float score = sqrtf(fmaxf(sum_sq / static_cast<float>(max(feature_dim, 1)), 1.0e-6f));
+  if (positional_template != nullptr) {
+    score /= fmaxf(1.0f + template_strength * (positional_template[patch_index] - 1.0f), 1.0e-3f);
+  }
+  output_patch_scores[idx] = score;
 }
 
 __global__ void component_filter_finalize_kernel(const uint8_t* mask,
@@ -2011,6 +2172,10 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   const auto hybrid_closed_mask_path = output_dir / "chunk_debug" / "chunk_hybrid_closed_mask.npy";
   const auto hybrid_filled_mask_path = output_dir / "chunk_debug" / "chunk_hybrid_filled_mask.npy";
   const auto hybrid_component_filtered_mask_path = output_dir / "chunk_debug" / "chunk_hybrid_component_filtered_mask.npy";
+  const auto coherence_rescue_mask_path = output_dir / "chunk_debug" / "chunk_coherence_rescue_mask.npy";
+  const auto coherence_band_mask_path = output_dir / "chunk_debug" / "chunk_coherence_band_mask.npy";
+  const auto dino_structure_mask_path = output_dir / "chunk_debug" / "chunk_dino_structure_mask.npy";
+  const auto initial_product_path = output_dir / "chunk_debug" / "chunk_initial_product.npy";
   const auto grouped_mask_path = output_dir / "chunk_debug" / "chunk_grouped_mask.npy";
   const auto final_mask_path = output_dir / "chunk_debug" / "chunk_final_mask.npy";
   const auto final_mask_source_path = output_dir / "chunk_debug" / "chunk_final_mask_source.npy";
@@ -2032,6 +2197,9 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   const auto hybrid_closed_mask_float = mask_to_float(selected_debug_chunk.hybrid_closed_mask);
   const auto hybrid_filled_mask_float = mask_to_float(selected_debug_chunk.hybrid_filled_mask);
   const auto hybrid_component_filtered_mask_float = mask_to_float(selected_debug_chunk.hybrid_component_filtered_mask);
+  const auto coherence_rescue_mask_float = mask_to_float(selected_debug_chunk.hybrid_coherence_rescue_mask);
+  const auto coherence_band_mask_float = mask_to_float(selected_debug_chunk.coherence_band_mask);
+  const auto dino_structure_mask_float = mask_to_float(selected_debug_chunk.dino_structure_mask);
   const auto final_mask_float = mask_to_float(selected_debug_chunk.final_mask);
   const auto projected_mask_float = mask_to_float(global_merged.projected_grouped_mask);
   const auto merged_box_mask_float = mask_to_float(global_merged.merged_box_mask);
@@ -2111,6 +2279,30 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
       !write_npy_2d(hybrid_component_filtered_mask_path,
             hybrid_component_filtered_mask_float.data(),
             hybrid_component_filtered_mask_float.size() * sizeof(float),
+            selected_debug_chunk.dst_rows,
+            selected_debug_chunk.dst_cols,
+            "<f4") ||
+      !write_npy_2d(coherence_rescue_mask_path,
+            coherence_rescue_mask_float.data(),
+            coherence_rescue_mask_float.size() * sizeof(float),
+            selected_debug_chunk.dst_rows,
+            selected_debug_chunk.dst_cols,
+            "<f4") ||
+      !write_npy_2d(coherence_band_mask_path,
+            coherence_band_mask_float.data(),
+            coherence_band_mask_float.size() * sizeof(float),
+            selected_debug_chunk.dst_rows,
+            selected_debug_chunk.dst_cols,
+            "<f4") ||
+      !write_npy_2d(dino_structure_mask_path,
+            dino_structure_mask_float.data(),
+            dino_structure_mask_float.size() * sizeof(float),
+            selected_debug_chunk.dst_rows,
+            selected_debug_chunk.dst_cols,
+            "<f4") ||
+      !write_npy_2d(initial_product_path,
+            selected_debug_chunk.initial_product.data(),
+            selected_debug_chunk.initial_product.size() * sizeof(float),
             selected_debug_chunk.dst_rows,
             selected_debug_chunk.dst_cols,
             "<f4") ||
@@ -2231,6 +2423,10 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   chunk_debug_summary << "  \"hybrid_closed_mask_npy\": \"" << json_escape(hybrid_closed_mask_path.string()) << "\",\n";
   chunk_debug_summary << "  \"hybrid_filled_mask_npy\": \"" << json_escape(hybrid_filled_mask_path.string()) << "\",\n";
   chunk_debug_summary << "  \"hybrid_component_filtered_mask_npy\": \"" << json_escape(hybrid_component_filtered_mask_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"coherence_rescue_mask_npy\": \"" << json_escape(coherence_rescue_mask_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"coherence_band_mask_npy\": \"" << json_escape(coherence_band_mask_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"dino_structure_mask_npy\": \"" << json_escape(dino_structure_mask_path.string()) << "\",\n";
+  chunk_debug_summary << "  \"initial_product_npy\": \"" << json_escape(initial_product_path.string()) << "\",\n";
   chunk_debug_summary << "  \"grouped_mask_npy\": \"" << json_escape(grouped_mask_path.string()) << "\",\n";
   chunk_debug_summary << "  \"grouped_boxes_json\": \"" << json_escape(grouped_boxes_path.string()) << "\",\n";
   chunk_debug_summary << "  \"final_mask_npy\": \"" << json_escape(final_mask_path.string()) << "\",\n";
@@ -4220,7 +4416,11 @@ bool compute_deweighted_raw_dino_score_native_cuda_batch_to_device(const float* 
                                                                    float positional_suppression,
                                                                    bool resized_full_chunk,
                                                                    float* output_score_device,
-                                                                   cudaStream_t cuda_stream) {
+                                                                   cudaStream_t cuda_stream,
+                                                                   float* output_patch_qnorm_device,
+                                                                   float* output_patch_prenorm_device,
+                                                                   const float* positional_template_device,
+                                                                   float positional_template_strength) {
   const int patch_count = patch_rows * patch_cols;
   if (batch_size <= 0 || patch_rows <= 0 || patch_cols <= 0 || feature_dim <= 0 || aligned_rows <= 0 || aligned_cols <= 0 ||
       output_rows <= 0 || output_cols <= 0 || patch_features_batch_device == nullptr || output_score_device == nullptr || patch_count <= 0) {
@@ -4269,15 +4469,27 @@ bool compute_deweighted_raw_dino_score_native_cuda_batch_to_device(const float* 
                                                                                 cache.design,
                                                                                 scratch.beta,
                                                                                 clamped_suppression,
+                                                                                positional_template_device,
+                                                                                positional_template_strength,
                                                                                 scratch.patch_values);
   } else {
     raw_dino_rms_energy_batch_kernel<<<patch_blocks, threads, 0, stream>>>(patch_features_batch_device,
                                                                              batch_size,
                                                                              patch_count,
                                                                              feature_dim,
+                                                                             positional_template_device,
+                                                                             positional_template_strength,
                                                                              scratch.patch_values);
   }
   if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  // Stage A calibration: export the pre-qnorm per-patch residual RMS (post positional
+  // template if enabled) so noise runs can be averaged into a sigma template offline.
+  if (output_patch_prenorm_device != nullptr &&
+      cudaMemcpyAsync(output_patch_prenorm_device, scratch.patch_values, patch_values * sizeof(float),
+                      cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
     return false;
   }
 
@@ -4292,6 +4504,15 @@ bool compute_deweighted_raw_dino_score_native_cuda_batch_to_device(const float* 
                                                            scratch.high_values,
                                                            scratch.patch_values,
                                                            stream)) {
+    return false;
+  }
+
+  // Export the per-chunk quantile-normalized patch-grid scores for the DINO
+  // structure gate before the (destructive) upsample and before any same-frame
+  // debug re-invocation clobbers scratch.patch_values.
+  if (output_patch_qnorm_device != nullptr &&
+      cudaMemcpyAsync(output_patch_qnorm_device, scratch.patch_values, patch_values * sizeof(float),
+                      cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
     return false;
   }
 
@@ -4686,6 +4907,8 @@ struct ResidualVetoCudaScratch {
   uint8_t* valid_row_mask = nullptr;
   uint8_t* mask_a = nullptr;
   uint8_t* mask_b = nullptr;
+  uint8_t* mask_rescue = nullptr;
+  uint8_t* mask_rescue_filtered = nullptr;
   size_t value_capacity = 0;
   size_t plane_capacity = 0;
   size_t batch_capacity = 0;
@@ -4755,6 +4978,14 @@ struct ResidualVetoCudaScratch {
     if (mask_b != nullptr) {
       cudaFree(mask_b);
       mask_b = nullptr;
+    }
+    if (mask_rescue != nullptr) {
+      cudaFree(mask_rescue);
+      mask_rescue = nullptr;
+    }
+    if (mask_rescue_filtered != nullptr) {
+      cudaFree(mask_rescue_filtered);
+      mask_rescue_filtered = nullptr;
     }
     plane_capacity = 0;
     batch_capacity = 0;
@@ -4885,8 +5116,18 @@ struct ResidualVetoCudaScratch {
         cudaFree(mask_b);
         mask_b = nullptr;
       }
+      if (mask_rescue != nullptr) {
+        cudaFree(mask_rescue);
+        mask_rescue = nullptr;
+      }
+      if (mask_rescue_filtered != nullptr) {
+        cudaFree(mask_rescue_filtered);
+        mask_rescue_filtered = nullptr;
+      }
       if (cudaMalloc(reinterpret_cast<void**>(&mask_a), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess ||
-          cudaMalloc(reinterpret_cast<void**>(&mask_b), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess) {
+          cudaMalloc(reinterpret_cast<void**>(&mask_b), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&mask_rescue), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&mask_rescue_filtered), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess) {
         release();
         return false;
       }
@@ -5003,6 +5244,8 @@ __global__ void residual_veto_normalize_quantile_pair_multiply_batch_kernel(cons
                                                                              const float* high_values_a,
                                                                              const float* low_values_b,
                                                                              const float* high_values_b,
+                                                                             int combine_max,
+                                                                             float dino_scale,
                                                                              float* output) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int plane = rows * cols;
@@ -5018,9 +5261,13 @@ __global__ void residual_veto_normalize_quantile_pair_multiply_batch_kernel(cons
   const float high_b = high_values_b[batch_index];
   const float inv_scale_a = 1.0f / fmaxf(high_a - low_a, 1.0e-6f);
   const float inv_scale_b = 1.0f / fmaxf(high_b - low_b, 1.0e-6f);
-  const float value_a = fminf(fmaxf((input_a[idx] - low_a) * inv_scale_a, 0.0f), 1.0f);
+  // input_a = DINO, input_b = coherence. dino_scale down-weights the DINO
+  // contribution so it only wins the max where it is genuinely stronger.
+  const float value_a = fminf(fmaxf((input_a[idx] - low_a) * inv_scale_a, 0.0f), 1.0f) * dino_scale;
   const float value_b = fminf(fmaxf((input_b[idx] - low_b) * inv_scale_b, 0.0f), 1.0f);
-  output[idx] = value_a * value_b;
+  // combine_max: coherence-preserving fusion (max cannot be pulled down by a weak
+  // factor); default multiply reproduces the legacy product exactly.
+  output[idx] = combine_max != 0 ? fmaxf(value_a, value_b) : value_a * value_b;
 }
 
 __global__ void residual_veto_normalize_quantile_pair_round_fp16_multiply_batch_kernel(const float* input_a,
@@ -5032,6 +5279,8 @@ __global__ void residual_veto_normalize_quantile_pair_round_fp16_multiply_batch_
                                                                                          const float* high_values_a,
                                                                                          const float* low_values_b,
                                                                                          const float* high_values_b,
+                                                                                         int combine_max,
+                                                                                         float dino_scale,
                                                                                          float* output) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int plane = rows * cols;
@@ -5047,9 +5296,10 @@ __global__ void residual_veto_normalize_quantile_pair_round_fp16_multiply_batch_
   const float high_b = high_values_b[batch_index];
   const float inv_scale_a = 1.0f / fmaxf(high_a - low_a, 1.0e-6f);
   const float inv_scale_b = 1.0f / fmaxf(high_b - low_b, 1.0e-6f);
-  const float value_a = __half2float(__float2half_rn(fminf(fmaxf((input_a[idx] - low_a) * inv_scale_a, 0.0f), 1.0f)));
+  // input_a = DINO (down-weighted by dino_scale), input_b = coherence.
+  const float value_a = __half2float(__float2half_rn(fminf(fmaxf((input_a[idx] - low_a) * inv_scale_a, 0.0f), 1.0f))) * dino_scale;
   const float value_b = __half2float(__float2half_rn(fminf(fmaxf((input_b[idx] - low_b) * inv_scale_b, 0.0f), 1.0f)));
-  output[idx] = value_a * value_b;
+  output[idx] = combine_max != 0 ? fmaxf(value_a, value_b) : value_a * value_b;
 }
 
 __global__ void residual_veto_masked_minmax_reduce_batch_kernel(const float* input,
@@ -6484,6 +6734,32 @@ __global__ void residual_veto_uint8_to_float_batch_kernel(const uint8_t* input, 
   output[idx] = input[idx] != 0 ? 1.0f : 0.0f;
 }
 
+// Coherence-rescue: monotonic OR (set-union) of an additive mask into an
+// existing binary mask. Only ever turns pixels ON, never off.
+__global__ void coherence_rescue_or_mask_batch_kernel(uint8_t* inout_mask, const uint8_t* add_mask, int total) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  inout_mask[idx] = (inout_mask[idx] != 0 || add_mask[idx] != 0) ? 1 : 0;
+}
+
+// Coherence-rescue: optional combined-score floor applied only inside rescued
+// pixels. Monotonic (score can only rise), and gated to the rescue mask so it
+// never lowers the DINO path. floor_strength <= 0 => no-op.
+__global__ void coherence_rescue_apply_score_floor_batch_kernel(float* score,
+                                                                const uint8_t* rescue_mask,
+                                                                int total,
+                                                                float floor_strength) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  if (rescue_mask[idx] != 0) {
+    score[idx] = fmaxf(score[idx], floor_strength);
+  }
+}
+
 bool copy_or_round_fp16_cuda_batch_to_device(const float* input_device,
                                              size_t total_values,
                                              bool use_fp16,
@@ -6623,7 +6899,9 @@ bool normalize_map01_quantile_exact_pair_multiply_cuda_batch_to_device(const flo
                                                                        float* low_values_b_device,
                                                                        float* high_values_b_device,
                                                                        float* output_batch_device,
-                                                                       cudaStream_t stream) {
+                                                                       cudaStream_t stream,
+                                                                       bool combine_max = false,
+                                                                       float dino_scale = 1.0f) {
   const size_t plane = static_cast<size_t>(rows) * static_cast<size_t>(cols);
   const size_t total_values = static_cast<size_t>(batch_size) * plane;
   if (!compute_exact_quantile_bounds_cuda_batch_to_device(input_a_batch_device,
@@ -6658,6 +6936,8 @@ bool normalize_map01_quantile_exact_pair_multiply_cuda_batch_to_device(const flo
                                                                                                 high_values_a_device,
                                                                                                 low_values_b_device,
                                                                                                 high_values_b_device,
+                                                                                                combine_max ? 1 : 0,
+                                                                                                dino_scale,
                                                                                                 output_batch_device);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -7479,7 +7759,9 @@ bool normalize_map01_quantile_exact_fp16_unit_pair_multiply_cuda_batch_to_device
                                                                                   float* low_values_b_device,
                                                                                   float* high_values_b_device,
                                                                                   float* output_batch_device,
-                                                                                  cudaStream_t stream) {
+                                                                                  cudaStream_t stream,
+                                                                                  bool combine_max = false,
+                                                                                  float dino_scale = 1.0f) {
   if (input_a_batch_device == nullptr || input_b_batch_device == nullptr || histograms_device == nullptr ||
       low_values_a_device == nullptr || high_values_a_device == nullptr || low_values_b_device == nullptr || high_values_b_device == nullptr ||
       output_batch_device == nullptr || batch_size <= 0 || rows <= 0 || cols <= 0) {
@@ -7531,11 +7813,581 @@ bool normalize_map01_quantile_exact_fp16_unit_pair_multiply_cuda_batch_to_device
                                                                                                            high_values_a_device,
                                                                                                            low_values_b_device,
                                                                                                            high_values_b_device,
+                                                                                                           combine_max ? 1 : 0,
+                                                                                                           dino_scale,
                                                                                                            output_batch_device);
   return cudaGetLastError() == cudaSuccess;
 }
 
 }  // namespace
+
+// ============================================================================
+// Coherence-primary fusion (Method 2) + DINO structure gate + scout helpers.
+// ============================================================================
+namespace {
+
+// Per-chunk threshold: pixel kept when value >= max(absolute, per_chunk_threshold[batch]).
+// per_chunk_threshold may be null (absolute only).
+__global__ void coherence_primary_threshold_mask_batch_kernel(const float* input,
+                                                              int batch_size,
+                                                              int rows,
+                                                              int cols,
+                                                              float absolute_threshold,
+                                                              const float* per_chunk_threshold,
+                                                              uint8_t* output_mask) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = rows * cols;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+  const int batch_index = idx / plane;
+  float threshold = absolute_threshold;
+  if (per_chunk_threshold != nullptr) {
+    threshold = fmaxf(threshold, per_chunk_threshold[batch_index]);
+  }
+  output_mask[idx] = input[idx] >= threshold ? 1 : 0;
+}
+
+// a = coherence, b = dino (scaled by b_scale = dino contribution strength).
+__global__ void coherence_primary_elementwise_max_batch_kernel(const float* a, const float* b, float b_scale, int total, float* out) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  out[idx] = fmaxf(a[idx], b[idx] * b_scale);
+}
+
+__global__ void coherence_primary_elementwise_mul_batch_kernel(const float* a, const float* b, float b_scale, int total, float* out) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  out[idx] = a[idx] * (b[idx] * b_scale);
+}
+
+// Count set pixels per plane (chunk) via atomics; out_counts must be zeroed first.
+__global__ void coherence_primary_mask_plane_count_batch_kernel(const uint8_t* mask, int batch_size, int plane, int* out_counts) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch_size * plane;
+  if (idx >= total) {
+    return;
+  }
+  if (mask[idx] != 0) {
+    atomicAdd(&out_counts[idx / plane], 1);
+  }
+}
+
+// Nearest-project a patch-grid binary mask to the chunk output grid, inverting the
+// forward score-projection geometry (bilinear-resample when resized_full_chunk,
+// else top-left crop). Writes plane output_plane_indices[b] (or b if null).
+__global__ void dino_structure_project_nearest_batch_kernel(const uint8_t* patch_mask,
+                                                            int batch_size,
+                                                            int patch_rows,
+                                                            int patch_cols,
+                                                            int aligned_rows,
+                                                            int aligned_cols,
+                                                            int output_rows,
+                                                            int output_cols,
+                                                            int resized_full_chunk,
+                                                            const int* output_plane_indices,
+                                                            uint8_t* out_full) {
+  const int out_plane = output_rows * output_cols;
+  const int total = batch_size * out_plane;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  const int b = idx / out_plane;
+  const int local = idx - b * out_plane;
+  const int out_row = local / output_cols;
+  const int out_col = local % output_cols;
+
+  float aligned_row = static_cast<float>(out_row);
+  float aligned_col = static_cast<float>(out_col);
+  bool inside = true;
+  if (resized_full_chunk != 0) {
+    aligned_row = ((static_cast<float>(out_row) + 0.5f) * static_cast<float>(aligned_rows) /
+                   static_cast<float>(max(output_rows, 1))) - 0.5f;
+    aligned_col = ((static_cast<float>(out_col) + 0.5f) * static_cast<float>(aligned_cols) /
+                   static_cast<float>(max(output_cols, 1))) - 0.5f;
+  } else if (out_row >= aligned_rows || out_col >= aligned_cols) {
+    inside = false;
+  }
+
+  uint8_t value = 0;
+  if (inside) {
+    int a_row = min(max(static_cast<int>(roundf(aligned_row)), 0), aligned_rows - 1);
+    int a_col = min(max(static_cast<int>(roundf(aligned_col)), 0), aligned_cols - 1);
+    const float p_row_f = ((static_cast<float>(a_row) + 0.5f) * static_cast<float>(patch_rows) /
+                           static_cast<float>(max(aligned_rows, 1))) - 0.5f;
+    const float p_col_f = ((static_cast<float>(a_col) + 0.5f) * static_cast<float>(patch_cols) /
+                           static_cast<float>(max(aligned_cols, 1))) - 0.5f;
+    const int p_row = min(max(static_cast<int>(roundf(p_row_f)), 0), patch_rows - 1);
+    const int p_col = min(max(static_cast<int>(roundf(p_col_f)), 0), patch_cols - 1);
+    const size_t patch_offset = static_cast<size_t>(b) * static_cast<size_t>(patch_rows) * static_cast<size_t>(patch_cols);
+    value = patch_mask[patch_offset + static_cast<size_t>(p_row) * static_cast<size_t>(patch_cols) + static_cast<size_t>(p_col)];
+  }
+
+  const int dst_plane = (output_plane_indices != nullptr) ? output_plane_indices[b] : b;
+  out_full[static_cast<size_t>(dst_plane) * static_cast<size_t>(out_plane) +
+           static_cast<size_t>(out_row) * static_cast<size_t>(output_cols) + static_cast<size_t>(out_col)] = value;
+}
+
+// Scratch for the coherence-band mask helper (chunk grid).
+struct CoherenceBandCudaScratch {
+  uint8_t* mask_a = nullptr;
+  uint8_t* mask_b = nullptr;
+  uint8_t* valid_row_mask = nullptr;
+  float* temp_plane = nullptr;
+  float* batch_low = nullptr;
+  float* batch_high = nullptr;
+  size_t mask_capacity = 0;
+  size_t row_mask_capacity = 0;
+  size_t plane_capacity = 0;
+  size_t batch_capacity = 0;
+
+  ~CoherenceBandCudaScratch() { release(); }
+
+  void release() {
+    if (mask_a != nullptr) { cudaFree(mask_a); mask_a = nullptr; }
+    if (mask_b != nullptr) { cudaFree(mask_b); mask_b = nullptr; }
+    if (valid_row_mask != nullptr) { cudaFree(valid_row_mask); valid_row_mask = nullptr; }
+    if (temp_plane != nullptr) { cudaFree(temp_plane); temp_plane = nullptr; }
+    if (batch_low != nullptr) { cudaFree(batch_low); batch_low = nullptr; }
+    if (batch_high != nullptr) { cudaFree(batch_high); batch_high = nullptr; }
+    mask_capacity = 0;
+    row_mask_capacity = 0;
+    plane_capacity = 0;
+    batch_capacity = 0;
+  }
+
+  bool ensure_capacity(size_t total, size_t plane, size_t batch, size_t row_mask) {
+    if (total > mask_capacity) {
+      if (mask_a != nullptr) { cudaFree(mask_a); mask_a = nullptr; }
+      if (mask_b != nullptr) { cudaFree(mask_b); mask_b = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&mask_a), total * sizeof(uint8_t)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&mask_b), total * sizeof(uint8_t)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      mask_capacity = total;
+    }
+    if (row_mask > row_mask_capacity) {
+      if (valid_row_mask != nullptr) { cudaFree(valid_row_mask); valid_row_mask = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&valid_row_mask), row_mask * sizeof(uint8_t)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      row_mask_capacity = row_mask;
+    }
+    if (plane > plane_capacity) {
+      if (temp_plane != nullptr) { cudaFree(temp_plane); temp_plane = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&temp_plane), plane * sizeof(float)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      plane_capacity = plane;
+    }
+    if (batch > batch_capacity) {
+      if (batch_low != nullptr) { cudaFree(batch_low); batch_low = nullptr; }
+      if (batch_high != nullptr) { cudaFree(batch_high); batch_high = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&batch_low), batch * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&batch_high), batch * sizeof(float)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      batch_capacity = batch;
+    }
+    return true;
+  }
+};
+
+CoherenceBandCudaScratch& coherence_band_cuda_scratch() {
+  static CoherenceBandCudaScratch scratch;
+  return scratch;
+}
+
+// Scratch for the DINO structure-mask helper (patch grid) + the fusion helper.
+struct CoherencePrimaryFusionCudaScratch {
+  // patch-grid buffers
+  uint8_t* patch_mask_a = nullptr;
+  uint8_t* patch_mask_b = nullptr;
+  uint8_t* patch_mask_union = nullptr;
+  float* patch_temp_plane = nullptr;
+  // chunk-grid fusion buffers
+  float* norm_a = nullptr;
+  float* norm_b = nullptr;
+  float* temp_plane = nullptr;
+  uint8_t* mask_union = nullptr;
+  uint8_t* mask_tmp = nullptr;
+  uint8_t* valid_row_mask = nullptr;
+  float* batch_low = nullptr;
+  float* batch_high = nullptr;
+  size_t patch_mask_capacity = 0;
+  size_t patch_plane_capacity = 0;
+  size_t value_capacity = 0;
+  size_t plane_capacity = 0;
+  size_t mask_capacity = 0;
+  size_t row_mask_capacity = 0;
+  size_t batch_capacity = 0;
+
+  ~CoherencePrimaryFusionCudaScratch() { release(); }
+
+  void release() {
+    if (patch_mask_a != nullptr) { cudaFree(patch_mask_a); patch_mask_a = nullptr; }
+    if (patch_mask_b != nullptr) { cudaFree(patch_mask_b); patch_mask_b = nullptr; }
+    if (patch_mask_union != nullptr) { cudaFree(patch_mask_union); patch_mask_union = nullptr; }
+    if (patch_temp_plane != nullptr) { cudaFree(patch_temp_plane); patch_temp_plane = nullptr; }
+    if (norm_a != nullptr) { cudaFree(norm_a); norm_a = nullptr; }
+    if (norm_b != nullptr) { cudaFree(norm_b); norm_b = nullptr; }
+    if (temp_plane != nullptr) { cudaFree(temp_plane); temp_plane = nullptr; }
+    if (mask_union != nullptr) { cudaFree(mask_union); mask_union = nullptr; }
+    if (mask_tmp != nullptr) { cudaFree(mask_tmp); mask_tmp = nullptr; }
+    if (valid_row_mask != nullptr) { cudaFree(valid_row_mask); valid_row_mask = nullptr; }
+    if (batch_low != nullptr) { cudaFree(batch_low); batch_low = nullptr; }
+    if (batch_high != nullptr) { cudaFree(batch_high); batch_high = nullptr; }
+    patch_mask_capacity = 0;
+    patch_plane_capacity = 0;
+    value_capacity = 0;
+    plane_capacity = 0;
+    mask_capacity = 0;
+    row_mask_capacity = 0;
+    batch_capacity = 0;
+  }
+
+  bool ensure_patch_capacity(size_t patch_total, size_t patch_plane) {
+    if (patch_total > patch_mask_capacity) {
+      if (patch_mask_a != nullptr) { cudaFree(patch_mask_a); patch_mask_a = nullptr; }
+      if (patch_mask_b != nullptr) { cudaFree(patch_mask_b); patch_mask_b = nullptr; }
+      if (patch_mask_union != nullptr) { cudaFree(patch_mask_union); patch_mask_union = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&patch_mask_a), patch_total * sizeof(uint8_t)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&patch_mask_b), patch_total * sizeof(uint8_t)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&patch_mask_union), patch_total * sizeof(uint8_t)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      patch_mask_capacity = patch_total;
+    }
+    if (patch_plane > patch_plane_capacity) {
+      if (patch_temp_plane != nullptr) { cudaFree(patch_temp_plane); patch_temp_plane = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&patch_temp_plane), patch_plane * sizeof(float)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      patch_plane_capacity = patch_plane;
+    }
+    return true;
+  }
+
+  bool ensure_fusion_capacity(size_t total, size_t plane, size_t batch, size_t row_mask) {
+    if (total > value_capacity) {
+      if (norm_a != nullptr) { cudaFree(norm_a); norm_a = nullptr; }
+      if (norm_b != nullptr) { cudaFree(norm_b); norm_b = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&norm_a), total * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&norm_b), total * sizeof(float)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      value_capacity = total;
+    }
+    if (total > mask_capacity) {
+      if (mask_union != nullptr) { cudaFree(mask_union); mask_union = nullptr; }
+      if (mask_tmp != nullptr) { cudaFree(mask_tmp); mask_tmp = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&mask_union), total * sizeof(uint8_t)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&mask_tmp), total * sizeof(uint8_t)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      mask_capacity = total;
+    }
+    if (plane > plane_capacity) {
+      if (temp_plane != nullptr) { cudaFree(temp_plane); temp_plane = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&temp_plane), plane * sizeof(float)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      plane_capacity = plane;
+    }
+    if (row_mask > row_mask_capacity) {
+      if (valid_row_mask != nullptr) { cudaFree(valid_row_mask); valid_row_mask = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&valid_row_mask), row_mask * sizeof(uint8_t)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      row_mask_capacity = row_mask;
+    }
+    if (batch > batch_capacity) {
+      if (batch_low != nullptr) { cudaFree(batch_low); batch_low = nullptr; }
+      if (batch_high != nullptr) { cudaFree(batch_high); batch_high = nullptr; }
+      if (cudaMalloc(reinterpret_cast<void**>(&batch_low), batch * sizeof(float)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&batch_high), batch * sizeof(float)) != cudaSuccess) {
+        release();
+        return false;
+      }
+      batch_capacity = batch;
+    }
+    return true;
+  }
+};
+
+CoherencePrimaryFusionCudaScratch& coherence_primary_fusion_cuda_scratch() {
+  static CoherencePrimaryFusionCudaScratch scratch;
+  return scratch;
+}
+
+}  // namespace
+
+bool compute_coherence_band_mask_gpu_batch_to_device(const float* coherence_gate_batch_device,
+                                                     int batch_size,
+                                                     int rows,
+                                                     int cols,
+                                                     const std::vector<uint8_t>& valid_row_mask_batch,
+                                                     const CoherencePrimaryConfig& config,
+                                                     uint8_t* output_band_mask_batch_device,
+                                                     cudaStream_t cuda_stream) {
+  if (batch_size <= 0 || rows <= 0 || cols <= 0 || coherence_gate_batch_device == nullptr ||
+      output_band_mask_batch_device == nullptr ||
+      valid_row_mask_batch.size() != static_cast<size_t>(batch_size) * static_cast<size_t>(rows)) {
+    return false;
+  }
+  const size_t plane = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  const size_t total = static_cast<size_t>(batch_size) * plane;
+  const size_t row_mask = static_cast<size_t>(batch_size) * static_cast<size_t>(rows);
+  auto& scratch = coherence_band_cuda_scratch();
+  if (!scratch.ensure_capacity(total, plane, static_cast<size_t>(batch_size), row_mask)) {
+    return false;
+  }
+  cudaStream_t stream = cuda_stream != nullptr ? cuda_stream : cudaStreamPerThread;
+  const int threads = 256;
+  const int blocks = static_cast<int>((total + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+
+  if (cudaMemcpyAsync(scratch.valid_row_mask, valid_row_mask_batch.data(), row_mask * sizeof(uint8_t),
+                      cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+    return false;
+  }
+
+  const float* per_chunk_threshold = nullptr;
+  if (config.coherence_quantile >= 0.0f) {
+    if (!compute_exact_quantile_bounds_cuda_batch_to_device(coherence_gate_batch_device, batch_size, plane,
+                                                            config.coherence_quantile, config.coherence_quantile,
+                                                            scratch.temp_plane, scratch.batch_low, scratch.batch_high,
+                                                            stream)) {
+      return false;
+    }
+    per_chunk_threshold = scratch.batch_high;
+  }
+
+  coherence_primary_threshold_mask_batch_kernel<<<blocks, threads, 0, stream>>>(coherence_gate_batch_device,
+                                                                                batch_size, rows, cols,
+                                                                                config.coherence_threshold,
+                                                                                per_chunk_threshold,
+                                                                                scratch.mask_a);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+  residual_veto_apply_valid_rows_mask_u8_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_a, batch_size, rows, cols,
+                                                                                      scratch.valid_row_mask);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  // Time-continuity opening along cols (erode then dilate). Result -> mask_a.
+  uint8_t* opened = scratch.mask_a;
+  if (config.open_time_px > 1) {
+    const int radius = (config.open_time_px - 1) / 2;
+    binary_erode_cols_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_a, batch_size, rows, cols, radius, scratch.mask_b);
+    if (cudaGetLastError() != cudaSuccess) {
+      return false;
+    }
+    binary_dilate_cols_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_b, batch_size, rows, cols, radius, scratch.mask_a);
+    if (cudaGetLastError() != cudaSuccess) {
+      return false;
+    }
+    opened = scratch.mask_a;
+  }
+
+  // Optional closing.
+  uint8_t* closed = opened;
+  if (config.close_freq_px > 1 || config.close_time_px > 1) {
+    if (!binary_closing_rect_cuda_batch_to_device(opened, batch_size, rows, cols,
+                                                  std::max(1, config.close_freq_px), std::max(1, config.close_time_px),
+                                                  scratch.mask_b, stream)) {
+      return false;
+    }
+    closed = scratch.mask_b;
+  }
+
+  // Drop small components -> output band mask (short-circuits when min_area <= 1).
+  return keep_large_components_cuda_batch_to_device(closed, batch_size, rows, cols, std::max(1, config.min_area_px),
+                                                    output_band_mask_batch_device, stream);
+}
+
+bool compute_dino_structure_mask_gpu_batch_to_device(const float* patch_qnorm_batch_device,
+                                                     int batch_size,
+                                                     int patch_rows,
+                                                     int patch_cols,
+                                                     const DinoStructureGateConfig& config,
+                                                     int aligned_rows,
+                                                     int aligned_cols,
+                                                     int output_rows,
+                                                     int output_cols,
+                                                     bool resized_full_chunk,
+                                                     const int* output_plane_indices_device,
+                                                     uint8_t* output_mask_full_batch_device,
+                                                     cudaStream_t cuda_stream) {
+  if (batch_size <= 0 || patch_rows <= 0 || patch_cols <= 0 || aligned_rows <= 0 || aligned_cols <= 0 ||
+      output_rows <= 0 || output_cols <= 0 || patch_qnorm_batch_device == nullptr || output_mask_full_batch_device == nullptr) {
+    return false;
+  }
+  const size_t patch_plane = static_cast<size_t>(patch_rows) * static_cast<size_t>(patch_cols);
+  const size_t patch_total = static_cast<size_t>(batch_size) * patch_plane;
+  auto& scratch = coherence_primary_fusion_cuda_scratch();
+  if (!scratch.ensure_patch_capacity(patch_total, patch_plane)) {
+    return false;
+  }
+  cudaStream_t stream = cuda_stream != nullptr ? cuda_stream : cudaStreamPerThread;
+  const int threads = 256;
+  const int patch_blocks = static_cast<int>((patch_total + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+
+  // Need per-chunk quantiles: reuse the band-mask scratch's batch buffers (distinct helper, sequential use).
+  auto& band_scratch = coherence_band_cuda_scratch();
+  if (!band_scratch.ensure_capacity(patch_total, patch_plane, static_cast<size_t>(batch_size),
+                                    static_cast<size_t>(batch_size))) {
+    return false;
+  }
+  if (!compute_exact_quantile_bounds_cuda_batch_to_device(patch_qnorm_batch_device, batch_size, patch_plane,
+                                                          config.threshold_quantile, config.threshold_quantile,
+                                                          band_scratch.temp_plane, band_scratch.batch_low, band_scratch.batch_high,
+                                                          stream)) {
+    return false;
+  }
+  coherence_primary_threshold_mask_batch_kernel<<<patch_blocks, threads, 0, stream>>>(patch_qnorm_batch_device,
+                                                                                      batch_size, patch_rows, patch_cols,
+                                                                                      0.0f, band_scratch.batch_high,
+                                                                                      scratch.patch_mask_a);
+  if (cudaGetLastError() != cudaSuccess) {
+    return false;
+  }
+
+  const int radius = std::max(1, (std::max(3, config.open_len) - 1) / 2);
+  // Time (cols) opening -> patch_mask_union.
+  binary_erode_cols_batch_kernel<<<patch_blocks, threads, 0, stream>>>(scratch.patch_mask_a, batch_size, patch_rows, patch_cols, radius, scratch.patch_mask_b);
+  if (cudaGetLastError() != cudaSuccess) { return false; }
+  binary_dilate_cols_batch_kernel<<<patch_blocks, threads, 0, stream>>>(scratch.patch_mask_b, batch_size, patch_rows, patch_cols, radius, scratch.patch_mask_union);
+  if (cudaGetLastError() != cudaSuccess) { return false; }
+  // Frequency (rows) opening -> patch_mask_a.
+  binary_erode_rows_batch_kernel<<<patch_blocks, threads, 0, stream>>>(scratch.patch_mask_a, batch_size, patch_rows, patch_cols, radius, scratch.patch_mask_b);
+  if (cudaGetLastError() != cudaSuccess) { return false; }
+  binary_dilate_rows_batch_kernel<<<patch_blocks, threads, 0, stream>>>(scratch.patch_mask_b, batch_size, patch_rows, patch_cols, radius, scratch.patch_mask_a);
+  if (cudaGetLastError() != cudaSuccess) { return false; }
+  // Union time ∪ freq -> patch_mask_union.
+  coherence_rescue_or_mask_batch_kernel<<<patch_blocks, threads, 0, stream>>>(scratch.patch_mask_union, scratch.patch_mask_a,
+                                                                              static_cast<int>(patch_total));
+  if (cudaGetLastError() != cudaSuccess) { return false; }
+
+  const size_t out_total = static_cast<size_t>(batch_size) * static_cast<size_t>(output_rows) * static_cast<size_t>(output_cols);
+  const int out_blocks = static_cast<int>((out_total + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+  dino_structure_project_nearest_batch_kernel<<<out_blocks, threads, 0, stream>>>(scratch.patch_mask_union,
+                                                                                  batch_size, patch_rows, patch_cols,
+                                                                                  aligned_rows, aligned_cols,
+                                                                                  output_rows, output_cols,
+                                                                                  resized_full_chunk ? 1 : 0,
+                                                                                  output_plane_indices_device,
+                                                                                  output_mask_full_batch_device);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool compute_coherence_primary_fusion_gpu_batch_to_device(const float* dino_score_batch_device,
+                                                          const float* coherence_batch_device,
+                                                          const uint8_t* coherence_band_mask_batch_device,
+                                                          const uint8_t* dino_structure_mask_batch_device,
+                                                          const float* legacy_final_mask_batch_device,
+                                                          int batch_size,
+                                                          int rows,
+                                                          int cols,
+                                                          const std::vector<uint8_t>& valid_row_mask_batch,
+                                                          float* output_combined_score_device,
+                                                          float* output_final_mask_device,
+                                                          float* debug_initial_product_device,
+                                                          cudaStream_t cuda_stream,
+                                                          float dino_contribution_strength) {
+  if (batch_size <= 0 || rows <= 0 || cols <= 0 || coherence_batch_device == nullptr ||
+      coherence_band_mask_batch_device == nullptr || dino_structure_mask_batch_device == nullptr ||
+      output_final_mask_device == nullptr ||
+      valid_row_mask_batch.size() != static_cast<size_t>(batch_size) * static_cast<size_t>(rows)) {
+    return false;
+  }
+  const size_t plane = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  const size_t total = static_cast<size_t>(batch_size) * plane;
+  const size_t row_mask = static_cast<size_t>(batch_size) * static_cast<size_t>(rows);
+  auto& scratch = coherence_primary_fusion_cuda_scratch();
+  if (!scratch.ensure_fusion_capacity(total, plane, static_cast<size_t>(batch_size), row_mask)) {
+    return false;
+  }
+  cudaStream_t stream = cuda_stream != nullptr ? cuda_stream : cudaStreamPerThread;
+  const int threads = 256;
+  const int blocks = static_cast<int>((total + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+
+  // Combined score = max(qnorm(coherence, 0.05-0.99), dino_contribution_strength * qnorm(dino, 0.05-0.95)) for grouping/viz.
+  if (output_combined_score_device != nullptr || debug_initial_product_device != nullptr) {
+    const float* dino_input = dino_score_batch_device;
+    if (!normalize_map01_quantile_exact_cuda_batch_to_device(coherence_batch_device, batch_size, rows, cols,
+                                                             0.05f, 0.99f, scratch.temp_plane, scratch.batch_low,
+                                                             scratch.batch_high, scratch.norm_a, stream)) {
+      return false;
+    }
+    if (dino_input != nullptr) {
+      if (!normalize_map01_quantile_exact_cuda_batch_to_device(dino_input, batch_size, rows, cols,
+                                                               0.05f, 0.95f, scratch.temp_plane, scratch.batch_low,
+                                                               scratch.batch_high, scratch.norm_b, stream)) {
+        return false;
+      }
+    } else {
+      if (cudaMemsetAsync(scratch.norm_b, 0, total * sizeof(float), stream) != cudaSuccess) {
+        return false;
+      }
+    }
+    if (output_combined_score_device != nullptr) {
+      coherence_primary_elementwise_max_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.norm_a, scratch.norm_b, dino_contribution_strength,
+                                                                                     static_cast<int>(total), output_combined_score_device);
+      if (cudaGetLastError() != cudaSuccess) { return false; }
+    }
+    if (debug_initial_product_device != nullptr) {
+      coherence_primary_elementwise_mul_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.norm_a, scratch.norm_b, dino_contribution_strength,
+                                                                                     static_cast<int>(total), debug_initial_product_device);
+      if (cudaGetLastError() != cudaSuccess) { return false; }
+    }
+  }
+
+  // Union = band ∪ structure ∪ threshold(legacy, 0.5). Consume legacy before writing output.
+  if (cudaMemcpyAsync(scratch.mask_union, coherence_band_mask_batch_device, total * sizeof(uint8_t),
+                      cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+    return false;
+  }
+  coherence_rescue_or_mask_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_union, dino_structure_mask_batch_device,
+                                                                        static_cast<int>(total));
+  if (cudaGetLastError() != cudaSuccess) { return false; }
+  if (legacy_final_mask_batch_device != nullptr) {
+    residual_veto_threshold_mask_batch_kernel<<<blocks, threads, 0, stream>>>(legacy_final_mask_batch_device,
+                                                                              static_cast<int>(total), 0.5f, scratch.mask_tmp);
+    if (cudaGetLastError() != cudaSuccess) { return false; }
+    coherence_rescue_or_mask_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_union, scratch.mask_tmp,
+                                                                          static_cast<int>(total));
+    if (cudaGetLastError() != cudaSuccess) { return false; }
+  }
+
+  if (cudaMemcpyAsync(scratch.valid_row_mask, valid_row_mask_batch.data(), row_mask * sizeof(uint8_t),
+                      cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+    return false;
+  }
+  residual_veto_apply_valid_rows_mask_u8_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_union, batch_size, rows, cols,
+                                                                                      scratch.valid_row_mask);
+  if (cudaGetLastError() != cudaSuccess) { return false; }
+  residual_veto_uint8_to_float_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_union, static_cast<int>(total),
+                                                                            output_final_mask_device);
+  return cudaGetLastError() == cudaSuccess;
+}
 
 bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_batch_device,
                                                        const float* coherence_batch_device,
@@ -7551,7 +8403,11 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
                                                        uint8_t* output_filled_mask_batch_device,
                                                        uint8_t* output_component_filtered_mask_batch_device,
                                                        cudaStream_t cuda_stream,
-                                                       CudaHybridStageTiming* stage_timing) {
+                                                       CudaHybridStageTiming* stage_timing,
+                                                       const CoherenceRescueConfig* rescue,
+                                                       float* debug_initial_product_device,
+                                                       bool combine_scores_with_max,
+                                                       float dino_contribution_strength) {
   if (batch_size <= 0 || rows <= 0 || cols <= 0 || dino_score_batch_device == nullptr || coherence_batch_device == nullptr ||
       output_combined_score_device == nullptr ||
       valid_row_mask_batch.size() != static_cast<size_t>(batch_size) * static_cast<size_t>(rows)) {
@@ -7612,7 +8468,9 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
                                                                                                                        scratch.batch_c,
                                                                                                                        scratch.batch_d,
                                                                                                                        output_combined_score_device,
-                                                                                                                       stream)
+                                                                                                                       stream,
+                                                                                                                       combine_scores_with_max,
+                                                                                                                       dino_contribution_strength)
                                          : normalize_map01_quantile_exact_pair_multiply_cuda_batch_to_device(scratch.values_a,
                                                                                                               scratch.values_b,
                                                                                                               batch_size,
@@ -7628,13 +8486,23 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
                                                                                                               scratch.batch_c,
                                                                                                               scratch.batch_d,
                                                                                                               output_combined_score_device,
-                                                                                                              stream);
+                                                                                                              stream,
+                                                                                                              combine_scores_with_max,
+                                                                                                              dino_contribution_strength);
     if (!normalization_ready) {
       return false;
     }
     if (cudaGetLastError() != cudaSuccess ||
         !maybe_round_fp16_cuda_batch_inplace(output_combined_score_device, total_values, use_fp16, stream) ||
         !finish_stage(normalization_start, stage_timing != nullptr ? &stage_timing->normalization_ms : nullptr)) {
+      return false;
+    }
+
+    // Diagnostic: capture the initial product qnorm(dino)*qnorm(coherence) before
+    // the residual-veto stack overwrites output_combined_score_device.
+    if (debug_initial_product_device != nullptr &&
+        cudaMemcpyAsync(debug_initial_product_device, output_combined_score_device, total_values * sizeof(float),
+                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
       return false;
     }
 
@@ -7693,6 +8561,50 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
                                                                                              scratch.valid_row_mask);
         if (cudaGetLastError() != cudaSuccess) {
           return false;
+        }
+        // Coherence-rescue floor for the no-post-processing path: union large,
+        // strong-coherence regions directly into the thresholded mask so all
+        // downstream copies (filled/component/final) inherit the rescue.
+        if (rescue != nullptr && rescue->enable && rescue->min_area_px > 0) {
+          residual_veto_threshold_mask_batch_kernel<<<blocks, threads, 0, stream>>>(coherence_batch_device,
+                                                                                     static_cast<int>(total_values),
+                                                                                     rescue->coherence_threshold,
+                                                                                     scratch.mask_rescue);
+          if (cudaGetLastError() != cudaSuccess) {
+            return false;
+          }
+          residual_veto_apply_valid_rows_mask_u8_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_rescue,
+                                                                                              batch_size,
+                                                                                              rows,
+                                                                                              cols,
+                                                                                              scratch.valid_row_mask);
+          if (cudaGetLastError() != cudaSuccess) {
+            return false;
+          }
+          if (!keep_large_components_cuda_batch_to_device(scratch.mask_rescue,
+                                                          batch_size,
+                                                          rows,
+                                                          cols,
+                                                          rescue->min_area_px,
+                                                          scratch.mask_rescue_filtered,
+                                                          stream)) {
+            return false;
+          }
+          coherence_rescue_or_mask_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_a,
+                                                                                scratch.mask_rescue_filtered,
+                                                                                static_cast<int>(total_values));
+          if (cudaGetLastError() != cudaSuccess) {
+            return false;
+          }
+          if (rescue->floor_strength > 0.0f) {
+            coherence_rescue_apply_score_floor_batch_kernel<<<blocks, threads, 0, stream>>>(output_combined_score_device,
+                                                                                            scratch.mask_rescue_filtered,
+                                                                                            static_cast<int>(total_values),
+                                                                                            rescue->floor_strength);
+            if (cudaGetLastError() != cudaSuccess) {
+              return false;
+            }
+          }
         }
         if (cudaMemcpyAsync(scratch.mask_b,
                             scratch.mask_a,
@@ -7952,9 +8864,73 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
       return false;
     }
 
+    // Coherence-rescue floor (monotonic OR). Where the pristine coherence gate is
+    // strong AND forms a large contiguous region, union that region into the final
+    // mask so a weak DINO/residual response cannot suppress a confident coherence
+    // detection (the wideband failure mode). This only ADDS pixels: the DINO
+    // component-filtered artifact (filtered_mask_output) is left untouched, and the
+    // union is written to scratch.mask_rescue which feeds the float output below.
+    const uint8_t* final_mask_uint8 = filtered_mask_output;
+    if (rescue != nullptr && rescue->enable && rescue->min_area_px > 0) {
+      // 1. Threshold the pristine coherence gate (never mutated by the veto stack).
+      residual_veto_threshold_mask_batch_kernel<<<blocks, threads, 0, stream>>>(coherence_batch_device,
+                                                                                 static_cast<int>(total_values),
+                                                                                 rescue->coherence_threshold,
+                                                                                 scratch.mask_rescue);
+      if (cudaGetLastError() != cudaSuccess) {
+        return false;
+      }
+      // 2. Respect invalid (guard/sideband) rows.
+      residual_veto_apply_valid_rows_mask_u8_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_rescue,
+                                                                                          batch_size,
+                                                                                          rows,
+                                                                                          cols,
+                                                                                          scratch.valid_row_mask);
+      if (cudaGetLastError() != cudaSuccess) {
+        return false;
+      }
+      // 3. Spatial-extent gate: keep only large contiguous strong-coherence regions.
+      if (!keep_large_components_cuda_batch_to_device(scratch.mask_rescue,
+                                                      batch_size,
+                                                      rows,
+                                                      cols,
+                                                      rescue->min_area_px,
+                                                      scratch.mask_rescue_filtered,
+                                                      stream)) {
+        return false;
+      }
+      // 4. Union the DINO component-filtered mask with the rescue mask into
+      //    scratch.mask_rescue (reused now that its threshold contents were consumed
+      //    in step 3; stream ordering guarantees keep_large_components finished reading it).
+      if (cudaMemcpyAsync(scratch.mask_rescue,
+                          filtered_mask_output,
+                          total_values * sizeof(uint8_t),
+                          cudaMemcpyDeviceToDevice,
+                          stream) != cudaSuccess) {
+        return false;
+      }
+      coherence_rescue_or_mask_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_rescue,
+                                                                            scratch.mask_rescue_filtered,
+                                                                            static_cast<int>(total_values));
+      if (cudaGetLastError() != cudaSuccess) {
+        return false;
+      }
+      final_mask_uint8 = scratch.mask_rescue;
+      // 5. Optional combined-score floor inside rescued pixels (defaults off).
+      if (rescue->floor_strength > 0.0f) {
+        coherence_rescue_apply_score_floor_batch_kernel<<<blocks, threads, 0, stream>>>(output_combined_score_device,
+                                                                                        scratch.mask_rescue_filtered,
+                                                                                        static_cast<int>(total_values),
+                                                                                        rescue->floor_strength);
+        if (cudaGetLastError() != cudaSuccess) {
+          return false;
+        }
+      }
+    }
+
     if (output_final_mask_device != nullptr) {
       const auto output_copy_start = std::chrono::steady_clock::now();
-      residual_veto_uint8_to_float_batch_kernel<<<blocks, threads, 0, stream>>>(filtered_mask_output,
+      residual_veto_uint8_to_float_batch_kernel<<<blocks, threads, 0, stream>>>(final_mask_uint8,
                                                                                  static_cast<int>(total_values),
                                                                                  output_final_mask_device);
       if (cudaGetLastError() != cudaSuccess ||
@@ -8262,11 +9238,157 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "DINO coherence gate span dB",
              "Span in dB for the coherence gate normalization.",
              3.0);
+  spec.param(dino_coherence_rescue_enable_,
+             "dino_coherence_rescue_enable",
+             "DINO coherence rescue enable",
+             "Enable the coherence-rescue floor: a monotonic OR that adds detections where the "
+             "coherence gate is strong and spatially extended, so a weak DINO/residual response "
+             "cannot suppress a confident wideband coherence detection. Disabled => current behavior.",
+             false);
+  spec.param(dino_coherence_rescue_min_area_px_,
+             "dino_coherence_rescue_min_area_px",
+             "DINO coherence rescue minimum area px",
+             "Minimum contiguous strong-coherence component area (pixels, in chunk/source grid) "
+             "eligible for rescue. Gates rescue to large regions so isolated coherence hot-pixels "
+             "and small narrowband regions are not admitted.",
+             256);
+  spec.param(dino_coherence_rescue_threshold_,
+             "dino_coherence_rescue_threshold",
+             "DINO coherence rescue threshold",
+             "Absolute threshold on the raw coherence gate above which a pixel is rescue-eligible. "
+             "The raw gate's dynamic range is ~0.1 (measured max ~0.11), so this must be a small "
+             "value; 0.05 is a sensible default. Negative => derive from "
+             "dino_coherence_gate_floor * 10^(dino_coherence_gate_span_db/20) (legacy, tends to be "
+             "unreachably high for this gate scale).",
+             0.05);
+  spec.param(dino_coherence_rescue_floor_strength_,
+             "dino_coherence_rescue_floor_strength",
+             "DINO coherence rescue score floor strength",
+             "Optional combined-score floor applied only inside rescued pixels (monotonic). "
+             "0 => mask-only rescue (no score change).",
+             0.0);
+  spec.param(hybrid_fusion_mode_,
+             "hybrid_fusion_mode",
+             "Hybrid fusion mode",
+             "Fusion strategy: 'legacy' (product + residual-veto, byte-identical to prior behavior) "
+             "or 'coherence_primary' (final mask = coherence-band union DINO-structure union optional "
+             "legacy mask). Unknown values fall back to 'legacy'.",
+             std::string("legacy"));
+  spec.param(coherence_band_threshold_,
+             "coherence_band_threshold",
+             "Coherence band threshold",
+             "Absolute threshold on the RAW coherence gate (~0.1 scale) used to build the trusted "
+             "coherence-band mask in coherence_primary mode.",
+             0.05);
+  spec.param(coherence_band_threshold_quantile_,
+             "coherence_band_threshold_quantile",
+             "Coherence band threshold quantile",
+             "Optional per-chunk quantile anchor for the band threshold; >=0 => per-chunk threshold = "
+             "max(coherence_band_threshold, quantile_value). Negative => absolute only.",
+             -1.0);
+  spec.param(coherence_band_open_time_px_,
+             "coherence_band_open_time_px",
+             "Coherence band open time px",
+             "Length (time/cols) of the 1xk binary opening that enforces banded time-continuity and "
+             "removes quantile-inflated noise speckle. <=1 => no opening.",
+             5);
+  spec.param(coherence_band_close_freq_px_,
+             "coherence_band_close_freq_px",
+             "Coherence band close freq px",
+             "Optional post-opening closing kernel height (frequency/rows). <=1 => skip closing.",
+             0);
+  spec.param(coherence_band_close_time_px_,
+             "coherence_band_close_time_px",
+             "Coherence band close time px",
+             "Optional post-opening closing kernel width (time/cols). <=1 => skip closing.",
+             0);
+  spec.param(coherence_band_min_area_px_,
+             "coherence_band_min_area_px",
+             "Coherence band minimum area px",
+             "Minimum connected-component area retained in the coherence-band mask.",
+             256);
+  spec.param(dino_structure_threshold_quantile_,
+             "dino_structure_threshold_quantile",
+             "DINO structure threshold quantile",
+             "Per-chunk quantile applied to the patch-grid DINO scores; patches above it are candidate "
+             "structure. Self-normalizes to noise so the run-length opening does the discrimination.",
+             0.90);
+  spec.param(dino_structure_open_len_,
+             "dino_structure_open_len",
+             "DINO structure open length (patches)",
+             "Run length in PATCH units for the structure opening; the final structure mask is the "
+             "union of a 1xN (time) and Nx1 (frequency) opening (\"runs of >=N patches in a row\"). "
+             "Rounded up to odd.",
+             3);
+  spec.param(coherence_primary_include_legacy_mask_,
+             "coherence_primary_include_legacy_mask",
+             "Coherence primary include legacy mask",
+             "In coherence_primary mode, also OR the legacy residual-veto final mask into the union "
+             "(runs the legacy stack). Keeps current narrowband detections; strictly additive.",
+             true);
+  spec.param(coherence_primary_legacy_score_,
+             "coherence_primary_legacy_score",
+             "Coherence primary legacy score combine",
+             "Score fed to the residual-veto sub-pipeline in coherence_primary mode: 'max' runs "
+             "keep_freq/keep_res/seeds on max(qnorm coherence, qnorm dino) so weak DINO cannot "
+             "suppress coherence inside the veto stack; 'product' reproduces the verbatim legacy "
+             "sub-mask (qnorm dino * qnorm coherence). Ignored in legacy mode.",
+             std::string("max"));
+  spec.param(dino_contribution_strength_,
+             "dino_contribution_strength",
+             "DINO contribution strength",
+             "Scales the normalized DINO score before it is combined with coherence "
+             "(max/product) in coherence_primary mode: combined = max(qnorm_coh, strength * qnorm_dino). "
+             "<1 down-weights DINO so it only wins where clearly stronger than coherence; 1.0 = equal. "
+             "Applies to the veto sub-pipeline input and the emitted combined score. Ignored in legacy mode.",
+             1.0);
+  spec.param(dino_scout_enable_,
+             "dino_scout_enable",
+             "DINO scout enable",
+             "Run DINO inference only on chunks the coherence-band pass leaves unexplained (Method 3). "
+             "Requires coherence_primary mode; ignored (with a one-time warning) otherwise.",
+             false);
+  spec.param(dino_scout_coverage_threshold_,
+             "dino_scout_coverage_threshold",
+             "DINO scout coverage threshold",
+             "Skip DINO on a chunk when the coherence-band mask already covers >= this fraction of the "
+             "chunk's valid pixels. Lower => DINO searches more chunks.",
+             0.65);
   spec.param(raw_dino_positional_deweight_,
              "raw_dino_positional_deweight",
              "Raw DINO positional deweight",
              "Trend-only positional suppression weight for raw patch-energy scoring.",
              0.75f);
+  spec.param(save_raw_dino_patch_prenorm_,
+             "save_raw_dino_patch_prenorm",
+             "Save raw DINO patch pre-qnorm",
+             "Dump the pre-qnorm per-patch residual RMS (frame-indexed) for offline positional-template "
+             "calibration. Requires debug artifact output; adds a per-frame .npy under chunk_debug/patch_prenorm/.",
+             false);
+  spec.param(save_raw_dino_patch_features_,
+             "save_raw_dino_patch_features",
+             "Save raw DINO patch features",
+             "Dump the raw ViT patch feature matrix (frame-indexed, ~50 MB/frame) for Stage-D mean-embedding "
+             "calibration. Short runs only; requires debug artifact output.",
+             false);
+  spec.param(raw_dino_positional_template_path_,
+             "raw_dino_positional_template_path",
+             "Raw DINO positional template path",
+             "Path to a mean-1 float32 (patch_rows x patch_cols) .npy noise template. When set, the per-patch "
+             "residual RMS is divided by it (score-space) to remove the fixed RoPE edge-ring bias. Empty = disabled.",
+             std::string(""));
+  spec.param(raw_dino_positional_template_strength_,
+             "raw_dino_positional_template_strength",
+             "Raw DINO positional template strength",
+             "Interpolates the template division: divisor = 1 + strength*(template-1), clamped [0,1]. "
+             "0 = disabled, 1 = full template.",
+             1.0);
+  spec.param(raw_dino_positional_mu_path_,
+             "raw_dino_positional_mu_path",
+             "Raw DINO positional mean-embedding path",
+             "Stage-D hook (not yet wired): path to a (patch_count x feature_dim) mean-embedding .npy for "
+             "embedding-space positional subtraction. Empty = disabled.",
+             std::string(""));
   spec.param(power_q_,
              "power_q",
              "Power quantile",
@@ -8872,6 +9994,18 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         cudaFree(buffers.hybrid_component_filtered_mask_batch_device);
         buffers.hybrid_component_filtered_mask_batch_device = nullptr;
       }
+      if (buffers.coherence_band_mask_batch_device != nullptr) {
+        cudaFree(buffers.coherence_band_mask_batch_device);
+        buffers.coherence_band_mask_batch_device = nullptr;
+      }
+      if (buffers.dino_structure_mask_batch_device != nullptr) {
+        cudaFree(buffers.dino_structure_mask_batch_device);
+        buffers.dino_structure_mask_batch_device = nullptr;
+      }
+      if (buffers.hybrid_initial_product_batch_device != nullptr) {
+        cudaFree(buffers.hybrid_initial_product_batch_device);
+        buffers.hybrid_initial_product_batch_device = nullptr;
+      }
       allocate_device_float(buffers.corrected_batch_device, batch_elements);
       allocate_device_float(buffers.coherence_gate_batch_device, batch_elements);
       allocate_device_float(buffers.raw_dino_score_batch_device, batch_elements);
@@ -8879,6 +10013,8 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       allocate_device_float(buffers.hybrid_final_mask_batch_device, batch_elements);
       allocate_device_uint8(buffers.hybrid_filled_mask_batch_device, batch_elements);
       allocate_device_uint8(buffers.hybrid_component_filtered_mask_batch_device, batch_elements);
+      allocate_device_uint8(buffers.coherence_band_mask_batch_device, batch_elements);
+      allocate_device_uint8(buffers.dino_structure_mask_batch_device, batch_elements);
       buffers.batch_elements = batch_elements;
     }
 
@@ -8942,7 +10078,122 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     int debug_aligned_cols = 0;
     bool debug_runtime_resized_full_chunk = false;
     bool debug_resized_full_chunk = false;
-    if (is_truthy_backend_mode(backend_mode_.get()) && !model_script_path_.get().empty()) {
+
+    // ---- Coherence-primary (Method 2) / DINO-scout (Method 3) configuration ----
+    const bool coherence_primary = (hybrid_fusion_mode_.get() == std::string("coherence_primary"));
+    CoherencePrimaryConfig primary_config;
+    primary_config.enable = coherence_primary;
+    primary_config.coherence_threshold = static_cast<float>(coherence_band_threshold_.get());
+    primary_config.coherence_quantile = static_cast<float>(coherence_band_threshold_quantile_.get());
+    primary_config.open_time_px = coherence_band_open_time_px_.get();
+    primary_config.close_freq_px = coherence_band_close_freq_px_.get();
+    primary_config.close_time_px = coherence_band_close_time_px_.get();
+    primary_config.min_area_px = coherence_band_min_area_px_.get();
+    primary_config.include_legacy_mask = coherence_primary_include_legacy_mask_.get();
+    DinoStructureGateConfig structure_config;
+    structure_config.threshold_quantile = static_cast<float>(dino_structure_threshold_quantile_.get());
+    structure_config.open_len = dino_structure_open_len_.get();
+    const bool scout_enabled = dino_scout_enable_.get() && coherence_primary;
+    if (dino_scout_enable_.get() && !coherence_primary && compute_count_ == 1) {
+      std::fprintf(stderr,
+                   "[cuda_dino_detector] WARN: dino_scout_enable ignored because hybrid_fusion_mode != coherence_primary\n");
+    }
+    // Scout selection state (populated below when scout is active).
+    std::vector<int> scout_selected_planes;
+    int scout_subset_count = chunk_count;
+    bool scout_active = false;
+    bool band_mask_ready = false;
+
+    if (coherence_primary) {
+      // Hoist the coherence gate + band mask ahead of the DINO block so the scout
+      // can gate inference on the coherence decision. Coherence reads only the
+      // packed corrected_batch_device, so this reordering is dependency-safe.
+      if (capture_operator_timing) {
+        throw_if_cuda_error(cudaEventRecord(buffers.coherence_start_event, buffers.processing_stream),
+                            "cuda_dino_detector coherence-start event record failed");
+      }
+      coherence_ready = compute_structure_tensor_gate_gpu_batch_to_device(buffers.corrected_batch_device,
+                                                                          chunk_count,
+                                                                          uniform_chunk_rows,
+                                                                          src_cols,
+                                                                          chunk_valid_rows_batch,
+                                                                          buffers.coherence_gate_batch_device,
+                                                                          buffers.processing_stream);
+      if (coherence_ready && capture_operator_timing) {
+        throw_if_cuda_error(cudaEventRecord(buffers.coherence_end_event, buffers.processing_stream),
+                            "cuda_dino_detector coherence-end event record failed");
+      }
+      if (coherence_ready) {
+        band_mask_ready = compute_coherence_band_mask_gpu_batch_to_device(buffers.coherence_gate_batch_device,
+                                                                          chunk_count,
+                                                                          uniform_chunk_rows,
+                                                                          src_cols,
+                                                                          chunk_valid_rows_batch,
+                                                                          primary_config,
+                                                                          buffers.coherence_band_mask_batch_device,
+                                                                          buffers.processing_stream);
+      }
+      // Zero DINO score + structure mask so skipped/failed chunks are well-defined
+      // (the raw score buffer is otherwise never cleared between frames).
+      throw_if_cuda_error(cudaMemsetAsync(buffers.raw_dino_score_batch_device, 0,
+                                          batch_elements * sizeof(float), buffers.processing_stream),
+                          "cuda_dino_detector raw score zero-init failed");
+      throw_if_cuda_error(cudaMemsetAsync(buffers.dino_structure_mask_batch_device, 0,
+                                          batch_elements * sizeof(uint8_t), buffers.processing_stream),
+                          "cuda_dino_detector structure mask zero-init failed");
+
+      // Method 3: choose which chunks still need DINO (coverage criterion).
+      if (scout_enabled && band_mask_ready) {
+        // Count band-mask pixels per chunk (scout_plane_indices_device doubles as the
+        // int counter buffer here; it is repurposed as the compact->full plane map below).
+        std::vector<int> band_pixel_counts(static_cast<size_t>(chunk_count), 0);
+        {
+          if (buffers.scout_row_start_capacity < static_cast<size_t>(chunk_count)) {
+            if (buffers.scout_row_starts_device != nullptr) { cudaFree(buffers.scout_row_starts_device); buffers.scout_row_starts_device = nullptr; }
+            if (buffers.scout_plane_indices_device != nullptr) { cudaFree(buffers.scout_plane_indices_device); buffers.scout_plane_indices_device = nullptr; }
+            allocate_device_int(buffers.scout_row_starts_device, static_cast<size_t>(chunk_count));
+            allocate_device_int(buffers.scout_plane_indices_device, static_cast<size_t>(chunk_count));
+            buffers.scout_row_start_capacity = static_cast<size_t>(chunk_count);
+          }
+          throw_if_cuda_error(cudaMemsetAsync(buffers.scout_plane_indices_device, 0,
+                                              static_cast<size_t>(chunk_count) * sizeof(int), buffers.processing_stream),
+                              "cuda_dino_detector scout coverage counter zero failed");
+          const int plane = uniform_chunk_rows * src_cols;
+          const int count_total = chunk_count * plane;
+          const int count_blocks = (count_total + threads - 1) / threads;
+          coherence_primary_mask_plane_count_batch_kernel<<<count_blocks, threads, 0, buffers.processing_stream>>>(
+              buffers.coherence_band_mask_batch_device, chunk_count, plane, buffers.scout_plane_indices_device);
+          throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector scout coverage count kernel launch failed");
+          throw_if_cuda_error(cudaMemcpyAsync(band_pixel_counts.data(), buffers.scout_plane_indices_device,
+                                              static_cast<size_t>(chunk_count) * sizeof(int),
+                                              cudaMemcpyDeviceToHost, buffers.processing_stream),
+                              "cuda_dino_detector scout coverage copy failed");
+          throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                              "cuda_dino_detector scout coverage sync failed");
+        }
+        // Valid-pixel count per chunk from the host valid-row mask.
+        const double coverage_threshold = dino_scout_coverage_threshold_.get();
+        for (int b = 0; b < chunk_count; ++b) {
+          int valid_rows = 0;
+          for (int row = 0; row < uniform_chunk_rows; ++row) {
+            valid_rows += chunk_valid_rows_batch[static_cast<size_t>(b) * static_cast<size_t>(uniform_chunk_rows) + static_cast<size_t>(row)] ? 1 : 0;
+          }
+          const double valid_px = static_cast<double>(valid_rows) * static_cast<double>(src_cols);
+          const double coverage = valid_px > 0.0 ? static_cast<double>(band_pixel_counts[static_cast<size_t>(b)]) / valid_px : 0.0;
+          if (coverage < coverage_threshold) {
+            scout_selected_planes.push_back(b);
+          }
+        }
+        scout_subset_count = static_cast<int>(scout_selected_planes.size());
+        scout_active = (scout_subset_count < chunk_count);
+      }
+    }
+
+    // Skip DINO inference entirely when the scout selected zero chunks (all coherence-
+    // explained): raw score + structure stay zeroed and fusion proceeds coherence-only.
+    const bool run_dino_inference = is_truthy_backend_mode(backend_mode_.get()) && !model_script_path_.get().empty() &&
+                                    !(scout_active && scout_subset_count == 0);
+    if (run_dino_inference) {
       DinoTorchRuntimeConfig runtime_config;
       runtime_config.inference_backend = inference_backend_.get();
       runtime_config.model_script_path = model_script_path_.get();
@@ -8956,8 +10207,50 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       runtime_config.compute_power_score = false;
       runtime_config.frontend_correction_enable = false;
 
+      // DINO batch routing: full-batch (Method 2) or scout subset (Method 3). When
+      // scout is active, gather only the selected chunk planes into a compact buffer
+      // and run inference on those; scores/structure are scattered back below.
+      const int plane_elems = uniform_chunk_rows * src_cols;
+      int dino_batch_size = chunk_count;
+      const float* dino_corrected_input = buffers.corrected_batch_device;
+      float* dino_raw_score_output = buffers.raw_dino_score_batch_device;
+      float* dino_patch_qnorm_output = nullptr;  // set after run_batch (patch dims known)
+      bool structure_input_ready = false;
+      if (scout_active) {
+        dino_batch_size = scout_subset_count;
+        std::vector<int> subset_row_starts(static_cast<size_t>(scout_subset_count), 0);
+        for (int c = 0; c < scout_subset_count; ++c) {
+          subset_row_starts[static_cast<size_t>(c)] =
+              chunk_plan[static_cast<size_t>(scout_selected_planes[static_cast<size_t>(c)])].row_start;
+        }
+        throw_if_cuda_error(cudaMemcpyAsync(buffers.scout_row_starts_device, subset_row_starts.data(),
+                                            static_cast<size_t>(scout_subset_count) * sizeof(int),
+                                            cudaMemcpyHostToDevice, buffers.processing_stream),
+                            "cuda_dino_detector scout row-start upload failed");
+        throw_if_cuda_error(cudaMemcpyAsync(buffers.scout_plane_indices_device, scout_selected_planes.data(),
+                                            static_cast<size_t>(scout_subset_count) * sizeof(int),
+                                            cudaMemcpyHostToDevice, buffers.processing_stream),
+                            "cuda_dino_detector scout plane-index upload failed");
+        const size_t subset_elems = static_cast<size_t>(scout_subset_count) * static_cast<size_t>(plane_elems);
+        if (buffers.scout_batch_capacity < subset_elems) {
+          if (buffers.corrected_scout_batch_device != nullptr) { cudaFree(buffers.corrected_scout_batch_device); buffers.corrected_scout_batch_device = nullptr; }
+          if (buffers.raw_dino_score_scout_device != nullptr) { cudaFree(buffers.raw_dino_score_scout_device); buffers.raw_dino_score_scout_device = nullptr; }
+          allocate_device_float(buffers.corrected_scout_batch_device, subset_elems);
+          allocate_device_float(buffers.raw_dino_score_scout_device, subset_elems);
+          buffers.scout_batch_capacity = subset_elems;
+        }
+        const int gather_total = scout_subset_count * plane_elems;
+        const int gather_blocks = (gather_total + threads - 1) / threads;
+        cuda_dino_pack_reference_chunks_kernel<<<gather_blocks, threads, 0, buffers.processing_stream>>>(
+            buffers.corrected_db_device, src_rows, src_cols, buffers.scout_row_starts_device,
+            uniform_chunk_rows, scout_subset_count, buffers.corrected_scout_batch_device);
+        throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector scout gather pack kernel launch failed");
+        dino_corrected_input = buffers.corrected_scout_batch_device;
+        dino_raw_score_output = buffers.raw_dino_score_scout_device;
+      }
+
       DinoTorchRuntimeBatchInput runtime_input;
-      runtime_input.batch_size = chunk_count;
+      runtime_input.batch_size = dino_batch_size;
       runtime_input.src_rows = uniform_chunk_rows;
       runtime_input.src_cols = src_cols;
       runtime_input.dst_rows = input_height_.get();
@@ -8966,7 +10259,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       runtime_input.cuda_stream = buffers.processing_stream;
       runtime_input.resolution_hz = resolution_hz;
       runtime_input.span_hz = span_hz;
-      runtime_input.corrected_db_batch_device = buffers.corrected_batch_device;
+      runtime_input.corrected_db_batch_device = dino_corrected_input;
 
       if (!runtime_) {
         runtime_ = std::make_shared<DinoTorchRuntime>();
@@ -8984,7 +10277,9 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         const bool project_full_chunk =
           runtime_resized_full_chunk ||
           (execution_strategy_.get() == "reference_chunks" && uniform_chunk_rows > runtime_result.aligned_rows);
-        debug_patch_features_batch_device = runtime_result.patch_features_batch_device;
+        // Under scout the patch features are a compact subset; disable the
+        // full-batch debug recompute path to avoid out-of-range indexing.
+        debug_patch_features_batch_device = scout_active ? nullptr : runtime_result.patch_features_batch_device;
         debug_patch_rows = runtime_result.patch_rows;
         debug_patch_cols = runtime_result.patch_cols;
         debug_feature_dim = runtime_result.feature_dim;
@@ -8994,9 +10289,57 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         debug_resized_full_chunk = project_full_chunk;
         if (runtime_result.patch_features_batch_device != nullptr && runtime_result.patch_rows > 0 && runtime_result.patch_cols > 0 &&
             runtime_result.feature_dim > 0) {
+          // In coherence_primary mode, capture the per-chunk quantile-normalized
+          // patch scores for the DINO structure gate (buffer sized to the batch used).
+          if (coherence_primary) {
+            const size_t patch_plane = static_cast<size_t>(runtime_result.patch_rows) * static_cast<size_t>(runtime_result.patch_cols);
+            const size_t patch_total = static_cast<size_t>(dino_batch_size) * patch_plane;
+            if (scout_active) {
+              if (buffers.patch_qnorm_scout_capacity < patch_total) {
+                if (buffers.patch_qnorm_scout_device != nullptr) { cudaFree(buffers.patch_qnorm_scout_device); buffers.patch_qnorm_scout_device = nullptr; }
+                allocate_device_float(buffers.patch_qnorm_scout_device, patch_total);
+                buffers.patch_qnorm_scout_capacity = patch_total;
+              }
+              dino_patch_qnorm_output = buffers.patch_qnorm_scout_device;
+            } else {
+              if (buffers.patch_qnorm_capacity < patch_total) {
+                if (buffers.patch_qnorm_batch_device != nullptr) { cudaFree(buffers.patch_qnorm_batch_device); buffers.patch_qnorm_batch_device = nullptr; }
+                allocate_device_float(buffers.patch_qnorm_batch_device, patch_total);
+                buffers.patch_qnorm_capacity = patch_total;
+              }
+              dino_patch_qnorm_output = buffers.patch_qnorm_batch_device;
+            }
+          }
+          // Resolve the positional noise template (production; both fusion modes;
+          // per-patch position so it is valid for full-batch and scout subsets alike).
+          const std::string positional_template_path = raw_dino_positional_template_path_.get();
+          const float* positional_template_device = nullptr;
+          float positional_template_strength = 0.0f;
+          if (!positional_template_path.empty() &&
+              positional_template_cuda_cache().ensure(positional_template_path, runtime_result.patch_rows,
+                                                      runtime_result.patch_cols, buffers.processing_stream)) {
+            positional_template_device = positional_template_cuda_cache().data;
+            positional_template_strength = static_cast<float>(std::clamp(raw_dino_positional_template_strength_.get(), 0.0, 1.0));
+          }
+          // Stage A calibration prenorm dump buffer (debug artifacts + flag + full batch only).
+          float* dino_patch_prenorm_output = nullptr;
+          {
+            const bool want_artifacts = debug_mode_.get() && enable_debug_artifact_host_copy_.get() &&
+                                        !debug_artifact_output_dir_.get().empty();
+            if (want_artifacts && save_raw_dino_patch_prenorm_.get() && !scout_active) {
+              const size_t patch_plane = static_cast<size_t>(runtime_result.patch_rows) * static_cast<size_t>(runtime_result.patch_cols);
+              const size_t patch_total = static_cast<size_t>(dino_batch_size) * patch_plane;
+              if (buffers.patch_prenorm_capacity < patch_total) {
+                if (buffers.patch_prenorm_batch_device != nullptr) { cudaFree(buffers.patch_prenorm_batch_device); buffers.patch_prenorm_batch_device = nullptr; }
+                allocate_device_float(buffers.patch_prenorm_batch_device, patch_total);
+                buffers.patch_prenorm_capacity = patch_total;
+              }
+              dino_patch_prenorm_output = buffers.patch_prenorm_batch_device;
+            }
+          }
           const auto raw_score_start_time = std::chrono::steady_clock::now();
           raw_score_ready = compute_deweighted_raw_dino_score_gpu_batch_to_device(runtime_result.patch_features_batch_device,
-                                                                                  chunk_count,
+                                                                                  dino_batch_size,
                                                                                   runtime_result.patch_rows,
                                                                                   runtime_result.patch_cols,
                                                                                   runtime_result.feature_dim,
@@ -9006,18 +10349,23 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                   src_cols,
                                                                                   raw_dino_positional_deweight_.get(),
                                                                                   project_full_chunk,
-                                                                                  buffers.raw_dino_score_batch_device,
-                                                                                  buffers.processing_stream);
+                                                                                  dino_raw_score_output,
+                                                                                  buffers.processing_stream,
+                                                                                  dino_patch_qnorm_output,
+                                                                                  dino_patch_prenorm_output,
+                                                                                  positional_template_device,
+                                                                                  positional_template_strength);
           if (capture_operator_timing) {
             throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
                                 "cuda_dino_detector raw score timing synchronization failed");
             timing_profile.raw_score_projection_ms = elapsed_ms_since(raw_score_start_time);
           }
           raw_score_source = raw_score_ready ? "patch_features" : "none";
+          structure_input_ready = coherence_primary && raw_score_ready && dino_patch_qnorm_output != nullptr;
         } else if (runtime_result.score_maps_device != nullptr) {
           const auto raw_score_start_time = std::chrono::steady_clock::now();
           raw_score_ready = project_runtime_score_batch_to_device(runtime_result.score_maps_device,
-                                                                  chunk_count,
+                                                                  dino_batch_size,
                                                                   input_height_.get(),
                                                                   input_width_.get(),
                                                                   runtime_result.aligned_rows,
@@ -9025,7 +10373,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                   uniform_chunk_rows,
                                                                   src_cols,
                                                                   project_full_chunk,
-                                                                  buffers.raw_dino_score_batch_device,
+                                                                  dino_raw_score_output,
                                                                   buffers.processing_stream);
           if (capture_operator_timing) {
             throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
@@ -9033,6 +10381,39 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
             timing_profile.raw_score_projection_ms = elapsed_ms_since(raw_score_start_time);
           }
           raw_score_source = raw_score_ready ? "score_map_fallback" : "none";
+        }
+        // Scatter scout subset scores back into the full raw-score buffer (planes
+        // not selected stay zeroed from the memset above).
+        if (scout_active && raw_score_ready) {
+          for (int c = 0; c < scout_subset_count; ++c) {
+            const int plane_idx = scout_selected_planes[static_cast<size_t>(c)];
+            throw_if_cuda_error(cudaMemcpyAsync(
+                                    buffers.raw_dino_score_batch_device + static_cast<size_t>(plane_idx) * static_cast<size_t>(plane_elems),
+                                    buffers.raw_dino_score_scout_device + static_cast<size_t>(c) * static_cast<size_t>(plane_elems),
+                                    static_cast<size_t>(plane_elems) * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, buffers.processing_stream),
+                                "cuda_dino_detector scout raw-score scatter failed");
+          }
+        }
+        // Build the DINO structure mask (patch-grid run-length gate). Writes only the
+        // selected planes under scout (compact->full via scout_plane_indices_device);
+        // unselected planes remain zeroed.
+        if (structure_input_ready) {
+          if (!compute_dino_structure_mask_gpu_batch_to_device(dino_patch_qnorm_output,
+                                                               dino_batch_size,
+                                                               runtime_result.patch_rows,
+                                                               runtime_result.patch_cols,
+                                                               structure_config,
+                                                               runtime_result.aligned_rows,
+                                                               runtime_result.aligned_cols,
+                                                               uniform_chunk_rows,
+                                                               src_cols,
+                                                               debug_resized_full_chunk,
+                                                               scout_active ? buffers.scout_plane_indices_device : nullptr,
+                                                               buffers.dino_structure_mask_batch_device,
+                                                               buffers.processing_stream)) {
+            std::fprintf(stderr, "[cuda_dino_detector] WARN: DINO structure mask computation failed\n");
+          }
         }
         if (meta) {
           meta->set("cuda_dino_runtime_backend_used", runtime_result.backend_used);
@@ -9051,20 +10432,24 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                    "[cuda_dino_detector] WARN: raw DINO stage skipped because model_script_path is empty\n");
     }
 
-    if (capture_operator_timing) {
-      throw_if_cuda_error(cudaEventRecord(buffers.coherence_start_event, buffers.processing_stream),
-                          "cuda_dino_detector coherence-start event record failed");
-    }
-    coherence_ready = compute_structure_tensor_gate_gpu_batch_to_device(buffers.corrected_batch_device,
-                                                                        chunk_count,
-                                                                        uniform_chunk_rows,
-                                                                        src_cols,
-                                                                        chunk_valid_rows_batch,
-                                                                        buffers.coherence_gate_batch_device,
-                                                                        buffers.processing_stream);
-    if (coherence_ready && capture_operator_timing) {
-      throw_if_cuda_error(cudaEventRecord(buffers.coherence_end_event, buffers.processing_stream),
-                          "cuda_dino_detector coherence-end event record failed");
+    // Legacy ordering: coherence after DINO. In coherence_primary mode it was
+    // already hoisted before the DINO block, so skip the recompute here.
+    if (!coherence_ready) {
+      if (capture_operator_timing) {
+        throw_if_cuda_error(cudaEventRecord(buffers.coherence_start_event, buffers.processing_stream),
+                            "cuda_dino_detector coherence-start event record failed");
+      }
+      coherence_ready = compute_structure_tensor_gate_gpu_batch_to_device(buffers.corrected_batch_device,
+                                                                          chunk_count,
+                                                                          uniform_chunk_rows,
+                                                                          src_cols,
+                                                                          chunk_valid_rows_batch,
+                                                                          buffers.coherence_gate_batch_device,
+                                                                          buffers.processing_stream);
+      if (coherence_ready && capture_operator_timing) {
+        throw_if_cuda_error(cudaEventRecord(buffers.coherence_end_event, buffers.processing_stream),
+                            "cuda_dino_detector coherence-end event record failed");
+      }
     }
 
     if (capture_operator_timing && coherence_ready) {
@@ -9088,7 +10473,106 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     const bool enable_mask_post_processing = enable_mask_post_processing_.get();
     const bool preserve_hybrid_debug_outputs = debug_mode_.get() && enable_debug_artifact_host_copy_.get();
     const bool write_operator_artifacts = preserve_hybrid_debug_outputs && !debug_artifact_output_dir_.get().empty();
-    if (coherence_ready && raw_score_ready) {
+    // Resolve the coherence-rescue floor config once per compute. Threshold defaults
+    // to the dormant dino_coherence_gate_floor/span_db mapping when left negative.
+    CoherenceRescueConfig rescue_config;
+    rescue_config.enable = dino_coherence_rescue_enable_.get();
+    rescue_config.min_area_px = dino_coherence_rescue_min_area_px_.get();
+    rescue_config.floor_strength = static_cast<float>(dino_coherence_rescue_floor_strength_.get());
+    {
+      const double configured_threshold = dino_coherence_rescue_threshold_.get();
+      double resolved_threshold = configured_threshold;
+      if (configured_threshold < 0.0) {
+        resolved_threshold = dino_coherence_gate_floor_.get() *
+                             std::pow(10.0, dino_coherence_gate_span_db_.get() / 20.0);
+      }
+      rescue_config.coherence_threshold = static_cast<float>(std::clamp(resolved_threshold, 0.0, 1.0));
+    }
+    if (meta) {
+      meta->set("cuda_dino_coherence_rescue_enable", rescue_config.enable);
+      meta->set("cuda_dino_coherence_rescue_threshold", static_cast<double>(rescue_config.coherence_threshold));
+      meta->set("cuda_dino_coherence_rescue_min_area_px", rescue_config.min_area_px);
+    }
+    // Debug-only initial-product buffer (dumped as chunk_initial_product.npy), lazily
+    // allocated and freed on batch-size change; nullptr in production.
+    float* debug_initial_product = nullptr;
+    if (write_operator_artifacts) {
+      if (buffers.hybrid_initial_product_batch_device == nullptr) {
+        allocate_device_float(buffers.hybrid_initial_product_batch_device, batch_elements);
+      }
+      debug_initial_product = buffers.hybrid_initial_product_batch_device;
+    }
+    std::string hybrid_stage_variant = "none";
+    if (coherence_primary) {
+      // ---- Method 2/3: coherence-primary union fusion ----
+      const auto hybrid_start_time = std::chrono::steady_clock::now();
+      // Feed the veto sub-pipeline max(qnorm coh, qnorm dino) instead of the product
+      // (default): keep_freq/keep_res/seeds then derive from the coherence-preserving
+      // score, so a weak DINO response cannot wash coherence out of those stages.
+      const bool legacy_score_max = (coherence_primary_legacy_score_.get() != std::string("product"));
+      const float dino_contribution_strength = static_cast<float>(dino_contribution_strength_.get());
+      float* legacy_mask_input = nullptr;
+      if (primary_config.include_legacy_mask && coherence_ready && raw_score_ready) {
+        // Run the legacy residual-veto stack into the hybrid buffers, then OR its
+        // final mask into the union so current narrowband detections are preserved.
+        CudaHybridStageTiming legacy_timing;
+        const bool legacy_ok = compute_residual_veto_hybrid_gpu_batch_to_device(buffers.raw_dino_score_batch_device,
+                                                                                buffers.coherence_gate_batch_device,
+                                                                                chunk_count,
+                                                                                uniform_chunk_rows,
+                                                                                src_cols,
+                                                                                chunk_valid_rows_batch,
+                                                                                use_fp16_precision(hybrid_torch_dtype_.get()),
+                                                                                enable_mask_post_processing,
+                                                                                hybrid_component_min_size_.get(),
+                                                                                buffers.hybrid_combined_score_batch_device,
+                                                                                buffers.hybrid_final_mask_batch_device,
+                                                                                write_operator_artifacts ? buffers.hybrid_filled_mask_batch_device : nullptr,
+                                                                                write_operator_artifacts ? buffers.hybrid_component_filtered_mask_batch_device : nullptr,
+                                                                                buffers.processing_stream,
+                                                                                &legacy_timing,
+                                                                                &rescue_config,
+                                                                                debug_initial_product,
+                                                                                legacy_score_max,
+                                                                                dino_contribution_strength);
+        if (legacy_ok) {
+          legacy_mask_input = buffers.hybrid_final_mask_batch_device;
+        }
+      }
+      if (band_mask_ready) {
+        hybrid_ready = compute_coherence_primary_fusion_gpu_batch_to_device(buffers.raw_dino_score_batch_device,
+                                                                            buffers.coherence_gate_batch_device,
+                                                                            buffers.coherence_band_mask_batch_device,
+                                                                            buffers.dino_structure_mask_batch_device,
+                                                                            legacy_mask_input,
+                                                                            chunk_count,
+                                                                            uniform_chunk_rows,
+                                                                            src_cols,
+                                                                            chunk_valid_rows_batch,
+                                                                            buffers.hybrid_combined_score_batch_device,
+                                                                            buffers.hybrid_final_mask_batch_device,
+                                                                            (legacy_mask_input == nullptr) ? debug_initial_product : nullptr,
+                                                                            buffers.processing_stream,
+                                                                            dino_contribution_strength);
+        hybrid_stage_variant = legacy_mask_input != nullptr ? std::string("coherence_primary_union_with_legacy")
+                                                            : std::string("coherence_primary_union");
+      }
+      if (capture_operator_timing) {
+        throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                            "cuda_dino_detector coherence-primary timing synchronization failed");
+        timing_profile.hybrid_batch_ms = elapsed_ms_since(hybrid_start_time);
+      }
+      if (meta) {
+        meta->set("cuda_dino_coherence_band_ready", band_mask_ready);
+        meta->set("cuda_dino_coherence_primary_legacy_score", legacy_score_max ? std::string("max") : std::string("product"));
+        meta->set("cuda_dino_contribution_strength", static_cast<double>(dino_contribution_strength));
+        meta->set("cuda_dino_scout_enabled", scout_enabled);
+        meta->set("cuda_dino_scout_chunks_total", static_cast<uint32_t>(std::max(0, chunk_count)));
+        meta->set("cuda_dino_scout_chunks_run", static_cast<uint32_t>(std::max(0, scout_active ? scout_subset_count : chunk_count)));
+        meta->set("cuda_dino_scout_chunks_skipped",
+                  static_cast<uint32_t>(std::max(0, scout_active ? (chunk_count - scout_subset_count) : 0)));
+      }
+    } else if (coherence_ready && raw_score_ready) {
       const auto hybrid_start_time = std::chrono::steady_clock::now();
       CudaHybridStageTiming hybrid_stage_timing;
       hybrid_ready = compute_residual_veto_hybrid_gpu_batch_to_device(buffers.raw_dino_score_batch_device,
@@ -9105,7 +10589,9 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                       write_operator_artifacts ? buffers.hybrid_filled_mask_batch_device : nullptr,
                                                                       write_operator_artifacts ? buffers.hybrid_component_filtered_mask_batch_device : nullptr,
                                                                       buffers.processing_stream,
-                                                                      &hybrid_stage_timing);
+                                                                      &hybrid_stage_timing,
+                                                                      &rescue_config,
+                                                                      debug_initial_product);
       if (capture_operator_timing) {
         throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
                             "cuda_dino_detector hybrid timing synchronization failed");
@@ -9118,17 +10604,18 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         timing_profile.hybrid_component_filter_ms = hybrid_stage_timing.component_filter_ms;
         timing_profile.hybrid_output_copy_ms = hybrid_stage_timing.output_copy_ms;
       }
+      hybrid_stage_variant = hybrid_ready
+                                 ? (enable_mask_post_processing ? std::string("residual_veto_post_component_filter")
+                                                                : std::string("combined_score_threshold_only"))
+                                 : std::string("none");
     }
     if (meta) {
       meta->set("cuda_dino_hybrid_ready", hybrid_ready);
       meta->set("cuda_dino_enable_mask_post_processing", enable_mask_post_processing);
       meta->set("cuda_dino_hybrid_gpu_post_morphology", hybrid_ready && enable_mask_post_processing);
       meta->set("cuda_dino_hybrid_torch_dtype", hybrid_torch_dtype_.get());
-      meta->set("cuda_dino_hybrid_stage_variant",
-                hybrid_ready
-                    ? (enable_mask_post_processing ? std::string("residual_veto_post_component_filter")
-                                                   : std::string("combined_score_threshold_only"))
-                    : std::string("none"));
+      meta->set("cuda_dino_hybrid_fusion_mode", coherence_primary ? std::string("coherence_primary") : std::string("legacy"));
+      meta->set("cuda_dino_hybrid_stage_variant", hybrid_stage_variant);
     }
 
     const bool emit_grouped_merged_mask = emit_grouped_merged_mask_.get();
@@ -9154,14 +10641,23 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       std::vector<uint8_t> hybrid_closed_mask_batch;
       std::vector<uint8_t> hybrid_filled_mask_batch;
       std::vector<uint8_t> hybrid_component_filtered_mask_batch;
+      std::vector<uint8_t> hybrid_coherence_rescue_mask_batch;
+      std::vector<uint8_t> coherence_band_mask_batch;
+      std::vector<uint8_t> dino_structure_mask_batch;
+      std::vector<float> initial_product_batch;
       std::vector<float> hybrid_seed_freq_thresholds;
       std::vector<float> hybrid_seed_res_thresholds;
       std::vector<float> hybrid_combined_thresholds;
       if (write_operator_artifacts) {
         auto& hybrid_scratch = residual_veto_cuda_scratch();
-        if (hybrid_scratch.values_a == nullptr || hybrid_scratch.values_d == nullptr || hybrid_scratch.mask_a == nullptr ||
-            hybrid_scratch.mask_b == nullptr || hybrid_scratch.batch_a == nullptr || hybrid_scratch.batch_b == nullptr ||
-            hybrid_scratch.batch_c == nullptr) {
+        // The residual-veto scratch is only populated when the legacy stack ran this
+        // frame (always in legacy mode; in coherence_primary only when include_legacy).
+        // When absent, skip the legacy per-stage copies and leave those artifacts zeroed.
+        const bool legacy_scratch_ready = hybrid_scratch.values_a != nullptr && hybrid_scratch.values_d != nullptr &&
+                                          hybrid_scratch.mask_a != nullptr && hybrid_scratch.mask_b != nullptr &&
+                                          hybrid_scratch.batch_a != nullptr && hybrid_scratch.batch_b != nullptr &&
+                                          hybrid_scratch.batch_c != nullptr;
+        if (!coherence_primary && !legacy_scratch_ready) {
           throw std::runtime_error("hybrid debug artifacts requested before residual scratch buffers were initialized");
         }
         corrected_batch.assign(batch_elements, 0.0f);
@@ -9174,6 +10670,10 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         hybrid_closed_mask_batch.assign(batch_elements, 0);
         hybrid_filled_mask_batch.assign(batch_elements, 0);
         hybrid_component_filtered_mask_batch.assign(batch_elements, 0);
+        hybrid_coherence_rescue_mask_batch.assign(batch_elements, 0);
+        coherence_band_mask_batch.assign(batch_elements, 0);
+        dino_structure_mask_batch.assign(batch_elements, 0);
+        initial_product_batch.assign(batch_elements, 0.0f);
         hybrid_seed_freq_thresholds.assign(static_cast<size_t>(chunk_count), 0.0f);
         hybrid_seed_res_thresholds.assign(static_cast<size_t>(chunk_count), 0.0f);
         hybrid_combined_thresholds.assign(static_cast<size_t>(chunk_count), 0.0f);
@@ -9195,48 +10695,50 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                             cudaMemcpyDeviceToHost,
                                             buffers.processing_stream),
                             "cuda_dino_detector raw DINO debug copy failed");
-        throw_if_cuda_error(cudaMemcpyAsync(hybrid_keep_freq_batch.data(),
-                    hybrid_scratch.values_a,
-                    batch_elements * sizeof(float),
-                    cudaMemcpyDeviceToHost,
-                    buffers.processing_stream),
-                "cuda_dino_detector hybrid keep-freq debug copy failed");
-        throw_if_cuda_error(cudaMemcpyAsync(hybrid_keep_res_batch.data(),
-                    hybrid_scratch.values_d,
-                    batch_elements * sizeof(float),
-                    cudaMemcpyDeviceToHost,
-                    buffers.processing_stream),
-                "cuda_dino_detector hybrid keep-res debug copy failed");
-        throw_if_cuda_error(cudaMemcpyAsync(hybrid_seed_mask_batch.data(),
-                    hybrid_scratch.mask_a,
-                    batch_elements * sizeof(uint8_t),
-                    cudaMemcpyDeviceToHost,
-                    buffers.processing_stream),
-                "cuda_dino_detector hybrid seed mask debug copy failed");
-        throw_if_cuda_error(cudaMemcpyAsync(hybrid_closed_mask_batch.data(),
-                    hybrid_scratch.mask_b,
-                    batch_elements * sizeof(uint8_t),
-                    cudaMemcpyDeviceToHost,
-                    buffers.processing_stream),
-                "cuda_dino_detector hybrid closed mask debug copy failed");
-        throw_if_cuda_error(cudaMemcpyAsync(hybrid_seed_freq_thresholds.data(),
-                    hybrid_scratch.batch_a,
-                    static_cast<size_t>(chunk_count) * sizeof(float),
-                    cudaMemcpyDeviceToHost,
-                    buffers.processing_stream),
-                "cuda_dino_detector hybrid seed-freq threshold debug copy failed");
-        throw_if_cuda_error(cudaMemcpyAsync(hybrid_seed_res_thresholds.data(),
-                    hybrid_scratch.batch_b,
-                    static_cast<size_t>(chunk_count) * sizeof(float),
-                    cudaMemcpyDeviceToHost,
-                    buffers.processing_stream),
-                "cuda_dino_detector hybrid seed-res threshold debug copy failed");
-        throw_if_cuda_error(cudaMemcpyAsync(hybrid_combined_thresholds.data(),
-                    hybrid_scratch.batch_c,
-                    static_cast<size_t>(chunk_count) * sizeof(float),
-                    cudaMemcpyDeviceToHost,
-                    buffers.processing_stream),
-                "cuda_dino_detector hybrid combined threshold debug copy failed");
+        if (legacy_scratch_ready) {
+          throw_if_cuda_error(cudaMemcpyAsync(hybrid_keep_freq_batch.data(),
+                      hybrid_scratch.values_a,
+                      batch_elements * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      buffers.processing_stream),
+                  "cuda_dino_detector hybrid keep-freq debug copy failed");
+          throw_if_cuda_error(cudaMemcpyAsync(hybrid_keep_res_batch.data(),
+                      hybrid_scratch.values_d,
+                      batch_elements * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      buffers.processing_stream),
+                  "cuda_dino_detector hybrid keep-res debug copy failed");
+          throw_if_cuda_error(cudaMemcpyAsync(hybrid_seed_mask_batch.data(),
+                      hybrid_scratch.mask_a,
+                      batch_elements * sizeof(uint8_t),
+                      cudaMemcpyDeviceToHost,
+                      buffers.processing_stream),
+                  "cuda_dino_detector hybrid seed mask debug copy failed");
+          throw_if_cuda_error(cudaMemcpyAsync(hybrid_closed_mask_batch.data(),
+                      hybrid_scratch.mask_b,
+                      batch_elements * sizeof(uint8_t),
+                      cudaMemcpyDeviceToHost,
+                      buffers.processing_stream),
+                  "cuda_dino_detector hybrid closed mask debug copy failed");
+          throw_if_cuda_error(cudaMemcpyAsync(hybrid_seed_freq_thresholds.data(),
+                      hybrid_scratch.batch_a,
+                      static_cast<size_t>(chunk_count) * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      buffers.processing_stream),
+                  "cuda_dino_detector hybrid seed-freq threshold debug copy failed");
+          throw_if_cuda_error(cudaMemcpyAsync(hybrid_seed_res_thresholds.data(),
+                      hybrid_scratch.batch_b,
+                      static_cast<size_t>(chunk_count) * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      buffers.processing_stream),
+                  "cuda_dino_detector hybrid seed-res threshold debug copy failed");
+          throw_if_cuda_error(cudaMemcpyAsync(hybrid_combined_thresholds.data(),
+                      hybrid_scratch.batch_c,
+                      static_cast<size_t>(chunk_count) * sizeof(float),
+                      cudaMemcpyDeviceToHost,
+                      buffers.processing_stream),
+                  "cuda_dino_detector hybrid combined threshold debug copy failed");
+        }
         raw_score_deweighted_batch = raw_score_batch;
 
         if (debug_patch_features_batch_device != nullptr && debug_patch_rows > 0 && debug_patch_cols > 0 &&
@@ -9294,6 +10796,41 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                             cudaMemcpyDeviceToHost,
                                             buffers.processing_stream),
                             "cuda_dino_detector hybrid component filtered mask debug copy failed");
+        // Coherence-rescue mask (rescue contribution alone). Only meaningful when
+        // the rescue ran; otherwise the buffer is stale so leave the host copy zeroed.
+        auto& rescue_scratch = residual_veto_cuda_scratch();
+        if (rescue_config.enable && rescue_scratch.mask_rescue_filtered != nullptr) {
+          throw_if_cuda_error(cudaMemcpyAsync(hybrid_coherence_rescue_mask_batch.data(),
+                                              rescue_scratch.mask_rescue_filtered,
+                                              batch_elements * sizeof(uint8_t),
+                                              cudaMemcpyDeviceToHost,
+                                              buffers.processing_stream),
+                              "cuda_dino_detector coherence rescue mask debug copy failed");
+        }
+        // Coherence-primary artifacts (band mask, structure mask, initial product).
+        // Populated in coherence_primary mode; left zeroed in legacy mode.
+        if (coherence_primary) {
+          throw_if_cuda_error(cudaMemcpyAsync(coherence_band_mask_batch.data(),
+                                              buffers.coherence_band_mask_batch_device,
+                                              batch_elements * sizeof(uint8_t),
+                                              cudaMemcpyDeviceToHost,
+                                              buffers.processing_stream),
+                              "cuda_dino_detector coherence band mask debug copy failed");
+          throw_if_cuda_error(cudaMemcpyAsync(dino_structure_mask_batch.data(),
+                                              buffers.dino_structure_mask_batch_device,
+                                              batch_elements * sizeof(uint8_t),
+                                              cudaMemcpyDeviceToHost,
+                                              buffers.processing_stream),
+                              "cuda_dino_detector dino structure mask debug copy failed");
+        }
+        if (buffers.hybrid_initial_product_batch_device != nullptr) {
+          throw_if_cuda_error(cudaMemcpyAsync(initial_product_batch.data(),
+                                              buffers.hybrid_initial_product_batch_device,
+                                              batch_elements * sizeof(float),
+                                              cudaMemcpyDeviceToHost,
+                                              buffers.processing_stream),
+                              "cuda_dino_detector initial product debug copy failed");
+        }
       }
       throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
                           "cuda_dino_detector hybrid debug synchronization failed");
@@ -9387,6 +10924,38 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                  src_cols,
                                                                                  live_chunk_result.dst_rows,
                                                                                  live_chunk_result.dst_cols);
+          std::vector<uint8_t> chunk_coherence_rescue_mask(
+              hybrid_coherence_rescue_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset),
+              hybrid_coherence_rescue_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset + chunk_elements));
+          live_chunk_result.hybrid_coherence_rescue_mask = resize_mask_nearest(chunk_coherence_rescue_mask,
+                                                                               uniform_chunk_rows,
+                                                                               src_cols,
+                                                                               live_chunk_result.dst_rows,
+                                                                               live_chunk_result.dst_cols);
+          std::vector<uint8_t> chunk_coherence_band_mask(
+              coherence_band_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset),
+              coherence_band_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset + chunk_elements));
+          live_chunk_result.coherence_band_mask = resize_mask_nearest(chunk_coherence_band_mask,
+                                                                      uniform_chunk_rows,
+                                                                      src_cols,
+                                                                      live_chunk_result.dst_rows,
+                                                                      live_chunk_result.dst_cols);
+          std::vector<uint8_t> chunk_dino_structure_mask(
+              dino_structure_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset),
+              dino_structure_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset + chunk_elements));
+          live_chunk_result.dino_structure_mask = resize_mask_nearest(chunk_dino_structure_mask,
+                                                                      uniform_chunk_rows,
+                                                                      src_cols,
+                                                                      live_chunk_result.dst_rows,
+                                                                      live_chunk_result.dst_cols);
+          std::vector<float> chunk_initial_product(
+              initial_product_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset),
+              initial_product_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset + chunk_elements));
+          live_chunk_result.initial_product = resize_bilinear(chunk_initial_product,
+                                                              uniform_chunk_rows,
+                                                              src_cols,
+                                                              live_chunk_result.dst_rows,
+                                                              live_chunk_result.dst_cols);
           live_chunk_result.hybrid_seed_freq_threshold = hybrid_seed_freq_thresholds[static_cast<size_t>(batch_index)];
           live_chunk_result.hybrid_seed_res_threshold = hybrid_seed_res_thresholds[static_cast<size_t>(batch_index)];
           live_chunk_result.hybrid_combined_threshold = hybrid_combined_thresholds[static_cast<size_t>(batch_index)];
@@ -9509,6 +11078,62 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                        global_merged,
                                        chunk_plan,
                                        timing_profile);
+        // Stage A: frame-indexed pre-qnorm patch-score dumps (accumulate across frames
+        // for offline positional-template calibration; the chunk_debug bundle above is
+        // overwritten each frame). Only populated when save flag + full batch + debug.
+        if (save_raw_dino_patch_prenorm_.get() && buffers.patch_prenorm_batch_device != nullptr &&
+            debug_patch_rows > 0 && debug_patch_cols > 0) {
+          const std::filesystem::path prenorm_dir =
+              std::filesystem::path(debug_artifact_output_dir_.get()) / "chunk_debug" / "patch_prenorm";
+          std::error_code prenorm_dir_ec;
+          std::filesystem::create_directories(prenorm_dir, prenorm_dir_ec);
+          const int prenorm_rows = chunk_count * debug_patch_rows;
+          const size_t prenorm_count = static_cast<size_t>(prenorm_rows) * static_cast<size_t>(debug_patch_cols);
+          std::vector<float> prenorm_host(prenorm_count, 0.0f);
+          throw_if_cuda_error(cudaMemcpyAsync(prenorm_host.data(), buffers.patch_prenorm_batch_device,
+                                              prenorm_count * sizeof(float), cudaMemcpyDeviceToHost,
+                                              buffers.processing_stream),
+                              "cuda_dino_detector patch prenorm debug copy failed");
+          throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
+                              "cuda_dino_detector patch prenorm sync failed");
+          char prenorm_name[64];
+          std::snprintf(prenorm_name, sizeof(prenorm_name), "patch_prenorm_f%05llu.npy",
+                        static_cast<unsigned long long>(artifact_dump_count_));
+          write_npy_2d(prenorm_dir / prenorm_name, prenorm_host.data(), prenorm_count * sizeof(float),
+                       prenorm_rows, debug_patch_cols, "<f4");
+          if (save_raw_dino_patch_features_.get() && debug_patch_features_batch_device != nullptr && debug_feature_dim > 0) {
+            const int feat_rows = chunk_count * debug_patch_rows * debug_patch_cols;
+            const size_t feat_count = static_cast<size_t>(feat_rows) * static_cast<size_t>(debug_feature_dim);
+            std::vector<float> feat_host(feat_count, 0.0f);
+            if (cudaMemcpyAsync(feat_host.data(), debug_patch_features_batch_device, feat_count * sizeof(float),
+                                cudaMemcpyDeviceToHost, buffers.processing_stream) == cudaSuccess &&
+                cudaStreamSynchronize(buffers.processing_stream) == cudaSuccess) {
+              char feat_name[64];
+              std::snprintf(feat_name, sizeof(feat_name), "patch_features_f%05llu.npy",
+                            static_cast<unsigned long long>(artifact_dump_count_));
+              write_npy_2d(prenorm_dir / feat_name, feat_host.data(), feat_count * sizeof(float), feat_rows,
+                           debug_feature_dim, "<f4");
+            }
+          }
+          const std::filesystem::path prenorm_meta_path = prenorm_dir / "meta.json";
+          if (!std::filesystem::exists(prenorm_meta_path)) {
+            std::ostringstream prenorm_meta_json;
+            prenorm_meta_json << "{\n"
+                              << "  \"artifact_contract\": \"raw_dino_patch_prenorm_v1\",\n"
+                              << "  \"patch_rows\": " << debug_patch_rows << ",\n"
+                              << "  \"patch_cols\": " << debug_patch_cols << ",\n"
+                              << "  \"chunk_count\": " << chunk_count << ",\n"
+                              << "  \"feature_dim\": " << debug_feature_dim << ",\n"
+                              << "  \"raw_dino_positional_deweight\": " << raw_dino_positional_deweight_.get() << ",\n"
+                              << "  \"raw_dino_positional_template_path\": \""
+                              << json_escape(raw_dino_positional_template_path_.get()) << "\",\n"
+                              << "  \"model_script_path\": \"" << json_escape(model_script_path_.get()) << "\",\n"
+                              << "  \"aligned_rows\": " << debug_aligned_rows << ",\n"
+                              << "  \"aligned_cols\": " << debug_aligned_cols << "\n"
+                              << "}\n";
+            write_text_file(prenorm_meta_path, prenorm_meta_json.str());
+          }
+        }
         ++artifact_dump_count_;
         if (meta) {
           meta->set("cuda_dino_debug_artifact_output_dir", debug_artifact_output_dir_.get());
@@ -9657,6 +11282,46 @@ void CudaDinoDetector::release_channel_buffers() {
       cudaFree(buffers.hybrid_component_filtered_mask_batch_device);
       buffers.hybrid_component_filtered_mask_batch_device = nullptr;
     }
+    if (buffers.coherence_band_mask_batch_device != nullptr) {
+      cudaFree(buffers.coherence_band_mask_batch_device);
+      buffers.coherence_band_mask_batch_device = nullptr;
+    }
+    if (buffers.dino_structure_mask_batch_device != nullptr) {
+      cudaFree(buffers.dino_structure_mask_batch_device);
+      buffers.dino_structure_mask_batch_device = nullptr;
+    }
+    if (buffers.patch_qnorm_batch_device != nullptr) {
+      cudaFree(buffers.patch_qnorm_batch_device);
+      buffers.patch_qnorm_batch_device = nullptr;
+    }
+    if (buffers.patch_prenorm_batch_device != nullptr) {
+      cudaFree(buffers.patch_prenorm_batch_device);
+      buffers.patch_prenorm_batch_device = nullptr;
+    }
+    if (buffers.hybrid_initial_product_batch_device != nullptr) {
+      cudaFree(buffers.hybrid_initial_product_batch_device);
+      buffers.hybrid_initial_product_batch_device = nullptr;
+    }
+    if (buffers.corrected_scout_batch_device != nullptr) {
+      cudaFree(buffers.corrected_scout_batch_device);
+      buffers.corrected_scout_batch_device = nullptr;
+    }
+    if (buffers.raw_dino_score_scout_device != nullptr) {
+      cudaFree(buffers.raw_dino_score_scout_device);
+      buffers.raw_dino_score_scout_device = nullptr;
+    }
+    if (buffers.patch_qnorm_scout_device != nullptr) {
+      cudaFree(buffers.patch_qnorm_scout_device);
+      buffers.patch_qnorm_scout_device = nullptr;
+    }
+    if (buffers.scout_row_starts_device != nullptr) {
+      cudaFree(buffers.scout_row_starts_device);
+      buffers.scout_row_starts_device = nullptr;
+    }
+    if (buffers.scout_plane_indices_device != nullptr) {
+      cudaFree(buffers.scout_plane_indices_device);
+      buffers.scout_plane_indices_device = nullptr;
+    }
     if (buffers.row_stat_device != nullptr) {
       cudaFree(buffers.row_stat_device);
       buffers.row_stat_device = nullptr;
@@ -9692,6 +11357,11 @@ void CudaDinoDetector::release_channel_buffers() {
     buffers.frame_elements = 0;
     buffers.batch_elements = 0;
     buffers.chunk_row_start_capacity = 0;
+    buffers.patch_qnorm_capacity = 0;
+    buffers.patch_prenorm_capacity = 0;
+    buffers.patch_qnorm_scout_capacity = 0;
+    buffers.scout_batch_capacity = 0;
+    buffers.scout_row_start_capacity = 0;
     buffers.row_elements = 0;
   }
   channel_buffers_.clear();
