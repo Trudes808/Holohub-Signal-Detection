@@ -159,6 +159,8 @@ target_link_libraries(usrp_wideband_signal_detection
   matx::matx
   holoscan::ops::coherent_power_signal_detector
   holoscan::ops::cuda_dino_detector
+  holoscan::ops::computer_vision_baseline
+  holoscan::ops::power_detection
   CUDA::cudart
   holoscan::core
   holoscan::advanced_network

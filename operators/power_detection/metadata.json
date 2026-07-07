@@ -1,0 +1,36 @@
+{
+    "operator": {
+        "name": "PowerDetection",
+        "authors": [
+            {
+                "name": "Holohub Signal Detection Baselines",
+                "affiliation": "The University of Texas at Austin"
+            }
+        ],
+        "language": ["C++"],
+        "version": "1.0.0",
+        "changelog": {
+            "1.0": "Initial release: traditional power-detector baseline on raw IQ with z-score moving-average (CA-CFAR) and first-N-frames baseline exceedance thresholding."
+        },
+        "holoscan_sdk": {
+            "minimum_required_version": "2.5.0",
+            "tested_versions": [
+                "2.5.0",
+                "3.0.0",
+                "3.1.0"
+            ]
+        },
+        "platforms": [
+            "x86_64"
+        ],
+        "tags": ["Signal Processing", "Detection"],
+        "ranking": 4,
+        "requirements": {
+            "libraries": [{
+              "name": "MatX",
+              "version": "0.9.0",
+              "url": "https://github.com/NVIDIA/MatX.git"
+            }]
+        }
+    }
+}
