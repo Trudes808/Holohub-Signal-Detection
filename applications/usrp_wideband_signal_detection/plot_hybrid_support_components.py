@@ -67,6 +67,7 @@ def resolve_artifact_path(raw_path: str, summary_path: Path) -> Path:
 
 def existing_component_specs(summary: dict) -> list[tuple[str, str, str]]:
     specs = [
+        ("DINO Enhanced Input", "dino_enhanced_input_npy", "magma"),
         ("DINO Raw Deweighted", "dino_score_raw_deweighted_npy", "magma"),
         ("Coherence Gate", "coherence_gate_npy", "viridis"),
         ("Veto Input Score", "initial_product_npy", "magma"),

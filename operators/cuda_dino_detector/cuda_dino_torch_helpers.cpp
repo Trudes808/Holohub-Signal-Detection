@@ -482,6 +482,7 @@ bool compute_structure_tensor_gate_gpu_batch_to_device(const float* corrected_ba
                                                        int rows,
                                                        int cols,
                                                        const std::vector<uint8_t>& valid_row_mask_batch,
+                                                       const float* per_row_floor_device,
                                                        float* output_gate_device,
                                                        cudaStream_t cuda_stream) {
   return compute_fast_directional_coherence_gate_gpu_batch_to_device(corrected_batch_device,
@@ -489,6 +490,7 @@ bool compute_structure_tensor_gate_gpu_batch_to_device(const float* corrected_ba
                                                                      rows,
                                                                      cols,
                                                                      valid_row_mask_batch,
+                                                                     per_row_floor_device,
                                                                      output_gate_device,
                                                                      cuda_stream);
 }
@@ -624,6 +626,7 @@ bool compute_structure_tensor_gate_gpu_batch_to_device(const float* corrected_ba
                                                        int rows,
                                                        int cols,
                                                        const std::vector<uint8_t>& valid_row_mask_batch,
+                                                       const float* per_row_floor_device,
                                                        float* output_gate_device,
                                                        cudaStream_t cuda_stream) {
   return compute_fast_directional_coherence_gate_gpu_batch_to_device(corrected_batch_device,
@@ -631,6 +634,7 @@ bool compute_structure_tensor_gate_gpu_batch_to_device(const float* corrected_ba
                                                                      rows,
                                                                      cols,
                                                                      valid_row_mask_batch,
+                                                                     per_row_floor_device,
                                                                      output_gate_device,
                                                                      cuda_stream);
 }

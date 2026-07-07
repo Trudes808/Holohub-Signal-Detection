@@ -479,6 +479,15 @@ def load_offline_detector_debug_artifacts(output_root: str | Path) -> OfflineDet
             key: np.asarray(np.load(resolve_offline_artifact_path(chunk_summary[key])))
             for key in chunk_array_keys
         }
+        # Optional keys introduced later; tolerate older artifact dirs that lack them.
+        for optional_key in ("dino_enhanced_input_npy",):
+            if optional_key in chunk_summary:
+                try:
+                    chunk_arrays[optional_key] = np.asarray(
+                        np.load(resolve_offline_artifact_path(chunk_summary[optional_key]))
+                    )
+                except (OSError, ValueError):
+                    pass
         global_arrays = {
             key: np.asarray(np.load(resolve_offline_artifact_path(validation_summary[key])))
             for key in global_array_keys
@@ -613,7 +622,6 @@ def show_offline_detector_debug_pathways(
     debug_artifacts: OfflineDetectorDebugArtifacts,
     figsize: tuple[float, float] = (18.0, 10.0),
 ) -> tuple[Any, Any, dict[str, Any]]:
-    fig, axes = plt.subplots(2, 4, figsize=figsize, constrained_layout=True)
     transpose_if_tall = debug_artifacts.detector_type != "coherent_power"
     if debug_artifacts.detector_type == "coherent_power":
         panels = [
@@ -628,6 +636,7 @@ def show_offline_detector_debug_pathways(
     else:
         panels = [
             ("corrected_resized_npy", "Corrected Spectrogram", "magma", False),
+            ("dino_enhanced_input_npy", "DINO Enhanced Input", "magma", False),
             ("dino_score_raw_npy", "DINO Raw Score", "viridis", False),
             ("dino_score_raw_deweighted_npy", "DINO Deweighted Score", "viridis", False),
             ("coherence_gate_npy", "Coherence Gate", "cividis", False),
@@ -636,9 +645,16 @@ def show_offline_detector_debug_pathways(
             ("combined_score_npy", "Combined Score", "inferno", False),
             ("projected_grouped_score_npy", "Projected Combined Score", "inferno", False),
         ]
-    for ax, (key, title, cmap, binary) in zip(axes.flat, panels):
+    ncols = 4
+    nrows = max(1, (len(panels) + ncols - 1) // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(figsize[0], figsize[1] / 2.0 * nrows),
+                             constrained_layout=True)
+    flat_axes = list(np.atleast_1d(axes).flat)
+    for ax, (key, title, cmap, binary) in zip(flat_axes, panels):
         source = debug_artifacts.chunk_arrays if key in debug_artifacts.chunk_arrays else debug_artifacts.global_arrays
         _show_stage_image(ax, source.get(key), title, cmap, binary=binary, transpose_if_tall=transpose_if_tall)
+    for ax in flat_axes[len(panels):]:
+        ax.axis("off")
 
     context = {
         "detector_type": debug_artifacts.detector_type,

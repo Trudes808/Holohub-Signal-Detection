@@ -62,6 +62,7 @@ bool compute_fast_directional_coherence_gate_gpu_batch_to_device(const float* co
                                                                  int rows,
                                                                  int cols,
                                                                  const std::vector<uint8_t>& valid_row_mask_batch,
+                                                                 const float* per_row_floor_device,
                                                                  float* output_gate_device,
                                                                  cudaStream_t cuda_stream);
 
@@ -70,6 +71,7 @@ bool compute_structure_tensor_gate_gpu_batch_to_device(const float* corrected_ba
                                                        int rows,
                                                        int cols,
                                                        const std::vector<uint8_t>& valid_row_mask_batch,
+                                                       const float* per_row_floor_device,
                                                        float* output_gate_device,
                                                        cudaStream_t cuda_stream);
 

@@ -38,6 +38,7 @@ class CudaDinoDetector : public holoscan::Operator {
     float* power_db_device = nullptr;
     float* corrected_db_device = nullptr;
     float* corrected_batch_device = nullptr;
+    float* dino_enhanced_batch_device = nullptr;  // matched-integration contrast input for DINO only
     float* coherence_gate_batch_device = nullptr;
     float* raw_dino_score_batch_device = nullptr;
     float* hybrid_combined_score_batch_device = nullptr;
@@ -59,6 +60,9 @@ class CudaDinoDetector : public holoscan::Operator {
     float* row_smooth_device = nullptr;
     float* frontend_reference_device = nullptr;
     int* chunk_row_starts_device = nullptr;
+    float* per_freq_floor_packed_device = nullptr;          // chunk_count*uniform_chunk_rows (dB + offset)
+    float* per_freq_gate_threshold_packed_device = nullptr; // chunk_count*uniform_chunk_rows (gate units)
+    size_t per_freq_packed_capacity = 0;
     cudaStream_t processing_stream = nullptr;
     cudaEvent_t copy_complete_event = nullptr;
     cudaEvent_t coherence_start_event = nullptr;
@@ -90,6 +94,13 @@ class CudaDinoDetector : public holoscan::Operator {
   holoscan::Parameter<bool> enable_debug_artifact_host_copy_;
   holoscan::Parameter<int> debug_chunk_index_;
   holoscan::Parameter<std::string> debug_artifact_output_dir_;
+  holoscan::Parameter<bool> save_coherence_stats_;
+  holoscan::Parameter<std::string> coherence_stats_dir_;
+  holoscan::Parameter<bool> per_freq_floor_enable_;
+  holoscan::Parameter<std::string> per_freq_floor_path_;
+  holoscan::Parameter<double> per_freq_floor_offset_db_;
+  holoscan::Parameter<bool> per_freq_gate_threshold_enable_;
+  holoscan::Parameter<std::string> per_freq_gate_threshold_path_;
   holoscan::Parameter<bool> save_aligned_spectrogram_preview_;
   holoscan::Parameter<bool> save_aligned_spectrogram_tensor_;
   holoscan::Parameter<int> aligned_spectrogram_output_height_;
@@ -111,6 +122,9 @@ class CudaDinoDetector : public holoscan::Operator {
   holoscan::Parameter<double> frontend_correction_edge_taper_fraction_;
   holoscan::Parameter<double> frontend_correction_edge_taper_sigma_;
   holoscan::Parameter<double> frontend_correction_edge_target_drop_db_;
+  holoscan::Parameter<bool> dino_input_enhance_;
+  holoscan::Parameter<int> dino_input_enhance_freq_bins_;
+  holoscan::Parameter<int> dino_input_enhance_time_bins_;
   holoscan::Parameter<double> dino_coherence_gate_floor_;
   holoscan::Parameter<double> dino_coherence_gate_span_db_;
   holoscan::Parameter<bool> dino_coherence_rescue_enable_;
@@ -164,6 +178,14 @@ class CudaDinoDetector : public holoscan::Operator {
   uint64_t compute_count_ = 0;
   bool startup_log_emitted_ = false;
   uint64_t artifact_dump_count_ = 0;
+  uint64_t coherence_stats_dump_count_ = 0;
+  // Calibrated per-frequency (global, length src_rows) arrays for the coherence gate.
+  std::vector<float> per_freq_floor_global_;          // dB; box-mean background capped at this
+  std::vector<float> per_freq_gate_threshold_global_; // gate units; per-row band threshold
+  bool per_freq_floor_loaded_ = false;
+  bool per_freq_floor_failed_ = false;
+  bool per_freq_gate_threshold_loaded_ = false;
+  bool per_freq_gate_threshold_failed_ = false;
   std::vector<uint64_t> frame_count_;
   std::vector<uint64_t> skipped_partial_batches_;
   std::vector<uint64_t> skipped_stride_frames_;

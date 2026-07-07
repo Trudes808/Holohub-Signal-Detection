@@ -1,0 +1,31 @@
+{
+  "artifact": "cuda_dino_coherence_calibration_v1",
+  "stats_run_dir": "/tmp/usrp_spectrograms/dino_coherence_cal/noise",
+  "src_rows": 10240,
+  "src_cols": 512,
+  "chunk_count": 1,
+  "uniform_chunk_rows": 9656,
+  "gate_normalize_span_db": 40.0,
+  "current_coherence_band_threshold": 0.05,
+  "policy": {
+    "power_floor_fp": 0.02,
+    "gate_fp": 0.02
+  },
+  "power_floor": {
+    "path": "calibration/dino_coherence_per_freq_power_floor.npy",
+    "quantile": 0.98,
+    "covered_median_db": -9.851771354675293,
+    "covered_min_db": -12.318690299987793,
+    "covered_max_db": 6.440782070159912
+  },
+  "gate_threshold": {
+    "path": "calibration/dino_coherence_per_freq_gate_threshold.npy",
+    "quantile": 0.98,
+    "covered_rows": 9656,
+    "sentinel_value": 1.0,
+    "covered_median": 0.06171324849128723,
+    "covered_min": 0.03728257492184639,
+    "covered_max": 0.4785497784614563
+  },
+  "created": "2026-07-06T16:41:05"
+}
