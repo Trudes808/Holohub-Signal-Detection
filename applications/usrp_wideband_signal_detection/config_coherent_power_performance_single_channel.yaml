@@ -224,6 +224,12 @@ coherent_power_signal_detector:
   fast_power_floor_db: 0.5
   fast_power_span_db: 3.0
   fast_score_threshold: 0.4
+  # Strong-signal rescue: let strong but frequency-narrow signals through the emit-mask width
+  # filters. A pixel >= 8 dB above the per-row noise floor is OR-ed into the mask after the
+  # morphology + frequency-persistence pass, provided it has more than 2 strong time bins.
+  fast_strong_rescue_enable: true
+  fast_strong_rescue_excess_db: 8.0
+  fast_strong_rescue_min_time_bins: 3
   live_emit_mask_rows: 16
   live_emit_mask_cols: 512
   live_emit_freq_persistence_window: 45

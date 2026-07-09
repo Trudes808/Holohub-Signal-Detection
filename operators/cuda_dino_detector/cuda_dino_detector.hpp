@@ -125,6 +125,8 @@ class CudaDinoDetector : public holoscan::Operator {
   holoscan::Parameter<bool> dino_input_enhance_;
   holoscan::Parameter<int> dino_input_enhance_freq_bins_;
   holoscan::Parameter<int> dino_input_enhance_time_bins_;
+  holoscan::Parameter<double> dino_gray_local_resid_weight_;
+  holoscan::Parameter<bool> dino_colormap_enable_;
   holoscan::Parameter<double> dino_coherence_gate_floor_;
   holoscan::Parameter<double> dino_coherence_gate_span_db_;
   holoscan::Parameter<bool> dino_coherence_rescue_enable_;

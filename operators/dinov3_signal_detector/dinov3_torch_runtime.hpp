@@ -17,6 +17,16 @@ struct DinoTorchRuntimeConfig {
   std::string torchscript_init_mode;
   std::string torch_dtype = "fp32";
   bool legacy_fast_gray_preprocess = false;
+  // DINO input tuning for low-SNR sensitivity.
+  // Blend weight on the local high-pass (residual/CFAR) term of the signal-agnostic gray
+  // vs the absolute detrended level: gray = w*local_resid + (1-w)*abs_detrended. Default
+  // 0.70 reproduces prior behavior; lower it toward 0 to favor the absolute level so faint,
+  // spatially-broad signals survive into the DINO input instead of being high-passed away.
+  double dino_gray_local_resid_weight = 0.70;
+  // Feed a true 3-channel colormap (turbo) of the gray scalar instead of replicating it into
+  // 3 identical channels, so small dB deltas map to large, decorrelated RGB deltas that
+  // excite the pretrained ViT's chromatic patch-embed filters. Default false = gray-replicate.
+  bool dino_colormap_enable = false;
   std::vector<double> imagenet_mean;
   std::vector<double> imagenet_std;
   bool return_final_mask = true;

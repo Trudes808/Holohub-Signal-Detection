@@ -151,6 +151,9 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
     float* power_db_host = nullptr;
     uint8_t* mask_device = nullptr;
     uint8_t* scratch_mask_device = nullptr;
+    uint8_t* strong_mask_device = nullptr;
+    uint8_t* strong_scratch_device = nullptr;
+    float* strong_row_floor_device = nullptr;
     uint8_t* mask_host = nullptr;
     size_t frame_elements = 0;
     size_t row_elements = 0;
@@ -239,6 +242,14 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<double> fast_coherence_floor_db_;
   holoscan::Parameter<double> fast_coherence_span_db_;
   holoscan::Parameter<double> fast_score_threshold_;
+  // Strong-signal rescue: OR pixels whose absolute corrected power exceeds the per-row
+  // (per-frequency) noise floor by a large margin back into the emitted mask AFTER the emit
+  // morphology + frequency-persistence pass, so a strong but frequency-narrow signal that the
+  // width filters would otherwise erase still survives. Requires >min_time_bins strong time
+  // bins so isolated impulsive spikes are not rescued.
+  holoscan::Parameter<bool> fast_strong_rescue_enable_;
+  holoscan::Parameter<double> fast_strong_rescue_excess_db_;
+  holoscan::Parameter<int> fast_strong_rescue_min_time_bins_;
   holoscan::Parameter<int> live_emit_mask_rows_;
   holoscan::Parameter<int> live_emit_mask_cols_;
   holoscan::Parameter<double> live_emit_mask_min_coverage_;

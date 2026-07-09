@@ -256,6 +256,12 @@ cuda_dino_detector:
   dino_input_enhance: true
   dino_input_enhance_freq_bins: 2   # narrow in frequency (preserve narrowband sharpness)
   dino_input_enhance_time_bins: 25  # long in time (exploit temporal persistence)
+  # DINO gray blend: bias away from the local high-pass (0.70 default) toward the absolute
+  # level so faint spatially-broad signals survive into the DINO input. Primary sweep knob.
+  dino_gray_local_resid_weight: 0.35
+  # Feed a true 3-channel turbo colormap (widest gamut) instead of grayscale-replicate,
+  # so small dB deltas map to large decorrelated RGB deltas that excite DINO's color filters.
+  dino_colormap_enable: true
   dino_coherence_gate_floor: 0.0
   dino_coherence_gate_span_db: 3.0
   # Coherence-rescue floor (monotonic OR). When enabled, large + confident

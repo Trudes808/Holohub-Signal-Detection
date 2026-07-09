@@ -1,0 +1,295 @@
+% ===========================================================================
+%  Methodology section for the INFOCOM systems paper.
+%  Requires: \usepackage{booktabs}, \usepackage{amsmath}, \usepackage{siunitx}
+%  (or replace \si/\num macros with plain text if siunitx is unavailable).
+% ===========================================================================
+
+\section{System Design and Methodology}
+\label{sec:methodology}
+
+We describe a GPU-resident, real-time wideband signal-detection system that
+ingests \SI{500}{\mega\hertz} of instantaneous bandwidth from a software-defined
+radio and produces per-frame time--frequency detection masks. We first present
+the end-to-end streaming architecture (\S\ref{sec:arch}), then the coherent-power
+detector as a \emph{hybrid image/power} algorithm (\S\ref{sec:detector}), and
+finally the labeled evaluation dataset (\S\ref{sec:dataset}) and offline scoring
+protocol (\S\ref{sec:eval}).
+
+% ---------------------------------------------------------------------------
+\subsection{End-to-End Streaming Architecture}
+\label{sec:arch}
+
+The pipeline is implemented as an NVIDIA Holoscan operator graph (single-channel
+coherent-power configuration with calibrated per-frequency thresholding). Each edge
+carries a device-resident tensor together with the CUDA stream on which it was
+produced, so the entire hot path---from network interface to detection mask---
+executes on the GPU with no host staging of raw samples. The active operator
+chain for the single-channel coherent-power configuration is:
+%
+\[
+\text{CHDR}\!\rightarrow\!\text{FFT}\!\rightarrow\!\text{Detector}
+\;\rightarrow\;\{\text{Mask preview},\ \text{Spectrogram preview},\ \text{Logger}\}.
+\]
+
+\paragraph{(1) RF ingest and GPUDirect DMA.}
+IQ samples are streamed as UHD CHDR/VITA packets over UDP and captured by a
+DPDK-managed network stack with flow isolation. The sample payload is DMA'd
+\emph{directly into GPU device memory} (a \texttt{device}-kind DPDK memory
+region), i.e.\ GPUDirect zero-copy from the NIC; only the small (\SI{42}{}/
+\SI{64}{}-byte) packet headers are placed in CPU memory. A CHDR-converter
+operator performs on-GPU endianness conversion and casts interleaved
+\num[]{16}-bit integer IQ to single-precision complex, normalizing by
+$1/\text{0x7FFF}$, and assembles packets into a per-batch device tensor of shape
+$[\,N_{\text{ffts}}\!=\!512,\ L_{\text{fft}}\!=\!20480\,]$. Four concurrent CUDA
+streams pipeline batch DMA. The operator emits a $512\times20480$ complex tensor
+per frame and attaches metadata (channel index, emit timestamps, sample rate,
+center frequency, and a partial-batch / soft-resync epoch used to reset detector
+state after packet loss).
+
+\paragraph{(2) Wideband FFT.}
+The FFT operator runs \num{512} batched length-\num{20480} complex-to-complex
+transforms via cuFFT on the inbound stream, then re-centers DC per row
+(\texttt{fftshift}). Crucially, the FFT emits \emph{complex} bins---no magnitude
+or log conversion happens here; dB formation is deferred to each consumer. The
+output is a $512\times20480$ complex time--frequency frame in which rows index
+time (\num{512} FFT frames) and columns index frequency (\num{20480} bins at
+\SI{24414}{\hertz}/bin spanning \SI{500}{\mega\hertz}). Frame-number and
+frequency-axis metadata (\texttt{span}, \texttt{resolution}, bin indices) are
+propagated.
+
+\paragraph{(3) Detector.}
+The coherent-power detector consumes the complex FFT frame directly (there is no
+intermediate spectrogram operator in this configuration) and emits a
+device-resident binary detection mask (\S\ref{sec:detector}). Its output port is
+unconditioned, so detection never blocks upstream ingest. Partial CHDR batches
+are dropped and detector state is reset on a soft-resync epoch to prevent
+stale-history contamination after loss.
+
+\paragraph{(4) Visualization and logging.}
+A preview operator forms the \emph{display} spectrogram---this is where the
+grayscale dB image is computed ($10\log_{10}(\lvert x\rvert^2+\epsilon)$),
+block-reduced to $1024$ frequency columns $\times\,8$ time rows per tile, and
+normalized with fixed limits $[\,\SI{-22}{},\SI{+35}{}\,]$~dB. Preview and mask
+messages are pushed into a process-global, mutex-guarded mailbox with a
+backpressure valve that drops the oldest frames; a Holoviz visualizer drains the
+mailbox on a $\sim$\SI{30}{\hertz} periodic condition and composites the mask as
+a colored overlay (blend $\alpha\!=\!0.7$). This mailbox decouples render cadence
+from the detection path so display backpressure never stalls detection. A
+separate logging operator reports throughput (MSps/Gbps) and GPU utilization.
+
+\paragraph{GPU-residency summary.}
+A single CUDA stream is threaded through the tuple message type
+$\langle \text{tensor}, \text{stream}\rangle$ from CHDR $\to$ FFT $\to$ detector,
+so cuFFT and every detector kernel run on the same batch stream. Tensors remain
+device-resident end to end; the only device-to-host transfers on the hot path are
+small scalar mask-population counters.
+
+% ---------------------------------------------------------------------------
+\subsection{Coherent-Power Detector: A Hybrid Image/Power Formulation}
+\label{sec:detector}
+
+The detector treats the power-dB spectrogram simultaneously as (i) a
+\emph{2-D image}, applying local spatial-contrast estimation and binary
+morphology, and (ii) a bank of per-frequency \emph{power channels}, applying an
+absolute, calibrated noise-floor test. These two views are complementary: the
+image view localizes signal boundaries and rejects speckle but hollows out the
+interior of wideband signals, whereas the absolute-power view fills wideband
+bodies solidly and rescues strong narrowband carriers. The final mask is their
+union, cleaned by morphology with a persistence constraint. All stages are custom
+CUDA kernels operating in an internal orientation with rows $=$ frequency and
+columns $=$ time.
+
+\paragraph{Power-dB formation and front-end equalization.}
+From the complex frame the detector computes
+$P_{\text{dB}}[f,t]=10\log_{10}\!\big(\Re^2+\Im^2+10^{-12}\big)$. An optional
+front-end correction estimates a smoothed per-frequency noise profile
+(Gaussian-smoothed row means, $\sigma\!=\!12$ bins) and applies a bounded
+per-row gain to flatten the noise floor across frequency---an image
+row-normalization---yielding $C_{\text{dB}}$. In the reported real-time profile
+the correction gain is clamped to \SI{0}{\decibel} (boost/cap disabled), so
+$C_{\text{dB}}\!\approx\!P_{\text{dB}}$ while the machinery remains available for
+environments with strong band tilt.
+
+\paragraph{Image view: local spatial support.}
+A separable box filter estimates a local background
+$B[f,t]$ as the 2-D mean of $C_{\text{dB}}$ over a $\pm$\num{10}-bin time window
+and $\pm$\num{8}-bin frequency window. The \emph{support} (local contrast) is
+$S[f,t]=C_{\text{dB}}[f,t]-B[f,t]$, normalized and thresholded:
+%
+\begin{equation}
+s[f,t]=\operatorname{clip}\!\Big(\tfrac{S[f,t]-\phi_{\text{floor}}}{\sigma_{\text{span}}},0,1\Big),\qquad
+m_{\text{box}}[f,t]=\mathbb{1}\!\left[s\ge\tau\right],
+\label{eq:support}
+\end{equation}
+%
+with $\phi_{\text{floor}}=\SI{0.5}{\decibel}$, $\sigma_{\text{span}}=\SI{3}{\decibel}$,
+$\tau=0.4$; i.e.\ a pixel is admitted when it exceeds its local neighborhood by
+$\ge\SI{1.7}{\decibel}$. This is a locally adaptive (CFAR-like) image detector: it
+follows slow gain/noise variation but, because $B$ averages over a wide frequency
+window, it high-pass-filters the interior of signals broader than the box.
+
+\paragraph{Power view: absolute per-frequency floor and strong rescue.}
+Two absolute-power tests are OR-ed into the mask, each raising the score without
+ever lowering it:
+\begin{itemize}
+  \item \emph{Per-frequency fill.} A calibrated absolute noise floor
+  $F[f]$ (one value per frequency bin, loaded from an offline calibration) admits
+  any pixel with $C_{\text{dB}}[f,t] > F[f]+\Delta_{\text{fill}}$
+  ($\Delta_{\text{fill}}=\SI{2}{\decibel}$). Unlike Eq.~\eqref{eq:support}, this
+  references the \emph{global} per-frequency floor rather than a local box mean, so
+  the solid interior of a wideband signal is filled instead of hollowed.
+  \item \emph{Strong-signal rescue.} A per-frequency floor is re-estimated as the
+  time-average of the local background (which dilutes any persistent narrow
+  carrier, keeping it a noise estimate). Pixels exceeding this floor by
+  $\Delta_{\text{strong}}=\SI{8}{\decibel}$ are flagged, subject to a
+  time-persistence guard requiring $\ge\num{3}$ strong time bins within a local
+  window (rejecting impulsive spikes). This candidate is OR-ed back in
+  \emph{after} the width-based morphology, so a strong but frequency-narrow signal
+  survives filters that would otherwise erase it.
+\end{itemize}
+
+\paragraph{Image morphology and persistence.}
+The unioned binary mask is cleaned with pure image-processing operations: a
+$3\times3$ majority filter, a morphological opening ($3\times7$ structuring
+element) to remove speckle, a closing ($5\times21$) to bridge gaps, and a
+frequency-persistence test that keeps a pixel only if $\ge\num{11}$ of \num{45}
+neighboring frequency bins on the same time row are active. The
+strong-rescue mask is then OR-ed back in to preserve narrowband detections.
+
+\paragraph{Mask emission.}
+The detector emits a full-resolution ($512\times20480$) device-resident binary
+mask (\texttt{DetectorMaskMessage}) backed by a recycled device-buffer pool, with
+per-frame population statistics attached as metadata for downstream logging and
+evaluation. Table~\ref{tab:params} summarizes the active parameters.
+
+\begin{table}[t]
+\centering
+\caption{Active coherent-power detector parameters (real-time single-channel profile).}
+\label{tab:params}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Stage & Parameter & Value \\
+\midrule
+Front end     & noise-smoothing $\sigma$          & \SI{12}{bins} \\
+              & max boost / signal cap            & \SI{0}{\decibel} (disabled) \\
+Local background & time / freq box radius         & $\pm10$ / $\pm8$ bins \\
+Support test  & floor $\phi_{\text{floor}}$       & \SI{0.5}{\decibel} \\
+              & span $\sigma_{\text{span}}$       & \SI{3}{\decibel} \\
+              & threshold $\tau$                  & $0.4$ \\
+Per-freq fill & offset $\Delta_{\text{fill}}$     & \SI{2}{\decibel} \\
+Strong rescue & excess $\Delta_{\text{strong}}$   & \SI{8}{\decibel} \\
+              & min.\ time bins                   & $3$ \\
+Morphology    & opening / closing SE             & $3{\times}7$ / $5{\times}21$ \\
+              & majority filter                   & $3{\times}3$, 1 iter. \\
+Persistence   & window / min.\ hits              & $45$ / $11$ bins \\
+Sideband guard & ignored per side                & \SI{7}{\mega\hertz} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------------
+\subsection{Evaluation Dataset}
+\label{sec:dataset}
+
+To evaluate detection across a controlled variety of modern waveforms and channel
+conditions, we use over-the-air captures recorded on a USRP~X410 at a sample rate
+of \SI{245.76}{\mega\hertz} (complex \texttt{cf32}), storing samples and labels in
+the \emph{SigMF} format. Each recording is a remote receive of a locally
+transmitted playlist that cycles a library of synthesized waveforms, so that
+every emission has a machine-generated ground-truth annotation.
+
+\paragraph{Waveform variety.}
+The library spans classical digital modulation, standardized communication
+waveforms, analog FM, and synchronization sequences
+(Table~\ref{tab:waveforms}). Linear-modulation classes (BPSK/QPSK/16QAM) are
+generated across a parametric grid---symbol rates from \SI{3.84}{} to
+\SI{61.44}{\mega\hertz}, root-raised-cosine and raised-cosine pulse shaping with
+roll-off $\alpha\!\in\!\{0.20,0.35\}$, multiple phase offsets and oversampling
+factors---encoded verbatim in a per-annotation \texttt{variation} string
+(e.g.\ \texttt{BPSK\_Rs61p44MHz\_occ82p944MHz\_rrc\_a0p35\_pn9}). Across all
+classes the library contains \num{287} distinct parameterizations. Standardized
+classes include OFDM, 5G downlink, IEEE~802.11ax (Wi-Fi~6), and Bluetooth; analog
+classes include narrowband and broadband FM; and Zadoff--Chu (ZC) sequences serve
+as fixed-bandwidth synchronization bursts. Dedicated \texttt{METADATA} blocks mark
+in-band header regions.
+
+\begin{table}[t]
+\centering
+\caption{Waveform classes and their occupied-bandwidth ranges in a representative
+capture. Emission durations take six discrete lengths
+$\{9830,49152,245760,1228800,2457600,4915200\}$ samples
+($\approx\SI{40}{\micro\second},\SI{200}{\micro\second},1,5,10,\SI{20}{\milli\second}$
+at \SI{245.76}{MSps}); ZC sync bursts are fixed at \num{2955} samples
+($\approx\SI{12}{\micro\second}$).}
+\label{tab:waveforms}
+\small
+\begin{tabular}{@{}llr@{}}
+\toprule
+Class & Type & Occ.\ BW (MHz) \\
+\midrule
+BPSK / QPSK / 16QAM & Linear PSK/QAM (RRC/RC) & $0.29$--$82.94$ \\
+OFDM               & Multicarrier            & $4.50$--$98.28$ \\
+5G\_Downlink       & 5G NR DL                & $3.96$--$98.28$ \\
+802\_11ax          & Wi-Fi 6                 & $20.0$--$160.0$ \\
+Bluetooth          & FHSS / GFSK             & $1.0$--$2.0$ \\
+Broadband\_FM      & Analog FM               & $0.13$--$61.47$ \\
+Narrowband\_FM     & Analog FM               & $0.01$--$0.03$ \\
+ZC                 & Zadoff--Chu sync        & $50.0$ (fixed) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Channel conditions.}
+The same waveform playlist is captured under a swept transmit attenuation of
+$\{0,5,10,\dots,55,60\}$~\si{\decibel} (\num{14} recordings), emulating a range of
+received-power / effective-SNR regimes from strong to near-noise-floor. Per-signal
+transmit power is held uniform within a capture, so the effective-SNR variation is
+captured entirely by this attenuation axis, which lets detection accuracy be
+reported as a function of received power and enables apples-to-apples comparison
+across detectors and channel conditions.
+
+\paragraph{Metadata schema.}
+Ground truth uses SigMF core annotation fields---\texttt{sample\_start},
+\texttt{sample\_count}, \texttt{freq\_lower\_edge}, \texttt{freq\_upper\_edge},
+and \texttt{label}---augmented with a \texttt{wfgt} (waveform-ground-truth)
+extension carrying \texttt{class}, the full parametric \texttt{variation} string,
+\texttt{occupied\_bw\_hz}, \texttt{power\_db}, \texttt{length\_samples},
+\texttt{block\_center\_hz}, and \texttt{time\_group} (a temporal scheduling index,
+enabling per-time-block analysis). Global fields record the datatype, sample rate,
+hardware (\texttt{USRP X410}), and channel count. Because every emission carries
+its exact time--frequency extent and physical-layer parameters, the same captures
+support detection, classification, and future ML studies without re-annotation,
+and support portable comparison across systems and environments.
+
+% ---------------------------------------------------------------------------
+\subsection{Offline Evaluation Protocol}
+\label{sec:eval}
+
+We score detectors offline against the SigMF ground truth so results are exactly
+reproducible and detector-agnostic. Each capture is replayed through the identical
+signal chain used online---SigMF $\rightarrow$ FFT $\rightarrow$ spectrogram
+$\rightarrow$ detector---under a synchronous scheduler with a fresh per-frame
+device tensor (eliminating any cross-frame buffer aliasing), so masks stay
+time-aligned with the source; a column-profile correlation self-check gates every
+run for zero systematic frame offset. The offline FFT geometry is derived from the
+SigMF sample rate (\SI{245.76}{MSps} $\rightarrow$ \num{10240}-point FFT,
+\SI{24}{\kilo\hertz} bins, \num{512} time rows per frame, $\approx$\num{332}
+frames per capture), and is shared by all detectors so comparisons are on a common
+grid; each detector's native-resolution mask is nearest-neighbor resampled onto
+this common $512\times10240$ grid before scoring.
+
+For each frame we rasterize every annotation into a filled frequency$\times$time
+ground-truth rectangle and compare it to the detector mask. We report two
+complementary families of metrics: (i) \emph{pixel-level} precision, recall, F1,
+IoU, and false-positive area, characterizing how clean and well-localized
+detections are; and (ii) \emph{region-level} coverage (fraction of each
+ground-truth box covered by the mask) and detection rate at a coverage threshold,
+characterizing whether each emission was found. Because ground truth is a filled
+box while energy-based detectors fire sparsely on signal support, we emphasize
+region detection rate and mean coverage for ``did it find the signal'' and pixel
+precision for ``are detections clean.'' Every metric is broken down along
+registered dimensions---signal class, occupied bandwidth, pulse length, transmit
+attenuation (the effective-SNR axis), and time group---so accuracy can be reported
+per waveform family and per channel condition. Maskless tail frames dropped to pipeline drain
+are recorded but excluded from aggregates so they do not bias the comparison.

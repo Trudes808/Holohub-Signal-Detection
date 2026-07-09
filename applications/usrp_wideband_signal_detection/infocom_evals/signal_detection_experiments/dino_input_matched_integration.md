@@ -57,6 +57,31 @@ Accept: low-SNR regions visibly brighter/flatter-noise in "DINO Enhanced Input" 
 windows smear narrowband/edges; rely on the DINO structure gate (≥3 patches in a row) to reject
 the extra noise texture that any local enhancement raises.
 
+## Gray-blend rebalance + turbo colormap (built)
+
+The signal-agnostic DINO gray transform (`signal_agnostic_dino_gray[_batch]` in
+`operators/dinov3_signal_detector/dinov3_torch_runtime.cpp`) is what actually reaches the ViT
+— not the corrected dB. It builds `gray = 0.70*local_resid + 0.30*abs_detrended` then quantizes
+to 8-bit and (previously) replicated it into 3 identical channels. The 0.70 local high-pass
+weight suppresses faint spatially-broad signals (local residual ≈ 0 over a smooth elevated
+region) — the same failure mode as keep_res, baked into the DINO input.
+
+- `dino_gray_local_resid_weight` (default 0.70 = prior behavior): blend weight `w` in
+  `gray = w*local_resid + (1-w)*abs_detrended`. Lower toward 0 to favor absolute level so
+  faint-broad signals survive. Set to **0.35** in the enhance config. **Primary sweep knob.**
+- `dino_colormap_enable` (default false): feed a true 3-channel **turbo** colormap
+  (`apply_turbo_colormap`, widest RGB gamut) of the gray scalar instead of grayscale-replicate,
+  so small dB deltas become large decorrelated RGB deltas that excite the pretrained ViT's
+  chromatic patch-embed filters (unused when the 3 channels are identical). Set **true**.
+
+Both are DINO-input-only; the coherence path is untouched. Threaded through
+`DinoTorchRuntimeConfig` and set from the operator params at both runtime-config sites.
+
+**Panel caveat:** the "DINO Enhanced Input" panel shows the matched-integrated *dB* (pre
+gray-transform), NOT the post-transform gray / turbo RGB the model ingests. To visualize the
+true model input (needed to tune `dino_gray_local_resid_weight` and see the colormap), wire the
+batch `return_pre_model_gray` (currently single-frame only) into a debug artifact — follow-up.
+
 ## Follow-ups (not built)
 
 - Local CFAR z-score `(integrated − local_p25_bg) / local_MAD` for a calibrated,

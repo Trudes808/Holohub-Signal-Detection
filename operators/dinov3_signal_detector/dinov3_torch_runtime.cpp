@@ -263,8 +263,11 @@ torch::Tensor binary_closing_rect_tensor(const torch::Tensor& mask, int kernel_r
   return binary_erode_rect_tensor(binary_dilate_rect_tensor(mask, kernel_rows, kernel_cols), kernel_rows, kernel_cols);
 }
 
-torch::Tensor signal_agnostic_dino_gray(const torch::Tensor& sxx_db_local) {
+torch::Tensor signal_agnostic_dino_gray(const torch::Tensor& sxx_db_local,
+                                        double local_resid_weight = 0.70) {
   auto x_db = sxx_db_local.to(torch::kFloat32).contiguous();
+  const double w_local = std::clamp(local_resid_weight, 0.0, 1.0);
+  const double w_abs = 1.0 - w_local;
 
   const double row_sigma = std::max(1.0, static_cast<double>(x_db.size(0)) / 32.0);
   const double col_sigma = std::max(1.0, static_cast<double>(x_db.size(1)) / 32.0);
@@ -284,7 +287,7 @@ torch::Tensor signal_agnostic_dino_gray(const torch::Tensor& sxx_db_local) {
   scale = torch::clamp_min(scale, 1e-6);
   auto local_resid_n = torch::clamp(0.5 + 0.5 * (local_z / scale), 0.0, 1.0);
 
-  auto combined = (0.70 * local_resid_n + 0.30 * abs_detrended).to(torch::kFloat32).contiguous();
+  auto combined = (w_local * local_resid_n + w_abs * abs_detrended).to(torch::kFloat32).contiguous();
   const double combined_std = combined.std(/*unbiased=*/false).item<double>();
   if (combined_std < 0.02) {
     combined = normalize_map01(detrended, 0.01, 0.99).to(torch::kFloat32).contiguous();
@@ -294,8 +297,11 @@ torch::Tensor signal_agnostic_dino_gray(const torch::Tensor& sxx_db_local) {
   return torch::round(torch::clamp(combined, 0.0, 1.0) * 255.0).div(255.0).contiguous();
 }
 
-torch::Tensor signal_agnostic_dino_gray_batch(const torch::Tensor& sxx_db_batch) {
+torch::Tensor signal_agnostic_dino_gray_batch(const torch::Tensor& sxx_db_batch,
+                                              double local_resid_weight = 0.70) {
   auto x_db = sxx_db_batch.to(torch::kFloat32).contiguous();
+  const double w_local = std::clamp(local_resid_weight, 0.0, 1.0);
+  const double w_abs = 1.0 - w_local;
 
   const double row_sigma = std::max(1.0, static_cast<double>(x_db.size(1)) / 32.0);
   const double col_sigma = std::max(1.0, static_cast<double>(x_db.size(2)) / 32.0);
@@ -315,7 +321,7 @@ torch::Tensor signal_agnostic_dino_gray_batch(const torch::Tensor& sxx_db_batch)
   scale = torch::clamp_min(scale, 1e-6);
   auto local_resid_n = torch::clamp(0.5 + 0.5 * (local_z / scale), 0.0, 1.0);
 
-  auto combined = (0.70 * local_resid_n + 0.30 * abs_detrended).to(torch::kFloat32).contiguous();
+  auto combined = (w_local * local_resid_n + w_abs * abs_detrended).to(torch::kFloat32).contiguous();
   auto combined_flat = combined.reshape({combined.size(0), -1});
   auto combined_centered = combined_flat - combined_flat.mean(1, true);
   auto combined_std = torch::sqrt(torch::mean(combined_centered * combined_centered, 1));
@@ -323,6 +329,26 @@ torch::Tensor signal_agnostic_dino_gray_batch(const torch::Tensor& sxx_db_batch)
   combined = torch::where(combined_std.view({combined.size(0), 1, 1}).lt(0.02), fallback, combined);
 
   return torch::round(torch::clamp(combined, 0.0, 1.0) * 255.0).div(255.0).contiguous();
+}
+
+// Map a [0,1] grayscale scalar to 3 real RGB channels via the "turbo" colormap
+// (Mikhailov 5th-order polynomial approximation). Turbo has the widest RGB gamut of the
+// common maps, so a small scalar delta becomes a large, channel-decorrelated RGB delta that
+// excites the pretrained ViT's chromatic patch-embed filters. Input (B,1,H,W) in [0,1];
+// output (B,3,H,W) in [0,1], float32. Computed in float32 for coefficient precision.
+torch::Tensor apply_turbo_colormap(const torch::Tensor& gray01) {
+  auto g = gray01.to(torch::kFloat32).clamp(0.0, 1.0);
+  auto g2 = g * g;
+  auto g3 = g2 * g;
+  auto g4 = g3 * g;
+  auto g5 = g4 * g;
+  auto r = 0.13572138 + 4.61539260 * g - 42.66032258 * g2 + 132.13108234 * g3 -
+           152.94239396 * g4 + 59.28637943 * g5;
+  auto grn = 0.09140261 + 2.19418839 * g + 4.84296658 * g2 - 14.18503333 * g3 +
+             4.27729857 * g4 + 2.82956604 * g5;
+  auto b = 0.10667330 + 12.64194608 * g - 60.58204836 * g2 + 110.36276771 * g3 -
+           89.90310912 * g4 + 27.34824973 * g5;
+  return torch::cat({r, grn, b}, 1).clamp(0.0, 1.0).contiguous();
 }
 
 torch::Tensor legacy_fast_dino_gray(const torch::Tensor& sxx_db_local) {
@@ -631,11 +657,18 @@ class DinoTorchRuntime::Impl {
       result.timing.model_prep_ms = measure_ms([&] {
         auto grayscale_2d = (config.legacy_fast_gray_preprocess
                                  ? legacy_fast_dino_gray(resized_db)
-                                 : signal_agnostic_dino_gray(resized_db))
+                                 : signal_agnostic_dino_gray(resized_db, config.dino_gray_local_resid_weight))
                                 .contiguous();
         const auto target_dtype = use_fp16 ? torch::kHalf : torch::kFloat32;
-        auto grayscale = grayscale_2d.unsqueeze(0).unsqueeze(0).to(target_dtype);
-        auto rgb = grayscale.expand({1, 3, grayscale.size(2), grayscale.size(3)}).contiguous(torch::MemoryFormat::ChannelsLast);
+        auto grayscale = grayscale_2d.unsqueeze(0).unsqueeze(0);
+        torch::Tensor rgb;
+        if (config.dino_colormap_enable) {
+          rgb = apply_turbo_colormap(grayscale).to(target_dtype).contiguous(torch::MemoryFormat::ChannelsLast);
+        } else {
+          rgb = grayscale.to(target_dtype)
+                    .expand({1, 3, grayscale.size(2), grayscale.size(3)})
+                    .contiguous(torch::MemoryFormat::ChannelsLast);
+        }
         const auto [mean, std] = get_normalization_tensors(config, compute_device, target_dtype);
         model_input = ((rgb - mean) / std).contiguous(torch::MemoryFormat::ChannelsLast);
 
@@ -843,11 +876,19 @@ class DinoTorchRuntime::Impl {
         const auto target_dtype = use_fp16 ? torch::kHalf : torch::kFloat32;
         auto grayscale_batch = (config.legacy_fast_gray_preprocess
                                     ? legacy_fast_dino_gray_batch(resized_batch)
-                                    : signal_agnostic_dino_gray_batch(resized_batch))
-                                   .unsqueeze(1)
-                                   .to(target_dtype);
-        auto rgb_batch = grayscale_batch.expand({static_cast<int64_t>(input.batch_size), 3, grayscale_batch.size(2), grayscale_batch.size(3)})
-                             .contiguous(torch::MemoryFormat::ChannelsLast);
+                                    : signal_agnostic_dino_gray_batch(resized_batch, config.dino_gray_local_resid_weight))
+                                   .unsqueeze(1);
+        torch::Tensor rgb_batch;
+        if (config.dino_colormap_enable) {
+          // True 3-channel turbo colormap (float32 for precision), then cast.
+          rgb_batch = apply_turbo_colormap(grayscale_batch)
+                          .to(target_dtype)
+                          .contiguous(torch::MemoryFormat::ChannelsLast);
+        } else {
+          rgb_batch = grayscale_batch.to(target_dtype)
+                          .expand({static_cast<int64_t>(input.batch_size), 3, grayscale_batch.size(2), grayscale_batch.size(3)})
+                          .contiguous(torch::MemoryFormat::ChannelsLast);
+        }
         const auto [mean, std] = get_normalization_tensors(config, compute_device, target_dtype);
         model_input = ((rgb_batch - mean) / std).contiguous(torch::MemoryFormat::ChannelsLast);
       });

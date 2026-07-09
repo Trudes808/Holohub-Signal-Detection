@@ -9385,6 +9385,20 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Integration window length along time in native bins (centered; taps = "
              "2*(bins/2)+1). Longer exploits temporal persistence of signals.",
              25);
+  spec.param(dino_gray_local_resid_weight_,
+             "dino_gray_local_resid_weight",
+             "DINO gray local-residual blend weight",
+             "Weight w on the local high-pass/CFAR term of the signal-agnostic DINO gray input: "
+             "gray = w*local_resid + (1-w)*abs_detrended. Default 0.70 (prior behavior); lower "
+             "toward 0 to favor absolute level so faint spatially-broad signals survive.",
+             0.70);
+  spec.param(dino_colormap_enable_,
+             "dino_colormap_enable",
+             "DINO turbo colormap input",
+             "If true, feed a true 3-channel turbo colormap of the gray scalar instead of "
+             "replicating it into 3 identical channels, to excite the ViT's chromatic filters. "
+             "Default false = grayscale replicate.",
+             false);
   spec.param(dino_coherence_gate_floor_,
              "dino_coherence_gate_floor",
              "DINO coherence gate floor",
@@ -9682,6 +9696,8 @@ void CudaDinoDetector::initialize() {
     runtime_config.torch_dtype = torch_dtype_.get();
     runtime_config.imagenet_mean = imagenet_mean_.get();
     runtime_config.imagenet_std = imagenet_std_.get();
+    runtime_config.dino_gray_local_resid_weight = dino_gray_local_resid_weight_.get();
+    runtime_config.dino_colormap_enable = dino_colormap_enable_.get();
     runtime_config.return_patch_features = true;
     runtime_config.return_patch_features_host = false;
     runtime_config.return_final_mask_device = true;
@@ -10499,6 +10515,8 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       runtime_config.torch_dtype = torch_dtype_.get();
       runtime_config.imagenet_mean = imagenet_mean_.get();
       runtime_config.imagenet_std = imagenet_std_.get();
+      runtime_config.dino_gray_local_resid_weight = dino_gray_local_resid_weight_.get();
+      runtime_config.dino_colormap_enable = dino_colormap_enable_.get();
       runtime_config.return_patch_features = true;
       runtime_config.return_patch_features_host = false;
       runtime_config.return_final_mask_device = true;

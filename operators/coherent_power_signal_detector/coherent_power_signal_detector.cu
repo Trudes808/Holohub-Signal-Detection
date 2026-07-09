@@ -1346,6 +1346,43 @@ __global__ void coherent_power_per_freq_fill_kernel(const float* corrected,
   }
 }
 
+// Strong-signal rescue candidate: mark a pixel when its absolute corrected power exceeds the
+// per-row (per-frequency) noise floor by excess_db. Built in the detector's internal
+// orientation (rows = frequency, cols = time). Unlike the box-mean support (which the emit-mask
+// opening + frequency-persistence pass erases for frequency-narrow features), this candidate is
+// OR-ed back in AFTER those width filters, so a strong narrow signal survives regardless of its
+// frequency width. Time persistence is enforced separately downstream.
+__global__ void coherent_power_strong_rescue_kernel(const float* corrected,
+                                                    const float* row_floor_db,
+                                                    int rows,
+                                                    int cols,
+                                                    int ignore_bins_per_side,
+                                                    float excess_db,
+                                                    uint8_t* strong_mask) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+  const int row = idx / cols;
+  if (row < ignore_bins_per_side || row >= (rows - ignore_bins_per_side)) {
+    strong_mask[idx] = 0;
+    return;
+  }
+  strong_mask[idx] = (corrected[idx] >= row_floor_db[row] + excess_db) ? 1 : 0;
+}
+
+// Elementwise OR of a source mask into a destination mask (both u8, same layout).
+__global__ void coherent_power_or_u8_kernel(uint8_t* dst, const uint8_t* src, int total) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  if (src[idx]) {
+    dst[idx] = 1;
+  }
+}
+
 __global__ void coherent_power_majority_smooth_kernel(const uint8_t* input,
                                                       int rows,
                                                       int cols,
@@ -7072,6 +7109,9 @@ CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
     cudaFree(buffers.always_on_stripe_flags_device);
     cudaFree(buffers.mask_device);
     cudaFree(buffers.scratch_mask_device);
+    cudaFree(buffers.strong_mask_device);
+    cudaFree(buffers.strong_scratch_device);
+    cudaFree(buffers.strong_row_floor_device);
     cudaFreeHost(buffers.power_db_host);
     cudaFreeHost(buffers.mask_host);
 
@@ -7103,6 +7143,9 @@ void CoherentPowerSignalDetector::reset_channel_state(uint16_t channel_number,
   reset_bytes(buffers.always_on_stripe_flags_device, row_elements * sizeof(uint8_t), "always-on stripe flags");
   reset_bytes(buffers.mask_device, frame_elements * sizeof(uint8_t), "mask buffer");
   reset_bytes(buffers.scratch_mask_device, frame_elements * sizeof(uint8_t), "scratch mask buffer");
+  reset_bytes(buffers.strong_mask_device, frame_elements * sizeof(uint8_t), "strong rescue mask buffer");
+  reset_bytes(buffers.strong_scratch_device, frame_elements * sizeof(uint8_t), "strong rescue scratch buffer");
+  reset_bytes(buffers.strong_row_floor_device, row_elements * sizeof(float), "strong rescue row floor buffer");
 
   HOLOSCAN_LOG_INFO("Reset coherent detector state for channel {} before processing the next full batch",
                     channel_number);
@@ -7169,6 +7212,9 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(fast_coherence_floor_db_, "fast_coherence_floor_db", "Fast path coherence floor", "Coherence floor in dB for the fast GPU detector path.", 0.4);
   spec.param(fast_coherence_span_db_, "fast_coherence_span_db", "Fast path coherence span", "Coherence normalization span in dB for the fast GPU detector path.", 3.0);
   spec.param(fast_score_threshold_, "fast_score_threshold", "Fast path score threshold", "Score threshold for the fast GPU detector path.", 0.58);
+  spec.param(fast_strong_rescue_enable_, "fast_strong_rescue_enable", "Fast path strong-signal rescue enable", "If true, OR strong signals (>= excess_db above the per-row noise floor) into the emitted mask after the emit morphology + frequency-persistence pass, so strong but frequency-narrow signals still detect.", false);
+  spec.param(fast_strong_rescue_excess_db_, "fast_strong_rescue_excess_db", "Fast path strong-signal rescue excess dB", "dB above the per-row (per-frequency) noise floor required to rescue a strong narrow signal.", 8.0);
+  spec.param(fast_strong_rescue_min_time_bins_, "fast_strong_rescue_min_time_bins", "Fast path strong-signal rescue minimum time bins", "Minimum in-window strong time bins required to rescue a pixel, so isolated impulsive spikes are not admitted. Values <= 1 disable the time-persistence guard.", 3);
   spec.param(live_emit_mask_rows_, "live_emit_mask_rows", "Live emit mask rows", "Target history rows for artifact snapshots reduced with the live visualizer rule.", 16);
   spec.param(live_emit_mask_cols_, "live_emit_mask_cols", "Live emit mask cols", "Target history columns for artifact snapshots reduced with the live visualizer rule.", 20480);
   spec.param(live_emit_mask_min_coverage_,
@@ -7303,6 +7349,9 @@ void CoherentPowerSignalDetector::initialize() {
     allocate_device_u8(buffers.always_on_stripe_flags_device, static_cast<size_t>(configured_rows));
     allocate_device_u8(buffers.mask_device, configured_elements);
     allocate_device_u8(buffers.scratch_mask_device, configured_elements);
+    allocate_device_u8(buffers.strong_mask_device, configured_elements);
+    allocate_device_u8(buffers.strong_scratch_device, configured_elements);
+    allocate_device_float(buffers.strong_row_floor_device, static_cast<size_t>(configured_rows));
     const auto analysis_tensor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
                                                    configured_elements * sizeof(coherent_power_complex));
     if (analysis_tensor_result != cudaSuccess) {
@@ -7646,6 +7695,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       cudaFree(buffers.score_device);
       cudaFree(buffers.mask_device);
       cudaFree(buffers.scratch_mask_device);
+      cudaFree(buffers.strong_mask_device);
+      cudaFree(buffers.strong_scratch_device);
       cudaFree(buffers.frontend_reference_device);
       cudaFree(buffers.always_on_stripe_flags_device);
       cudaFree(buffers.analysis_tensor_device);
@@ -7663,6 +7714,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       buffers.score_device = nullptr;
       buffers.mask_device = nullptr;
       buffers.scratch_mask_device = nullptr;
+      buffers.strong_mask_device = nullptr;
+      buffers.strong_scratch_device = nullptr;
       buffers.frontend_reference_device = nullptr;
       buffers.always_on_stripe_flags_device = nullptr;
       buffers.power_db_host = nullptr;
@@ -7679,6 +7732,8 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       allocate_device_u8(buffers.always_on_stripe_flags_device, static_cast<size_t>(src_rows));
       allocate_device_u8(buffers.mask_device, static_cast<size_t>(total_bins));
       allocate_device_u8(buffers.scratch_mask_device, static_cast<size_t>(total_bins));
+      allocate_device_u8(buffers.strong_mask_device, static_cast<size_t>(total_bins));
+      allocate_device_u8(buffers.strong_scratch_device, static_cast<size_t>(total_bins));
       const auto analysis_tensor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
                                                      static_cast<size_t>(total_bins) * sizeof(coherent_power_complex));
       if (analysis_tensor_result != cudaSuccess) {
@@ -7710,6 +7765,10 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         cudaFree(buffers.always_on_stripe_flags_device);
         buffers.always_on_stripe_flags_device = nullptr;
       }
+      if (buffers.strong_row_floor_device != nullptr) {
+        cudaFree(buffers.strong_row_floor_device);
+        buffers.strong_row_floor_device = nullptr;
+      }
       const auto row_stat_result = cudaMalloc(reinterpret_cast<void**>(&buffers.row_stat_device), static_cast<size_t>(src_rows) * sizeof(float));
       if (row_stat_result != cudaSuccess) {
         throw std::runtime_error(std::string("row_stat buffer allocation failed: ") + cudaGetErrorString(row_stat_result));
@@ -7721,6 +7780,10 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       const auto stripe_flags_result = cudaMalloc(reinterpret_cast<void**>(&buffers.always_on_stripe_flags_device), static_cast<size_t>(src_rows) * sizeof(uint8_t));
       if (stripe_flags_result != cudaSuccess) {
         throw std::runtime_error(std::string("always-on stripe flag buffer allocation failed: ") + cudaGetErrorString(stripe_flags_result));
+      }
+      const auto strong_row_floor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.strong_row_floor_device), static_cast<size_t>(src_rows) * sizeof(float));
+      if (strong_row_floor_result != cudaSuccess) {
+        throw std::runtime_error(std::string("strong rescue row floor buffer allocation failed: ") + cudaGetErrorString(strong_row_floor_result));
       }
       buffers.row_elements = static_cast<size_t>(src_rows);
     }
@@ -8118,6 +8181,52 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       kernel_result = cudaGetLastError();
       if (kernel_result != cudaSuccess) {
         throw std::runtime_error(std::string("per_freq_fill kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+    }
+
+    if (fast_strong_rescue_enable_.get()) {
+      // Per-frequency (per-row) noise floor = mean over time of the local box-mean background.
+      // Averaging the box mean (freq radius covers many bins) over time dilutes a narrow carrier,
+      // so this stays a noise-floor estimate even when a persistent narrow signal is present.
+      coherent_power_row_sampled_mean_kernel<<<src_rows, threads, 0, stream>>>(buffers.background_device,
+                                                                                src_rows,
+                                                                                src_cols,
+                                                                                1,
+                                                                                buffers.strong_row_floor_device);
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("strong rescue row-floor kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+
+      coherent_power_strong_rescue_kernel<<<blocks, threads, 0, stream>>>(buffers.corrected_db_device,
+                                                                           buffers.strong_row_floor_device,
+                                                                           src_rows,
+                                                                           src_cols,
+                                                                           ignore_bins_per_side,
+                                                                           static_cast<float>(fast_strong_rescue_excess_db_.get()),
+                                                                           buffers.strong_mask_device);
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("strong rescue kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+
+      // Time-persistence guard. cols = time in the internal orientation, so the frequency
+      // persistence kernel enforces horizontal (time) support: keep a strong pixel only when at
+      // least min_time_bins strong pixels fall within +/-(min_time_bins-1) time bins on its row,
+      // rejecting isolated impulsive spikes while leaving the frequency width unconstrained.
+      const int strong_min_time_bins = std::max(1, fast_strong_rescue_min_time_bins_.get());
+      if (strong_min_time_bins > 1) {
+        coherent_power_frequency_persistence_kernel<<<blocks, threads, 0, stream>>>(buffers.strong_mask_device,
+                                                                                     src_rows,
+                                                                                     src_cols,
+                                                                                     strong_min_time_bins - 1,
+                                                                                     strong_min_time_bins,
+                                                                                     buffers.strong_scratch_device);
+        kernel_result = cudaGetLastError();
+        if (kernel_result != cudaSuccess) {
+          throw std::runtime_error(std::string("strong rescue time-persistence kernel launch failed: ") + cudaGetErrorString(kernel_result));
+        }
+        std::swap(buffers.strong_mask_device, buffers.strong_scratch_device);
       }
     }
 
@@ -9089,6 +9198,39 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         emit_mask_result = cudaGetLastError();
         if (emit_mask_result != cudaSuccess) {
           throw std::runtime_error(std::string("always-on stripe OR kernel launch failed: ") + cudaGetErrorString(emit_mask_result));
+        }
+      }
+
+      // Strong-signal rescue: OR the (time-persisted) strong mask back in AFTER the emit
+      // morphology + frequency-persistence pass, transposed into the emit orientation to match.
+      // This is what lets a strong but frequency-narrow signal survive the width filters.
+      if (fast_strong_rescue_enable_.get()) {
+        auto strong_emit_buffer = allocate_owned_u8_buffer(emitted_mask_bytes);
+        if (canonical_view.transposed) {
+          transpose_u8_kernel<<<count_blocks, count_threads, 0, stream>>>(buffers.strong_mask_device,
+                                                                           src_rows,
+                                                                           src_cols,
+                                                                           strong_emit_buffer.get());
+          emit_mask_result = cudaGetLastError();
+          if (emit_mask_result != cudaSuccess) {
+            throw std::runtime_error(std::string("strong rescue transpose-to-emit kernel launch failed: ") + cudaGetErrorString(emit_mask_result));
+          }
+        } else {
+          emit_mask_result = cudaMemcpyAsync(strong_emit_buffer.get(),
+                                             buffers.strong_mask_device,
+                                             emitted_mask_bytes,
+                                             cudaMemcpyDeviceToDevice,
+                                             stream);
+          if (emit_mask_result != cudaSuccess) {
+            throw std::runtime_error(std::string("strong rescue emit copy failed: ") + cudaGetErrorString(emit_mask_result));
+          }
+        }
+        coherent_power_or_u8_kernel<<<count_blocks, count_threads, 0, stream>>>(mask_buffer.get(),
+                                                                                 strong_emit_buffer.get(),
+                                                                                 compact_total);
+        emit_mask_result = cudaGetLastError();
+        if (emit_mask_result != cudaSuccess) {
+          throw std::runtime_error(std::string("strong rescue OR kernel launch failed: ") + cudaGetErrorString(emit_mask_result));
         }
       }
 
