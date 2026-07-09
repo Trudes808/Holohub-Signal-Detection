@@ -33,34 +33,43 @@ EVAL_DIR    = Path.home() / ("Holohub-Signal-Detection/applications/usrp_wideban
 BATCH_ROOT  = Path("/tmp/usrp_spectrograms/batch_eval/sweep_20260630")
 CAPTURE_DIRS = [Path.home() / "captures"]
 FIG_DIR     = FT_ROOT / "reports/figs_compare"; FIG_DIR.mkdir(parents=True, exist_ok=True)
+# Aggregate numbers come from the SAME canonical tables as batch_eval_review_three_detectors.ipynb
+# (produced by eval_detector_masks.py over all three detectors) — so both notebooks agree exactly.
+TABLES_DIR  = FT_ROOT / "notebooks/compare_tables_canonical"
 
 # ---- which fine-tuned model to compare ----
 FT_CKPT   = FT_ROOT / "checkpoints/M1_ft/best.pt"     # best overall IoU/F1; swap to M2_ft for best 45-50 dB
 FT_EVALMETA = FT_ROOT / "eval_out/M1_ft/eval_meta.json"
-DET_THRESHOLD = 0.30   # region "detected" if coverage >= this (matches report.md)
+DET_THRESHOLD = 0.10   # region "detected" if coverage >= this (matches the original batch_eval_review notebook)
 
 for p in (DINO_REPO, FT_ROOT / "src", EVAL_DIR):
     sys.path.insert(0, str(p))
 
 import eval_viz as v
 import mask_eval_metrics as mem
+import plot_eval_results as pe
 import finetuned_infer as fi
 import yaml
 
-# pretty display names + fixed colors/order for the three detectors
-DET_ORDER  = ["coherent_power", "cuda_dino", "finetuned_dino"]
+# pretty display names + fixed colors/order for the four detectors
+DET_ORDER  = ["coherent_power", "cuda_dino", "finetuned_dino", "finetuned_dino_m2"]
 DET_LABEL  = {"coherent_power": "Coherent Power",
               "cuda_dino": "Zero-shot DINOv3",
-              "finetuned_dino": "Fine-tuned DINOv3"}
-DET_COLOR  = {"coherent_power": "#d95f02", "cuda_dino": "#7570b3", "finetuned_dino": "#1b9e77"}
+              "finetuned_dino": "Fine-tuned DINOv3 (M1: ≤30 dB)",
+              "finetuned_dino_m2": "Fine-tuned DINOv3 (M2: all dB)"}
+DET_COLOR  = {"coherent_power": "#d95f02", "cuda_dino": "#7570b3",
+              "finetuned_dino": "#1b9e77", "finetuned_dino_m2": "#e7298a"}
 
 # %%
-# Load the fine-tuned detector once.
+# Load both fine-tuned detectors (M1 = trained on ≤30 dB, M2 = trained on all dB).
 train_cfg = yaml.safe_load(open(FT_ROOT / "configs/train.yaml"))
 ds_meta   = json.loads((FT_ROOT / "data/dataset/dataset_meta.json").read_text())
-THRESH    = fi.load_threshold(FT_EVALMETA)
-detector  = fi.FinetunedDetector(str(FT_CKPT), train_cfg, ds_meta, threshold=THRESH)
-print(f"Fine-tuned model: {FT_CKPT.parent.name}  (decision threshold={THRESH:.2f})")
+detector    = fi.FinetunedDetector(str(FT_ROOT / "checkpoints/M1_ft/best.pt"), train_cfg, ds_meta,
+                                   threshold=fi.load_threshold(FT_ROOT / "eval_out/M1_ft/eval_meta.json"))
+detector_m2 = fi.FinetunedDetector(str(FT_ROOT / "checkpoints/M2_ft/best.pt"), train_cfg, ds_meta,
+                                   threshold=fi.load_threshold(FT_ROOT / "eval_out/M2_ft/eval_meta.json"))
+FT_MODELS = {"finetuned_dino": detector, "finetuned_dino_m2": detector_m2}
+print(f"fine-tuned models: M1_ft (thr={detector.threshold:.2f}), M2_ft (thr={detector_m2.threshold:.2f})")
 
 ATTEN = {  # stem -> attenuation dB
     "attenuation_dB_0": 0, "attenuation_dB_5": 5, "attenuation_dB_10": 10,
@@ -73,16 +82,15 @@ ATTEN = {  # stem -> attenuation dB
 
 # %%
 def add_finetuned(bundle, stem):
-    """Run the fine-tuned model on this frame's IQ and attach its mask (display grid)."""
+    """Run both fine-tuned models on this frame's IQ and attach their masks (display grid)."""
     dp = v.find_capture_data(stem, CAPTURE_DIRS)
     row = next(r for r in mem.load_manifest(BATCH_ROOT / "coherent_power" / stem)
                if int(r["frame_number"]) == bundle.frame_number)
     iq = v.read_frame_iq(dp, int(row["local_file_offset_complex"]), int(row["complex_samples_read"]))
-    m_native = detector.mask_for_iq(iq)                       # (rows, 1024)
     # max-pool onto the display/GT grid so thin short-time detections survive the
     # 10x time downsample (nearest would drop Zadoff-Chu-style pulses).
-    bundle.detector_masks["finetuned_dino"] = fi.to_display_grid(
-        m_native, bundle.fft_rows, bundle.fft_cols)
+    for name, mdl in FT_MODELS.items():
+        bundle.detector_masks[name] = fi.to_display_grid(mdl.mask_for_iq(iq), bundle.fft_rows, bundle.fft_cols)
     return bundle
 
 
@@ -130,87 +138,56 @@ for stem in SHOWCASE:
     fig = v.plot_frame_panels(b, detectors=list(pretty.keys()))
     fig.suptitle(f"{stem}  ({ATTEN[stem]} dB attenuation)  — frame {frame}", y=1.02, fontsize=13)
     fig.savefig(FIG_DIR / f"panels_{stem}.png", dpi=95, bbox_inches="tight")
-    plt.show()
+    display(fig); plt.close(fig)   # close -> no duplicate auto-render at cell end
 
 
 # %% [markdown]
-# ## 2. Aggregate metrics vs attenuation (the fair comparison)
+# ## 2. Aggregate metrics vs attenuation (from the canonical 3-detector tables)
 #
-# For each capture we sample several annotated frames, and for every ground-truth
-# region measure the coverage each detector achieves. **Region detection rate**
-# (coverage ≥ 0.30) is the headline; pixel-IoU is shown too, with the caveat that it
-# rewards box-filling.
+# Numbers come from `compare_tables_canonical/` — the **same** `eval_detector_masks.py`
+# output used by `batch_eval_review_three_detectors.ipynb`, so both notebooks agree
+# exactly. **Region detection rate** (coverage ≥ threshold) is the fair headline;
+# pixel-IoU is shown too (it rewards box-filling — see caveats).
 
 # %%
-def region_bandwidth_bucket(item):
-    bw = abs(float(item.get("freq_upper_hz", 0)) - float(item.get("freq_lower_hz", 0)))
-    return mem.bucket_bandwidth({"occupied_bw_hz": bw})
-
-K_FRAMES = 6          # annotated frames sampled per capture
-rows_det, rows_pix = [], []
-for stem, atten in ATTEN.items():
-    ann, _ = v.classify_frames(BATCH_ROOT, stem)
-    if not ann:
-        continue
-    picks = v.pick_spread(ann, K_FRAMES)
-    for frame in picks:
-        try:
-            b = load_all(stem, frame)
-        except Exception as e:
-            print("skip", stem, frame, e); continue
-        gt = (b.gt_mask > 0).astype(np.uint8)
-        for k in DET_ORDER:
-            if k not in b.detector_masks:
-                continue
-            pred = (b.detector_masks[k] > 0).astype(np.uint8)
-            pm = mem.pixel_metrics(pred, gt)
-            rows_pix.append({"stem": stem, "atten": atten, "det": k,
-                             "iou": pm.iou, "recall": pm.recall, "precision": pm.precision})
-            for it in b.gt_items:
-                rr = mem.region_coverage(pred, it, b.fft_rows, b.fft_cols)
-                rows_det.append({"stem": stem, "atten": atten, "det": k,
-                                 "coverage": rr.coverage, "label": it.get("label"),
-                                 "bw_bucket": region_bandwidth_bucket(it),
-                                 "detected": (rr.coverage >= DET_THRESHOLD)})
-    print(f"  {stem}: {len(picks)} frames")
-
 import pandas as pd
-det_df = pd.DataFrame(rows_det); pix_df = pd.DataFrame(rows_pix)
-det_df.to_csv(FIG_DIR / "region_detection_3det.csv", index=False)
-pix_df.to_csv(FIG_DIR / "pixel_metrics_3det.csv", index=False)
-print("regions scored:", len(det_df), "| frames scored:", len(pix_df))
-
+region = pd.DataFrame(pe.load_region(TABLES_DIR / "region_metrics.csv"))
+frame  = pd.DataFrame(pe.load_frame(TABLES_DIR / "frame_pixel_metrics.csv"))
+region["detected"] = region["coverage"].astype(float) >= DET_THRESHOLD
+print("detectors:", sorted(region.detector.unique()),
+      "| region rows:", len(region), "| frame rows:", len(frame))
 
 # %%
 # Region detection rate vs attenuation (headline) + pixel IoU vs attenuation.
 fig, axes = plt.subplots(1, 2, figsize=(15, 5))
 for k in DET_ORDER:
-    g = det_df[det_df.det == k].groupby("atten")["detected"].mean()
+    g = region[region.detector == k].groupby("attenuation_db")["detected"].mean()
     axes[0].plot(g.index, g.values, "-o", label=DET_LABEL[k], color=DET_COLOR[k])
-    gp = pix_df[pix_df.det == k].groupby("atten")["iou"].mean()
+    fk = frame[(frame.detector == k) & (frame.mask_present)]
+    gp = fk.groupby("attenuation_db")["iou"].mean()
     axes[1].plot(gp.index, gp.values, "-o", label=DET_LABEL[k], color=DET_COLOR[k])
 axes[0].set_title(f"Region detection rate vs attenuation (coverage ≥ {DET_THRESHOLD})")
 axes[1].set_title("Pixel IoU vs attenuation (favors box-filling — see caveats)")
 for ax in axes:
     ax.set_xlabel("attenuation (dB)  — higher = lower SNR"); ax.grid(alpha=0.3)
     ax.set_ylim(-0.02, 1.02); ax.legend()
-axes[0].set_ylabel("detection rate"); axes[1].set_ylabel("mean IoU")
-fig.tight_layout(); fig.savefig(FIG_DIR / "metrics_vs_atten_3det.png", dpi=110); plt.show()
+axes[0].set_ylabel("detection rate"); axes[1].set_ylabel("mean pixel IoU")
+fig.tight_layout(); fig.savefig(FIG_DIR / "metrics_vs_atten_3det.png", dpi=110)
+display(fig); plt.close(fig)
 
 
 # %%
 # Detection rate by waveform class (which signals each detector misses).
-import pandas as pd
-piv = (det_df.assign(det=det_df.det.map(DET_LABEL))
-       .pivot_table(index="label", columns="det", values="detected", aggfunc="mean"))
-piv = piv.reindex(columns=[DET_LABEL[k] for k in DET_ORDER])
+piv = region.pivot_table(index="signal_class", columns="detector", values="detected", aggfunc="mean")
+piv = piv.reindex(columns=[k for k in DET_ORDER if k in piv.columns])
+piv.columns = [DET_LABEL[c] for c in piv.columns]
 print("Detection rate by waveform class (all attenuations pooled):")
 display(piv.round(2))
-ax = piv.plot(kind="bar", figsize=(12, 5),
-              color=[DET_COLOR[k] for k in DET_ORDER])
+ax = piv.plot(kind="bar", figsize=(12, 5), color=[DET_COLOR[k] for k in DET_ORDER])
 ax.set_title(f"Detection rate by waveform class (coverage ≥ {DET_THRESHOLD})")
 ax.set_ylabel("detection rate"); ax.set_ylim(0, 1.02); ax.grid(alpha=0.3, axis="y")
-plt.tight_layout(); plt.savefig(FIG_DIR / "detection_by_class_3det.png", dpi=110); plt.show()
+fig = ax.get_figure(); fig.tight_layout(); fig.savefig(FIG_DIR / "detection_by_class_3det.png", dpi=110)
+display(fig); plt.close(fig)
 
 
 # %% [markdown]
