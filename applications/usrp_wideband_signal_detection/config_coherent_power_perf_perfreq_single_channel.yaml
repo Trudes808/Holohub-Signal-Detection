@@ -237,6 +237,16 @@ coherent_power_signal_detector:
   per_freq_threshold_enable: true
   per_freq_threshold_offset_db: 2.0
   per_freq_threshold_path: "/workspace/holohub/applications/usrp_wideband_signal_detection/calibration/coherent_power_per_freq_floor.npy"
+  # Per-frequency floor source: "calibrated" (load the .npy above), "dynamic" (learn a monotone
+  # running-min floor live), or "static" (disable the per-frequency fill). Empty = legacy behavior
+  # (derives from per_freq_threshold_enable). This config stays on the calibrated floor.
+  per_freq_threshold_mode: "calibrated"
+  # Dynamic-mode tuning (only used when per_freq_threshold_mode == "dynamic"):
+  dynamic_floor_init_db: 40.0        # high starting bar per bin; each bin only ever descends from here
+  dynamic_floor_std_k: 2.0           # per-frame per-row stat = mean + k*std of corrected_db (approx noise high-quantile)
+  dynamic_floor_warmup_frames: 0     # frames to accumulate before the dynamic floor feeds the fill
+  dynamic_floor_window_slots: 8      # sub-window minima kept per bin; floor = min across slots (stale lows age out)
+  dynamic_floor_slot_frames: 16      # frames each slot accumulates before rotating (effective window = slots * slot_frames)
   live_emit_mask_rows: 16
   live_emit_mask_cols: 512
   live_emit_freq_persistence_window: 45

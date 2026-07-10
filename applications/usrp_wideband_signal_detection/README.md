@@ -481,6 +481,27 @@ The validator writes replay artifacts under `validator_artifacts/` next to the s
 
 The matching notebook replay path now lives in [dinov3/notebooks/coherant_power_signal_detector_validation.ipynb](dinov3/notebooks/coherant_power_signal_detector_validation.ipynb). Use that notebook to load the same snapshot sidecar, replay the Python reference pipeline, and compare the notebook outputs against the offline C++ validator on the exact same frozen input.
 
+### Coherent-Power Per-Frequency Floor Modes
+
+The coherent detector's per-frequency fill (OR-ed into the fast mask; fires where `corrected_db` exceeds a per-row noise floor by `per_freq_threshold_offset_db`) can source that per-row floor three ways, selected in the `coherent_power_signal_detector` config block via `per_freq_threshold_mode`:
+
+- `"calibrated"` — load the static per-row floor `.npy` produced by the offline calibration flow (`calibrate_coherent_power_config.sh`, written to `calibration/coherent_power_per_freq_floor.npy` and referenced by `per_freq_threshold_path`). Best when the live noise environment matches the capture set you calibrated against; recalibrate when the front end, gain, or band changes. See the header of [calibrate_coherent_power_config.sh](calibrate_coherent_power_config.sh) for the full calibration procedure and policy knobs.
+- `"dynamic"` — learn the per-row floor live, no calibration run required. Each bin starts at a high bar (`dynamic_floor_init_db`) and only descends toward the quietest power it observes, self-calibrating to the current noise floor. An always-on signal never presents a quiet frame, so its bin stays high and is ignored by design. The floor re-seeds to the high bar on app reset and on a center-frequency change. Ready-made config: `config_coherent_power_perf_dynamic_single_channel.yaml`.
+- `"static"` — disable the per-frequency fill entirely; only the global `fast_power_floor_db` / `fast_score_threshold` path runs.
+- (empty) — legacy behavior: derived from `per_freq_threshold_enable` (`true` → calibrated, `false` → static), so existing configs are unchanged.
+
+Dynamic-mode tuning knobs (config block):
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `dynamic_floor_init_db` | `40.0` | High starting bar per bin, in dB; each bin only ever descends from here. |
+| `dynamic_floor_std_k` | `2.0` | Per-frame per-row statistic = `mean + k*std` of `corrected_db`; `k` approximates the noise high-quantile the offline calibration measures. Raise to reduce false positives. |
+| `dynamic_floor_window_slots` | `8` | Number of sub-window minima kept per bin. The floor is the min across all slots; stale lows age out once every slot rotates, bounding the slow downward creep a pure global minimum would accumulate over a long run. |
+| `dynamic_floor_slot_frames` | `16` | Frames each slot accumulates before the cursor rotates. Effective sliding window = `window_slots * slot_frames` frames (default `8*16 = 128`). Shorter window = more responsive and less creep but a noisier floor; longer = smoother and closer to the calibrated floor but slower to adapt. |
+| `dynamic_floor_warmup_frames` | `0` | Frames to accumulate before the learned floor feeds the fill. The high init bar already keeps early frames conservative, so `0` is usually fine. |
+
+`per_freq_threshold_offset_db` still sets the firing margin above the floor in every mode, and in dynamic mode it also absorbs any residual bias in the learned floor.
+
 For the staged bottleneck-isolation passes, reuse the same helper with `CONFIG_NAME`:
 
 ```bash

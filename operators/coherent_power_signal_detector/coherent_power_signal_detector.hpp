@@ -154,6 +154,15 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
     uint8_t* strong_mask_device = nullptr;
     uint8_t* strong_scratch_device = nullptr;
     float* strong_row_floor_device = nullptr;
+    // Dynamic per-frequency floor (dB), one value per frequency row. In "dynamic" mode this holds the
+    // published floor = minimum over a small ring of sub-window minima, so each bin tracks its noise
+    // floor while stale lows age out (bounded creep); re-seeded to a high bar on reset / retune.
+    float* dynamic_floor_device = nullptr;
+    // Ring of per-bin sub-window minima, laid out row-major as [row * window_slots + slot]. Each slot
+    // accumulates the running min of the per-row statistic over dynamic_floor_slot_frames frames; the
+    // published floor is the min across all slots. Rotating slots gives a sliding window of
+    // window_slots * slot_frames frames without storing every frame.
+    float* dynamic_floor_ring_device = nullptr;
     uint8_t* mask_host = nullptr;
     size_t frame_elements = 0;
     size_t row_elements = 0;
@@ -209,6 +218,15 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<bool> per_freq_threshold_enable_;
   holoscan::Parameter<std::string> per_freq_threshold_path_;
   holoscan::Parameter<double> per_freq_threshold_offset_db_;
+  // Per-frequency floor source: "calibrated" (load .npy), "dynamic" (learn a monotone running-min
+  // floor live), or "static" (disable the per-frequency fill). Empty derives from
+  // per_freq_threshold_enable for backward compatibility. Dynamic-mode tuning below.
+  holoscan::Parameter<std::string> per_freq_threshold_mode_;
+  holoscan::Parameter<double> dynamic_floor_init_db_;
+  holoscan::Parameter<double> dynamic_floor_std_k_;
+  holoscan::Parameter<int> dynamic_floor_warmup_frames_;
+  holoscan::Parameter<int> dynamic_floor_window_slots_;
+  holoscan::Parameter<int> dynamic_floor_slot_frames_;
   holoscan::Parameter<double> chunk_bandwidth_hz_;
   holoscan::Parameter<double> chunk_overlap_hz_;
   holoscan::Parameter<double> uncalibrated_chunk_fraction_;
@@ -285,6 +303,14 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   std::vector<ChannelBuffers> channel_buffers_;
   std::vector<uint8_t> reset_detector_state_on_next_full_batch_;
   std::vector<uint64_t> last_seen_chdr_soft_resync_epoch_;
+  // Dynamic per-frequency floor bookkeeping: last-seen tuning center frequency (a change re-seeds
+  // the floor) and a per-channel "re-seed the floor to the high bar on the next dynamic frame" flag.
+  std::vector<uint64_t> last_seen_center_frequency_;
+  std::vector<uint8_t> dynamic_floor_seed_pending_;
+  // Per-channel ring cursor: which sub-window slot is currently accumulating, and how many frames
+  // have been folded into it so far (rotates to the next slot after dynamic_floor_slot_frames).
+  std::vector<int> dynamic_floor_slot_;
+  std::vector<int> dynamic_floor_slot_frame_;
   std::atomic<bool> stop_requested_ {false};
 
   // Calibrated per-frequency (per-row) noise floor in dB, shared across channels. A pixel

@@ -18,6 +18,55 @@
 # Override the input set via env (noise floor is attenuation-independent; signal level
 # should come from mid/low-SNR captures that actually carry annotations):
 #     sudo INPUT_GLOBS="generated_inputs/attenuation_dB_*_*.sigmf-data" ./calibrate_coherent_power_config.sh
+#
+# ---------------------------------------------------------------------------------------
+# Per-frequency floor mode: calibrated vs dynamic vs static
+# ---------------------------------------------------------------------------------------
+# The per-frequency fill (OR-ed into the fast mask; fires where corrected_db exceeds a
+# per-row noise floor by per_freq_threshold_offset_db) can source its floor three ways,
+# selected in the config's `coherent_power_signal_detector` block via
+# `per_freq_threshold_mode`. This offline script produces the CALIBRATED floor; the other
+# two modes need no calibration run.
+#
+#   per_freq_threshold_mode: "calibrated"   (what this script targets)
+#     Loads the static per-row floor .npy this script writes
+#     (calibration/coherent_power_per_freq_floor.npy, referenced by per_freq_threshold_path).
+#     Best when the noise environment matches the capture set you calibrated against.
+#     Recalibrate (re-run this script) when the front end, gain, or band changes.
+#
+#   per_freq_threshold_mode: "dynamic"       (no calibration run; learns live)
+#     Learns the per-row floor online from the running stream: each bin starts at a high
+#     bar (dynamic_floor_init_db) and only descends toward the quietest power it observes,
+#     so it self-calibrates to the current noise floor without a capture set. An
+#     always-on signal never presents a quiet frame, so its bin stays high and is ignored
+#     by design. Re-seeds to the high bar on app reset and on a center-frequency change.
+#     Tuning knobs (config block):
+#       dynamic_floor_init_db      high starting bar per bin, in dB (default 40).
+#       dynamic_floor_std_k        per-frame per-row statistic = mean + k*std of
+#                                  corrected_db; k approximates the noise high-quantile this
+#                                  script measures. Raise to reduce false positives (default 2.0).
+#       dynamic_floor_window_slots number of sub-window minima kept per bin. The floor is the
+#                                  min across all slots; stale lows age out once every slot
+#                                  rotates, which bounds the slow downward creep a pure global
+#                                  minimum would accumulate over a long run (default 8).
+#       dynamic_floor_slot_frames  frames each slot accumulates before the cursor rotates. The
+#                                  effective sliding window = window_slots * slot_frames frames
+#                                  (default 16 -> 8*16 = 128 frames). Shorter window = more
+#                                  responsive + less creep but a noisier floor; longer = smoother
+#                                  and closer to the calibrated floor but slower to adapt.
+#       dynamic_floor_warmup_frames frames to accumulate before the learned floor is allowed to
+#                                  feed the fill (default 0; the high init bar already keeps early
+#                                  frames conservative).
+#     per_freq_threshold_offset_db still sets the firing margin above the floor, same as in
+#     calibrated mode, and also absorbs any residual bias in the learned floor.
+#     Ready-made config: config_coherent_power_perf_dynamic_single_channel.yaml.
+#
+#   per_freq_threshold_mode: "static"        (per-frequency fill disabled)
+#     No per-row floor; only the global fast_power_floor_db / fast_score_threshold path runs.
+#
+#   (empty)  -> legacy behavior: derives from per_freq_threshold_enable
+#               (true -> calibrated, false -> static).
+# ---------------------------------------------------------------------------------------
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"

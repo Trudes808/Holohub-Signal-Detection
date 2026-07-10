@@ -1346,6 +1346,92 @@ __global__ void coherent_power_per_freq_fill_kernel(const float* corrected,
   }
 }
 
+// Fill a float buffer with a constant. Used to seed the dynamic per-frequency floor to a high bar
+// so every bin starts above any plausible signal and can only descend from there.
+__global__ void coherent_power_fill_float_kernel(float* buf, int n, float value) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) {
+    return;
+  }
+  buf[idx] = value;
+}
+
+// Dynamic per-frequency floor update (one block per frequency row). Computes a robust per-row
+// high-power statistic over this frame's time bins -- mean + std_k * std of corrected_db, a cheap
+// single-pass proxy for the noise high-quantile the offline calibration measures -- then folds it
+// into a windowed minimum: a small ring of sub-window minima per bin. The current slot accumulates
+// the running min of the statistic; on the first frame of a slot the slot is overwritten (so the
+// oldest window ages out), and the published floor is the min across all slots. This tracks the
+// noise floor downward while bounding the creep a strictly-global min would accumulate over a long
+// run. Bins that are noise most of the time settle onto their floor within a window; an always-on
+// signal never presents a quiet frame and keeps its bin high (ignored by design). Ignore-band rows
+// are left untouched.
+__global__ void coherent_power_dynamic_floor_update_kernel(const float* corrected,
+                                                           int rows,
+                                                           int cols,
+                                                           int ignore_bins_per_side,
+                                                           float std_k,
+                                                           float* ring,
+                                                           int window_slots,
+                                                           int cur_slot,
+                                                           int first_frame_of_slot,
+                                                           float* floor_db) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  __shared__ float partial_sum[256];
+  __shared__ float partial_sq[256];
+  __shared__ unsigned int partial_count[256];
+  const int tid = threadIdx.x;
+  float sum = 0.0f;
+  float sq = 0.0f;
+  unsigned int count = 0;
+  for (int col = tid; col < cols; col += blockDim.x) {
+    const float v = corrected[static_cast<size_t>(row) * static_cast<size_t>(cols) + static_cast<size_t>(col)];
+    sum += v;
+    sq += v * v;
+    ++count;
+  }
+  partial_sum[tid] = sum;
+  partial_sq[tid] = sq;
+  partial_count[tid] = count;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      partial_sum[tid] += partial_sum[tid + stride];
+      partial_sq[tid] += partial_sq[tid + stride];
+      partial_count[tid] += partial_count[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    if (row < ignore_bins_per_side || row >= (rows - ignore_bins_per_side)) {
+      return;
+    }
+    const unsigned int n = partial_count[0];
+    if (n == 0) {
+      return;
+    }
+    const float mean = partial_sum[0] / static_cast<float>(n);
+    const float var = fmaxf(partial_sq[0] / static_cast<float>(n) - mean * mean, 0.0f);
+    const float stat = mean + std_k * sqrtf(var);
+
+    const size_t base = static_cast<size_t>(row) * static_cast<size_t>(window_slots);
+    // Overwrite the slot on its first frame (retiring the window it previously held), otherwise fold
+    // the statistic into the slot's running minimum.
+    ring[base + cur_slot] = first_frame_of_slot ? stat : fminf(ring[base + cur_slot], stat);
+    float f = ring[base];
+    for (int w = 1; w < window_slots; ++w) {
+      f = fminf(f, ring[base + w]);
+    }
+    floor_db[row] = f;
+  }
+}
+
 // Strong-signal rescue candidate: mark a pixel when its absolute corrected power exceeds the
 // per-row (per-frequency) noise floor by excess_db. Built in the detector's internal
 // orientation (rows = frequency, cols = time). Unlike the box-mean support (which the emit-mask
@@ -7112,6 +7198,8 @@ CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
     cudaFree(buffers.strong_mask_device);
     cudaFree(buffers.strong_scratch_device);
     cudaFree(buffers.strong_row_floor_device);
+    cudaFree(buffers.dynamic_floor_device);
+    cudaFree(buffers.dynamic_floor_ring_device);
     cudaFreeHost(buffers.power_db_host);
     cudaFreeHost(buffers.mask_host);
 
@@ -7147,6 +7235,13 @@ void CoherentPowerSignalDetector::reset_channel_state(uint16_t channel_number,
   reset_bytes(buffers.strong_scratch_device, frame_elements * sizeof(uint8_t), "strong rescue scratch buffer");
   reset_bytes(buffers.strong_row_floor_device, row_elements * sizeof(float), "strong rescue row floor buffer");
 
+  // The dynamic per-frequency floor is a running minimum, not a per-frame buffer: zeroing it would
+  // wrongly pin every bin to 0 dB. Instead flag it so the next dynamic frame re-seeds it to the
+  // high init bar and it relearns the noise floor from scratch.
+  if (channel_number < dynamic_floor_seed_pending_.size()) {
+    dynamic_floor_seed_pending_[channel_number] = 1;
+  }
+
   HOLOSCAN_LOG_INFO("Reset coherent detector state for channel {} before processing the next full batch",
                     channel_number);
 }
@@ -7179,6 +7274,12 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(per_freq_threshold_enable_, "per_freq_threshold_enable", "Per-frequency threshold enable", "If true, OR a per-frequency noise-floor detection into the fast mask so strong signals broader than the local box fill in.", false);
   spec.param(per_freq_threshold_path_, "per_freq_threshold_path", "Per-frequency floor path", "Path to a calibrated per-row noise-floor .npy (length src_rows, float32 dB). Empty disables the per-frequency fill.", std::string(""));
   spec.param(per_freq_threshold_offset_db_, "per_freq_threshold_offset_db", "Per-frequency threshold offset", "dB above the calibrated per-row floor required to fire the per-frequency fill.", 2.0);
+  spec.param(per_freq_threshold_mode_, "per_freq_threshold_mode", "Per-frequency threshold mode", "Source of the per-frequency floor when the fill is enabled: 'calibrated' (load the .npy at per_freq_threshold_path), 'dynamic' (learn a monotone running-min floor live from the stream), or 'static' (disable the per-frequency fill). Empty falls back to per_freq_threshold_enable for backward compatibility.", std::string(""));
+  spec.param(dynamic_floor_init_db_, "dynamic_floor_init_db", "Dynamic floor init", "Initial high per-bin floor (dB) for dynamic mode; each bin only ever descends from here. Reset to this on startup and on a center-frequency change.", 40.0);
+  spec.param(dynamic_floor_std_k_, "dynamic_floor_std_k", "Dynamic floor std multiplier", "The per-frame per-row statistic folded into the running min is mean + k*std of corrected_db; k approximates the noise high-quantile the offline calibration uses. Combine with per_freq_threshold_offset_db for the final firing margin.", 2.0);
+  spec.param(dynamic_floor_warmup_frames_, "dynamic_floor_warmup_frames", "Dynamic floor warmup", "Frames to accumulate into the running min before the dynamic floor is allowed to feed the fill kernel (0 = use it immediately; the high init bar already keeps early frames conservative).", 0);
+  spec.param(dynamic_floor_window_slots_, "dynamic_floor_window_slots", "Dynamic floor window slots", "Number of sub-window minima kept per bin. The published floor is the min across all slots; stale lows age out after all slots rotate, bounding creep. Effective window = window_slots * slot_frames frames.", 8);
+  spec.param(dynamic_floor_slot_frames_, "dynamic_floor_slot_frames", "Dynamic floor slot frames", "Frames each sub-window slot accumulates before the cursor rotates to the next slot.", 16);
   spec.param(chunk_bandwidth_hz_, "chunk_bandwidth_hz", "Chunk bandwidth", "Chunk bandwidth in Hz.", 25.0e6);
   spec.param(chunk_overlap_hz_, "chunk_overlap_hz", "Chunk overlap", "Chunk overlap in Hz.", 6.25e6);
   spec.param(uncalibrated_chunk_fraction_, "uncalibrated_chunk_fraction", "Uncalibrated chunk fraction", "Fractional chunk span for uncalibrated inputs.", 0.40);
@@ -7308,6 +7409,11 @@ void CoherentPowerSignalDetector::initialize() {
   channel_buffers_.assign(num_channels_.get(), ChannelBuffers {});
   reset_detector_state_on_next_full_batch_.assign(num_channels_.get(), 0);
   last_seen_chdr_soft_resync_epoch_.assign(num_channels_.get(), 0);
+  last_seen_center_frequency_.assign(num_channels_.get(), 0);
+  // Seed the dynamic per-frequency floor on the first dynamic frame of each channel.
+  dynamic_floor_seed_pending_.assign(num_channels_.get(), 1);
+  dynamic_floor_slot_.assign(num_channels_.get(), 0);
+  dynamic_floor_slot_frame_.assign(num_channels_.get(), 0);
 
   auto cuda_result = cudaFree(nullptr);
   if (cuda_result != cudaSuccess) {
@@ -7352,6 +7458,10 @@ void CoherentPowerSignalDetector::initialize() {
     allocate_device_u8(buffers.strong_mask_device, configured_elements);
     allocate_device_u8(buffers.strong_scratch_device, configured_elements);
     allocate_device_float(buffers.strong_row_floor_device, static_cast<size_t>(configured_rows));
+    allocate_device_float(buffers.dynamic_floor_device, static_cast<size_t>(configured_rows));
+    allocate_device_float(buffers.dynamic_floor_ring_device,
+                          static_cast<size_t>(configured_rows) *
+                              static_cast<size_t>(std::max(1, dynamic_floor_window_slots_.get())));
     const auto analysis_tensor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.analysis_tensor_device),
                                                    configured_elements * sizeof(coherent_power_complex));
     if (analysis_tensor_result != cudaSuccess) {
@@ -7519,6 +7629,19 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         "Observed CHDR soft resync epoch {} on channel {}; detector state will reset on the next full batch",
         chdr_soft_resync_epoch,
         channel_number);
+  }
+  // A tuning change invalidates the learned per-frequency floor (the noise floor is frequency
+  // dependent), so re-seed the dynamic floor to the high bar when the center frequency changes.
+  const uint64_t center_frequency = meta->get<uint64_t>("center_frequency", 0);
+  if (center_frequency != last_seen_center_frequency_[channel_number]) {
+    if (last_seen_center_frequency_[channel_number] != 0) {
+      dynamic_floor_seed_pending_[channel_number] = 1;
+      HOLOSCAN_LOG_INFO(
+          "Center frequency changed to {} Hz on channel {}; dynamic per-frequency floor will re-seed",
+          center_frequency,
+          channel_number);
+    }
+    last_seen_center_frequency_[channel_number] = center_frequency;
   }
   const uint32_t chdr_packets_in_batch = meta->get<uint32_t>("chdr_packets_in_batch", 0);
   const uint32_t chdr_expected_packets_in_batch = meta->get<uint32_t>("chdr_expected_packets_in_batch", 0);
@@ -7769,6 +7892,14 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         cudaFree(buffers.strong_row_floor_device);
         buffers.strong_row_floor_device = nullptr;
       }
+      if (buffers.dynamic_floor_device != nullptr) {
+        cudaFree(buffers.dynamic_floor_device);
+        buffers.dynamic_floor_device = nullptr;
+      }
+      if (buffers.dynamic_floor_ring_device != nullptr) {
+        cudaFree(buffers.dynamic_floor_ring_device);
+        buffers.dynamic_floor_ring_device = nullptr;
+      }
       const auto row_stat_result = cudaMalloc(reinterpret_cast<void**>(&buffers.row_stat_device), static_cast<size_t>(src_rows) * sizeof(float));
       if (row_stat_result != cudaSuccess) {
         throw std::runtime_error(std::string("row_stat buffer allocation failed: ") + cudaGetErrorString(row_stat_result));
@@ -7785,6 +7916,19 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       if (strong_row_floor_result != cudaSuccess) {
         throw std::runtime_error(std::string("strong rescue row floor buffer allocation failed: ") + cudaGetErrorString(strong_row_floor_result));
       }
+      const auto dynamic_floor_result = cudaMalloc(reinterpret_cast<void**>(&buffers.dynamic_floor_device), static_cast<size_t>(src_rows) * sizeof(float));
+      if (dynamic_floor_result != cudaSuccess) {
+        throw std::runtime_error(std::string("dynamic per-frequency floor buffer allocation failed: ") + cudaGetErrorString(dynamic_floor_result));
+      }
+      const auto dynamic_floor_ring_result = cudaMalloc(
+          reinterpret_cast<void**>(&buffers.dynamic_floor_ring_device),
+          static_cast<size_t>(src_rows) *
+              static_cast<size_t>(std::max(1, dynamic_floor_window_slots_.get())) * sizeof(float));
+      if (dynamic_floor_ring_result != cudaSuccess) {
+        throw std::runtime_error(std::string("dynamic per-frequency floor ring buffer allocation failed: ") + cudaGetErrorString(dynamic_floor_ring_result));
+      }
+      // Row count changed: the running floor is stale, re-seed it on the next dynamic frame.
+      dynamic_floor_seed_pending_[channel_number] = 1;
       buffers.row_elements = static_cast<size_t>(src_rows);
     }
 
@@ -8136,41 +8280,118 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       throw std::runtime_error(std::string("fast_score kernel launch failed: ") + cudaGetErrorString(kernel_result));
     }
 
-    // Calibrated per-frequency noise-floor fill (OR-ed into the box mask). Loaded once,
-    // shared across channels; a length/shape mismatch or unreadable file disables it.
-    if (per_freq_threshold_enable_.get() && !per_freq_threshold_ready_ && !per_freq_threshold_failed_) {
-      bool loaded_ok = false;
-      const std::string floor_path = per_freq_threshold_path_.get();
-      std::vector<float> floor_host = floor_path.empty()
-                                          ? std::vector<float>{}
-                                          : read_npy_float32(floor_path, loaded_ok);
-      if (loaded_ok && static_cast<int>(floor_host.size()) == src_rows) {
-        const auto alloc_result = cudaMalloc(reinterpret_cast<void**>(&per_freq_threshold_device_),
-                                             floor_host.size() * sizeof(float));
-        if (alloc_result == cudaSuccess &&
-            cudaMemcpy(per_freq_threshold_device_, floor_host.data(),
-                       floor_host.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess) {
-          per_freq_threshold_len_ = static_cast<int>(floor_host.size());
-          per_freq_threshold_ready_ = true;
-          HOLOSCAN_LOG_INFO("Loaded per-frequency noise floor ({} rows) from {}",
-                            per_freq_threshold_len_, floor_path);
-        } else {
-          per_freq_threshold_failed_ = true;
-          cudaFree(per_freq_threshold_device_);
-          per_freq_threshold_device_ = nullptr;
-          HOLOSCAN_LOG_ERROR("Failed to upload per-frequency noise floor; per-frequency fill disabled.");
-        }
-      } else {
-        per_freq_threshold_failed_ = true;
-        HOLOSCAN_LOG_ERROR("Per-frequency floor '{}' unreadable or wrong length (got {}, need {}); "
-                           "per-frequency fill disabled.",
-                           floor_path, floor_host.size(), src_rows);
+    // Per-frequency noise-floor fill (OR-ed into the box mask): fires where absolute corrected_db
+    // exceeds a per-row floor + offset, filling wide-signal interiors the local box hollows out.
+    // The floor comes from one of three sources selected by per_freq_threshold_mode:
+    //   "calibrated" -> load a static .npy once (shared across channels);
+    //   "dynamic"    -> a per-channel monotone running minimum learned live from the stream;
+    //   "static"     -> disabled.
+    // An empty mode preserves the legacy per_freq_threshold_enable behavior (enable -> calibrated).
+    std::string per_freq_mode = per_freq_threshold_mode_.get();
+    for (char& c : per_freq_mode) {
+      if (c >= 'A' && c <= 'Z') {
+        c = static_cast<char>(c - 'A' + 'a');
       }
     }
-    if (per_freq_threshold_enable_.get() && per_freq_threshold_ready_) {
+    if (per_freq_mode.empty()) {
+      per_freq_mode = per_freq_threshold_enable_.get() ? "calibrated" : "static";
+    }
+
+    const float* fill_floor_device = nullptr;
+
+    if (per_freq_mode == "calibrated") {
+      // Loaded once, shared across channels; a length/shape mismatch or unreadable file disables it.
+      if (!per_freq_threshold_ready_ && !per_freq_threshold_failed_) {
+        bool loaded_ok = false;
+        const std::string floor_path = per_freq_threshold_path_.get();
+        std::vector<float> floor_host = floor_path.empty()
+                                            ? std::vector<float>{}
+                                            : read_npy_float32(floor_path, loaded_ok);
+        if (loaded_ok && static_cast<int>(floor_host.size()) == src_rows) {
+          const auto alloc_result = cudaMalloc(reinterpret_cast<void**>(&per_freq_threshold_device_),
+                                               floor_host.size() * sizeof(float));
+          if (alloc_result == cudaSuccess &&
+              cudaMemcpy(per_freq_threshold_device_, floor_host.data(),
+                         floor_host.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess) {
+            per_freq_threshold_len_ = static_cast<int>(floor_host.size());
+            per_freq_threshold_ready_ = true;
+            HOLOSCAN_LOG_INFO("Loaded per-frequency noise floor ({} rows) from {}",
+                              per_freq_threshold_len_, floor_path);
+          } else {
+            per_freq_threshold_failed_ = true;
+            cudaFree(per_freq_threshold_device_);
+            per_freq_threshold_device_ = nullptr;
+            HOLOSCAN_LOG_ERROR("Failed to upload per-frequency noise floor; per-frequency fill disabled.");
+          }
+        } else {
+          per_freq_threshold_failed_ = true;
+          HOLOSCAN_LOG_ERROR("Per-frequency floor '{}' unreadable or wrong length (got {}, need {}); "
+                             "per-frequency fill disabled.",
+                             floor_path, floor_host.size(), src_rows);
+        }
+      }
+      if (per_freq_threshold_ready_) {
+        fill_floor_device = per_freq_threshold_device_;
+      }
+    } else if (per_freq_mode == "dynamic") {
+      const int window_slots = std::max(1, dynamic_floor_window_slots_.get());
+      const int slot_frames = std::max(1, dynamic_floor_slot_frames_.get());
+      // Re-seed the ring + published floor to the high init bar on the first frame / after a reset,
+      // and rewind the slot cursor so the window relearns from scratch.
+      if (dynamic_floor_seed_pending_[channel_number]) {
+        const float init_db = static_cast<float>(dynamic_floor_init_db_.get());
+        const int ring_elems = src_rows * window_slots;
+        const int ring_blocks = (ring_elems + threads - 1) / threads;
+        coherent_power_fill_float_kernel<<<ring_blocks, threads, 0, stream>>>(
+            buffers.dynamic_floor_ring_device, ring_elems, init_db);
+        const int floor_blocks = (src_rows + threads - 1) / threads;
+        coherent_power_fill_float_kernel<<<floor_blocks, threads, 0, stream>>>(
+            buffers.dynamic_floor_device, src_rows, init_db);
+        kernel_result = cudaGetLastError();
+        if (kernel_result != cudaSuccess) {
+          throw std::runtime_error(std::string("dynamic floor seed kernel launch failed: ") + cudaGetErrorString(kernel_result));
+        }
+        dynamic_floor_slot_[channel_number] = 0;
+        dynamic_floor_slot_frame_[channel_number] = 0;
+        dynamic_floor_seed_pending_[channel_number] = 0;
+      }
+      // Fold this frame's per-row robust power statistic into the current sub-window slot, then
+      // publish floor = min across all slots. The slot is overwritten on its first frame so the
+      // window it previously held ages out (bounded creep).
+      const int cur_slot = dynamic_floor_slot_[channel_number];
+      const int first_frame_of_slot = (dynamic_floor_slot_frame_[channel_number] == 0) ? 1 : 0;
+      coherent_power_dynamic_floor_update_kernel<<<src_rows, threads, 0, stream>>>(
+          buffers.corrected_db_device,
+          src_rows,
+          src_cols,
+          ignore_bins_per_side,
+          static_cast<float>(dynamic_floor_std_k_.get()),
+          buffers.dynamic_floor_ring_device,
+          window_slots,
+          cur_slot,
+          first_frame_of_slot,
+          buffers.dynamic_floor_device);
+      kernel_result = cudaGetLastError();
+      if (kernel_result != cudaSuccess) {
+        throw std::runtime_error(std::string("dynamic floor update kernel launch failed: ") + cudaGetErrorString(kernel_result));
+      }
+      // Advance the ring cursor: rotate to the next slot once this one has accumulated slot_frames.
+      if (++dynamic_floor_slot_frame_[channel_number] >= slot_frames) {
+        dynamic_floor_slot_frame_[channel_number] = 0;
+        dynamic_floor_slot_[channel_number] = (cur_slot + 1) % window_slots;
+      }
+      // Only feed the fill once enough frames have been folded in (the high init bar keeps early
+      // frames conservative regardless, so warmup defaults to 0).
+      const uint64_t warmup = static_cast<uint64_t>(std::max(0, dynamic_floor_warmup_frames_.get()));
+      if (processing_frame_number >= warmup) {
+        fill_floor_device = buffers.dynamic_floor_device;
+      }
+    }
+
+    if (fill_floor_device != nullptr) {
       coherent_power_per_freq_fill_kernel<<<blocks, threads, 0, stream>>>(
           buffers.corrected_db_device,
-          per_freq_threshold_device_,
+          fill_floor_device,
           src_rows,
           src_cols,
           ignore_bins_per_side,

@@ -1,0 +1,281 @@
+# SPDX-FileCopyrightText: 2026 National Instruments Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+num_runs: -1
+
+pipeline:
+  enable_spectrogram: true
+  enable_detector: true
+  detector_type: "coherent_power"
+  log_from_spectrogram: false
+
+scheduler:
+  worker_thread_number: 4
+  stop_on_deadlock: true
+  stop_on_deadlock_timeout: 500
+
+advanced_network:
+  cfg:
+    version: 1
+    manager: "dpdk"
+    master_core: 9
+    debug: false
+    log_level: "info"
+
+    memory_regions:
+      - name: "Headers_RX_CPU"
+        kind: "huge"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 131072
+        buf_size: 42
+      - name: "CH1_CHDR_Headers_RX_CPU"
+        kind: "huge"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 131072
+        buf_size: 64
+      - name: "CH1_Data_RX_GPU"
+        kind: "device"
+        affinity: 0
+        access:
+          - local
+        num_bufs: 131072
+        buf_size: 4096
+
+    interfaces:
+      - name: sdr_data
+        address: 0000:a2:00.1
+        rx:
+          flow_isolation: true
+          queues:
+            - name: "Channel 1 data"
+              id: 0
+              cpu_core: 10
+              batch_size: 1024
+              memory_regions:
+                - "Headers_RX_CPU"
+                - "CH1_CHDR_Headers_RX_CPU"
+                - "CH1_Data_RX_GPU"
+
+          flows:
+            - name: "Channel 1 data packets"
+              id: 0
+              action:
+                type: queue
+                id: 0
+              match:
+                udp_src: 49153
+                udp_dst: 1234
+
+chdr_converter:
+  interface_name: sdr_data
+  num_complex_samples_per_packet: 1024
+  num_packets_per_fft: 20
+  num_ffts_per_batch: 512
+  num_simul_batches: 4
+  num_channels: 1
+  log_packets: false
+  log_data: false
+  partial_batch_drop_timeout_ms: 250
+  degraded_reset_on_rx_queue_warning: false
+  degraded_shutdown_on_rx_queue_warning_threshold: 3
+  degraded_shutdown_force_exit_timeout_ms: 2000
+  degraded_reset_partial_flush_threshold: 3
+  degraded_reset_cooldown_ms: 1000
+
+fft:
+  burst_size: 20480
+  num_bursts: 512
+  num_channels: 1
+  spectrum_type: 1
+  averaging_type: 1
+  window_time: 0
+  window_type: 0
+  reference_span_hz: 500000000
+  reference_fft_size: 20480
+  override_fft_bin_size: 0
+  # FFT length in bins. For this path it should stay aligned with burst_size.
+  transform_points: 20480
+  # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
+  window_points: 20480
+  # Fallback bin width in Hz. Keep this equal to round(span / transform_points).
+  resolution: 24414
+  # Analyzed bandwidth in Hz. When upstream metadata does not provide sample_rate_hz,
+  # this must match the radio sender rate, e.g. rx_to_remote_udp.py --rate 500e6.
+  span: 500000000
+  weighting_factor: 0
+  f1_index: -10240
+  f2_index: 10239
+  window_time_delta: 0
+
+logger:
+  num_channels: 1
+  log_interval: 5
+
+visualization:
+  enable: true
+  renderer:
+    num_channels: 1
+    history_frames: 1
+    output_height: 512
+    output_width: 1024
+    display_time_rows: 2048
+    display_freq_bins: 20480
+    history_memory_budget_mb: 1024
+    rows_per_frame: 8
+    mask_frame_offset: 0
+    allow_backpressure_valve: true
+    render_every_n_frames: 1
+    timing_summary_enable: true
+    timing_summary_every_n: 128
+    channel_filter: 0
+    tensor_name: "spectrogram"
+    blue_limit: 0.10
+    red_limit: 0.92
+    overlay_alpha: 0.7 #0.38
+    center_frequency_hz: 0.0
+    fft_size: 20480
+    dino_chunk_rows: 256
+    dino_chunk_cols: 512
+    db_floor: -22.0
+    db_ceil: 35.0
+    row_average_n: 1
+  holoviz:
+    width: 1280
+    height: 720
+    window_title: "USRP Wideband Spectrogram"
+    fullscreen: false
+
+spectrogram:
+  num_channels: 1
+  enable_save: false
+  enable_tensor_save: false
+  save_every_n_frames: 100
+  max_images_per_channel: 0
+  output_height: 256
+  output_width: 512
+  output_dir: "/workspace/spectrograms"
+
+dinov3_signal_detector:
+  num_channels: 1
+  input_height: 256
+  input_width: 512
+  patch_size: 16
+  emit_stride: 1
+  mask_threshold_db: -20.0
+  log_detections: false
+  enable_mask_save: false
+  save_every_n_frames: 100
+  max_masks_per_channel: 0
+  output_dir: "/workspace/dino_masks"
+  use_pytorch_backend: true
+  inference_backend: "torchscript"
+  model_name: "dinov3_vitb16"
+  model_repo_path: "/workspace/models/dinov3"
+  weights_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
+  model_script_path: "/workspace/models/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts"
+  torchscript_init_mode: "load_cuda_eval"
+  strict_model_forward: true
+  imagenet_mean: [0.485, 0.456, 0.406]
+  imagenet_std: [0.229, 0.224, 0.225]
+  fft_size: 20480
+  noverlap: 256
+  ignore_sideband_hz: 7000000.0
+  frontend_correction_enable: true
+  frontend_correction_row_q: 25.0
+  frontend_correction_smooth_sigma: 12.0
+  frontend_correction_reference_q: 75.0
+  frontend_correction_max_boost_db: 12.0
+  frontend_correction_soft_knee_db: 4.0
+  frontend_correction_edge_taper_fraction: 0.10
+  frontend_correction_edge_taper_sigma: 6.0
+  frontend_correction_edge_target_drop_db: 2.5
+  frontend_edge_guard_floor: 0.35
+  dino_coherence_gate_floor: 0.25
+  texture_q: 0.90
+  texture_k: 6
+  power_q: 0.90
+  dino_group_k: 8
+  dino_group_spatial_weight: 0.35
+  dino_group_score_q: 0.60
+  pipeline_final_threshold: 0.20
+  pipeline_final_threshold_no_speckle: 0.10
+  pipeline_gap_floor: 0.10
+  pipeline_component_min_size: 5
+  pipeline_component_min_size_no_speckle: 2
+  pipeline_power_rescue_floor: 0.10
+  pipeline_power_rescue_gain: 2.0
+  pipeline_strong_speckle_min_component: 10
+  pipeline_texture_speckle_clean_threshold: 0.85
+  pipeline_texture_speckle_strong_threshold: 0.20
+  timing_summary_enable: false
+  timing_summary_every_n: 64
+  timing_summary_window: 64
+
+coherent_power_signal_detector:
+  num_channels: 1
+  input_height: 250 #256
+  input_width: 512
+  # Full-rate aggressive profile matching the active two-channel fast path,
+  # restricted to channel 0 only.
+  fast_power_floor_db: 0.5
+  fast_power_span_db: 3.0
+  fast_score_threshold: 0.4
+  # Strong-signal rescue: let strong but frequency-narrow signals through the emit-mask width
+  # filters. A pixel >= 8 dB above the per-row noise floor is OR-ed into the mask after the
+  # morphology + frequency-persistence pass, provided it has more than 2 strong time bins.
+  fast_strong_rescue_enable: true
+  fast_strong_rescue_excess_db: 8.0
+  fast_strong_rescue_min_time_bins: 3
+  # Per-frequency absolute noise-floor fill (runs BEFORE the emit morphology). ORs in pixels
+  # that exceed the calibrated per-row floor by offset_db, so wide signals fill in solidly
+  # instead of hollowing out under the local box-mean support. Complements the strong rescue:
+  # per-freq fill recovers wideband body; strong rescue recovers frequency-narrow signals.
+  per_freq_threshold_enable: true
+  per_freq_threshold_offset_db: 2.0
+  per_freq_threshold_path: "/workspace/holohub/applications/usrp_wideband_signal_detection/calibration/coherent_power_per_freq_floor.npy"
+  # Per-frequency floor source: "calibrated" (load the .npy above), "dynamic" (learn a monotone
+  # running-min floor live), or "static" (disable the per-frequency fill). Empty = legacy behavior
+  # (derives from per_freq_threshold_enable). This config uses the live-learned dynamic floor
+  # (the .npy path above is ignored in this mode).
+  per_freq_threshold_mode: "dynamic"
+  # Dynamic-mode tuning (only used when per_freq_threshold_mode == "dynamic"):
+  dynamic_floor_init_db: 40.0        # high starting bar per bin; each bin only ever descends from here
+  dynamic_floor_std_k: 2.0           # per-frame per-row stat = mean + k*std of corrected_db (approx noise high-quantile)
+  dynamic_floor_warmup_frames: 0     # frames to accumulate before the dynamic floor feeds the fill
+  dynamic_floor_window_slots: 8      # sub-window minima kept per bin; floor = min across slots (stale lows age out)
+  dynamic_floor_slot_frames: 16      # frames each slot accumulates before rotating (effective window = slots * slot_frames)
+  live_emit_mask_rows: 16
+  live_emit_mask_cols: 512
+  live_emit_freq_persistence_window: 45
+  live_emit_freq_persistence_min_hits: 11
+  emit_stride: 1
+  log_detections: true
+  save_performance_path_artifacts: false
+  enable_mask_save: false
+  save_every_n_frames: 100
+  max_masks_per_channel: 0
+  output_dir: "/workspace/coherent_power_masks"
+  ignore_sideband_percent: 0.0
+  ignore_sideband_hz: 7000000.0
+  frontend_row_q: 25.0
+  frontend_reference_q: 75.0
+  frontend_smooth_sigma: 12.0
+  frontend_max_boost_db: 0.0
+  frontend_signal_cap_db: 0.0
+  min_component_size: 1
+  filter_detection_mask: true
+  grouping_bridge_freq_px: 33
+  grouping_bridge_time_px: 5
+  grouping_min_component_size: 1
+  grouping_min_freq_span_px: 1
+  grouping_min_time_span_px: 1
+  grouping_min_density: 0.0
+  grouping_time_continuity_ratio: 0.85
+  timing_summary_enable: true
+  timing_summary_every_n: 512
+  timing_summary_window: 512
+

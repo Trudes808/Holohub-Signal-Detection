@@ -236,36 +236,44 @@ def show_offline_saved_mask_comparison(
     if resolved_detector_mask is None and saved_detector_mask_path is not None:
         resolved_detector_mask = load_detector_mask(saved_detector_mask_path)
 
-    display_gt_mask = None if resolved_gt_mask is None else np.asarray(resolved_gt_mask).T
-    display_detector_mask = None if resolved_detector_mask is None else np.asarray(resolved_detector_mask).T
+    # Axes convention: frequency on X, time (sample index) on Y. Saved masks are native
+    # (time, freq) == (rows, cols), which is already what imshow wants for freq-on-X / time-on-Y,
+    # so no transpose here; the spectrogram (power_db is (freq, time)) is transposed instead.
+    display_gt_mask = None if resolved_gt_mask is None else np.asarray(resolved_gt_mask)
+    display_detector_mask = None if resolved_detector_mask is None else np.asarray(resolved_detector_mask)
 
     vmax = float(np.nanmax(spectrogram_frame.power_db))
     vmin = vmax - float(dynamic_range_db)
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
         vmin, vmax = np.percentile(spectrogram_frame.power_db, [5.0, 99.5])
 
+    # spectrogram_frame.extent is [sample_start, sample_stop, freq_low_mhz, freq_high_mhz];
+    # swap it to [freq_low, freq_high, sample_start, sample_stop] for freq-on-X / time-on-Y.
+    se = spectrogram_frame.extent
+    spectrogram_extent_fx = [se[2], se[3], se[0], se[1]]
+
     fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True, sharex=True, sharey=True)
     titles = ["SigMF GT Boxes", "Saved Offline GT Mask", "Saved Offline Detector vs GT"]
     for ax, title in zip(axes, titles):
         ax.imshow(
-            spectrogram_frame.power_db,
+            spectrogram_frame.power_db.T,
             origin="lower",
             aspect="auto",
-            extent=spectrogram_frame.extent,
+            extent=spectrogram_extent_fx,
             cmap="magma",
             vmin=float(vmin),
             vmax=float(vmax),
         )
         ax.set_title(title)
-        ax.set_xlabel("Sample Index")
-    axes[0].set_ylabel("Frequency (MHz)")
+        ax.set_xlabel("Frequency (MHz)")
+    axes[0].set_ylabel("Sample Index")
 
     for overlay in overlays:
         color = KIND_COLORS.get(overlay["kind"], "magenta")
         rect = Rectangle(
-            (float(overlay["overlap_start"]), float(overlay["freq_lower_hz"] / 1.0e6)),
-            max(1.0, float(overlay["overlap_stop"] - overlay["overlap_start"])),
+            (float(overlay["freq_lower_hz"] / 1.0e6), float(overlay["overlap_start"])),
             float((overlay["freq_upper_hz"] - overlay["freq_lower_hz"]) / 1.0e6),
+            max(1.0, float(overlay["overlap_stop"] - overlay["overlap_start"])),
             fill=False,
             linewidth=2.0,
             edgecolor=color,
@@ -273,10 +281,10 @@ def show_offline_saved_mask_comparison(
         axes[0].add_patch(rect)
 
     offline_extent = [
-        float(window.start_sample),
-        float(window.stop_sample),
         float((bundle.center_frequency_hz - 0.5 * bundle.sample_rate_hz) / 1.0e6),
         float((bundle.center_frequency_hz + 0.5 * bundle.sample_rate_hz) / 1.0e6),
+        float(window.start_sample),
+        float(window.stop_sample),
     ]
 
     if display_gt_mask is not None:
@@ -353,13 +361,15 @@ def show_offline_saved_binary_masks(
     if resolved_detector_mask is None and saved_detector_mask_path is not None:
         resolved_detector_mask = load_detector_mask(saved_detector_mask_path)
 
-    display_gt_mask = None if resolved_gt_mask is None else np.asarray(resolved_gt_mask).T
-    display_detector_mask = None if resolved_detector_mask is None else np.asarray(resolved_detector_mask).T
+    # Frequency on X, time (sample index) on Y. Masks are native (time, freq) == (rows, cols),
+    # which is already imshow-ready for freq-on-X / time-on-Y, so no transpose.
+    display_gt_mask = None if resolved_gt_mask is None else np.asarray(resolved_gt_mask)
+    display_detector_mask = None if resolved_detector_mask is None else np.asarray(resolved_detector_mask)
     offline_extent = [
-        float(window.start_sample),
-        float(window.stop_sample),
         float((bundle.center_frequency_hz - 0.5 * bundle.sample_rate_hz) / 1.0e6),
         float((bundle.center_frequency_hz + 0.5 * bundle.sample_rate_hz) / 1.0e6),
+        float(window.start_sample),
+        float(window.stop_sample),
     ]
 
     fig, axes = plt.subplots(1, 2, figsize=figsize, constrained_layout=True, sharex=True, sharey=True)
@@ -368,7 +378,7 @@ def show_offline_saved_binary_masks(
     cmaps = ["Blues", "Greens"]
     for ax, title, mask, cmap in zip(axes, titles, masks, cmaps):
         ax.set_title(title)
-        ax.set_xlabel("Sample Index")
+        ax.set_xlabel("Frequency (MHz)")
         if mask is None:
             ax.text(0.5, 0.5, "No saved mask", transform=ax.transAxes, ha="center", va="center")
             continue
@@ -383,7 +393,7 @@ def show_offline_saved_binary_masks(
             vmin=0,
             vmax=1,
         )
-    axes[0].set_ylabel("Frequency (MHz)")
+    axes[0].set_ylabel("Sample Index")
 
     context = {
         "saved_gt_mask_shape": None if resolved_gt_mask is None else list(np.asarray(resolved_gt_mask).shape),
@@ -445,6 +455,18 @@ def load_offline_detector_debug_artifacts(output_root: str | Path) -> OfflineDet
     resolved_output_root = Path(output_root).expanduser().resolve()
     validation_summary_path = resolved_output_root / "offline_validation_summary.json"
     if not validation_summary_path.exists():
+        # The offline run now goes through the batch-eval binary (run_offline_cuda_detector_eval),
+        # which writes offline_eval_summary.json + per-frame artifacts, NOT the reference-validator's
+        # offline_validation_summary.json with its corrected_full/chunk debug arrays. So these
+        # validator-only debug/diagnostic cells no longer apply. Use the mask-comparison and
+        # cell-6-style panel cells above for the faithful batch-equivalent spot check.
+        if (resolved_output_root / "offline_eval_summary.json").exists():
+            raise FileNotFoundError(
+                "This is a batch-eval-pathway run (offline_eval_summary.json present), which does not "
+                "produce the reference-validator debug arrays these cells expect. Skip these two "
+                "coherent debug cells; the mask-comparison and panel cells above already show the "
+                f"faithful batch-equivalent result. (looked under {resolved_output_root})"
+            )
         raise FileNotFoundError(build_missing_debug_artifacts_message(resolved_output_root))
 
     validation_summary = load_json_artifact(validation_summary_path)
@@ -1538,6 +1560,7 @@ def build_offline_wrapper_command(
     wrapper_path: str | Path = DEFAULT_OFFLINE_WRAPPER_PATH,
     target_chunk_count: int | None = None,
     debug_chunk_index: int | None = None,
+    detector_type: str | None = None,
     dry_run: bool = False,
 ) -> list[str]:
     resolved_data_path = Path(data_path).expanduser().resolve()
@@ -1546,10 +1569,16 @@ def build_offline_wrapper_command(
     resolved_output_root = (
         Path(output_root).expanduser().resolve() if output_root is not None else default_offline_output_root_for_input(resolved_data_path)
     )
+    # Mirror run_batch_offline_eval.run_one: pass --detector so the wrapper (and the real
+    # run_offline_cuda_detector_eval binary) runs the matching operator. Default cuda_dino
+    # in the wrapper would otherwise ignore a coherent_power config.
+    resolved_detector_type = detector_type or read_detector_type_from_config(resolved_config_path)
     command = [
         sys.executable,
         str(resolved_wrapper_path),
         str(resolved_data_path),
+        "--detector",
+        str(resolved_detector_type),
         "--config",
         str(resolved_config_path),
         "--output-root",
@@ -1737,6 +1766,20 @@ def export_coherent_offline_inputs(
                 "grouping_min_time_span_px",
                 "grouping_min_density",
                 "grouping_time_continuity_ratio",
+                # Fast-performance path + per-frequency floor fill. Required for the offline
+                # validator to reproduce a fast/perfreq config (e.g.
+                # config_coherent_power_perf_perfreq_single_channel.yaml); without these the
+                # validator falls back to the slow reference path with zeroed thresholds.
+                "fast_power_floor_db",
+                "fast_power_span_db",
+                "fast_score_threshold",
+                "fast_background_freq_radius",
+                "fast_background_time_radius",
+                "fast_mask_smooth_iterations",
+                "per_freq_threshold_enable",
+                "per_freq_threshold_mode",
+                "per_freq_threshold_path",
+                "per_freq_threshold_offset_db",
             }
         },
     }
@@ -1837,16 +1880,13 @@ def run_offline_cuda_dino_file(
     debug_chunk_index: int | None = None,
     dry_run: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
+    # Both detectors (cuda_dino AND coherent_power) go through the SAME real-operator binary
+    # (run_offline_cuda_detector_eval, via the wrapper) that run_batch_offline_eval.py drives,
+    # just over a SigMF cropped to the requested section. This makes the offline run a faithful
+    # single-file/single-section equivalent of the batch eval, instead of the separate
+    # reference-only offline_coherent_power_validator (which does not implement the live/fast
+    # coherent path and produced masks that did not match the batch).
     detector_type = read_detector_type_from_config(config_path)
-    if detector_type == "coherent_power":
-        return run_offline_coherent_power_file(
-            data_path,
-            config_path=config_path,
-            output_root=output_root,
-            bundle=bundle,
-            window=window,
-            dry_run=dry_run,
-        )
 
     resolved_data_path = Path(data_path).expanduser().resolve()
     effective_data_path = resolved_data_path
@@ -1865,6 +1905,7 @@ def run_offline_cuda_dino_file(
         wrapper_path=wrapper_path,
         target_chunk_count=target_chunk_count,
         debug_chunk_index=debug_chunk_index,
+        detector_type=detector_type,
         dry_run=dry_run,
     )
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
