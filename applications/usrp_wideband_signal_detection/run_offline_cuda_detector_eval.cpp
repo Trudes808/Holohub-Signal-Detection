@@ -8,9 +8,11 @@
 #include "spectrogram_visualization.hpp"
 
 #include <coherent_power_signal_detector.hpp>
+#include <computer_vision_baseline.hpp>
 #include <cuda_dino_detector.hpp>
 #include <fft.hpp>
 #include <holoscan/holoscan.hpp>
+#include <power_detection.hpp>
 #include <spectrogram.hpp>
 
 #include <cuda_runtime.h>
@@ -762,7 +764,7 @@ uint64_t ceil_div(uint64_t numerator, uint64_t denominator) {
 void usage(const char* argv0) {
   HOLOSCAN_LOG_INFO(
       "Usage: {} [--config FILE] [--input-file FILE.sigmf-data] [--output-root DIR] "
-      "[--detector cuda_dino|coherent_power] [--progress-every N]",
+      "[--detector cuda_dino|coherent_power|computer_vision|power_detection] [--progress-every N]",
       argv0);
 }
 
@@ -2077,6 +2079,12 @@ class MaskArtifactSinkOp : public holoscan::Operator {
 struct DetectorAdapter {
   std::string name;  // matches offline_eval.detector_type and the config block key
   std::function<std::shared_ptr<holoscan::Operator>(holoscan::Application&, const EvalOverrides&)> make_op;
+  // Most detectors consume the (pass-through) Spectrogram complex tensor. A few
+  // (e.g. power_detection) instead tap the raw-IQ source and run their own FFT,
+  // exactly like the live app taps the CHDR converter output. Both the source and
+  // the spectrogram emit the identical {tensor<complex,2>, cudaStream_t} tuple, so
+  // the only difference is which upstream operator feeds the detector's "in" port.
+  bool consumes_raw_iq = false;
 };
 
 const std::vector<DetectorAdapter>& detector_adapter_table() {
@@ -2110,6 +2118,32 @@ const std::vector<DetectorAdapter>& detector_adapter_table() {
                 holoscan::Arg("channel_filter") = overrides.channel_number,
                 holoscan::Arg("emit_stride") = 1);
           }},
+      // Classical CV baseline: consumes the spectrogram complex tensor (same as the
+      // DINO / coherent detectors). Construction mirrors main.cpp's live wiring.
+      DetectorAdapter {
+          "computer_vision",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::ComputerVisionBaseline>(
+                "computerVisionBaselineOpCh0",
+                app.from_config("computer_vision_baseline"),
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          }},
+      // Traditional power detector: taps the raw-IQ source and runs its own FFT, so
+      // it needs the FFT geometry (burst_size / num_bursts) the source emits. Mirrors
+      // main.cpp's live wiring (burst_size = actual FFT size, num_bursts = fft.num_bursts).
+      DetectorAdapter {
+          "power_detection",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::PowerDetection>(
+                "powerDetectionOpCh0",
+                app.from_config("power_detection"),
+                holoscan::Arg("burst_size") = static_cast<int>(overrides.fft_burst_size),
+                holoscan::Arg("num_bursts") = overrides.fft_num_bursts,
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          },
+          /*consumes_raw_iq=*/true},
   };
   return table;
 }
@@ -2228,7 +2262,15 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
     add_flow(source, fft);
     add_flow(fft, spectrogram);
     add_flow(spectrogram, spectrogram_sink);
-    add_flow(spectrogram, detector);
+    // Raw-IQ detectors (e.g. power_detection) tap the source directly and run their
+    // own FFT; the source fans out to both the FFT chain (for spectrogram artifacts)
+    // and the detector, exactly as the live CHDR converter does. All other detectors
+    // consume the pass-through Spectrogram tensor.
+    if (detector_adapter->consumes_raw_iq) {
+      add_flow(source, detector);
+    } else {
+      add_flow(spectrogram, detector);
+    }
     add_flow(detector, mask_sink, {{"mask_out", "in"}});
   }
 

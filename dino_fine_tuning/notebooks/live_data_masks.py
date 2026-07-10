@@ -95,6 +95,37 @@ for data_path, fidx in picks:
 
 
 # %% [markdown]
+# ## Collaborator-matched sample (test_1, specific offset)
+# The exact IQ window a collaborator analyzed on `test_1` (same offset/count), so the
+# M1/M2 masks line up 1:1 with their output. Verified byte-identical to
+# `/home/sat3737/Documents/test_1.sigmf-data`. `SAMPLE_COUNT` = one 512×10240 frame.
+
+# %%
+# --- collaborator's input selection (their exact settings; alternates kept as comments) ---
+INPUT_DATA_PATH = LIVE_DIR / "test_1.sigmf-data"   # == /home/sat3737/Documents/test_1.sigmf-data (identical bytes)
+# ANNOTATION_INDEX = 557
+ANNOTATION_INDEX = None
+# SAMPLE_START = 0; SAMPLE_COUNT = 5242880   # first frame / arbitrary region
+SAMPLE_START = 488513093
+SAMPLE_COUNT = 5242880                        # one 512 x 10240 frame
+
+mm = np.memmap(INPUT_DATA_PATH, dtype=np.complex64, mode="r")
+iq = np.asarray(mm[SAMPLE_START:SAMPLE_START + SAMPLE_COUNT], dtype=np.complex64)
+db = v.spectrogram_db_from_iq(iq, FRAME_ROWS, NFFT)
+m1 = fi.to_display_grid(M1.mask_for_iq(iq), FRAME_ROWS, NFFT)
+m2 = fi.to_display_grid(M2.mask_for_iq(iq), FRAME_ROWS, NFFT)
+finite = db[np.isfinite(db)]; vmin, vmax = np.percentile(finite, 5), np.percentile(finite, 99.5)
+print(f"test_1 samples [{SAMPLE_START}:{SAMPLE_START + SAMPLE_COUNT}] — "
+      f"flagged M1={100*(m1>0).mean():.2f}%, M2={100*(m2>0).mean():.2f}%")
+fig, axes = plt.subplots(1, 3, figsize=(19, 4.6), constrained_layout=True)
+draw(axes[0], db, vmin, vmax, None, f"test_1 — samples [{SAMPLE_START}:{SAMPLE_START + SAMPLE_COUNT}]\nspectrogram")
+draw(axes[1], db, vmin, vmax, m1, f"M1 (≤30 dB) mask  (on={100*(m1>0).mean():.2f}%)")
+draw(axes[2], db, vmin, vmax, m2, f"M2 (all dB) mask  (on={100*(m2>0).mean():.2f}%)")
+fig.savefig(FIG_DIR / "collab_test1_sample.png", dpi=95, bbox_inches="tight")
+display(fig); plt.close(fig)
+
+
+# %% [markdown]
 # ## Notes
 # - **No ground truth** — these are unlabeled live captures, so this is a qualitative
 #   look at what each model flags as signal. Red overlay = predicted signal.

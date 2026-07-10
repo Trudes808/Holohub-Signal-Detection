@@ -17,6 +17,10 @@ APP_DIR = REPO_ROOT / "applications/usrp_wideband_signal_detection"
 DETECTOR_BASE_CONFIGS = {
     "cuda_dino": APP_DIR / "config_cuda_dino_performance_single_channel.yaml",
     "coherent_power": APP_DIR / "config_coherent_power_performance_single_channel.yaml",
+    # Traditional baselines (INFOCOM eval). power_detection taps raw IQ and runs its
+    # own FFT; computer_vision consumes the spectrogram like the DINO/coherent detectors.
+    "computer_vision": APP_DIR / "config_computer_vision_single_channel.yaml",
+    "power_detection": APP_DIR / "config_power_detection_single_channel.yaml",
 }
 DEFAULT_DETECTOR = "cuda_dino"
 DEFAULT_CONFIG_PATH = DETECTOR_BASE_CONFIGS[DEFAULT_DETECTOR]

@@ -259,6 +259,8 @@ target_link_libraries(run_offline_cuda_detector_eval
   holoscan::ops::spectrogram
   holoscan::ops::cuda_dino_detector
   holoscan::ops::coherent_power_signal_detector
+  holoscan::ops::computer_vision_baseline
+  holoscan::ops::power_detection
 )
 
 if(NOT Torch_FOUND)
