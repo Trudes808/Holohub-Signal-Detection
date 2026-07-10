@@ -29,6 +29,9 @@ Backbone weights (DINOv3 ViT-B/16, pretrained):
 | Rich comparison graphs (mirrors `batch_eval_review.ipynb`, 4 detectors) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/batch_eval_review_three_detectors.ipynb` |
 | Side-by-side spectrogram panels + headline metrics | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/compare_three_detectors.ipynb` |
 | **Low-SNR false-positive analysis** (M2 hallucination gallery) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/low_snr_false_positives.ipynb` |
+| **Wide-bandwidth low-SNR eval** (OFDM / 5G / 802.11ax) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/wideband_lowsnr_eval.ipynb` |
+| **LTE OOD eval** (unseen waveform; detection/recall/coverage/FP vs SNR) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/lte_ood_eval.ipynb` |
+| **Live-data M1/M2 masks** (unlabeled; spectrogram · M1 · M2) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/live_data_masks.ipynb` |
 
 ### Reports & tables
 | item | absolute path |
@@ -42,6 +45,18 @@ Backbone weights (DINOv3 ViT-B/16, pretrained):
 
 Source captures (SigMF, 245.76 MSps): `/home/bqn82/captures/` ·
 Deployed-detector batch masks: `/tmp/usrp_spectrograms/batch_eval/sweep_20260630/`
+
+**Extra datasets (M1/M2 run offline; deployed baselines pending a container run):**
+- LTE OOD captures: `/home/bqn82/captures/lte/` → M1/M2 masks+GT in
+  `notebooks/sweep_lte/`, tables in `notebooks/compare_tables_lte/`. To add the two
+  deployed baselines, run the offline pipeline on the LTE captures (standard 512×10240
+  framing), drop `coherent_power/` and `cuda_dino/` under `notebooks/sweep_lte/`, then
+  regenerate the tables (command in the notebook's last cell) and re-run — they appear
+  automatically. **OOD result:** both fine-tuned models detect the unseen LTE waveform
+  perfectly to 30 dB; M2 again leads at low SNR (det 0.85/0.75/0.35 vs M1 0.69/0.14/0 at
+  40/45/50 dB); both fail by 55–60 dB.
+- Live unlabeled captures: `/home/bqn82/captures/live_data/sigmf_out/` → qualitative
+  M1/M2 mask panels in `live_data_masks.ipynb` (no GT).
 
 ### Environment
 Conda env **`dinov3`** (`/home/bqn82/miniforge3/envs/dinov3`), registered Jupyter
@@ -100,6 +115,13 @@ Region-detection threshold matches the original notebook (coverage ≥ 0.1).
   causes it to *hallucinate* on some pure-noise frames (~7.5% at 55 dB → ~35% at
   60 dB), whereas M1 never false-alarms on noise. Coherent power emits constant
   low-level speckle. This is the sensitivity/precision trade-off at the noise floor.
+- **Wide-bandwidth waveforms (OFDM / 5G / 802.11ax) at low SNR** (see
+  `notebooks/wideband_lowsnr_eval.ipynb`): coherent power & zero-shot DINOv3 collapse to
+  ~0 detection by 45–50 dB; M1 falls off after ~45 dB; **M2 is the only method that
+  survives** — e.g. detection at 55 / 60 dB: OFDM 0.74 / 0.43, 5G 0.67 / 0.34,
+  802.11ax 0.29 / 0.02, vs ≈0 for all others. At the **widest channels** even M2 breaks:
+  160 MHz 802.11ax fails by 55–60 dB (≤8% coverage), while 98 MHz 5G still partially
+  recovers (~51% / 41% coverage at 55 / 60 dB).
 - **Failure modes:** OFDM is hard even at high SNR; narrowband (<240 kHz) is
   sub-pixel at this grid. Per-class/bandwidth breakdowns in the notebooks.
 
