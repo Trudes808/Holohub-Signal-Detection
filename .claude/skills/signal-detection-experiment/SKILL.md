@@ -18,22 +18,21 @@ Goal: $ARGUMENTS
 
 Recommended baselines:
 
-- Coherent live single-channel: `config_coherent_power_performance_single_channel.yaml`
-- Coherent validation: `config_coherent_power_validation.yaml`
-- Coherent frozen-input capture: `old_configs/config_coherent_power_debug_capture.yaml`
-- DINO live single-channel: `config_torchscript_performance_single_channel.yaml`
-- DINO live two-channel: `config_torchscript_performance.yaml`
+- Coherent live (calibrated per-freq): `config_coherent_power_perf_perfreq_single_channel.yaml`
+- Coherent live (dynamic floor): `config_coherent_power_perf_dynamic_single_channel.yaml`
+- Coherent frozen-input capture: `config_coherent_power_capture_chdr_single_channel.yaml`
+- Cable-loopback replay: `config_coherent_power_performance_single_channel_replay.yaml`
+- DINO live: `config_cuda_dino_performance_single_channel.yaml`
 
 ## Execution rules
 
-- If you create a new runnable live config, keep it at the app root and name it `config*.yaml`.
+- If you create a new runnable live config, keep it at the app root and name it `config*.yaml`. Shell wrappers live in `bash_scripts/`, calibration in `calibration/`, superseded configs in `old_configs/`, notes in `notes/` — keep that layout.
 - Do not use host-local CMake or raw `./holohub build` for this app.
-- Use the documented wrappers:
-  - `./rebuild_demo_container_app.sh`
-  - `CONFIG_NAME=<config>.yaml ./run_coherent_power_performance.sh`
-  - `CONFIG_NAME=<config>.yaml ./run_torchscript_performance_test.sh`
-  - `./run_offline_coherent_power_validator_from_tensor.sh --latest-snapshot`
-  - `./dino_cuda_validation.sh --tensor-npy <path> ...`
+- Use the documented wrappers (run from the app root; container identity from `bash_scripts/container_env.sh`):
+  - `sudo ./bash_scripts/rebuild_demo_container_app.sh`
+  - `CONFIG_NAME=<config>.yaml sudo ./bash_scripts/run_coherent_power_performance.sh`
+  - `CONFIG_NAME=<config>.yaml sudo ./bash_scripts/run_torchscript_performance_test.sh`
+  - Offline eval: `python3 run_cuda_dino_offline_file.py <file.sigmf-data> --detector {coherent_power|cuda_dino} --config <cfg> --output-root <dir>`
 - Preserve validation and production parity by keeping the detector backend consistent. Vary `emit_stride`, logging, saves, or timing flags before changing the validated backend.
 
 ## Experiment record

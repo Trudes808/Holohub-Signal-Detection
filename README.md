@@ -1,3 +1,27 @@
+# RF AI Fork of HoloHub
+
+> **This is a fork of NVIDIA's [HoloHub](https://github.com/nvidia-holoscan/holohub)** — the
+> Holoscan reference-applications repository — extended to build in additional support for
+> **RF / AI applications**. The headline addition is a GPU-accelerated **wideband RF
+> signal-detection pipeline** (USRP X410 ingest → FFT → spectrogram → AI + coherent detectors
+> → live visualization), which lives in
+> [`applications/usrp_wideband_signal_detection/`](applications/usrp_wideband_signal_detection/).
+>
+> ## Getting started
+>
+> 1. **Install and verify the base platform** by following the upstream HoloHub documentation
+>    below (prerequisites, container tooling, build system, and verification steps). Nothing in
+>    the upstream setup changes for this fork.
+> 2. **Run the signal-detection pipeline** by following its dedicated guide:
+>    **→ [`applications/usrp_wideband_signal_detection/README.md`](applications/usrp_wideband_signal_detection/README.md)**
+>    That README is the single source of truth for the pipeline: container build, detector
+>    calibration, and running the detectors **offline on captured files**, over **cable-loopback
+>    replay**, and **live against a USRP X410** (with visualization enabled by default).
+>
+> Everything below this line is the upstream HoloHub documentation, unchanged.
+
+---
+
 # Holoscan Reference Applications
 
 ![Lint](https://img.shields.io/github/actions/workflow/status/nvidia-holoscan/holohub/check_lint.yml?branch=main&label=Lint

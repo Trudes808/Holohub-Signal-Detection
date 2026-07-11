@@ -2,23 +2,20 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+APP_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 source "${SCRIPT_DIR}/container_repo_guard.sh"
-EXPECTED_REPO_ROOT=${EXPECTED_REPO_ROOT:-$(expected_repo_root_from_script_dir "${SCRIPT_DIR}")}
+EXPECTED_REPO_ROOT=${EXPECTED_REPO_ROOT:-$(expected_repo_root_from_script_dir "${APP_DIR}")}
+
+source "${SCRIPT_DIR}/container_env.sh"
 
 CONTAINER_NAME=${CONTAINER_NAME:-usrp_x410_signal_detection_demo}
 WORKSPACE_DIR=${WORKSPACE_DIR:-/workspace/holohub}
 BUILD_DIR=${BUILD_DIR:-build/usrp_wideband_signal_detection}
 APP_NAME=${APP_NAME:-usrp_wideband_signal_detection}
 VISUALIZER_NAME=${VISUALIZER_NAME:-offline_spectrogram_visualizer}
-COHERENT_VALIDATOR_NAME=${COHERENT_VALIDATOR_NAME:-offline_coherent_power_validator}
-DINO_VALIDATOR_NAME=${DINO_VALIDATOR_NAME:-offline_dino_validator}
-PERF_DINO_VALIDATOR_NAME=${PERF_DINO_VALIDATOR_NAME:-offline_dino_validator_performance}
 REPLAY_NAME=${REPLAY_NAME:-offline_cuda_dino_operator_replay}
 OFFLINE_EVAL_NAME=${OFFLINE_EVAL_NAME:-run_offline_cuda_detector_eval}
 VISUALIZER_TARGET=${VISUALIZER_TARGET:-applications/${APP_NAME}/${VISUALIZER_NAME}}
-COHERENT_VALIDATOR_TARGET=${COHERENT_VALIDATOR_TARGET:-applications/${APP_NAME}/${COHERENT_VALIDATOR_NAME}}
-DINO_VALIDATOR_TARGET=${DINO_VALIDATOR_TARGET:-applications/${APP_NAME}/${DINO_VALIDATOR_NAME}}
-PERF_DINO_VALIDATOR_TARGET=${PERF_DINO_VALIDATOR_TARGET:-applications/${APP_NAME}/${PERF_DINO_VALIDATOR_NAME}}
 REPLAY_TARGET=${REPLAY_TARGET:-applications/${APP_NAME}/${REPLAY_NAME}}
 OFFLINE_EVAL_TARGET=${OFFLINE_EVAL_TARGET:-applications/${APP_NAME}/${OFFLINE_EVAL_NAME}}
 MATX_DIR=${MATX_DIR:-/usr/local/lib/cmake/matx}
@@ -83,14 +80,14 @@ primary_build_targets() {
 
 optional_build_targets() {
   if torch_available_in_container >/dev/null 2>&1; then
-    echo "${VISUALIZER_TARGET} ${COHERENT_VALIDATOR_TARGET} ${DINO_VALIDATOR_TARGET} ${PERF_DINO_VALIDATOR_TARGET} coherent_power_signal_detector dinov3_signal_detector dinov3_libtorch_sandbox"
+    echo "${VISUALIZER_TARGET} coherent_power_signal_detector dinov3_signal_detector"
   else
-    echo "${VISUALIZER_TARGET} ${COHERENT_VALIDATOR_TARGET} ${DINO_VALIDATOR_TARGET} ${PERF_DINO_VALIDATOR_TARGET} coherent_power_signal_detector"
+    echo "${VISUALIZER_TARGET} coherent_power_signal_detector"
   fi
 }
 
 compare_build_targets() {
-  echo "${REPLAY_TARGET} ${PERF_DINO_VALIDATOR_TARGET} ${OFFLINE_EVAL_TARGET}"
+  echo "${REPLAY_TARGET} ${OFFLINE_EVAL_TARGET}"
 }
 
 ninja_target_exists() {

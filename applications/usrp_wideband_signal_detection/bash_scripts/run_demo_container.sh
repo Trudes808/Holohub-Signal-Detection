@@ -50,7 +50,10 @@ ensure_container_repo_mount_matches() {
   fi
 }
 
-EXPECTED_REPO_ROOT=${EXPECTED_REPO_ROOT:-$(expected_repo_root_from_script_dir "${SCRIPT_DIR}")}
+APP_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
+EXPECTED_REPO_ROOT=${EXPECTED_REPO_ROOT:-$(expected_repo_root_from_script_dir "${APP_DIR}")}
+
+source "${SCRIPT_DIR}/container_env.sh"
 
 CONTAINER_NAME=${CONTAINER_NAME:-usrp_x410_signal_detection_demo}
 if ! sudo docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then

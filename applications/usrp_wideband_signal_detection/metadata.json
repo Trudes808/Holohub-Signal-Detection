@@ -3,8 +3,8 @@
         "name": "USRP Wideband Signal Detection",
         "authors": [
             {
-                "name": "Satya (Sage workflow)",
-                "affiliation": "National Instruments Corporation."
+                "name": "Sage Trudeau",
+                "affiliation": "UT Austin"
             }
         ],
         "language": "C++",

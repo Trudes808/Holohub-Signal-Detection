@@ -3,13 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 WORKING_DIR=$(pwd -P)
+source "${SCRIPT_DIR}/container_env.sh"
 CONTAINER_NAME=${CONTAINER_NAME:-usrp_x410_signal_detection_demo}
 BUILD_APP_DIR=${BUILD_APP_DIR:-/workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection}
-DEFAULT_CONFIG=${DEFAULT_CONFIG:-${SCRIPT_DIR}/config_cuda_dino_scaffold_single_channel.yaml}
+DEFAULT_CONFIG=${DEFAULT_CONFIG:-${SCRIPT_DIR}/../config_cuda_dino_performance_single_channel.yaml}
 RUN_DEMO_CONTAINER=${RUN_DEMO_CONTAINER:-${SCRIPT_DIR}/run_demo_container.sh}
 REPLAY_BIN=${REPLAY_BIN:-}
 REPLAY_NAME=${REPLAY_NAME:-offline_cuda_dino_operator_replay}
-HOST_REPO_ROOT=${HOST_REPO_ROOT:-$(dirname "$(dirname "${SCRIPT_DIR}")")}
+# repo root is three levels up from bash_scripts/ (bash_scripts -> app -> applications -> repo)
+HOST_REPO_ROOT=${HOST_REPO_ROOT:-$(dirname "$(dirname "$(dirname "${SCRIPT_DIR}")")")}
 
 absolutize_host_path() {
   local raw_path=$1

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -16,11 +18,32 @@ APP_DIR = REPO_ROOT / "applications/usrp_wideband_signal_detection"
 # spectrogram / scheduler blocks. The offline_eval block is injected below.
 DETECTOR_BASE_CONFIGS = {
     "cuda_dino": APP_DIR / "config_cuda_dino_performance_single_channel.yaml",
-    "coherent_power": APP_DIR / "config_coherent_power_performance_single_channel.yaml",
+    "coherent_power": APP_DIR / "old_configs/config_coherent_power_performance_single_channel.yaml",
 }
 DEFAULT_DETECTOR = "cuda_dino"
 DEFAULT_CONFIG_PATH = DETECTOR_BASE_CONFIGS[DEFAULT_DETECTOR]
-CONTAINER_NAME = "usrp_x410_signal_detection_demo"
+# Container name resolution, in priority order:
+#   1. CONTAINER_NAME env var (survives only if not stripped by sudo);
+#   2. the CONTAINER_NAME default in bash_scripts/container_env.sh (the shared source of truth
+#      the wrappers use) so `sudo python3 ...` still targets the right container;
+#   3. a hardcoded back-compat default.
+def _container_name_from_env_file() -> str | None:
+    env_file = APP_DIR / "bash_scripts" / "container_env.sh"
+    try:
+        for line in env_file.read_text().splitlines():
+            m = re.search(r'CONTAINER_NAME:=([^}"\']+)', line)
+            if m:
+                return m.group(1).strip()
+    except OSError:
+        pass
+    return None
+
+
+CONTAINER_NAME = (
+    os.environ.get("CONTAINER_NAME")
+    or _container_name_from_env_file()
+    or "usrp_x410_signal_detection_demo"
+)
 HOST_SCRATCH_ROOT = Path("/tmp/usrp_spectrograms")
 CONTAINER_SCRATCH_ROOT = Path("/workspace/spectrograms")
 CONTAINER_REPO_ROOT = Path("/workspace/holohub")

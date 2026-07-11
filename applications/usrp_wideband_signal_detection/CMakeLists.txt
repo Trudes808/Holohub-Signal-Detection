@@ -184,18 +184,6 @@ add_executable(offline_spectrogram_visualizer
   screenshot_sink.cpp
 )
 
-add_executable(offline_coherent_power_validator
-  offline_coherent_power_validator.cpp
-)
-
-add_executable(offline_dino_validator
-  offline_dino_validator.cpp
-)
-
-  add_executable(offline_dino_validator_performance
-    offline_dino_validator_performance.cpp
-  )
-
 add_executable(offline_cuda_dino_operator_replay
   offline_cuda_dino_operator_replay.cpp
 )
@@ -225,23 +213,6 @@ target_link_libraries(offline_spectrogram_visualizer
   holoscan::viz::imgui
 )
 
-target_link_libraries(offline_coherent_power_validator
-  PRIVATE
-  holoscan::ops::coherent_power_signal_detector
-)
-
-target_link_libraries(offline_dino_validator
-  PRIVATE
-  CUDA::cudart
-  holoscan::ops::dinov3_signal_detector
-)
-
-target_link_libraries(offline_dino_validator_performance
-  PRIVATE
-  CUDA::cudart
-  holoscan::ops::dinov3_signal_detector
-)
-
 target_link_libraries(offline_cuda_dino_operator_replay
   PRIVATE
   CUDA::cudart
@@ -260,18 +231,8 @@ target_link_libraries(run_offline_cuda_detector_eval
 )
 
 if(NOT Torch_FOUND)
-  message(FATAL_ERROR "offline_dino_validator requires LibTorch, but find_package(Torch) failed. Ensure Python torch is installed in the build environment.")
+  message(FATAL_ERROR "run_offline_cuda_detector_eval / offline_cuda_dino_operator_replay require LibTorch (via the shared dino torch runtime), but find_package(Torch) failed. Ensure Python torch is installed in the build environment.")
 endif()
-
-target_link_libraries(offline_dino_validator
-  PRIVATE
-  ${TORCH_LIBRARIES}
-)
-
-target_link_libraries(offline_dino_validator_performance
-  PRIVATE
-  ${TORCH_LIBRARIES}
-)
 
 target_link_libraries(offline_cuda_dino_operator_replay
   PRIVATE
@@ -297,22 +258,16 @@ endforeach()
 
 if(APP_NVJITLINK_LINK_ITEM)
   target_link_libraries(usrp_wideband_signal_detection PRIVATE ${APP_NVJITLINK_LINK_ITEM})
-  target_link_libraries(offline_dino_validator PRIVATE ${APP_NVJITLINK_LINK_ITEM})
-  target_link_libraries(offline_dino_validator_performance PRIVATE ${APP_NVJITLINK_LINK_ITEM})
   target_link_libraries(offline_cuda_dino_operator_replay PRIVATE ${APP_NVJITLINK_LINK_ITEM})
   target_link_libraries(run_offline_cuda_detector_eval PRIVATE ${APP_NVJITLINK_LINK_ITEM})
 endif()
 
 target_link_directories(usrp_wideband_signal_detection PRIVATE ${CUDA_LINK_DIRS})
-target_link_directories(offline_dino_validator PRIVATE ${CUDA_LINK_DIRS})
-target_link_directories(offline_dino_validator_performance PRIVATE ${CUDA_LINK_DIRS})
 target_link_directories(offline_cuda_dino_operator_replay PRIVATE ${CUDA_LINK_DIRS})
 target_link_directories(run_offline_cuda_detector_eval PRIVATE ${CUDA_LINK_DIRS})
 foreach(CUDA_LINK_DIR IN LISTS CUDA_LINK_DIRS)
   if(EXISTS "${CUDA_LINK_DIR}")
     target_link_options(usrp_wideband_signal_detection PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
-    target_link_options(offline_dino_validator PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
-    target_link_options(offline_dino_validator_performance PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
     target_link_options(offline_cuda_dino_operator_replay PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
     target_link_options(run_offline_cuda_detector_eval PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
   endif()
@@ -329,34 +284,6 @@ target_include_directories(offline_spectrogram_visualizer
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_include_directories(offline_coherent_power_validator
-  PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/coherent_power_signal_detector
-)
-
-target_include_directories(offline_dino_validator
-  PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/dinov3_signal_detector
-)
-
-target_include_directories(offline_dino_validator_performance
-  PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/dinov3_signal_detector
-)
-
-if(TORCH_INCLUDE_DIRS)
-  target_include_directories(offline_dino_validator PRIVATE ${TORCH_INCLUDE_DIRS})
-  target_include_directories(offline_dino_validator_performance PRIVATE ${TORCH_INCLUDE_DIRS})
-endif()
-
-if(TORCH_INCLUDE_HINTS)
-  target_include_directories(offline_dino_validator PRIVATE ${TORCH_INCLUDE_HINTS})
-  target_include_directories(offline_dino_validator_performance PRIVATE ${TORCH_INCLUDE_HINTS})
-endif()
-
 target_compile_definitions(usrp_wideband_signal_detection
   PRIVATE
   USRP_WIDEBAND_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
@@ -366,15 +293,6 @@ target_compile_definitions(offline_spectrogram_visualizer
   PRIVATE
   USRP_WIDEBAND_APP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
-
-target_compile_features(offline_coherent_power_validator PRIVATE cxx_std_17)
-target_compile_features(offline_dino_validator PRIVATE cxx_std_17)
-target_compile_features(offline_dino_validator_performance PRIVATE cxx_std_17)
-
-if(TORCH_CXX_FLAGS)
-  target_compile_options(offline_dino_validator PRIVATE ${TORCH_CXX_FLAGS})
-  target_compile_options(offline_dino_validator_performance PRIVATE ${TORCH_CXX_FLAGS})
-endif()
 
 if(NOT DEFINED ANO_MGR)
     set(ANO_MGR "dpdk gpunetio" CACHE STRING "Manager type(s) list")
@@ -388,32 +306,11 @@ endforeach()
   file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/old_configs)
 
   set(USRP_WIDEBAND_CONFIG_FILES
-    old_configs/config.yaml
-    old_configs/config_coherent_power_debug_capture.yaml
-    config_coherent_power_live_timing_reference.yaml
-    config_coherent_power_performance_emit_stride1_two_channel.yaml
-    old_configs/config_coherent_power_realtime_guarded.yaml
-    config_coherent_power_validation.yaml
-    config_torchscript_validation_capture_single_channel.yaml
-    old_configs/config_offline_replay.yaml
-    old_configs/config_cuda_fallback.yaml
-    config_torchscript_debug_timing_reference.yaml
-    config_torchscript_performance.yaml
-    config_torchscript_validation_spectrogram_only.yaml
-    old_configs/config_torchscript_performance_timing_debug.yaml
-    old_configs/config_torchscript_performance_timing_debug_fast_post.yaml
-    old_configs/config_torchscript_performance_timing_debug_small_input.yaml
-    old_configs/config_torchscript_performance_timing_debug_fp16.yaml
-    old_configs/config_torchscript_realtime_guarded.yaml
-    old_configs/config_torchscript_performance_fft_only_matched.yaml
-    old_configs/config_torchscript_performance_fft_only.yaml
-    old_configs/config_torchscript_performance_small_batches.yaml
-    old_configs/config_torchscript_performance_spectrogram_only.yaml
-    old_configs/config_torchscript_validation_single_channel.yaml
-    old_configs/config_torchscript_cpu_eval.yaml
-    old_configs/config_torchscript_cuda_no_eval.yaml
-    old_configs/config_torchscript_validation.yaml
-    old_configs/config_torchscript_load_only.yaml
+    config_coherent_power_perf_perfreq_single_channel.yaml
+    config_coherent_power_perf_dynamic_single_channel.yaml
+    config_cuda_dino_performance_single_channel.yaml
+    config_coherent_power_performance_single_channel_replay.yaml
+    config_coherent_power_capture_chdr_single_channel.yaml
   )
 
   set(USRP_WIDEBAND_CONFIG_OUTPUTS)
@@ -430,6 +327,3 @@ endforeach()
 
   add_custom_target(usrp_wideband_configs DEPENDS ${USRP_WIDEBAND_CONFIG_OUTPUTS})
   add_dependencies(usrp_wideband_signal_detection usrp_wideband_configs)
-  add_dependencies(offline_coherent_power_validator usrp_wideband_configs)
-  add_dependencies(offline_dino_validator usrp_wideband_configs)
-  add_dependencies(offline_dino_validator_performance usrp_wideband_configs)

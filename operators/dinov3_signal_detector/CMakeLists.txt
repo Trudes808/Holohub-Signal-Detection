@@ -9,7 +9,6 @@ enable_language(CUDA)
 
 find_package(holoscan 2.5.0 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
-find_package(matx CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
@@ -71,9 +70,9 @@ list(REMOVE_DUPLICATES TORCH_INCLUDE_HINTS)
 
 if(TORCH_SEARCH_HINTS)
   list(PREPEND CMAKE_PREFIX_PATH ${TORCH_SEARCH_HINTS})
-  message(STATUS "dinov3_signal_detector: Torch search hints=${TORCH_SEARCH_HINTS}")
+  message(STATUS "dinov3_torch_runtime: Torch search hints=${TORCH_SEARCH_HINTS}")
 else()
-  message(STATUS "dinov3_signal_detector: No Python Torch CMake hints detected from ${Python3_EXECUTABLE}")
+  message(STATUS "dinov3_torch_runtime: No Python Torch CMake hints detected from ${Python3_EXECUTABLE}")
 endif()
 
 find_package(Torch QUIET PATHS ${TORCH_SEARCH_HINTS})
@@ -82,51 +81,41 @@ if(NOT Torch_FOUND)
   find_package(Torch QUIET)
 endif()
 
-set(DINOV3_SIGNAL_DETECTOR_SOURCES
-  dinov3_signal_detector.cu
-  dinov3_signal_detector.hpp
-)
-
+# This directory now provides ONLY the shared TorchScript runtime library
+# (dinov3_torch_runtime). The legacy non-CUDA DinoV3SignalDetector operator and
+# its libtorch sandbox were removed in the refactor_cleanup_07_10 cleanup.
+# CudaDinoDetector links this library for the shared DinoTorchRuntime; the
+# target/alias name is kept as holoscan::ops::dinov3_signal_detector so
+# downstream consumers link unchanged.
 if(Torch_FOUND)
-  add_library(dinov3_torch_runtime_obj OBJECT dinov3_torch_runtime.cpp)
-  target_include_directories(dinov3_torch_runtime_obj
-    PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}
-  )
-  target_link_libraries(dinov3_torch_runtime_obj
-    PRIVATE
-      ${TORCH_LIBRARIES}
-  )
-  if(TORCH_INCLUDE_DIRS)
-    target_include_directories(dinov3_torch_runtime_obj PRIVATE ${TORCH_INCLUDE_DIRS})
-  endif()
-  if(TORCH_INCLUDE_HINTS)
-    target_include_directories(dinov3_torch_runtime_obj PRIVATE ${TORCH_INCLUDE_HINTS})
-    message(STATUS "dinov3_signal_detector: Torch include hints=${TORCH_INCLUDE_HINTS}")
-  endif()
+  set(DINOV3_TORCH_RUNTIME_SOURCES dinov3_torch_runtime.cpp)
 else()
-  list(APPEND DINOV3_SIGNAL_DETECTOR_SOURCES dinov3_torch_runtime_stub.cpp)
+  set(DINOV3_TORCH_RUNTIME_SOURCES dinov3_torch_runtime_stub.cpp)
 endif()
 
 add_library(dinov3_signal_detector
-  ${DINOV3_SIGNAL_DETECTOR_SOURCES}
+  ${DINOV3_TORCH_RUNTIME_SOURCES}
 )
-
-if(Torch_FOUND)
-  target_sources(dinov3_signal_detector PRIVATE $<TARGET_OBJECTS:dinov3_torch_runtime_obj>)
-endif()
 
 add_library(holoscan::ops::dinov3_signal_detector ALIAS dinov3_signal_detector)
 target_include_directories(dinov3_signal_detector INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(dinov3_signal_detector PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(dinov3_signal_detector
   PRIVATE
     holoscan::core
-    matx::matx
+    CUDA::cudart
 )
 
 if(Torch_FOUND)
   target_link_libraries(dinov3_signal_detector PRIVATE ${TORCH_LIBRARIES})
+  if(TORCH_INCLUDE_DIRS)
+    target_include_directories(dinov3_signal_detector PRIVATE ${TORCH_INCLUDE_DIRS})
+  endif()
+  if(TORCH_INCLUDE_HINTS)
+    target_include_directories(dinov3_signal_detector PRIVATE ${TORCH_INCLUDE_HINTS})
+    message(STATUS "dinov3_torch_runtime: Torch include hints=${TORCH_INCLUDE_HINTS}")
+  endif()
 
   set(OP_NVJITLINK_LINK_ITEM "")
   if(TARGET CUDA::nvJitLink)
@@ -145,7 +134,7 @@ if(Torch_FOUND)
         list(APPEND CUDA_LINK_DIRS ${OP_NVJITLINK_LINK_DIR})
       endif()
     else()
-      message(WARNING "dinov3_signal_detector: nvJitLink library not found; Torch linkage may fail")
+      message(WARNING "dinov3_torch_runtime: nvJitLink library not found; Torch linkage may fail")
     endif()
   endif()
 
@@ -162,37 +151,13 @@ if(Torch_FOUND)
   endforeach()
 
   target_compile_definitions(dinov3_signal_detector PRIVATE HOLOHUB_HAS_TORCH=1)
-  target_compile_features(dinov3_signal_detector PRIVATE cxx_std_17)
+  target_compile_options(dinov3_signal_detector PRIVATE ${TORCH_CXX_FLAGS})
 
-  target_compile_options(dinov3_torch_runtime_obj PRIVATE ${TORCH_CXX_FLAGS})
-  target_compile_definitions(dinov3_torch_runtime_obj PRIVATE HOLOHUB_HAS_TORCH=1)
-  target_compile_features(dinov3_torch_runtime_obj PRIVATE cxx_std_17)
-
-  add_executable(dinov3_libtorch_sandbox
-    dinov3_libtorch_sandbox.cpp
-  )
-  target_link_libraries(dinov3_libtorch_sandbox PRIVATE ${TORCH_LIBRARIES})
-  if(TORCH_INCLUDE_DIRS)
-    target_include_directories(dinov3_libtorch_sandbox PRIVATE ${TORCH_INCLUDE_DIRS})
-  endif()
-  if(TORCH_INCLUDE_HINTS)
-    target_include_directories(dinov3_libtorch_sandbox PRIVATE ${TORCH_INCLUDE_HINTS})
-  endif()
-  if(OP_NVJITLINK_LINK_ITEM)
-    target_link_libraries(dinov3_libtorch_sandbox PRIVATE ${OP_NVJITLINK_LINK_ITEM})
-  endif()
-  target_link_directories(dinov3_libtorch_sandbox PRIVATE ${CUDA_LINK_DIRS})
-  foreach(CUDA_LINK_DIR IN LISTS CUDA_LINK_DIRS)
-    if(EXISTS "${CUDA_LINK_DIR}")
-      target_link_options(dinov3_libtorch_sandbox PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
-    endif()
-  endforeach()
-  target_compile_options(dinov3_libtorch_sandbox PRIVATE ${TORCH_CXX_FLAGS})
-  target_compile_features(dinov3_libtorch_sandbox PRIVATE cxx_std_17)
-
-  message(STATUS "dinov3_signal_detector: Torch found, enabling PyTorch backend path")
+  message(STATUS "dinov3_torch_runtime: Torch found, enabling PyTorch runtime backend")
 else()
-  message(STATUS "dinov3_signal_detector: Torch not found, building CUDA fallback path only")
+  message(STATUS "dinov3_torch_runtime: Torch not found, building CUDA fallback stub only")
 endif()
+
+target_compile_features(dinov3_signal_detector PRIVATE cxx_std_17)
 
 install(TARGETS dinov3_signal_detector)

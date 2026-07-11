@@ -1,12 +1,35 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 from typing import Any
+
+
+def _resolve_default_container_name() -> str:
+    """Container name from the CONTAINER_NAME env var, else the default in
+    bash_scripts/container_env.sh (so it survives sudo env-stripping and matches
+    whatever container the wrappers target), else a back-compat default."""
+    env_name = os.environ.get("CONTAINER_NAME")
+    if env_name:
+        return env_name
+    env_file = (
+        Path(__file__).resolve().parents[4]
+        / "applications/usrp_wideband_signal_detection/bash_scripts/container_env.sh"
+    )
+    try:
+        for line in env_file.read_text().splitlines():
+            m = re.search(r'CONTAINER_NAME:=([^}"\']+)', line)
+            if m:
+                return m.group(1).strip()
+    except OSError:
+        pass
+    return "usrp_x410_signal_detection_demo"
 
 import matplotlib.patheffects as patheffects
 import matplotlib.pyplot as plt
@@ -35,9 +58,9 @@ DEFAULT_COHERENT_OFFLINE_OUTPUT_ROOT = Path(
     "/home/sat3737/holohub-dev/applications/usrp_wideband_signal_detection/generated_inputs/coherent_power_offline"
 )
 DEFAULT_RUN_DEMO_CONTAINER_PATH = Path(
-    "/home/sat3737/holohub-dev/applications/usrp_wideband_signal_detection/run_demo_container.sh"
+    "/home/sat3737/holohub-dev/applications/usrp_wideband_signal_detection/bash_scripts/run_demo_container.sh"
 )
-DEFAULT_CONTAINER_NAME = "usrp_x410_signal_detection_demo"
+DEFAULT_CONTAINER_NAME = _resolve_default_container_name()
 DEFAULT_CONTAINER_BUILD_APP_DIR = (
     "/workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection"
 )

@@ -2,8 +2,11 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd -P)
+APP_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
+REPO_ROOT=$(cd "${APP_DIR}/../.." && pwd -P)
 WORKSPACE_ROOT=$(cd "${REPO_ROOT}/.." && pwd -P)
+
+source "${SCRIPT_DIR}/container_env.sh"
 
 APP_NAME=${APP_NAME:-usrp_wideband_signal_detection}
 IMAGE_NAME=${IMAGE_NAME:-usrp_x410_signal_detection_demo:latest}

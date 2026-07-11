@@ -3,4 +3,4 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-exec "${SCRIPT_DIR}/run_torchscript_performance_test.sh" config_coherent_power_performance_emit_stride1_two_channel.yaml
+exec "${SCRIPT_DIR}/run_torchscript_performance_test.sh" config_coherent_power_perf_perfreq_single_channel.yaml

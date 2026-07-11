@@ -14,14 +14,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-cd "${SCRIPT_DIR}"
+APP_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+# Run from the app root so generated_inputs/, config paths, and the offline driver resolve.
+cd "${APP_DIR}"
+# Pick up the container identity (CONTAINER_NAME) the offline driver targets.
+source "${APP_DIR}/bash_scripts/container_env.sh"
 
 # --- config (override via env) ---
 INPUT_GLOBS="${INPUT_GLOBS:-generated_inputs/attenuation_dB_45_*.sigmf-data generated_inputs/attenuation_dB_50_*.sigmf-data generated_inputs/attenuation_dB_55_*.sigmf-data generated_inputs/attenuation_dB_60_*.sigmf-data}"
 NOISE_DIR="${NOISE_DIR:-/tmp/usrp_spectrograms/calibration_noise}"
 RUN_ROOT="${RUN_ROOT:-/tmp/usrp_spectrograms/offline_cuda_dino}"
 RUN_NAME="${RUN_NAME:-cal_noise_concat}"
-CAL_CONFIG="${CAL_CONFIG:-config_cuda_dino_calibration_dump_single_channel.yaml}"
+CAL_CONFIG="${CAL_CONFIG:-calibration/config_cuda_dino_calibration_dump_single_channel.yaml}"
 TEMPLATE_OUT="${TEMPLATE_OUT:-calibration/dino_vitb16_noise_sigma_64x64.npy}"
 REDUCE="${REDUCE:-median}"          # median | quantile | mean
 QUANTILE="${QUANTILE:-0.30}"        # used when REDUCE=quantile
@@ -45,7 +49,7 @@ python3 run_cuda_dino_offline_file.py "${NOISE_DATA}" --detector cuda_dino \
 
 echo
 echo "=== [3/3] fitting the positional template ==="
-python3 calibrate_dino_positional_template.py \
+python3 calibration/calibrate_dino_positional_template.py \
     --run-dir "${RUN_ROOT}/${RUN_NAME}" \
     --output "${TEMPLATE_OUT}" \
     --expect-deweight 0.75 --reduce "${REDUCE}" --quantile "${QUANTILE}" \

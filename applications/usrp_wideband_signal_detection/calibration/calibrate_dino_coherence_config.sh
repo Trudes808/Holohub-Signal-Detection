@@ -16,7 +16,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-cd "${SCRIPT_DIR}"
+APP_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+# Run from the app root so generated_inputs/, config paths, and the offline driver resolve.
+cd "${APP_DIR}"
+# Pick up the container identity (CONTAINER_NAME) the offline driver targets.
+source "${APP_DIR}/bash_scripts/container_env.sh"
 
 # --- config (override via env) ---
 INPUT_GLOBS="${INPUT_GLOBS:-generated_inputs/attenuation_dB_45_*.sigmf-data generated_inputs/attenuation_dB_50_*.sigmf-data generated_inputs/attenuation_dB_55_*.sigmf-data generated_inputs/attenuation_dB_60_*.sigmf-data}"
@@ -27,12 +31,12 @@ RUN_ROOT="${RUN_ROOT:-/tmp/usrp_spectrograms/offline_cuda_dino}"
 CAL_ROOT="${CAL_ROOT:-/tmp/usrp_spectrograms/dino_coherence_cal}"
 STATS_RUN_DIR="${CAL_ROOT}/run"
 BASE_CONFIG="${BASE_CONFIG:-config_cuda_dino_performance_single_channel.yaml}"
-DUMP_CONFIG="${DUMP_CONFIG:-config_cuda_dino_coherence_calibration_dump_single_channel.yaml}"
+DUMP_CONFIG="${DUMP_CONFIG:-calibration/config_cuda_dino_coherence_calibration_dump_single_channel.yaml}"
 POWER_FLOOR_FP="${POWER_FLOOR_FP:-0.02}"
 GATE_FP="${GATE_FP:-0.02}"
 POWER_FLOOR_OUT="${POWER_FLOOR_OUT:-calibration/dino_coherence_per_freq_power_floor.npy}"
 GATE_THRESHOLD_OUT="${GATE_THRESHOLD_OUT:-calibration/dino_coherence_per_freq_gate_threshold.npy}"
-OUTPUT_CONFIG="${OUTPUT_CONFIG:-config_cuda_dino_coherence_calibrated_single_channel.yaml}"
+OUTPUT_CONFIG="${OUTPUT_CONFIG:-calibration/config_cuda_dino_coherence_calibrated_single_channel.yaml}"
 # Static coherence_band_threshold floor in the emitted config; per-row threshold is max'd with
 # this. 0.0 lets the per-frequency values govern fully (incl. rows calibrated below the old 0.05).
 COHERENCE_BAND_THRESHOLD="${COHERENCE_BAND_THRESHOLD:-0.0}"
@@ -79,7 +83,7 @@ echo "  stats -> ${CAL_ROOT}/noise ($(ls "${CAL_ROOT}/noise"/coherence_stats_*_c
 
 echo
 echo "=== [4/4] fitting per-frequency floor + gate threshold ==="
-python3 calibrate_dino_coherence_config.py \
+python3 calibration/calibrate_dino_coherence_config.py \
     --stats-run-dir "${CAL_ROOT}/noise" \
     --power-floor-fp "${POWER_FLOOR_FP}" \
     --gate-fp "${GATE_FP}" \

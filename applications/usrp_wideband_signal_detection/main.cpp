@@ -19,7 +19,6 @@
 #include <unistd.h>
 #include <coherent_power_signal_detector.hpp>
 #include <cuda_dino_detector.hpp>
-#include <dinov3_signal_detector.hpp>
 #include <fft.hpp>
 #include <gxf/core/gxf.h>
 #include <holoscan/holoscan.hpp>
@@ -452,11 +451,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
                              (enable_detector && !detector_consumes_fft_directly) ||
                              (enable_visualization && !visualization_consumes_fft_directly));
     const bool detector_uses_dino_style_stride =
-      enable_detector && (detector_type == "dinov3" || detector_type == "cuda_dino");
+      enable_detector && detector_type == "cuda_dino";
     const int configured_dino_emit_stride =
-      (enable_detector && detector_type == "dinov3")
-        ? std::max(1, from_config("dinov3_signal_detector.emit_stride").as<int>())
-      : (enable_detector && detector_type == "cuda_dino")
+      (enable_detector && detector_type == "cuda_dino")
         ? std::max(1, from_config("cuda_dino_detector.emit_stride").as<int>())
         : 1;
     const bool enable_fft_emit_stride =
@@ -488,14 +485,13 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       exit(1);
     }
 
-    if (enable_detector && detector_type != "dinov3" && detector_type != "cuda_dino" && detector_type != "coherent_power") {
-      HOLOSCAN_LOG_ERROR("Unsupported pipeline.detector_type='{}'. Expected 'dinov3', 'cuda_dino', or 'coherent_power'.",
+    if (enable_detector && detector_type != "cuda_dino" && detector_type != "coherent_power") {
+      HOLOSCAN_LOG_ERROR("Unsupported pipeline.detector_type='{}'. Expected 'cuda_dino' or 'coherent_power'.",
                          detector_type);
       exit(1);
     }
 
     std::vector<std::shared_ptr<holoscan::Operator>> spectrogramOps;
-    std::vector<std::shared_ptr<holoscan::Operator>> dinoDetectorOps;
     std::vector<std::shared_ptr<holoscan::Operator>> cudaDinoDetectorOps;
     std::vector<std::shared_ptr<holoscan::Operator>> coherentDetectorOps;
     if (spectrogram_required) {
@@ -507,23 +503,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       }
     }
     if (enable_detector) {
-      if (detector_type == "dinov3") {
-        const int detector_channels = from_config("dinov3_signal_detector.num_channels").as<int>();
-        if (detector_channels != pipeline_channels) {
-          HOLOSCAN_LOG_ERROR("dinov3_signal_detector.num_channels={} must match chdr_converter.num_channels={} for one-to-one channel routing.",
-                             detector_channels,
-                             pipeline_channels);
-          exit(1);
-        }
-        for (int channel_index = 0; channel_index < std::max(1, detector_channels); ++channel_index) {
-          dinoDetectorOps.push_back(make_operator<ops::DinoV3SignalDetector>(
-              std::string("dinoV3SignalDetectorOpCh") + std::to_string(channel_index),
-              from_config("dinov3_signal_detector"),
-            holoscan::Arg("fft_size") = fft_runtime.actual_fft_size,
-              holoscan::Arg("channel_filter") = channel_index,
-              holoscan::Arg("emit_stride") = (enable_fft_emit_stride ? 1 : configured_dino_emit_stride)));
-        }
-      } else if (detector_type == "cuda_dino") {
+      if (detector_type == "cuda_dino") {
         const int detector_channels = from_config("cuda_dino_detector.num_channels").as<int>();
         if (detector_channels != pipeline_channels) {
           HOLOSCAN_LOG_ERROR("cuda_dino_detector.num_channels={} must match chdr_converter.num_channels={} for one-to-one channel routing.",
@@ -603,7 +583,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         const auto visualization_channel_filter =
           from_config("visualization.renderer.channel_filter").as<int>();
       const std::string detector_label =
-          (!enable_detector || detector_type == "dinov3" || detector_type == "cuda_dino")
+          (!enable_detector || detector_type == "cuda_dino")
               ? std::string("Dinov3")
               : std::string("Coherent Power");
       spectrogramVisualizerOp = make_operator<ops::SpectrogramToHolovizOp>(
@@ -694,10 +674,6 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         for (auto& op : cudaDinoDetectorOps) {
           add_operator(op);
         }
-      } else {
-        for (auto& op : dinoDetectorOps) {
-          add_operator(op);
-        }
       }
     }
     if (enable_visualization) {
@@ -764,8 +740,6 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           add_flow(detector_source, coherentDetectorOps[static_cast<size_t>(channel_index)]);
         } else if (detector_type == "cuda_dino") {
           add_flow(detector_source, cudaDinoDetectorOps[static_cast<size_t>(channel_index)]);
-        } else {
-          add_flow(detector_source, dinoDetectorOps[static_cast<size_t>(channel_index)]);
         }
       }
 

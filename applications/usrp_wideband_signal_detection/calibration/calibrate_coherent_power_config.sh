@@ -70,7 +70,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-cd "${SCRIPT_DIR}"
+APP_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+# Run from the app root so generated_inputs/, config paths, and the offline driver resolve.
+cd "${APP_DIR}"
+# Pick up the container identity (CONTAINER_NAME) the offline driver targets.
+source "${APP_DIR}/bash_scripts/container_env.sh"
 
 # --- config (override via env) ---
 INPUT_GLOBS="${INPUT_GLOBS:-generated_inputs/attenuation_dB_45_*.sigmf-data generated_inputs/attenuation_dB_50_*.sigmf-data generated_inputs/attenuation_dB_55_*.sigmf-data generated_inputs/attenuation_dB_60_*.sigmf-data}"
@@ -82,9 +86,9 @@ RUN_ROOT="${RUN_ROOT:-/tmp/usrp_spectrograms/offline_coherent_power}"
 # host /tmp/usrp_spectrograms/coherent_power_cal/run (= STATS_RUN_DIR here).
 CAL_ROOT="${CAL_ROOT:-/tmp/usrp_spectrograms/coherent_power_cal}"
 STATS_RUN_DIR="${CAL_ROOT}/run"
-DUMP_CONFIG="${DUMP_CONFIG:-config_coherent_power_calibration_dump_single_channel.yaml}"
-BASE_CONFIG="${BASE_CONFIG:-config_coherent_power_performance_single_channel.yaml}"
-OUTPUT_CONFIG="${OUTPUT_CONFIG:-config_coherent_power_calibrated_single_channel.yaml}"
+DUMP_CONFIG="${DUMP_CONFIG:-calibration/config_coherent_power_calibration_dump_single_channel.yaml}"
+BASE_CONFIG="${BASE_CONFIG:-old_configs/config_coherent_power_performance_single_channel.yaml}"
+OUTPUT_CONFIG="${OUTPUT_CONFIG:-calibration/config_coherent_power_calibrated_single_channel.yaml}"
 
 # Calibration policy (passed through to calibrate_coherent_power_config.py).
 FP_RATE="${FP_RATE:-1e-3}"
@@ -144,7 +148,7 @@ run_detector "${SIGNAL_DATA}" signal
 
 echo
 echo "=== [4/4] fitting calibrated fast-path thresholds ==="
-python3 calibrate_coherent_power_config.py \
+python3 calibration/calibrate_coherent_power_config.py \
     --noise-run-dir "${CAL_ROOT}/noise" \
     --signal-run-dir "${CAL_ROOT}/signal" \
     --base-config "${BASE_CONFIG}" \

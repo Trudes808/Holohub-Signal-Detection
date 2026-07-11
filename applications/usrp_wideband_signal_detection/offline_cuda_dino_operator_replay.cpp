@@ -25,7 +25,7 @@ using ReplayTensor = holoscan::ops::cuda_dino_in_t;
 using ReplayComplex = holoscan::ops::cuda_dino_complex;
 
 struct ReplayOverrides {
-  std::string config_path = "config_cuda_dino_scaffold_single_channel.yaml";
+  std::string config_path = "old_configs/config_cuda_dino_scaffold_single_channel.yaml";
   std::string tensor_path;
   std::string output_dir;
   std::string tensor_axis_order = "auto";

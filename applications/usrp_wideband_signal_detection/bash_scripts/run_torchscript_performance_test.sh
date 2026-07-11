@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "${SCRIPT_DIR}/container_env.sh"
 CONTAINER_NAME=${CONTAINER_NAME:-usrp_x410_signal_detection_demo}
 BUILD_APP_DIR=${BUILD_APP_DIR:-/workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection}
 SOURCE_APP_DIR=${SOURCE_APP_DIR:-/workspace/holohub/applications/usrp_wideband_signal_detection}
@@ -15,7 +16,7 @@ if [[ $# -gt 1 ]]; then
 	exit 1
 fi
 
-CONFIG_NAME=${1:-${CONFIG_NAME:-config_torchscript_performance.yaml}}
+CONFIG_NAME=${1:-${CONFIG_NAME:-config_cuda_dino_performance_single_channel.yaml}}
 
 echo "Running usrp_wideband_signal_detection with config: ${CONFIG_NAME}"
 
