@@ -20,17 +20,6 @@ struct CudaHybridStageTiming {
     double output_copy_ms = 0.0;
 };
 
-// Coherence-rescue floor: a monotonic OR path that can only ADD detections in
-// regions where the coherence gate is strong AND spatially extended. It never
-// weakens the DINO path (disabled => byte-identical behavior), so it cannot
-// regress narrowband detection. See compute_residual_veto_native_cuda_batch_to_device.
-struct CoherenceRescueConfig {
-    bool enable = false;            // master switch; false => current behavior
-    float coherence_threshold = 0.35f;  // resolved [0,1] threshold on the raw coherence gate
-    int min_area_px = 256;          // min contiguous strong-coherence component area to rescue
-    float floor_strength = 0.0f;    // optional combined-score floor inside rescued pixels (0 => mask-only)
-};
-
 // Coherence-primary fusion (hybrid_fusion_mode: "coherence_primary"): the final
 // mask is a union of independently derived decisions instead of the legacy
 // product+residual-veto pipeline. Banded/time-continuous coherence is trusted
@@ -184,7 +173,6 @@ bool compute_residual_veto_hybrid_gpu_batch_to_device(const float* dino_score_ba
                                                       uint8_t* output_component_filtered_mask_batch_device,
                                                       cudaStream_t cuda_stream,
                                                       CudaHybridStageTiming* stage_timing = nullptr,
-                                                      const CoherenceRescueConfig* rescue = nullptr,
                                                       float* debug_initial_product_device = nullptr,
                                                       bool combine_scores_with_max = false,
                                                       float dino_contribution_strength = 1.0f);

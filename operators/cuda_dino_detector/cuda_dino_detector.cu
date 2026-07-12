@@ -155,11 +155,9 @@ struct DebugChunkResult {
   std::vector<uint8_t> hybrid_closed_mask;
   std::vector<uint8_t> hybrid_component_filtered_mask;
   std::vector<uint8_t> hybrid_component_filtered_mask_source;
-  std::vector<uint8_t> hybrid_coherence_rescue_mask;
   std::vector<uint8_t> coherence_band_mask;
   std::vector<uint8_t> dino_structure_mask;
   std::vector<float> initial_product;
-  std::vector<float> dino_enhanced_input;
   std::vector<uint8_t> final_mask;
   std::vector<uint8_t> final_mask_source;
   std::vector<float> combined_score;
@@ -2193,11 +2191,9 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   const auto hybrid_closed_mask_path = output_dir / "chunk_debug" / "chunk_hybrid_closed_mask.npy";
   const auto hybrid_filled_mask_path = output_dir / "chunk_debug" / "chunk_hybrid_filled_mask.npy";
   const auto hybrid_component_filtered_mask_path = output_dir / "chunk_debug" / "chunk_hybrid_component_filtered_mask.npy";
-  const auto coherence_rescue_mask_path = output_dir / "chunk_debug" / "chunk_coherence_rescue_mask.npy";
   const auto coherence_band_mask_path = output_dir / "chunk_debug" / "chunk_coherence_band_mask.npy";
   const auto dino_structure_mask_path = output_dir / "chunk_debug" / "chunk_dino_structure_mask.npy";
   const auto initial_product_path = output_dir / "chunk_debug" / "chunk_initial_product.npy";
-  const auto dino_enhanced_path = output_dir / "chunk_debug" / "chunk_dino_enhanced_input.npy";
   const auto grouped_mask_path = output_dir / "chunk_debug" / "chunk_grouped_mask.npy";
   const auto final_mask_path = output_dir / "chunk_debug" / "chunk_final_mask.npy";
   const auto final_mask_source_path = output_dir / "chunk_debug" / "chunk_final_mask_source.npy";
@@ -2219,7 +2215,6 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   const auto hybrid_closed_mask_float = mask_to_float(selected_debug_chunk.hybrid_closed_mask);
   const auto hybrid_filled_mask_float = mask_to_float(selected_debug_chunk.hybrid_filled_mask);
   const auto hybrid_component_filtered_mask_float = mask_to_float(selected_debug_chunk.hybrid_component_filtered_mask);
-  const auto coherence_rescue_mask_float = mask_to_float(selected_debug_chunk.hybrid_coherence_rescue_mask);
   const auto coherence_band_mask_float = mask_to_float(selected_debug_chunk.coherence_band_mask);
   const auto dino_structure_mask_float = mask_to_float(selected_debug_chunk.dino_structure_mask);
   const auto final_mask_float = mask_to_float(selected_debug_chunk.final_mask);
@@ -2304,12 +2299,6 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
             selected_debug_chunk.dst_rows,
             selected_debug_chunk.dst_cols,
             "<f4") ||
-      !write_npy_2d(coherence_rescue_mask_path,
-            coherence_rescue_mask_float.data(),
-            coherence_rescue_mask_float.size() * sizeof(float),
-            selected_debug_chunk.dst_rows,
-            selected_debug_chunk.dst_cols,
-            "<f4") ||
       !write_npy_2d(coherence_band_mask_path,
             coherence_band_mask_float.data(),
             coherence_band_mask_float.size() * sizeof(float),
@@ -2325,12 +2314,6 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
       !write_npy_2d(initial_product_path,
             selected_debug_chunk.initial_product.data(),
             selected_debug_chunk.initial_product.size() * sizeof(float),
-            selected_debug_chunk.dst_rows,
-            selected_debug_chunk.dst_cols,
-            "<f4") ||
-      !write_npy_2d(dino_enhanced_path,
-            selected_debug_chunk.dino_enhanced_input.data(),
-            selected_debug_chunk.dino_enhanced_input.size() * sizeof(float),
             selected_debug_chunk.dst_rows,
             selected_debug_chunk.dst_cols,
             "<f4") ||
@@ -2451,11 +2434,9 @@ void write_operator_artifact_bundle(const std::filesystem::path& output_dir,
   chunk_debug_summary << "  \"hybrid_closed_mask_npy\": \"" << json_escape(hybrid_closed_mask_path.string()) << "\",\n";
   chunk_debug_summary << "  \"hybrid_filled_mask_npy\": \"" << json_escape(hybrid_filled_mask_path.string()) << "\",\n";
   chunk_debug_summary << "  \"hybrid_component_filtered_mask_npy\": \"" << json_escape(hybrid_component_filtered_mask_path.string()) << "\",\n";
-  chunk_debug_summary << "  \"coherence_rescue_mask_npy\": \"" << json_escape(coherence_rescue_mask_path.string()) << "\",\n";
   chunk_debug_summary << "  \"coherence_band_mask_npy\": \"" << json_escape(coherence_band_mask_path.string()) << "\",\n";
   chunk_debug_summary << "  \"dino_structure_mask_npy\": \"" << json_escape(dino_structure_mask_path.string()) << "\",\n";
   chunk_debug_summary << "  \"initial_product_npy\": \"" << json_escape(initial_product_path.string()) << "\",\n";
-  chunk_debug_summary << "  \"dino_enhanced_input_npy\": \"" << json_escape(dino_enhanced_path.string()) << "\",\n";
   chunk_debug_summary << "  \"grouped_mask_npy\": \"" << json_escape(grouped_mask_path.string()) << "\",\n";
   chunk_debug_summary << "  \"grouped_boxes_json\": \"" << json_escape(grouped_boxes_path.string()) << "\",\n";
   chunk_debug_summary << "  \"final_mask_npy\": \"" << json_escape(final_mask_path.string()) << "\",\n";
@@ -4217,55 +4198,6 @@ __global__ void cuda_dino_pack_reference_chunks_kernel(const float* corrected_fu
   corrected_batch[index] = corrected_full[flat_index(cols, global_row, col)];
 }
 
-// Matched-integration contrast enhancement for the DINO input (DINO-only; the coherence
-// path keeps the un-integrated corrected batch). Each output pixel is the mean LINEAR
-// power over a centered window of (2*freq_radius+1) frequency bins x (2*time_radius+1)
-// time bins, converted back to dB. Averaging N ~ IID noise samples in linear power
-// shrinks the per-pixel noise spread by ~sqrt(N) while preserving a spatially-coherent
-// signal's mean level, so a low-SNR region that is only a couple dB above the floor
-// stands out far more clearly. Window is deliberately narrow in frequency (keep
-// narrowband sharp) and long in time (signals persist in time). Operates on packed
-// batch planes (rows=frequency bins, cols=time bins); edges use available taps only.
-__global__ void cuda_dino_matched_integrate_db_batch_kernel(const float* input_db,
-                                                            int batch_size,
-                                                            int rows,
-                                                            int cols,
-                                                            int freq_radius,
-                                                            int time_radius,
-                                                            float* output_db) {
-  const long index = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const long total = static_cast<long>(batch_size) * rows * cols;
-  if (index >= total) {
-    return;
-  }
-  const int col = static_cast<int>(index % cols);
-  const long tmp = index / cols;
-  const int row = static_cast<int>(tmp % rows);
-  const int batch_index = static_cast<int>(tmp / rows);
-  const float* plane = input_db + static_cast<size_t>(batch_index) * rows * cols;
-
-  float sum = 0.0f;
-  int count = 0;
-  for (int df = -freq_radius; df <= freq_radius; ++df) {
-    const int r = row + df;
-    if (r < 0 || r >= rows) {
-      continue;
-    }
-    for (int dt = -time_radius; dt <= time_radius; ++dt) {
-      const int c = col + dt;
-      if (c < 0 || c >= cols) {
-        continue;
-      }
-      // dB -> linear power (10^(dB/10)) before averaging.
-      sum += exp10f(plane[static_cast<size_t>(r) * cols + c] * 0.1f);
-      ++count;
-    }
-  }
-  const float avg = count > 0 ? sum / static_cast<float>(count)
-                              : exp10f(plane[static_cast<size_t>(row) * cols + col] * 0.1f);
-  output_db[index] = 10.0f * log10f(fmaxf(avg, 1.0e-20f));
-}
-
 __global__ void cuda_dino_stitch_reference_chunk_mask_kernel(const float* input_mask_batch,
                                                              int full_rows,
                                                              int cols,
@@ -4985,8 +4917,6 @@ struct ResidualVetoCudaScratch {
   uint8_t* valid_row_mask = nullptr;
   uint8_t* mask_a = nullptr;
   uint8_t* mask_b = nullptr;
-  uint8_t* mask_rescue = nullptr;
-  uint8_t* mask_rescue_filtered = nullptr;
   size_t value_capacity = 0;
   size_t plane_capacity = 0;
   size_t batch_capacity = 0;
@@ -5056,14 +4986,6 @@ struct ResidualVetoCudaScratch {
     if (mask_b != nullptr) {
       cudaFree(mask_b);
       mask_b = nullptr;
-    }
-    if (mask_rescue != nullptr) {
-      cudaFree(mask_rescue);
-      mask_rescue = nullptr;
-    }
-    if (mask_rescue_filtered != nullptr) {
-      cudaFree(mask_rescue_filtered);
-      mask_rescue_filtered = nullptr;
     }
     plane_capacity = 0;
     batch_capacity = 0;
@@ -5194,18 +5116,8 @@ struct ResidualVetoCudaScratch {
         cudaFree(mask_b);
         mask_b = nullptr;
       }
-      if (mask_rescue != nullptr) {
-        cudaFree(mask_rescue);
-        mask_rescue = nullptr;
-      }
-      if (mask_rescue_filtered != nullptr) {
-        cudaFree(mask_rescue_filtered);
-        mask_rescue_filtered = nullptr;
-      }
       if (cudaMalloc(reinterpret_cast<void**>(&mask_a), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess ||
-          cudaMalloc(reinterpret_cast<void**>(&mask_b), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess ||
-          cudaMalloc(reinterpret_cast<void**>(&mask_rescue), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess ||
-          cudaMalloc(reinterpret_cast<void**>(&mask_rescue_filtered), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess) {
+          cudaMalloc(reinterpret_cast<void**>(&mask_b), requested_mask_capacity * sizeof(uint8_t)) != cudaSuccess) {
         release();
         return false;
       }
@@ -6822,22 +6734,6 @@ __global__ void coherence_rescue_or_mask_batch_kernel(uint8_t* inout_mask, const
   inout_mask[idx] = (inout_mask[idx] != 0 || add_mask[idx] != 0) ? 1 : 0;
 }
 
-// Coherence-rescue: optional combined-score floor applied only inside rescued
-// pixels. Monotonic (score can only rise), and gated to the rescue mask so it
-// never lowers the DINO path. floor_strength <= 0 => no-op.
-__global__ void coherence_rescue_apply_score_floor_batch_kernel(float* score,
-                                                                const uint8_t* rescue_mask,
-                                                                int total,
-                                                                float floor_strength) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total) {
-    return;
-  }
-  if (rescue_mask[idx] != 0) {
-    score[idx] = fmaxf(score[idx], floor_strength);
-  }
-}
-
 bool copy_or_round_fp16_cuda_batch_to_device(const float* input_device,
                                              size_t total_values,
                                              bool use_fp16,
@@ -7900,7 +7796,7 @@ bool normalize_map01_quantile_exact_fp16_unit_pair_multiply_cuda_batch_to_device
 }  // namespace
 
 // ============================================================================
-// Coherence-primary fusion (Method 2) + DINO structure gate + scout helpers.
+// Coherence-primary fusion (Method 2) + DINO structure gate helpers.
 // ============================================================================
 namespace {
 
@@ -7947,18 +7843,6 @@ __global__ void coherence_primary_elementwise_mul_batch_kernel(const float* a, c
     return;
   }
   out[idx] = a[idx] * (b[idx] * b_scale);
-}
-
-// Count set pixels per plane (chunk) via atomics; out_counts must be zeroed first.
-__global__ void coherence_primary_mask_plane_count_batch_kernel(const uint8_t* mask, int batch_size, int plane, int* out_counts) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = batch_size * plane;
-  if (idx >= total) {
-    return;
-  }
-  if (mask[idx] != 0) {
-    atomicAdd(&out_counts[idx / plane], 1);
-  }
 }
 
 // Nearest-project a patch-grid binary mask to the chunk output grid, inverting the
@@ -8490,7 +8374,6 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
                                                        uint8_t* output_component_filtered_mask_batch_device,
                                                        cudaStream_t cuda_stream,
                                                        CudaHybridStageTiming* stage_timing,
-                                                       const CoherenceRescueConfig* rescue,
                                                        float* debug_initial_product_device,
                                                        bool combine_scores_with_max,
                                                        float dino_contribution_strength) {
@@ -8647,50 +8530,6 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
                                                                                              scratch.valid_row_mask);
         if (cudaGetLastError() != cudaSuccess) {
           return false;
-        }
-        // Coherence-rescue floor for the no-post-processing path: union large,
-        // strong-coherence regions directly into the thresholded mask so all
-        // downstream copies (filled/component/final) inherit the rescue.
-        if (rescue != nullptr && rescue->enable && rescue->min_area_px > 0) {
-          residual_veto_threshold_mask_batch_kernel<<<blocks, threads, 0, stream>>>(coherence_batch_device,
-                                                                                     static_cast<int>(total_values),
-                                                                                     rescue->coherence_threshold,
-                                                                                     scratch.mask_rescue);
-          if (cudaGetLastError() != cudaSuccess) {
-            return false;
-          }
-          residual_veto_apply_valid_rows_mask_u8_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_rescue,
-                                                                                              batch_size,
-                                                                                              rows,
-                                                                                              cols,
-                                                                                              scratch.valid_row_mask);
-          if (cudaGetLastError() != cudaSuccess) {
-            return false;
-          }
-          if (!keep_large_components_cuda_batch_to_device(scratch.mask_rescue,
-                                                          batch_size,
-                                                          rows,
-                                                          cols,
-                                                          rescue->min_area_px,
-                                                          scratch.mask_rescue_filtered,
-                                                          stream)) {
-            return false;
-          }
-          coherence_rescue_or_mask_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_a,
-                                                                                scratch.mask_rescue_filtered,
-                                                                                static_cast<int>(total_values));
-          if (cudaGetLastError() != cudaSuccess) {
-            return false;
-          }
-          if (rescue->floor_strength > 0.0f) {
-            coherence_rescue_apply_score_floor_batch_kernel<<<blocks, threads, 0, stream>>>(output_combined_score_device,
-                                                                                            scratch.mask_rescue_filtered,
-                                                                                            static_cast<int>(total_values),
-                                                                                            rescue->floor_strength);
-            if (cudaGetLastError() != cudaSuccess) {
-              return false;
-            }
-          }
         }
         if (cudaMemcpyAsync(scratch.mask_b,
                             scratch.mask_a,
@@ -8950,69 +8789,7 @@ bool compute_residual_veto_native_cuda_batch_to_device(const float* dino_score_b
       return false;
     }
 
-    // Coherence-rescue floor (monotonic OR). Where the pristine coherence gate is
-    // strong AND forms a large contiguous region, union that region into the final
-    // mask so a weak DINO/residual response cannot suppress a confident coherence
-    // detection (the wideband failure mode). This only ADDS pixels: the DINO
-    // component-filtered artifact (filtered_mask_output) is left untouched, and the
-    // union is written to scratch.mask_rescue which feeds the float output below.
     const uint8_t* final_mask_uint8 = filtered_mask_output;
-    if (rescue != nullptr && rescue->enable && rescue->min_area_px > 0) {
-      // 1. Threshold the pristine coherence gate (never mutated by the veto stack).
-      residual_veto_threshold_mask_batch_kernel<<<blocks, threads, 0, stream>>>(coherence_batch_device,
-                                                                                 static_cast<int>(total_values),
-                                                                                 rescue->coherence_threshold,
-                                                                                 scratch.mask_rescue);
-      if (cudaGetLastError() != cudaSuccess) {
-        return false;
-      }
-      // 2. Respect invalid (guard/sideband) rows.
-      residual_veto_apply_valid_rows_mask_u8_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_rescue,
-                                                                                          batch_size,
-                                                                                          rows,
-                                                                                          cols,
-                                                                                          scratch.valid_row_mask);
-      if (cudaGetLastError() != cudaSuccess) {
-        return false;
-      }
-      // 3. Spatial-extent gate: keep only large contiguous strong-coherence regions.
-      if (!keep_large_components_cuda_batch_to_device(scratch.mask_rescue,
-                                                      batch_size,
-                                                      rows,
-                                                      cols,
-                                                      rescue->min_area_px,
-                                                      scratch.mask_rescue_filtered,
-                                                      stream)) {
-        return false;
-      }
-      // 4. Union the DINO component-filtered mask with the rescue mask into
-      //    scratch.mask_rescue (reused now that its threshold contents were consumed
-      //    in step 3; stream ordering guarantees keep_large_components finished reading it).
-      if (cudaMemcpyAsync(scratch.mask_rescue,
-                          filtered_mask_output,
-                          total_values * sizeof(uint8_t),
-                          cudaMemcpyDeviceToDevice,
-                          stream) != cudaSuccess) {
-        return false;
-      }
-      coherence_rescue_or_mask_batch_kernel<<<blocks, threads, 0, stream>>>(scratch.mask_rescue,
-                                                                            scratch.mask_rescue_filtered,
-                                                                            static_cast<int>(total_values));
-      if (cudaGetLastError() != cudaSuccess) {
-        return false;
-      }
-      final_mask_uint8 = scratch.mask_rescue;
-      // 5. Optional combined-score floor inside rescued pixels (defaults off).
-      if (rescue->floor_strength > 0.0f) {
-        coherence_rescue_apply_score_floor_batch_kernel<<<blocks, threads, 0, stream>>>(output_combined_score_device,
-                                                                                        scratch.mask_rescue_filtered,
-                                                                                        static_cast<int>(total_values),
-                                                                                        rescue->floor_strength);
-        if (cudaGetLastError() != cudaSuccess) {
-          return false;
-        }
-      }
-    }
 
     if (output_final_mask_device != nullptr) {
       const auto output_copy_start = std::chrono::steady_clock::now();
@@ -9233,33 +9010,6 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Coherence stats directory",
              "Directory where coherence-gate calibration stats are written (container path).",
              std::string("/workspace/spectrograms/dino_coherence_cal/run"));
-  spec.param(per_freq_floor_enable_,
-             "per_freq_floor_enable",
-             "Per-frequency gate floor enable",
-             "If true, cap the coherence gate's local box-mean background at a calibrated per-frequency "
-             "noise floor so strong broad signals fill in. Empty path disables. Byte-identical when off.",
-             false);
-  spec.param(per_freq_floor_path_,
-             "per_freq_floor_path",
-             "Per-frequency floor path",
-             "Path to the calibrated per-row power floor .npy (length src_rows, float32 dB).",
-             std::string(""));
-  spec.param(per_freq_floor_offset_db_,
-             "per_freq_floor_offset_db",
-             "Per-frequency floor offset",
-             "dB added to the per-row floor before capping the background (default 0).",
-             0.0);
-  spec.param(per_freq_gate_threshold_enable_,
-             "per_freq_gate_threshold_enable",
-             "Per-frequency band threshold enable",
-             "If true, use a calibrated per-frequency coherence-band threshold (max'd with coherence_band_threshold). "
-             "Empty path disables. Byte-identical when off.",
-             false);
-  spec.param(per_freq_gate_threshold_path_,
-             "per_freq_gate_threshold_path",
-             "Per-frequency gate threshold path",
-             "Path to the calibrated per-row gate threshold .npy (length src_rows, float32 gate units).",
-             std::string(""));
   spec.param(save_aligned_spectrogram_preview_,
              "save_aligned_spectrogram_preview",
              "Save aligned spectrogram preview",
@@ -9288,7 +9038,7 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(execution_strategy_,
              "execution_strategy",
              "Execution strategy",
-             "CUDA DINO execution strategy: reference_chunks, adaptive_tiles, or coarse_to_fine.",
+             "CUDA DINO execution strategy: reference_chunks (only implemented strategy).",
              std::string("reference_chunks"));
   spec.param(max_tokens_per_inference_,
              "max_tokens_per_inference",
@@ -9365,26 +9115,6 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Frontend correction edge target drop dB",
              "Target edge attenuation in dB.",
              2.5);
-  spec.param(dino_input_enhance_,
-             "dino_input_enhance",
-             "DINO input matched-integration enhance",
-             "If true, contrast-enhance the DINO input by matched integration: average LINEAR "
-             "power over a narrow-frequency / long-time window (per-bin energy detector), then "
-             "back to dB. Boosts low-SNR spatially-coherent regions before DINO sees them. "
-             "DINO-only; the coherence path is untouched. Default false = byte-identical input.",
-             false);
-  spec.param(dino_input_enhance_freq_bins_,
-             "dino_input_enhance_freq_bins",
-             "DINO input enhance frequency window (bins)",
-             "Integration window length along frequency in native bins (centered; taps = "
-             "2*(bins/2)+1). Keep small to preserve narrowband sharpness.",
-             2);
-  spec.param(dino_input_enhance_time_bins_,
-             "dino_input_enhance_time_bins",
-             "DINO input enhance time window (bins)",
-             "Integration window length along time in native bins (centered; taps = "
-             "2*(bins/2)+1). Longer exploits temporal persistence of signals.",
-             25);
   spec.param(dino_gray_local_resid_weight_,
              "dino_gray_local_resid_weight",
              "DINO gray local-residual blend weight",
@@ -9392,13 +9122,6 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "gray = w*local_resid + (1-w)*abs_detrended. Default 0.70 (prior behavior); lower "
              "toward 0 to favor absolute level so faint spatially-broad signals survive.",
              0.70);
-  spec.param(dino_colormap_enable_,
-             "dino_colormap_enable",
-             "DINO turbo colormap input",
-             "If true, feed a true 3-channel turbo colormap of the gray scalar instead of "
-             "replicating it into 3 identical channels, to excite the ViT's chromatic filters. "
-             "Default false = grayscale replicate.",
-             false);
   spec.param(dino_coherence_gate_floor_,
              "dino_coherence_gate_floor",
              "DINO coherence gate floor",
@@ -9409,35 +9132,6 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "DINO coherence gate span dB",
              "Span in dB for the coherence gate normalization.",
              3.0);
-  spec.param(dino_coherence_rescue_enable_,
-             "dino_coherence_rescue_enable",
-             "DINO coherence rescue enable",
-             "Enable the coherence-rescue floor: a monotonic OR that adds detections where the "
-             "coherence gate is strong and spatially extended, so a weak DINO/residual response "
-             "cannot suppress a confident wideband coherence detection. Disabled => current behavior.",
-             false);
-  spec.param(dino_coherence_rescue_min_area_px_,
-             "dino_coherence_rescue_min_area_px",
-             "DINO coherence rescue minimum area px",
-             "Minimum contiguous strong-coherence component area (pixels, in chunk/source grid) "
-             "eligible for rescue. Gates rescue to large regions so isolated coherence hot-pixels "
-             "and small narrowband regions are not admitted.",
-             256);
-  spec.param(dino_coherence_rescue_threshold_,
-             "dino_coherence_rescue_threshold",
-             "DINO coherence rescue threshold",
-             "Absolute threshold on the raw coherence gate above which a pixel is rescue-eligible. "
-             "The raw gate's dynamic range is ~0.1 (measured max ~0.11), so this must be a small "
-             "value; 0.05 is a sensible default. Negative => derive from "
-             "dino_coherence_gate_floor * 10^(dino_coherence_gate_span_db/20) (legacy, tends to be "
-             "unreachably high for this gate scale).",
-             0.05);
-  spec.param(dino_coherence_rescue_floor_strength_,
-             "dino_coherence_rescue_floor_strength",
-             "DINO coherence rescue score floor strength",
-             "Optional combined-score floor applied only inside rescued pixels (monotonic). "
-             "0 => mask-only rescue (no score change).",
-             0.0);
   spec.param(hybrid_fusion_mode_,
              "hybrid_fusion_mode",
              "Hybrid fusion mode",
@@ -9513,18 +9207,6 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "<1 down-weights DINO so it only wins where clearly stronger than coherence; 1.0 = equal. "
              "Applies to the veto sub-pipeline input and the emitted combined score. Ignored in legacy mode.",
              1.0);
-  spec.param(dino_scout_enable_,
-             "dino_scout_enable",
-             "DINO scout enable",
-             "Run DINO inference only on chunks the coherence-band pass leaves unexplained (Method 3). "
-             "Requires coherence_primary mode; ignored (with a one-time warning) otherwise.",
-             false);
-  spec.param(dino_scout_coverage_threshold_,
-             "dino_scout_coverage_threshold",
-             "DINO scout coverage threshold",
-             "Skip DINO on a chunk when the coherence-band mask already covers >= this fraction of the "
-             "chunk's valid pixels. Lower => DINO searches more chunks.",
-             0.65);
   spec.param(raw_dino_positional_deweight_,
              "raw_dino_positional_deweight",
              "Raw DINO positional deweight",
@@ -9554,12 +9236,6 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Interpolates the template division: divisor = 1 + strength*(template-1), clamped [0,1]. "
              "0 = disabled, 1 = full template.",
              1.0);
-  spec.param(raw_dino_positional_mu_path_,
-             "raw_dino_positional_mu_path",
-             "Raw DINO positional mean-embedding path",
-             "Stage-D hook (not yet wired): path to a (patch_count x feature_dim) mean-embedding .npy for "
-             "embedding-space positional subtraction. Empty = disabled.",
-             std::string(""));
   spec.param(power_q_,
              "power_q",
              "Power quantile",
@@ -9615,11 +9291,6 @@ void CudaDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Filter detection mask",
              "Apply reference-style grouped region filtering before final box merge.",
              true);
-  spec.param(emit_grouped_merged_mask_,
-             "emit_grouped_merged_mask",
-             "Emit grouped merged mask",
-             "Emit the grouped and merged detector box mask instead of the raw stitched threshold mask.",
-             false);
   spec.param(grouping_time_continuity_ratio_,
              "grouping_time_continuity_ratio",
              "Grouping time continuity ratio",
@@ -9697,7 +9368,6 @@ void CudaDinoDetector::initialize() {
     runtime_config.imagenet_mean = imagenet_mean_.get();
     runtime_config.imagenet_std = imagenet_std_.get();
     runtime_config.dino_gray_local_resid_weight = dino_gray_local_resid_weight_.get();
-    runtime_config.dino_colormap_enable = dino_colormap_enable_.get();
     runtime_config.return_patch_features = true;
     runtime_config.return_patch_features_host = false;
     runtime_config.return_final_mask_device = true;
@@ -9880,10 +9550,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       cudaFree(buffers.corrected_batch_device);
       buffers.corrected_batch_device = nullptr;
       buffers.batch_elements = 0;
-    }
-    if (buffers.dino_enhanced_batch_device != nullptr) {
-      cudaFree(buffers.dino_enhanced_batch_device);
-      buffers.dino_enhanced_batch_device = nullptr;
     }
     if (buffers.coherence_gate_batch_device != nullptr) {
       cudaFree(buffers.coherence_gate_batch_device);
@@ -10147,10 +9813,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         cudaFree(buffers.corrected_batch_device);
         buffers.corrected_batch_device = nullptr;
       }
-      if (buffers.dino_enhanced_batch_device != nullptr) {
-        cudaFree(buffers.dino_enhanced_batch_device);
-        buffers.dino_enhanced_batch_device = nullptr;
-      }
       if (buffers.coherence_gate_batch_device != nullptr) {
         cudaFree(buffers.coherence_gate_batch_device);
         buffers.coherence_gate_batch_device = nullptr;
@@ -10188,7 +9850,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         buffers.hybrid_initial_product_batch_device = nullptr;
       }
       allocate_device_float(buffers.corrected_batch_device, batch_elements);
-      allocate_device_float(buffers.dino_enhanced_batch_device, batch_elements);
       allocate_device_float(buffers.coherence_gate_batch_device, batch_elements);
       allocate_device_float(buffers.raw_dino_score_batch_device, batch_elements);
       allocate_device_float(buffers.hybrid_combined_score_batch_device, batch_elements);
@@ -10220,86 +9881,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                         cudaMemcpyHostToDevice,
                                         buffers.processing_stream),
                         "cuda_dino_detector chunk row-start upload failed");
-
-    // ---- Stage-2 per-frequency calibration: load global arrays once, then pack per chunk-row ----
-    // Lazy-load the calibrated global (length src_rows) arrays.
-    if (per_freq_floor_enable_.get() && !per_freq_floor_path_.get().empty() &&
-        !per_freq_floor_loaded_ && !per_freq_floor_failed_) {
-      std::vector<float> vals; int rr = 0, cc = 0;
-      if (read_npy_2d_float(per_freq_floor_path_.get(), vals, rr, cc) && static_cast<int>(vals.size()) == src_rows) {
-        per_freq_floor_global_ = std::move(vals);
-        per_freq_floor_loaded_ = true;
-        std::fprintf(stderr, "[cuda_dino_detector] INFO: loaded per-frequency floor (%d rows) from %s\n",
-                     src_rows, per_freq_floor_path_.get().c_str());
-      } else {
-        per_freq_floor_failed_ = true;
-        std::fprintf(stderr, "[cuda_dino_detector] WARN: per_freq_floor '%s' unreadable or length != src_rows(%d); floor disabled\n",
-                     per_freq_floor_path_.get().c_str(), src_rows);
-      }
-    }
-    if (per_freq_gate_threshold_enable_.get() && !per_freq_gate_threshold_path_.get().empty() &&
-        !per_freq_gate_threshold_loaded_ && !per_freq_gate_threshold_failed_) {
-      std::vector<float> vals; int rr = 0, cc = 0;
-      if (read_npy_2d_float(per_freq_gate_threshold_path_.get(), vals, rr, cc) && static_cast<int>(vals.size()) == src_rows) {
-        per_freq_gate_threshold_global_ = std::move(vals);
-        per_freq_gate_threshold_loaded_ = true;
-        std::fprintf(stderr, "[cuda_dino_detector] INFO: loaded per-frequency gate threshold (%d rows) from %s\n",
-                     src_rows, per_freq_gate_threshold_path_.get().c_str());
-      } else {
-        per_freq_gate_threshold_failed_ = true;
-        std::fprintf(stderr, "[cuda_dino_detector] WARN: per_freq_gate_threshold '%s' unreadable or length != src_rows(%d); disabled\n",
-                     per_freq_gate_threshold_path_.get().c_str(), src_rows);
-      }
-    }
-    const bool floor_active = per_freq_floor_enable_.get() && per_freq_floor_loaded_;
-    const bool gate_thr_active = per_freq_gate_threshold_enable_.get() && per_freq_gate_threshold_loaded_;
-    const size_t per_freq_packed_rows = static_cast<size_t>(chunk_count) * static_cast<size_t>(uniform_chunk_rows);
-    if (buffers.per_freq_packed_capacity < per_freq_packed_rows) {
-      if (buffers.per_freq_floor_packed_device != nullptr) { cudaFree(buffers.per_freq_floor_packed_device); buffers.per_freq_floor_packed_device = nullptr; }
-      if (buffers.per_freq_gate_threshold_packed_device != nullptr) { cudaFree(buffers.per_freq_gate_threshold_packed_device); buffers.per_freq_gate_threshold_packed_device = nullptr; }
-      buffers.per_freq_packed_capacity = 0;
-    }
-    // Pointers stay null (=> byte-identical kernels) unless the corresponding path is active.
-    if (floor_active && per_freq_packed_rows > 0) {
-      if (buffers.per_freq_floor_packed_device == nullptr) { allocate_device_float(buffers.per_freq_floor_packed_device, per_freq_packed_rows); }
-      std::vector<float> packed_floor(per_freq_packed_rows, 1.0e30f);  // 1e30 => min(bg,.) is a no-op
-      const float floor_offset = static_cast<float>(per_freq_floor_offset_db_.get());
-      for (int cidx = 0; cidx < chunk_count; ++cidx) {
-        for (int rr = 0; rr < uniform_chunk_rows; ++rr) {
-          const int g = chunk_row_starts[static_cast<size_t>(cidx)] + rr;
-          if (g >= 0 && g < src_rows) {
-            packed_floor[static_cast<size_t>(cidx) * static_cast<size_t>(uniform_chunk_rows) + static_cast<size_t>(rr)] =
-                per_freq_floor_global_[static_cast<size_t>(g)] + floor_offset;
-          }
-        }
-      }
-      throw_if_cuda_error(cudaMemcpyAsync(buffers.per_freq_floor_packed_device, packed_floor.data(),
-                                          per_freq_packed_rows * sizeof(float), cudaMemcpyHostToDevice, buffers.processing_stream),
-                          "cuda_dino_detector per-freq floor packed upload failed");
-    } else if (buffers.per_freq_floor_packed_device != nullptr) {
-      cudaFree(buffers.per_freq_floor_packed_device); buffers.per_freq_floor_packed_device = nullptr;
-    }
-    if (gate_thr_active && per_freq_packed_rows > 0) {
-      if (buffers.per_freq_gate_threshold_packed_device == nullptr) { allocate_device_float(buffers.per_freq_gate_threshold_packed_device, per_freq_packed_rows); }
-      std::vector<float> packed_gate(per_freq_packed_rows, 0.0f);  // 0 => max(absolute,0) leaves absolute
-      for (int cidx = 0; cidx < chunk_count; ++cidx) {
-        for (int rr = 0; rr < uniform_chunk_rows; ++rr) {
-          const int g = chunk_row_starts[static_cast<size_t>(cidx)] + rr;
-          if (g >= 0 && g < src_rows) {
-            packed_gate[static_cast<size_t>(cidx) * static_cast<size_t>(uniform_chunk_rows) + static_cast<size_t>(rr)] =
-                per_freq_gate_threshold_global_[static_cast<size_t>(g)];
-          }
-        }
-      }
-      throw_if_cuda_error(cudaMemcpyAsync(buffers.per_freq_gate_threshold_packed_device, packed_gate.data(),
-                                          per_freq_packed_rows * sizeof(float), cudaMemcpyHostToDevice, buffers.processing_stream),
-                          "cuda_dino_detector per-freq gate threshold packed upload failed");
-    } else if (buffers.per_freq_gate_threshold_packed_device != nullptr) {
-      cudaFree(buffers.per_freq_gate_threshold_packed_device); buffers.per_freq_gate_threshold_packed_device = nullptr;
-    }
-    if ((floor_active || gate_thr_active) && per_freq_packed_rows > 0) {
-      buffers.per_freq_packed_capacity = std::max(buffers.per_freq_packed_capacity, per_freq_packed_rows);
-    }
 
     const int pack_total = chunk_count * uniform_chunk_rows * src_cols;
     const int pack_blocks = (pack_total + threads - 1) / threads;
@@ -10341,7 +9922,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     bool debug_runtime_resized_full_chunk = false;
     bool debug_resized_full_chunk = false;
 
-    // ---- Coherence-primary (Method 2) / DINO-scout (Method 3) configuration ----
+    // ---- Coherence-primary (Method 2) configuration ----
     const bool coherence_primary = (hybrid_fusion_mode_.get() == std::string("coherence_primary"));
     CoherencePrimaryConfig primary_config;
     primary_config.enable = coherence_primary;
@@ -10355,21 +9936,12 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     DinoStructureGateConfig structure_config;
     structure_config.threshold_quantile = static_cast<float>(dino_structure_threshold_quantile_.get());
     structure_config.open_len = dino_structure_open_len_.get();
-    const bool scout_enabled = dino_scout_enable_.get() && coherence_primary;
-    if (dino_scout_enable_.get() && !coherence_primary && compute_count_ == 1) {
-      std::fprintf(stderr,
-                   "[cuda_dino_detector] WARN: dino_scout_enable ignored because hybrid_fusion_mode != coherence_primary\n");
-    }
-    // Scout selection state (populated below when scout is active).
-    std::vector<int> scout_selected_planes;
-    int scout_subset_count = chunk_count;
-    bool scout_active = false;
     bool band_mask_ready = false;
 
     if (coherence_primary) {
-      // Hoist the coherence gate + band mask ahead of the DINO block so the scout
-      // can gate inference on the coherence decision. Coherence reads only the
-      // packed corrected_batch_device, so this reordering is dependency-safe.
+      // Hoist the coherence gate + band mask ahead of the DINO block. Coherence
+      // reads only the packed corrected_batch_device, so this reordering is
+      // dependency-safe.
       if (capture_operator_timing) {
         throw_if_cuda_error(cudaEventRecord(buffers.coherence_start_event, buffers.processing_stream),
                             "cuda_dino_detector coherence-start event record failed");
@@ -10379,7 +9951,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                           uniform_chunk_rows,
                                                                           src_cols,
                                                                           chunk_valid_rows_batch,
-                                                                          buffers.per_freq_floor_packed_device,
+                                                                          nullptr,
                                                                           buffers.coherence_gate_batch_device,
                                                                           buffers.processing_stream);
       if (coherence_ready && capture_operator_timing) {
@@ -10393,7 +9965,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                           src_cols,
                                                                           chunk_valid_rows_batch,
                                                                           primary_config,
-                                                                          buffers.per_freq_gate_threshold_packed_device,
+                                                                          nullptr,
                                                                           buffers.coherence_band_mask_batch_device,
                                                                           buffers.processing_stream);
       }
@@ -10455,58 +10027,9 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       throw_if_cuda_error(cudaMemsetAsync(buffers.dino_structure_mask_batch_device, 0,
                                           batch_elements * sizeof(uint8_t), buffers.processing_stream),
                           "cuda_dino_detector structure mask zero-init failed");
-
-      // Method 3: choose which chunks still need DINO (coverage criterion).
-      if (scout_enabled && band_mask_ready) {
-        // Count band-mask pixels per chunk (scout_plane_indices_device doubles as the
-        // int counter buffer here; it is repurposed as the compact->full plane map below).
-        std::vector<int> band_pixel_counts(static_cast<size_t>(chunk_count), 0);
-        {
-          if (buffers.scout_row_start_capacity < static_cast<size_t>(chunk_count)) {
-            if (buffers.scout_row_starts_device != nullptr) { cudaFree(buffers.scout_row_starts_device); buffers.scout_row_starts_device = nullptr; }
-            if (buffers.scout_plane_indices_device != nullptr) { cudaFree(buffers.scout_plane_indices_device); buffers.scout_plane_indices_device = nullptr; }
-            allocate_device_int(buffers.scout_row_starts_device, static_cast<size_t>(chunk_count));
-            allocate_device_int(buffers.scout_plane_indices_device, static_cast<size_t>(chunk_count));
-            buffers.scout_row_start_capacity = static_cast<size_t>(chunk_count);
-          }
-          throw_if_cuda_error(cudaMemsetAsync(buffers.scout_plane_indices_device, 0,
-                                              static_cast<size_t>(chunk_count) * sizeof(int), buffers.processing_stream),
-                              "cuda_dino_detector scout coverage counter zero failed");
-          const int plane = uniform_chunk_rows * src_cols;
-          const int count_total = chunk_count * plane;
-          const int count_blocks = (count_total + threads - 1) / threads;
-          coherence_primary_mask_plane_count_batch_kernel<<<count_blocks, threads, 0, buffers.processing_stream>>>(
-              buffers.coherence_band_mask_batch_device, chunk_count, plane, buffers.scout_plane_indices_device);
-          throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector scout coverage count kernel launch failed");
-          throw_if_cuda_error(cudaMemcpyAsync(band_pixel_counts.data(), buffers.scout_plane_indices_device,
-                                              static_cast<size_t>(chunk_count) * sizeof(int),
-                                              cudaMemcpyDeviceToHost, buffers.processing_stream),
-                              "cuda_dino_detector scout coverage copy failed");
-          throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
-                              "cuda_dino_detector scout coverage sync failed");
-        }
-        // Valid-pixel count per chunk from the host valid-row mask.
-        const double coverage_threshold = dino_scout_coverage_threshold_.get();
-        for (int b = 0; b < chunk_count; ++b) {
-          int valid_rows = 0;
-          for (int row = 0; row < uniform_chunk_rows; ++row) {
-            valid_rows += chunk_valid_rows_batch[static_cast<size_t>(b) * static_cast<size_t>(uniform_chunk_rows) + static_cast<size_t>(row)] ? 1 : 0;
-          }
-          const double valid_px = static_cast<double>(valid_rows) * static_cast<double>(src_cols);
-          const double coverage = valid_px > 0.0 ? static_cast<double>(band_pixel_counts[static_cast<size_t>(b)]) / valid_px : 0.0;
-          if (coverage < coverage_threshold) {
-            scout_selected_planes.push_back(b);
-          }
-        }
-        scout_subset_count = static_cast<int>(scout_selected_planes.size());
-        scout_active = (scout_subset_count < chunk_count);
-      }
     }
 
-    // Skip DINO inference entirely when the scout selected zero chunks (all coherence-
-    // explained): raw score + structure stay zeroed and fusion proceeds coherence-only.
-    const bool run_dino_inference = is_truthy_backend_mode(backend_mode_.get()) && !model_script_path_.get().empty() &&
-                                    !(scout_active && scout_subset_count == 0);
+    const bool run_dino_inference = is_truthy_backend_mode(backend_mode_.get()) && !model_script_path_.get().empty();
     if (run_dino_inference) {
       DinoTorchRuntimeConfig runtime_config;
       runtime_config.inference_backend = inference_backend_.get();
@@ -10516,71 +10039,19 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       runtime_config.imagenet_mean = imagenet_mean_.get();
       runtime_config.imagenet_std = imagenet_std_.get();
       runtime_config.dino_gray_local_resid_weight = dino_gray_local_resid_weight_.get();
-      runtime_config.dino_colormap_enable = dino_colormap_enable_.get();
       runtime_config.return_patch_features = true;
       runtime_config.return_patch_features_host = false;
       runtime_config.return_final_mask_device = true;
       runtime_config.compute_power_score = false;
       runtime_config.frontend_correction_enable = false;
 
-      // DINO batch routing: full-batch (Method 2) or scout subset (Method 3). When
-      // scout is active, gather only the selected chunk planes into a compact buffer
-      // and run inference on those; scores/structure are scattered back below.
-      const int plane_elems = uniform_chunk_rows * src_cols;
+      // DINO batch routing: full-batch (Method 2). Scores/structure derive from the
+      // packed corrected batch directly.
       int dino_batch_size = chunk_count;
       const float* dino_corrected_input = buffers.corrected_batch_device;
       float* dino_raw_score_output = buffers.raw_dino_score_batch_device;
       float* dino_patch_qnorm_output = nullptr;  // set after run_batch (patch dims known)
       bool structure_input_ready = false;
-      if (scout_active) {
-        dino_batch_size = scout_subset_count;
-        std::vector<int> subset_row_starts(static_cast<size_t>(scout_subset_count), 0);
-        for (int c = 0; c < scout_subset_count; ++c) {
-          subset_row_starts[static_cast<size_t>(c)] =
-              chunk_plan[static_cast<size_t>(scout_selected_planes[static_cast<size_t>(c)])].row_start;
-        }
-        throw_if_cuda_error(cudaMemcpyAsync(buffers.scout_row_starts_device, subset_row_starts.data(),
-                                            static_cast<size_t>(scout_subset_count) * sizeof(int),
-                                            cudaMemcpyHostToDevice, buffers.processing_stream),
-                            "cuda_dino_detector scout row-start upload failed");
-        throw_if_cuda_error(cudaMemcpyAsync(buffers.scout_plane_indices_device, scout_selected_planes.data(),
-                                            static_cast<size_t>(scout_subset_count) * sizeof(int),
-                                            cudaMemcpyHostToDevice, buffers.processing_stream),
-                            "cuda_dino_detector scout plane-index upload failed");
-        const size_t subset_elems = static_cast<size_t>(scout_subset_count) * static_cast<size_t>(plane_elems);
-        if (buffers.scout_batch_capacity < subset_elems) {
-          if (buffers.corrected_scout_batch_device != nullptr) { cudaFree(buffers.corrected_scout_batch_device); buffers.corrected_scout_batch_device = nullptr; }
-          if (buffers.raw_dino_score_scout_device != nullptr) { cudaFree(buffers.raw_dino_score_scout_device); buffers.raw_dino_score_scout_device = nullptr; }
-          allocate_device_float(buffers.corrected_scout_batch_device, subset_elems);
-          allocate_device_float(buffers.raw_dino_score_scout_device, subset_elems);
-          buffers.scout_batch_capacity = subset_elems;
-        }
-        const int gather_total = scout_subset_count * plane_elems;
-        const int gather_blocks = (gather_total + threads - 1) / threads;
-        cuda_dino_pack_reference_chunks_kernel<<<gather_blocks, threads, 0, buffers.processing_stream>>>(
-            buffers.corrected_db_device, src_rows, src_cols, buffers.scout_row_starts_device,
-            uniform_chunk_rows, scout_subset_count, buffers.corrected_scout_batch_device);
-        throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector scout gather pack kernel launch failed");
-        dino_corrected_input = buffers.corrected_scout_batch_device;
-        dino_raw_score_output = buffers.raw_dino_score_scout_device;
-      }
-
-      // Matched-integration contrast enhancement (DINO-only). Averages LINEAR power over a
-      // narrow-frequency / long-time window so low-SNR, spatially-coherent regions rise out
-      // of the noise before DINO sees them; the coherence path keeps the raw corrected batch.
-      if (dino_input_enhance_.get() && buffers.dino_enhanced_batch_device != nullptr) {
-        const int freq_radius = std::max(0, dino_input_enhance_freq_bins_.get() / 2);
-        const int time_radius = std::max(0, dino_input_enhance_time_bins_.get() / 2);
-        if (freq_radius > 0 || time_radius > 0) {
-          const long enhance_total = static_cast<long>(dino_batch_size) * uniform_chunk_rows * src_cols;
-          const int enhance_blocks = static_cast<int>((enhance_total + threads - 1) / threads);
-          cuda_dino_matched_integrate_db_batch_kernel<<<enhance_blocks, threads, 0, buffers.processing_stream>>>(
-              dino_corrected_input, dino_batch_size, uniform_chunk_rows, src_cols,
-              freq_radius, time_radius, buffers.dino_enhanced_batch_device);
-          throw_if_cuda_error(cudaGetLastError(), "cuda_dino_detector matched-integration enhance kernel launch failed");
-          dino_corrected_input = buffers.dino_enhanced_batch_device;
-        }
-      }
 
       DinoTorchRuntimeBatchInput runtime_input;
       runtime_input.batch_size = dino_batch_size;
@@ -10610,9 +10081,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         const bool project_full_chunk =
           runtime_resized_full_chunk ||
           (execution_strategy_.get() == "reference_chunks" && uniform_chunk_rows > runtime_result.aligned_rows);
-        // Under scout the patch features are a compact subset; disable the
-        // full-batch debug recompute path to avoid out-of-range indexing.
-        debug_patch_features_batch_device = scout_active ? nullptr : runtime_result.patch_features_batch_device;
+        debug_patch_features_batch_device = runtime_result.patch_features_batch_device;
         debug_patch_rows = runtime_result.patch_rows;
         debug_patch_cols = runtime_result.patch_cols;
         debug_feature_dim = runtime_result.feature_dim;
@@ -10627,24 +10096,15 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
           if (coherence_primary) {
             const size_t patch_plane = static_cast<size_t>(runtime_result.patch_rows) * static_cast<size_t>(runtime_result.patch_cols);
             const size_t patch_total = static_cast<size_t>(dino_batch_size) * patch_plane;
-            if (scout_active) {
-              if (buffers.patch_qnorm_scout_capacity < patch_total) {
-                if (buffers.patch_qnorm_scout_device != nullptr) { cudaFree(buffers.patch_qnorm_scout_device); buffers.patch_qnorm_scout_device = nullptr; }
-                allocate_device_float(buffers.patch_qnorm_scout_device, patch_total);
-                buffers.patch_qnorm_scout_capacity = patch_total;
-              }
-              dino_patch_qnorm_output = buffers.patch_qnorm_scout_device;
-            } else {
-              if (buffers.patch_qnorm_capacity < patch_total) {
-                if (buffers.patch_qnorm_batch_device != nullptr) { cudaFree(buffers.patch_qnorm_batch_device); buffers.patch_qnorm_batch_device = nullptr; }
-                allocate_device_float(buffers.patch_qnorm_batch_device, patch_total);
-                buffers.patch_qnorm_capacity = patch_total;
-              }
-              dino_patch_qnorm_output = buffers.patch_qnorm_batch_device;
+            if (buffers.patch_qnorm_capacity < patch_total) {
+              if (buffers.patch_qnorm_batch_device != nullptr) { cudaFree(buffers.patch_qnorm_batch_device); buffers.patch_qnorm_batch_device = nullptr; }
+              allocate_device_float(buffers.patch_qnorm_batch_device, patch_total);
+              buffers.patch_qnorm_capacity = patch_total;
             }
+            dino_patch_qnorm_output = buffers.patch_qnorm_batch_device;
           }
           // Resolve the positional noise template (production; both fusion modes;
-          // per-patch position so it is valid for full-batch and scout subsets alike).
+          // per-patch position).
           const std::string positional_template_path = raw_dino_positional_template_path_.get();
           const float* positional_template_device = nullptr;
           float positional_template_strength = 0.0f;
@@ -10659,7 +10119,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
           {
             const bool want_artifacts = debug_mode_.get() && enable_debug_artifact_host_copy_.get() &&
                                         !debug_artifact_output_dir_.get().empty();
-            if (want_artifacts && save_raw_dino_patch_prenorm_.get() && !scout_active) {
+            if (want_artifacts && save_raw_dino_patch_prenorm_.get()) {
               const size_t patch_plane = static_cast<size_t>(runtime_result.patch_rows) * static_cast<size_t>(runtime_result.patch_cols);
               const size_t patch_total = static_cast<size_t>(dino_batch_size) * patch_plane;
               if (buffers.patch_prenorm_capacity < patch_total) {
@@ -10715,22 +10175,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
           }
           raw_score_source = raw_score_ready ? "score_map_fallback" : "none";
         }
-        // Scatter scout subset scores back into the full raw-score buffer (planes
-        // not selected stay zeroed from the memset above).
-        if (scout_active && raw_score_ready) {
-          for (int c = 0; c < scout_subset_count; ++c) {
-            const int plane_idx = scout_selected_planes[static_cast<size_t>(c)];
-            throw_if_cuda_error(cudaMemcpyAsync(
-                                    buffers.raw_dino_score_batch_device + static_cast<size_t>(plane_idx) * static_cast<size_t>(plane_elems),
-                                    buffers.raw_dino_score_scout_device + static_cast<size_t>(c) * static_cast<size_t>(plane_elems),
-                                    static_cast<size_t>(plane_elems) * sizeof(float),
-                                    cudaMemcpyDeviceToDevice, buffers.processing_stream),
-                                "cuda_dino_detector scout raw-score scatter failed");
-          }
-        }
-        // Build the DINO structure mask (patch-grid run-length gate). Writes only the
-        // selected planes under scout (compact->full via scout_plane_indices_device);
-        // unselected planes remain zeroed.
+        // Build the DINO structure mask (patch-grid run-length gate).
         if (structure_input_ready) {
           if (!compute_dino_structure_mask_gpu_batch_to_device(dino_patch_qnorm_output,
                                                                dino_batch_size,
@@ -10742,7 +10187,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                uniform_chunk_rows,
                                                                src_cols,
                                                                debug_resized_full_chunk,
-                                                               scout_active ? buffers.scout_plane_indices_device : nullptr,
+                                                               nullptr,
                                                                buffers.dino_structure_mask_batch_device,
                                                                buffers.processing_stream)) {
             std::fprintf(stderr, "[cuda_dino_detector] WARN: DINO structure mask computation failed\n");
@@ -10777,7 +10222,7 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                           uniform_chunk_rows,
                                                                           src_cols,
                                                                           chunk_valid_rows_batch,
-                                                                          buffers.per_freq_floor_packed_device,
+                                                                          nullptr,
                                                                           buffers.coherence_gate_batch_device,
                                                                           buffers.processing_stream);
       if (coherence_ready && capture_operator_timing) {
@@ -10807,26 +10252,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
     const bool enable_mask_post_processing = enable_mask_post_processing_.get();
     const bool preserve_hybrid_debug_outputs = debug_mode_.get() && enable_debug_artifact_host_copy_.get();
     const bool write_operator_artifacts = preserve_hybrid_debug_outputs && !debug_artifact_output_dir_.get().empty();
-    // Resolve the coherence-rescue floor config once per compute. Threshold defaults
-    // to the dormant dino_coherence_gate_floor/span_db mapping when left negative.
-    CoherenceRescueConfig rescue_config;
-    rescue_config.enable = dino_coherence_rescue_enable_.get();
-    rescue_config.min_area_px = dino_coherence_rescue_min_area_px_.get();
-    rescue_config.floor_strength = static_cast<float>(dino_coherence_rescue_floor_strength_.get());
-    {
-      const double configured_threshold = dino_coherence_rescue_threshold_.get();
-      double resolved_threshold = configured_threshold;
-      if (configured_threshold < 0.0) {
-        resolved_threshold = dino_coherence_gate_floor_.get() *
-                             std::pow(10.0, dino_coherence_gate_span_db_.get() / 20.0);
-      }
-      rescue_config.coherence_threshold = static_cast<float>(std::clamp(resolved_threshold, 0.0, 1.0));
-    }
-    if (meta) {
-      meta->set("cuda_dino_coherence_rescue_enable", rescue_config.enable);
-      meta->set("cuda_dino_coherence_rescue_threshold", static_cast<double>(rescue_config.coherence_threshold));
-      meta->set("cuda_dino_coherence_rescue_min_area_px", rescue_config.min_area_px);
-    }
     // Debug-only initial-product buffer (dumped as chunk_initial_product.npy), lazily
     // allocated and freed on batch-size change; nullptr in production.
     float* debug_initial_product = nullptr;
@@ -10865,7 +10290,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                 write_operator_artifacts ? buffers.hybrid_component_filtered_mask_batch_device : nullptr,
                                                                                 buffers.processing_stream,
                                                                                 &legacy_timing,
-                                                                                &rescue_config,
                                                                                 debug_initial_product,
                                                                                 legacy_score_max,
                                                                                 dino_contribution_strength);
@@ -10900,11 +10324,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         meta->set("cuda_dino_coherence_band_ready", band_mask_ready);
         meta->set("cuda_dino_coherence_primary_legacy_score", legacy_score_max ? std::string("max") : std::string("product"));
         meta->set("cuda_dino_contribution_strength", static_cast<double>(dino_contribution_strength));
-        meta->set("cuda_dino_scout_enabled", scout_enabled);
-        meta->set("cuda_dino_scout_chunks_total", static_cast<uint32_t>(std::max(0, chunk_count)));
-        meta->set("cuda_dino_scout_chunks_run", static_cast<uint32_t>(std::max(0, scout_active ? scout_subset_count : chunk_count)));
-        meta->set("cuda_dino_scout_chunks_skipped",
-                  static_cast<uint32_t>(std::max(0, scout_active ? (chunk_count - scout_subset_count) : 0)));
       }
     } else if (coherence_ready && raw_score_ready) {
       const auto hybrid_start_time = std::chrono::steady_clock::now();
@@ -10924,7 +10343,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                       write_operator_artifacts ? buffers.hybrid_component_filtered_mask_batch_device : nullptr,
                                                                       buffers.processing_stream,
                                                                       &hybrid_stage_timing,
-                                                                      &rescue_config,
                                                                       debug_initial_product);
       if (capture_operator_timing) {
         throw_if_cuda_error(cudaStreamSynchronize(buffers.processing_stream),
@@ -10952,19 +10370,13 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       meta->set("cuda_dino_hybrid_stage_variant", hybrid_stage_variant);
     }
 
-    const bool emit_grouped_merged_mask = emit_grouped_merged_mask_.get();
-    if (meta) {
-      meta->set("cuda_dino_emit_grouped_merged_mask_requested", emit_grouped_merged_mask);
-    }
-
     std::vector<uint8_t> emitted_mask_detector_host;
     bool emitted_mask_from_host_merge = false;
 
-    const bool host_projection_merge_enabled = hybrid_ready && (write_operator_artifacts || emit_grouped_merged_mask);
+    const bool host_projection_merge_enabled = hybrid_ready && write_operator_artifacts;
     if (host_projection_merge_enabled) {
       const auto debug_device_to_host_start_time = std::chrono::steady_clock::now();
       std::vector<float> corrected_batch;
-      std::vector<float> dino_enhanced_batch;
       std::vector<float> coherence_gate_batch;
       std::vector<float> raw_score_batch;
       std::vector<float> raw_score_deweighted_batch;
@@ -10976,7 +10388,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       std::vector<uint8_t> hybrid_closed_mask_batch;
       std::vector<uint8_t> hybrid_filled_mask_batch;
       std::vector<uint8_t> hybrid_component_filtered_mask_batch;
-      std::vector<uint8_t> hybrid_coherence_rescue_mask_batch;
       std::vector<uint8_t> coherence_band_mask_batch;
       std::vector<uint8_t> dino_structure_mask_batch;
       std::vector<float> initial_product_batch;
@@ -11005,7 +10416,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         hybrid_closed_mask_batch.assign(batch_elements, 0);
         hybrid_filled_mask_batch.assign(batch_elements, 0);
         hybrid_component_filtered_mask_batch.assign(batch_elements, 0);
-        hybrid_coherence_rescue_mask_batch.assign(batch_elements, 0);
         coherence_band_mask_batch.assign(batch_elements, 0);
         dino_structure_mask_batch.assign(batch_elements, 0);
         initial_product_batch.assign(batch_elements, 0.0f);
@@ -11018,17 +10428,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                             cudaMemcpyDeviceToHost,
                                             buffers.processing_stream),
                             "cuda_dino_detector corrected batch debug copy failed");
-        // When matched-integration enhancement ran (full-batch/non-scout), the enhanced
-        // buffer holds chunk_count planes in identity order, matching corrected_batch.
-        if (dino_input_enhance_.get() && !scout_active && buffers.dino_enhanced_batch_device != nullptr) {
-          dino_enhanced_batch.assign(batch_elements, 0.0f);
-          throw_if_cuda_error(cudaMemcpyAsync(dino_enhanced_batch.data(),
-                                              buffers.dino_enhanced_batch_device,
-                                              batch_elements * sizeof(float),
-                                              cudaMemcpyDeviceToHost,
-                                              buffers.processing_stream),
-                              "cuda_dino_detector dino enhanced batch debug copy failed");
-        }
         throw_if_cuda_error(cudaMemcpyAsync(coherence_gate_batch.data(),
                                             buffers.coherence_gate_batch_device,
                                             batch_elements * sizeof(float),
@@ -11142,17 +10541,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                             cudaMemcpyDeviceToHost,
                                             buffers.processing_stream),
                             "cuda_dino_detector hybrid component filtered mask debug copy failed");
-        // Coherence-rescue mask (rescue contribution alone). Only meaningful when
-        // the rescue ran; otherwise the buffer is stale so leave the host copy zeroed.
-        auto& rescue_scratch = residual_veto_cuda_scratch();
-        if (rescue_config.enable && rescue_scratch.mask_rescue_filtered != nullptr) {
-          throw_if_cuda_error(cudaMemcpyAsync(hybrid_coherence_rescue_mask_batch.data(),
-                                              rescue_scratch.mask_rescue_filtered,
-                                              batch_elements * sizeof(uint8_t),
-                                              cudaMemcpyDeviceToHost,
-                                              buffers.processing_stream),
-                              "cuda_dino_detector coherence rescue mask debug copy failed");
-        }
         // Coherence-primary artifacts (band mask, structure mask, initial product).
         // Populated in coherence_primary mode; left zeroed in legacy mode.
         if (coherence_primary) {
@@ -11270,14 +10658,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                                                  src_cols,
                                                                                  live_chunk_result.dst_rows,
                                                                                  live_chunk_result.dst_cols);
-          std::vector<uint8_t> chunk_coherence_rescue_mask(
-              hybrid_coherence_rescue_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset),
-              hybrid_coherence_rescue_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset + chunk_elements));
-          live_chunk_result.hybrid_coherence_rescue_mask = resize_mask_nearest(chunk_coherence_rescue_mask,
-                                                                               uniform_chunk_rows,
-                                                                               src_cols,
-                                                                               live_chunk_result.dst_rows,
-                                                                               live_chunk_result.dst_cols);
           std::vector<uint8_t> chunk_coherence_band_mask(
               coherence_band_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset),
               coherence_band_mask_batch.begin() + static_cast<std::ptrdiff_t>(batch_offset + chunk_elements));
@@ -11302,19 +10682,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
                                                               src_cols,
                                                               live_chunk_result.dst_rows,
                                                               live_chunk_result.dst_cols);
-          // DINO input actually consumed this frame: the matched-integration enhanced
-          // batch when enabled, else the plain corrected batch (so the panel always
-          // shows what DINO saw, and comparing it to "Corrected" reveals the contrast gain).
-          const std::vector<float>& dino_input_src =
-              !dino_enhanced_batch.empty() ? dino_enhanced_batch : corrected_batch;
-          std::vector<float> chunk_dino_enhanced(
-              dino_input_src.begin() + static_cast<std::ptrdiff_t>(batch_offset),
-              dino_input_src.begin() + static_cast<std::ptrdiff_t>(batch_offset + chunk_elements));
-          live_chunk_result.dino_enhanced_input = resize_bilinear(chunk_dino_enhanced,
-                                                                  uniform_chunk_rows,
-                                                                  src_cols,
-                                                                  live_chunk_result.dst_rows,
-                                                                  live_chunk_result.dst_cols);
           live_chunk_result.hybrid_seed_freq_threshold = hybrid_seed_freq_thresholds[static_cast<size_t>(batch_index)];
           live_chunk_result.hybrid_seed_res_threshold = hybrid_seed_res_thresholds[static_cast<size_t>(batch_index)];
           live_chunk_result.hybrid_combined_threshold = hybrid_combined_thresholds[static_cast<size_t>(batch_index)];
@@ -11373,13 +10740,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
         meta->set("cuda_dino_debug_projected_fraction", static_cast<double>(mean_mask_value(global_merged.projected_grouped_mask)));
         meta->set("cuda_dino_debug_final_fraction", static_cast<double>(mean_mask_value(global_merged.merged_box_mask)));
         meta->set("cuda_dino_debug_connected_fraction", static_cast<double>(connected_fraction(global_merged.merged_box_mask, source_valid_mask)));
-      }
-      if (emit_grouped_merged_mask) {
-        emitted_mask_detector_host.assign(global_merged.merged_box_mask.size(), static_cast<uint8_t>(0));
-        for (size_t index = 0; index < global_merged.merged_box_mask.size(); ++index) {
-          emitted_mask_detector_host[index] = global_merged.merged_box_mask[index] ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
-        }
-        emitted_mask_from_host_merge = !emitted_mask_detector_host.empty();
       }
       if (write_operator_artifacts && !live_chunk_results.empty()) {
         const int selected_batch_index = clamp_value(debug_chunk_index_.get(), 0, chunk_count - 1);
@@ -11501,10 +10861,6 @@ void CudaDinoDetector::compute(holoscan::InputContext& op_input,
       }
     } else if (meta) {
       meta->set("cuda_dino_group_merge_ready", false);
-    }
-
-    if (meta) {
-      meta->set("cuda_dino_emit_grouped_merged_mask_applied", emitted_mask_from_host_merge);
     }
 
     if (hybrid_ready) {
@@ -11661,26 +11017,6 @@ void CudaDinoDetector::release_channel_buffers() {
       cudaFree(buffers.hybrid_initial_product_batch_device);
       buffers.hybrid_initial_product_batch_device = nullptr;
     }
-    if (buffers.corrected_scout_batch_device != nullptr) {
-      cudaFree(buffers.corrected_scout_batch_device);
-      buffers.corrected_scout_batch_device = nullptr;
-    }
-    if (buffers.raw_dino_score_scout_device != nullptr) {
-      cudaFree(buffers.raw_dino_score_scout_device);
-      buffers.raw_dino_score_scout_device = nullptr;
-    }
-    if (buffers.patch_qnorm_scout_device != nullptr) {
-      cudaFree(buffers.patch_qnorm_scout_device);
-      buffers.patch_qnorm_scout_device = nullptr;
-    }
-    if (buffers.scout_row_starts_device != nullptr) {
-      cudaFree(buffers.scout_row_starts_device);
-      buffers.scout_row_starts_device = nullptr;
-    }
-    if (buffers.scout_plane_indices_device != nullptr) {
-      cudaFree(buffers.scout_plane_indices_device);
-      buffers.scout_plane_indices_device = nullptr;
-    }
     if (buffers.row_stat_device != nullptr) {
       cudaFree(buffers.row_stat_device);
       buffers.row_stat_device = nullptr;
@@ -11697,15 +11033,6 @@ void CudaDinoDetector::release_channel_buffers() {
       cudaFree(buffers.chunk_row_starts_device);
       buffers.chunk_row_starts_device = nullptr;
     }
-    if (buffers.per_freq_floor_packed_device != nullptr) {
-      cudaFree(buffers.per_freq_floor_packed_device);
-      buffers.per_freq_floor_packed_device = nullptr;
-    }
-    if (buffers.per_freq_gate_threshold_packed_device != nullptr) {
-      cudaFree(buffers.per_freq_gate_threshold_packed_device);
-      buffers.per_freq_gate_threshold_packed_device = nullptr;
-    }
-    buffers.per_freq_packed_capacity = 0;
     if (buffers.copy_complete_event != nullptr) {
       cudaEventDestroy(buffers.copy_complete_event);
       buffers.copy_complete_event = nullptr;
@@ -11727,9 +11054,6 @@ void CudaDinoDetector::release_channel_buffers() {
     buffers.chunk_row_start_capacity = 0;
     buffers.patch_qnorm_capacity = 0;
     buffers.patch_prenorm_capacity = 0;
-    buffers.patch_qnorm_scout_capacity = 0;
-    buffers.scout_batch_capacity = 0;
-    buffers.scout_row_start_capacity = 0;
     buffers.row_elements = 0;
   }
   channel_buffers_.clear();

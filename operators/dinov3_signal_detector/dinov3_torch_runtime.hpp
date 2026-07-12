@@ -23,10 +23,6 @@ struct DinoTorchRuntimeConfig {
   // 0.70 reproduces prior behavior; lower it toward 0 to favor the absolute level so faint,
   // spatially-broad signals survive into the DINO input instead of being high-passed away.
   double dino_gray_local_resid_weight = 0.70;
-  // Feed a true 3-channel colormap (turbo) of the gray scalar instead of replicating it into
-  // 3 identical channels, so small dB deltas map to large, decorrelated RGB deltas that
-  // excite the pretrained ViT's chromatic patch-embed filters. Default false = gray-replicate.
-  bool dino_colormap_enable = false;
   std::vector<double> imagenet_mean;
   std::vector<double> imagenet_std;
   bool return_final_mask = true;
