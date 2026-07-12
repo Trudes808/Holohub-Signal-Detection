@@ -134,12 +134,12 @@ run_detector() {  # $1 = input .sigmf-data, $2 = dest stats dir name
 
 echo "=== [1/4] extracting annotation-free noise regions ==="
 # shellcheck disable=SC2086
-python3 extract_noise_regions.py --inputs ${INPUT_GLOBS} --output "${NOISE_DATA}"
+python3 calibration/extract_noise_regions.py --inputs ${INPUT_GLOBS} --output "${NOISE_DATA}"
 
 echo
 echo "=== [2/4] extracting annotated signal regions ==="
 # shellcheck disable=SC2086
-python3 extract_signal_regions.py --inputs ${INPUT_GLOBS} --output "${SIGNAL_DATA}"
+python3 calibration/extract_signal_regions.py --inputs ${INPUT_GLOBS} --output "${SIGNAL_DATA}"
 
 echo
 echo "=== [3/4] running detector on noise + signal (fast-path stats dump) ==="

@@ -1,0 +1,13 @@
+# Local artifacts and generated data — do NOT commit (large / regenerable / machine-specific).
+# Captures used by calibration + offline eval (large SigMF; keep locally, never in git):
+generated_inputs/
+# Per-run configs the offline driver generates from the base configs:
+generated_configs/
+# Old debug/comparison artifact dumps:
+chunk_compare_artifacts/
+# Host-side detector output dirs, if ever created under the app tree:
+coherent_power_masks/
+dino_masks/
+# Python bytecode:
+__pycache__/
+*.pyc

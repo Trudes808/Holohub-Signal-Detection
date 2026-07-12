@@ -38,7 +38,7 @@ NOISE_DATA="${NOISE_DIR}/${RUN_NAME}.sigmf-data"
 
 echo "=== [1/3] extracting annotation-free noise regions ==="
 # shellcheck disable=SC2086
-python3 extract_noise_regions.py --inputs ${INPUT_GLOBS} \
+python3 calibration/extract_noise_regions.py --inputs ${INPUT_GLOBS} \
     --output "${NOISE_DATA}" --guard-samples "${GUARD}" --min-gap-samples "${MIN_GAP}"
 
 echo

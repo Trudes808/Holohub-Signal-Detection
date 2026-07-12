@@ -32,10 +32,12 @@ as the working root; wrappers and helpers live in subfolders and are called with
 | --- | --- |
 | `config_*.yaml` (top level) | The **current** configs — see the table below. Only these are synced into the container build tree by the rebuild wrapper. |
 | `bash_scripts/` | All container/build/run shell wrappers (`build`, `rebuild`, `run_*`, `enter`, `after_reboot`, and the shared `container_env.sh` / `container_repo_guard.sh`). |
-| `calibration/` | Calibration configs, calibrate scripts (`calibrate_*.sh` + their `.py`), and the emitted `.npy` calibration artifacts. |
+| `calibration/` | Calibration configs, calibrate scripts (`calibrate_*.sh` + their `.py`), the region-extraction helpers (`extract_*_regions.py`), and the emitted `.npy` calibration artifacts. |
 | `old_configs/` | Superseded / experimental configs kept for reference. Not synced automatically; runnable via the wrappers by passing the `old_configs/<name>.yaml` path. |
 | `notes/` | Historical development notes and design plans. |
-| `main.cpp`, `spectrogram_visualization.cu`, `run_offline_cuda_detector_eval.cpp`, … | App and offline-eval sources. Detectors themselves live in `operators/{coherent_power_signal_detector,cuda_dino_detector}`. |
+| `debug_scripts/` | Ad-hoc debug / analysis / plotting helpers. Not part of the build or the documented workflows; nothing in the app depends on them. |
+| `run_cuda_dino_offline_file.py` | Offline-eval driver (documented below). `export_dinov3_torchscript.py` is the one-time DINO TorchScript export used during container setup. |
+| `main.cpp`, `spectrogram_visualization.cu`, `run_offline_cuda_detector_eval.cpp`, `*.hpp`, … | App and offline-eval build sources. The detectors themselves live in `operators/{coherent_power_signal_detector,cuda_dino_detector}`. |
 | `infocom_evals/signal_detection_experiments/` | Offline evaluation notebook + harness and experiment records. |
 
 ### Current configs
@@ -149,15 +151,18 @@ Single file, either detector:
 
 ```bash
 cd applications/usrp_wideband_signal_detection
-python3 run_cuda_dino_offline_file.py <capture.sigmf-data> \
+sudo python3 run_cuda_dino_offline_file.py <capture.sigmf-data> \
 	--detector cuda_dino \
 	--config config_cuda_dino_performance_single_channel.yaml \
 	--output-root /tmp/usrp_spectrograms/offline_cuda_dino/<run>
 # swap --detector coherent_power --config config_coherent_power_perf_perfreq_single_channel.yaml
 ```
 
-`CONTAINER_NAME` is honored by the driver; export it (or source `bash_scripts/container_env.sh`)
-so it targets your container. For interactive sweeps and mask comparisons, use the notebook
+`sudo` is needed (the driver runs the container via `docker` and stages inputs under
+`/tmp/usrp_spectrograms`). The driver auto-resolves the container name from
+`bash_scripts/container_env.sh`, so it targets your container even though `sudo` strips the
+environment (override with `CONTAINER_NAME=... sudo ...` if needed). For interactive sweeps and
+mask comparisons, use the notebook
 [`infocom_evals/signal_detection_experiments/debugging_signal_detection_eval.ipynb`](infocom_evals/signal_detection_experiments/debugging_signal_detection_eval.ipynb),
 which routes both detectors through the same batch binary. Detector masks and spectrogram
 previews are written under the `--output-root` directory.
