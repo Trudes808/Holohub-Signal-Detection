@@ -21,6 +21,9 @@ DETECTOR_BASE_CONFIGS = {
     # own FFT; computer_vision consumes the spectrogram like the DINO/coherent detectors.
     "computer_vision": APP_DIR / "config_computer_vision_single_channel.yaml",
     "power_detection": APP_DIR / "config_power_detection_single_channel.yaml",
+    # Tuned classical baselines (fair, task-aware versions of the two above).
+    "computer_vision_tuned": APP_DIR / "config_computer_vision_tuned_single_channel.yaml",
+    "power_detection_tuned": APP_DIR / "config_power_detection_tuned_single_channel.yaml",
 }
 DEFAULT_DETECTOR = "cuda_dino"
 DEFAULT_CONFIG_PATH = DETECTOR_BASE_CONFIGS[DEFAULT_DETECTOR]

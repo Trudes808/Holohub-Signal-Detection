@@ -19,10 +19,12 @@
 #include <unistd.h>
 #include <coherent_power_signal_detector.hpp>
 #include <computer_vision_baseline.hpp>
+#include <computer_vision_tuned.hpp>
 #include <cuda_dino_detector.hpp>
 #include <dinov3_signal_detector.hpp>
 #include <fft.hpp>
 #include <power_detection.hpp>
+#include <power_detection_tuned.hpp>
 #include <gxf/core/gxf.h>
 #include <holoscan/holoscan.hpp>
 #include <holoscan/operators/holoviz/holoviz.hpp>
@@ -450,7 +452,8 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     // The traditional power detector operates on raw IQ (it runs its own FFT),
     // so it taps the CHDR converter directly and does not consume the
     // spectrogram/FFT detector_source like the other detectors.
-    const bool detector_consumes_raw_iq = enable_detector && detector_type == "power_detection";
+    const bool detector_consumes_raw_iq = enable_detector &&
+      (detector_type == "power_detection" || detector_type == "power_detection_tuned");
     const bool spectrogram_required =
       enable_spectrogram && (spectrogram_save_enabled ||
                              spectrogram_tensor_save_enabled ||
@@ -497,9 +500,11 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     if (enable_detector && detector_type != "dinov3" && detector_type != "cuda_dino" &&
         detector_type != "coherent_power" && detector_type != "power_detection" &&
-        detector_type != "computer_vision") {
+        detector_type != "power_detection_tuned" && detector_type != "computer_vision" &&
+        detector_type != "computer_vision_tuned") {
       HOLOSCAN_LOG_ERROR("Unsupported pipeline.detector_type='{}'. Expected 'dinov3', 'cuda_dino', "
-                         "'coherent_power', 'power_detection', or 'computer_vision'.",
+                         "'coherent_power', 'power_detection', 'power_detection_tuned', "
+                         "'computer_vision', or 'computer_vision_tuned'.",
                          detector_type);
       exit(1);
     }
@@ -509,7 +514,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     std::vector<std::shared_ptr<holoscan::Operator>> cudaDinoDetectorOps;
     std::vector<std::shared_ptr<holoscan::Operator>> coherentDetectorOps;
     std::vector<std::shared_ptr<holoscan::Operator>> powerDetectionOps;
+    std::vector<std::shared_ptr<holoscan::Operator>> powerDetectionTunedOps;
     std::vector<std::shared_ptr<holoscan::Operator>> computerVisionOps;
+    std::vector<std::shared_ptr<holoscan::Operator>> computerVisionTunedOps;
     if (spectrogram_required) {
       spectrogramOps.reserve(static_cast<size_t>(pipeline_channels));
       for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
@@ -564,6 +571,20 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
               from_config("computer_vision_baseline"),
               holoscan::Arg("channel_filter") = channel_index));
         }
+      } else if (detector_type == "computer_vision_tuned") {
+        const int detector_channels = from_config("computer_vision_tuned.num_channels").as<int>();
+        if (detector_channels != pipeline_channels) {
+          HOLOSCAN_LOG_ERROR("computer_vision_tuned.num_channels={} must match chdr_converter.num_channels={} for one-to-one channel routing.",
+                             detector_channels,
+                             pipeline_channels);
+          exit(1);
+        }
+        for (int channel_index = 0; channel_index < std::max(1, detector_channels); ++channel_index) {
+          computerVisionTunedOps.push_back(make_operator<ops::ComputerVisionTuned>(
+              std::string("computerVisionTunedOpCh") + std::to_string(channel_index),
+              from_config("computer_vision_tuned"),
+              holoscan::Arg("channel_filter") = channel_index));
+        }
       } else if (detector_type == "power_detection") {
         const int detector_channels = from_config("power_detection.num_channels").as<int>();
         if (detector_channels != pipeline_channels) {
@@ -581,6 +602,24 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
               from_config("power_detection"),
               holoscan::Arg("burst_size") = static_cast<int>(fft_runtime.actual_fft_size),
               holoscan::Arg("num_bursts") = power_detection_num_bursts,
+              holoscan::Arg("channel_filter") = channel_index));
+        }
+      } else if (detector_type == "power_detection_tuned") {
+        const int detector_channels = from_config("power_detection_tuned.num_channels").as<int>();
+        if (detector_channels != pipeline_channels) {
+          HOLOSCAN_LOG_ERROR("power_detection_tuned.num_channels={} must match chdr_converter.num_channels={} for one-to-one channel routing.",
+                             detector_channels,
+                             pipeline_channels);
+          exit(1);
+        }
+        // Same raw-IQ geometry as power_detection (runs its own windowed FFT).
+        const int power_detection_tuned_num_bursts = from_config("fft.num_bursts").as<int>();
+        for (int channel_index = 0; channel_index < std::max(1, detector_channels); ++channel_index) {
+          powerDetectionTunedOps.push_back(make_operator<ops::PowerDetectionTuned>(
+              std::string("powerDetectionTunedOpCh") + std::to_string(channel_index),
+              from_config("power_detection_tuned"),
+              holoscan::Arg("burst_size") = static_cast<int>(fft_runtime.actual_fft_size),
+              holoscan::Arg("num_bursts") = power_detection_tuned_num_bursts,
               holoscan::Arg("channel_filter") = channel_index));
         }
       } else {
@@ -652,8 +691,12 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
               ? std::string("Dinov3")
           : (detector_type == "power_detection")
               ? std::string("Power Detection")
+          : (detector_type == "power_detection_tuned")
+              ? std::string("Power Detection (Tuned)")
           : (detector_type == "computer_vision")
               ? std::string("Computer Vision")
+          : (detector_type == "computer_vision_tuned")
+              ? std::string("Computer Vision (Tuned)")
               : std::string("Coherent Power");
       spectrogramVisualizerOp = make_operator<ops::SpectrogramToHolovizOp>(
         "spectrogramVisualizerOp",
@@ -747,8 +790,16 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         for (auto& op : computerVisionOps) {
           add_operator(op);
         }
+      } else if (detector_type == "computer_vision_tuned") {
+        for (auto& op : computerVisionTunedOps) {
+          add_operator(op);
+        }
       } else if (detector_type == "power_detection") {
         for (auto& op : powerDetectionOps) {
+          add_operator(op);
+        }
+      } else if (detector_type == "power_detection_tuned") {
+        for (auto& op : powerDetectionTunedOps) {
           add_operator(op);
         }
       } else {
@@ -823,12 +874,19 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           add_flow(detector_source, cudaDinoDetectorOps[static_cast<size_t>(channel_index)]);
         } else if (detector_type == "computer_vision") {
           add_flow(detector_source, computerVisionOps[static_cast<size_t>(channel_index)]);
+        } else if (detector_type == "computer_vision_tuned") {
+          add_flow(detector_source, computerVisionTunedOps[static_cast<size_t>(channel_index)]);
         } else if (detector_type == "power_detection") {
           // Traditional power detector runs on raw IQ, fanned out from the CHDR
           // converter (same source and port as the FFT operator); it performs
           // its own FFT internally and ignores the spectrogram detector_source.
           add_flow(chdrConverterOp,
                    powerDetectionOps[static_cast<size_t>(channel_index)],
+                   {{chdr_port, "in"}});
+        } else if (detector_type == "power_detection_tuned") {
+          // Tuned power detector likewise taps raw IQ and runs its own windowed FFT.
+          add_flow(chdrConverterOp,
+                   powerDetectionTunedOps[static_cast<size_t>(channel_index)],
                    {{chdr_port, "in"}});
         } else {
           add_flow(detector_source, dinoDetectorOps[static_cast<size_t>(channel_index)]);
@@ -867,8 +925,16 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           add_flow(computerVisionOps[static_cast<size_t>(ch)],
                    visualMaskGateOps[static_cast<size_t>(ch)],
                    {{"mask_out", "in"}});
+        } else if (detector_type == "computer_vision_tuned") {
+          add_flow(computerVisionTunedOps[static_cast<size_t>(ch)],
+                   visualMaskGateOps[static_cast<size_t>(ch)],
+                   {{"mask_out", "in"}});
         } else if (detector_type == "power_detection") {
           add_flow(powerDetectionOps[static_cast<size_t>(ch)],
+                   visualMaskGateOps[static_cast<size_t>(ch)],
+                   {{"mask_out", "in"}});
+        } else if (detector_type == "power_detection_tuned") {
+          add_flow(powerDetectionTunedOps[static_cast<size_t>(ch)],
                    visualMaskGateOps[static_cast<size_t>(ch)],
                    {{"mask_out", "in"}});
         } else {

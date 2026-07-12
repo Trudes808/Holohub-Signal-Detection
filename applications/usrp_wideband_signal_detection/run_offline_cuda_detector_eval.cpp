@@ -9,10 +9,12 @@
 
 #include <coherent_power_signal_detector.hpp>
 #include <computer_vision_baseline.hpp>
+#include <computer_vision_tuned.hpp>
 #include <cuda_dino_detector.hpp>
 #include <fft.hpp>
 #include <holoscan/holoscan.hpp>
 #include <power_detection.hpp>
+#include <power_detection_tuned.hpp>
 #include <spectrogram.hpp>
 
 #include <cuda_runtime.h>
@@ -764,7 +766,7 @@ uint64_t ceil_div(uint64_t numerator, uint64_t denominator) {
 void usage(const char* argv0) {
   HOLOSCAN_LOG_INFO(
       "Usage: {} [--config FILE] [--input-file FILE.sigmf-data] [--output-root DIR] "
-      "[--detector cuda_dino|coherent_power|computer_vision|power_detection] [--progress-every N]",
+      "[--detector cuda_dino|coherent_power|computer_vision|computer_vision_tuned|power_detection|power_detection_tuned] [--progress-every N]",
       argv0);
 }
 
@@ -2129,6 +2131,16 @@ const std::vector<DetectorAdapter>& detector_adapter_table() {
                 holoscan::Arg("channel_filter") = overrides.channel_number,
                 holoscan::Arg("emit_stride") = 1);
           }},
+      // Tuned classical CV baseline: same spectrogram tap, stronger algorithm.
+      DetectorAdapter {
+          "computer_vision_tuned",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::ComputerVisionTuned>(
+                "computerVisionTunedOpCh0",
+                app.from_config("computer_vision_tuned"),
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          }},
       // Traditional power detector: taps the raw-IQ source and runs its own FFT, so
       // it needs the FFT geometry (burst_size / num_bursts) the source emits. Mirrors
       // main.cpp's live wiring (burst_size = actual FFT size, num_bursts = fft.num_bursts).
@@ -2138,6 +2150,19 @@ const std::vector<DetectorAdapter>& detector_adapter_table() {
             return app.make_operator<holoscan::ops::PowerDetection>(
                 "powerDetectionOpCh0",
                 app.from_config("power_detection"),
+                holoscan::Arg("burst_size") = static_cast<int>(overrides.fft_burst_size),
+                holoscan::Arg("num_bursts") = overrides.fft_num_bursts,
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          },
+          /*consumes_raw_iq=*/true},
+      // Tuned classical power detector: same raw-IQ tap + own FFT, stronger CFAR.
+      DetectorAdapter {
+          "power_detection_tuned",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::PowerDetectionTuned>(
+                "powerDetectionTunedOpCh0",
+                app.from_config("power_detection_tuned"),
                 holoscan::Arg("burst_size") = static_cast<int>(overrides.fft_burst_size),
                 holoscan::Arg("num_bursts") = overrides.fft_num_bursts,
                 holoscan::Arg("channel_filter") = overrides.channel_number,
