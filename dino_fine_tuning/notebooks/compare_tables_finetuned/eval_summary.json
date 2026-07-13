@@ -1,0 +1,516 @@
+{
+  "n_runs": 56,
+  "n_frame_rows": 18896,
+  "n_region_rows": 228852,
+  "coverage_threshold": 0.1,
+  "tables": {
+    "frame_pixel_metrics_csv": "notebooks/compare_tables_finetuned/frame_pixel_metrics.csv",
+    "region_metrics_csv": "notebooks/compare_tables_finetuned/region_metrics.csv"
+  },
+  "runs": [
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_0",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_0",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_0.sigmf-meta",
+      "frames": 332,
+      "regions": 4077,
+      "regions_matched_source": 4077
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_10",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_10",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_10.sigmf-meta",
+      "frames": 338,
+      "regions": 4089,
+      "regions_matched_source": 4089
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_15",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_15",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_15.sigmf-meta",
+      "frames": 338,
+      "regions": 4076,
+      "regions_matched_source": 4076
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_20",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_20",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_20.sigmf-meta",
+      "frames": 334,
+      "regions": 4088,
+      "regions_matched_source": 4088
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_25",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_25",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_25.sigmf-meta",
+      "frames": 335,
+      "regions": 4108,
+      "regions_matched_source": 4108
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_30",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_30",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_30.sigmf-meta",
+      "frames": 343,
+      "regions": 4122,
+      "regions_matched_source": 4122
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_30_v2",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_30_v2",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_30_v2.sigmf-meta",
+      "frames": 337,
+      "regions": 4071,
+      "regions_matched_source": 4071
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_35",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_35",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_35.sigmf-meta",
+      "frames": 334,
+      "regions": 4080,
+      "regions_matched_source": 4080
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_40",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_40",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_40.sigmf-meta",
+      "frames": 340,
+      "regions": 4099,
+      "regions_matched_source": 4099
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_45",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_45",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_45.sigmf-meta",
+      "frames": 336,
+      "regions": 4076,
+      "regions_matched_source": 4076
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_5",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_5",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_5.sigmf-meta",
+      "frames": 339,
+      "regions": 4071,
+      "regions_matched_source": 4071
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_50",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_50",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_50.sigmf-meta",
+      "frames": 340,
+      "regions": 4088,
+      "regions_matched_source": 4088
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_55",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_55",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_55.sigmf-meta",
+      "frames": 340,
+      "regions": 4077,
+      "regions_matched_source": 4077
+    },
+    {
+      "detector": "m1_frozen",
+      "file_stem": "attenuation_dB_60",
+      "run_dir": "notebooks/sweep_finetuned/m1_frozen/attenuation_dB_60",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_60.sigmf-meta",
+      "frames": 338,
+      "regions": 4091,
+      "regions_matched_source": 4091
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_0",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_0",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_0.sigmf-meta",
+      "frames": 332,
+      "regions": 4077,
+      "regions_matched_source": 4077
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_10",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_10",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_10.sigmf-meta",
+      "frames": 338,
+      "regions": 4089,
+      "regions_matched_source": 4089
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_15",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_15",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_15.sigmf-meta",
+      "frames": 338,
+      "regions": 4076,
+      "regions_matched_source": 4076
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_20",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_20",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_20.sigmf-meta",
+      "frames": 334,
+      "regions": 4088,
+      "regions_matched_source": 4088
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_25",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_25",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_25.sigmf-meta",
+      "frames": 335,
+      "regions": 4108,
+      "regions_matched_source": 4108
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_30",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_30",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_30.sigmf-meta",
+      "frames": 343,
+      "regions": 4122,
+      "regions_matched_source": 4122
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_30_v2",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_30_v2",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_30_v2.sigmf-meta",
+      "frames": 337,
+      "regions": 4071,
+      "regions_matched_source": 4071
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_35",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_35",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_35.sigmf-meta",
+      "frames": 334,
+      "regions": 4080,
+      "regions_matched_source": 4080
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_40",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_40",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_40.sigmf-meta",
+      "frames": 340,
+      "regions": 4099,
+      "regions_matched_source": 4099
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_45",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_45",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_45.sigmf-meta",
+      "frames": 336,
+      "regions": 4076,
+      "regions_matched_source": 4076
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_5",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_5",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_5.sigmf-meta",
+      "frames": 339,
+      "regions": 4071,
+      "regions_matched_source": 4071
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_50",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_50",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_50.sigmf-meta",
+      "frames": 340,
+      "regions": 4088,
+      "regions_matched_source": 4088
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_55",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_55",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_55.sigmf-meta",
+      "frames": 340,
+      "regions": 4077,
+      "regions_matched_source": 4077
+    },
+    {
+      "detector": "m1_ft",
+      "file_stem": "attenuation_dB_60",
+      "run_dir": "notebooks/sweep_finetuned/m1_ft/attenuation_dB_60",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_60.sigmf-meta",
+      "frames": 338,
+      "regions": 4091,
+      "regions_matched_source": 4091
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_0",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_0",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_0.sigmf-meta",
+      "frames": 332,
+      "regions": 4077,
+      "regions_matched_source": 4077
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_10",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_10",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_10.sigmf-meta",
+      "frames": 338,
+      "regions": 4089,
+      "regions_matched_source": 4089
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_15",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_15",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_15.sigmf-meta",
+      "frames": 338,
+      "regions": 4076,
+      "regions_matched_source": 4076
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_20",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_20",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_20.sigmf-meta",
+      "frames": 334,
+      "regions": 4088,
+      "regions_matched_source": 4088
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_25",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_25",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_25.sigmf-meta",
+      "frames": 335,
+      "regions": 4108,
+      "regions_matched_source": 4108
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_30",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_30",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_30.sigmf-meta",
+      "frames": 343,
+      "regions": 4122,
+      "regions_matched_source": 4122
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_30_v2",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_30_v2",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_30_v2.sigmf-meta",
+      "frames": 337,
+      "regions": 4071,
+      "regions_matched_source": 4071
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_35",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_35",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_35.sigmf-meta",
+      "frames": 334,
+      "regions": 4080,
+      "regions_matched_source": 4080
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_40",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_40",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_40.sigmf-meta",
+      "frames": 340,
+      "regions": 4099,
+      "regions_matched_source": 4099
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_45",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_45",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_45.sigmf-meta",
+      "frames": 336,
+      "regions": 4076,
+      "regions_matched_source": 4076
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_5",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_5",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_5.sigmf-meta",
+      "frames": 339,
+      "regions": 4071,
+      "regions_matched_source": 4071
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_50",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_50",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_50.sigmf-meta",
+      "frames": 340,
+      "regions": 4088,
+      "regions_matched_source": 4088
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_55",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_55",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_55.sigmf-meta",
+      "frames": 340,
+      "regions": 4077,
+      "regions_matched_source": 4077
+    },
+    {
+      "detector": "m2_frozen",
+      "file_stem": "attenuation_dB_60",
+      "run_dir": "notebooks/sweep_finetuned/m2_frozen/attenuation_dB_60",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_60.sigmf-meta",
+      "frames": 338,
+      "regions": 4091,
+      "regions_matched_source": 4091
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_0",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_0",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_0.sigmf-meta",
+      "frames": 332,
+      "regions": 4077,
+      "regions_matched_source": 4077
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_10",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_10",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_10.sigmf-meta",
+      "frames": 338,
+      "regions": 4089,
+      "regions_matched_source": 4089
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_15",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_15",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_15.sigmf-meta",
+      "frames": 338,
+      "regions": 4076,
+      "regions_matched_source": 4076
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_20",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_20",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_20.sigmf-meta",
+      "frames": 334,
+      "regions": 4088,
+      "regions_matched_source": 4088
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_25",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_25",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_25.sigmf-meta",
+      "frames": 335,
+      "regions": 4108,
+      "regions_matched_source": 4108
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_30",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_30",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_30.sigmf-meta",
+      "frames": 343,
+      "regions": 4122,
+      "regions_matched_source": 4122
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_30_v2",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_30_v2",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_30_v2.sigmf-meta",
+      "frames": 337,
+      "regions": 4071,
+      "regions_matched_source": 4071
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_35",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_35",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_35.sigmf-meta",
+      "frames": 334,
+      "regions": 4080,
+      "regions_matched_source": 4080
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_40",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_40",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_40.sigmf-meta",
+      "frames": 340,
+      "regions": 4099,
+      "regions_matched_source": 4099
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_45",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_45",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_45.sigmf-meta",
+      "frames": 336,
+      "regions": 4076,
+      "regions_matched_source": 4076
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_5",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_5",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_5.sigmf-meta",
+      "frames": 339,
+      "regions": 4071,
+      "regions_matched_source": 4071
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_50",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_50",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_50.sigmf-meta",
+      "frames": 340,
+      "regions": 4088,
+      "regions_matched_source": 4088
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_55",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_55",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_55.sigmf-meta",
+      "frames": 340,
+      "regions": 4077,
+      "regions_matched_source": 4077
+    },
+    {
+      "detector": "m2_ft",
+      "file_stem": "attenuation_dB_60",
+      "run_dir": "notebooks/sweep_finetuned/m2_ft/attenuation_dB_60",
+      "source_meta": "/home/bqn82/captures/attenuation_dB_60.sigmf-meta",
+      "frames": 338,
+      "regions": 4091,
+      "regions_matched_source": 4091
+    }
+  ]
+}

@@ -66,3 +66,11 @@ applications/usrp_wideband_signal_detection/generated_configs/
 
 # Batch offline-eval outputs (masks/GT/manifests + state + metrics tables) — large, regenerable
 applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_experiments/batch_runs/
+
+# dino fine tuning artifacts
+dino_fine_tuning/checkpoints/
+dino_fine_tuning/eval_out/
+dino_fine_tuning/notebooks/sweep*
+
+# claude dump files
+.claude/

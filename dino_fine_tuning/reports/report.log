@@ -1,0 +1,9 @@
+[report] figures:
+  reports/figs/pixel_metrics_vs_atten.png
+  reports/figs/fp_rate_vs_atten.png
+  reports/figs/detection_vs_atten.png
+  reports/figs/detection_by_class.png
+  reports/figs/detection_by_bandwidth.png
+  reports/figs/detection_by_length.png
+  reports/figs/class_atten_heatmap_M2_ft.png
+[report] wrote metrics_tables.md + summary.json

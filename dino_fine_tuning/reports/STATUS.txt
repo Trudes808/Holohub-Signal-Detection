@@ -1,0 +1,21 @@
+[2026-07-07 18:30:53] === FULL RUN START ===
+[2026-07-07 18:30:53] STEP 1/4 build dataset (all captures)
+[2026-07-07 18:33:26] dataset counts: 
+[2026-07-07 18:33:26] STEP 2/4 train 4 models
+[2026-07-07 18:33:26]   [M1_frozen] training (mode=frozen --atten-max 30)
+[2026-07-07 22:49:15] === FULL RUN START ===
+[2026-07-07 22:49:15] STEP 1/4 dataset already built, skipping (FORCE_BUILD=1 to rebuild)
+[2026-07-07 22:49:15] dataset counts: 
+[2026-07-07 22:49:15] STEP 2/4 train 4 models
+[2026-07-07 22:49:15]   [M1_frozen] training (mode=frozen --atten-max 30)
+[2026-07-07 23:35:50]   [M1_ft] training (mode=ft_lastN --atten-max 30)
+[2026-07-08 00:42:30]   [M2_frozen] training (mode=frozen )
+[2026-07-08 01:55:35]   [M2_ft] training (mode=ft_lastN )
+[2026-07-08 03:43:46] STEP 3/4 evaluate on shared all-dB test split
+[2026-07-08 03:43:46]   [eval energy]
+[2026-07-08 03:44:08]   [eval M1_frozen]
+[2026-07-08 03:46:17]   [eval M1_ft]
+[2026-07-08 03:48:25]   [eval M2_frozen]
+[2026-07-08 03:50:33]   [eval M2_ft]
+[2026-07-08 03:52:42] STEP 4/4 build report figures + tables
+[2026-07-08 03:52:43] === FULL RUN DONE ===
