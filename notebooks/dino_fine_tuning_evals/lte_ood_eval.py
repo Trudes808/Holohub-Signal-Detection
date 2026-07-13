@@ -13,6 +13,7 @@
 
 # %%
 from pathlib import Path
+import os
 import sys, warnings
 import numpy as np
 import pandas as pd
@@ -21,11 +22,13 @@ from IPython.display import display
 warnings.filterwarnings("ignore")
 
 FT_ROOT      = Path.home() / "Holohub-Signal-Detection/dino_fine_tuning"
+EVAL_ROOT    = Path(os.environ.get("DINO_EVAL_ROOT",
+                    str(Path.home() / "Holohub-Signal-Detection/notebooks/dino_fine_tuning_evals")))   # eval tables + mask-sweep dirs; override via env DINO_EVAL_ROOT
 DINO_REPO    = Path.home() / "dinov3"
 EVAL_DIR     = Path.home() / ("Holohub-Signal-Detection/applications/usrp_wideband_signal_detection"
                               "/infocom_evals/signal_detection_experiments")
-DETS_ROOT    = FT_ROOT / "notebooks/sweep_lte"
-TABLES_DIR   = FT_ROOT / "notebooks/compare_tables_lte"
+DETS_ROOT    = EVAL_ROOT / "sweeps" / "sweep_lte"
+TABLES_DIR   = EVAL_ROOT / "compare_tables" / "compare_tables_lte"
 CAPTURE_DIRS = [Path.home() / "captures/lte"]
 FIG_DIR      = FT_ROOT / "reports/figs_lte"; FIG_DIR.mkdir(parents=True, exist_ok=True)
 DET_THRESHOLD = 0.1
@@ -185,7 +188,7 @@ if len(noise_fr):
            else m2n.iloc[len(m2n) // 2])
     stem, fr = row.file_stem, int(row.frame_number)
     b = v.load_frame_bundle_smart(DETS_ROOT, fr, file_stem=stem, capture_dirs=CAPTURE_DIRS)
-    on = {DET_SHORT[k]: 100 * (b.detector_masks[k] > 0).mean() for k in DET_ORDER}
+    on = {DET_SHORT[k]: 100 * (b.detector_masks[k] > 0).mean() for k in DET_ORDER if k in b.detector_masks}
     print(f"[NOISE-ONLY] {stem} frame {fr} ({row.attenuation_db:.0f} dB) — % of frame flagged: " +
           ", ".join(f"{k}={p:.2f}%" for k, p in on.items()))
     b.detector_masks = {DET_LABEL[k]: b.detector_masks[k] for k in DET_ORDER if k in b.detector_masks}

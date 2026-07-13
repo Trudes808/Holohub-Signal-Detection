@@ -19,6 +19,7 @@
 
 # %%
 from pathlib import Path
+import os
 import sys, json, warnings
 import numpy as np
 import matplotlib.pyplot as plt
@@ -28,6 +29,8 @@ warnings.filterwarnings("ignore")
 # ---- paths (edit if your layout differs) ----
 DINO_REPO   = Path.home() / "dinov3"
 FT_ROOT     = Path.home() / "Holohub-Signal-Detection/dino_fine_tuning"
+EVAL_ROOT    = Path(os.environ.get("DINO_EVAL_ROOT",
+                    str(Path.home() / "Holohub-Signal-Detection/notebooks/dino_fine_tuning_evals")))   # eval tables + mask-sweep dirs; override via env DINO_EVAL_ROOT
 EVAL_DIR    = Path.home() / ("Holohub-Signal-Detection/applications/usrp_wideband_signal_detection"
                              "/infocom_evals/signal_detection_experiments")
 BATCH_ROOT  = Path("/tmp/usrp_spectrograms/batch_eval/sweep_20260630")
@@ -35,7 +38,7 @@ CAPTURE_DIRS = [Path.home() / "captures"]
 FIG_DIR     = FT_ROOT / "reports/figs_compare"; FIG_DIR.mkdir(parents=True, exist_ok=True)
 # Aggregate numbers come from the SAME canonical tables as batch_eval_review_three_detectors.ipynb
 # (produced by eval_detector_masks.py over all three detectors) — so both notebooks agree exactly.
-TABLES_DIR  = FT_ROOT / "notebooks/compare_tables_canonical"
+TABLES_DIR  = EVAL_ROOT / "compare_tables" / "compare_tables_canonical"
 
 # ---- which fine-tuned model to compare ----
 FT_CKPT   = FT_ROOT / "checkpoints/M1_ft/best.pt"     # best overall IoU/F1; swap to M2_ft for best 45-50 dB

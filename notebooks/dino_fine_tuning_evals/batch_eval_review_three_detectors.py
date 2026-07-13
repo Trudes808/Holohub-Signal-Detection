@@ -19,18 +19,21 @@
 
 # %%
 from pathlib import Path
+import os
 import sys, json, subprocess, warnings
 import matplotlib.pyplot as plt
 from IPython.display import display
 warnings.filterwarnings("ignore")
 
 FT_ROOT      = Path.home() / "Holohub-Signal-Detection/dino_fine_tuning"
+EVAL_ROOT    = Path(os.environ.get("DINO_EVAL_ROOT",
+                    str(Path.home() / "Holohub-Signal-Detection/notebooks/dino_fine_tuning_evals")))   # eval tables + mask-sweep dirs; override via env DINO_EVAL_ROOT
 DINO_REPO    = Path.home() / "dinov3"
 EVAL_DIR     = Path.home() / ("Holohub-Signal-Detection/applications/usrp_wideband_signal_detection"
                               "/infocom_evals/signal_detection_experiments")
 BATCH_ROOT   = Path("/tmp/usrp_spectrograms/batch_eval/sweep_20260630")   # deployed masks (for panels)
-DETS_ROOT    = FT_ROOT / "notebooks/sweep_detectors"                       # combined multi-detector run root
-TABLES_DIR   = FT_ROOT / "notebooks/compare_tables_canonical"             # eval_detector_masks output
+DETS_ROOT    = EVAL_ROOT / "sweeps" / "sweep_detectors"                       # combined multi-detector run root
+TABLES_DIR   = EVAL_ROOT / "compare_tables" / "compare_tables_canonical"             # eval_detector_masks output
 CAPTURE_DIRS = [Path.home() / "captures"]
 DET_THRESHOLD = 0.1   # coverage>=this counts as 'detected' (matches the original; GT are filled boxes; try 0.05-0.3)
 

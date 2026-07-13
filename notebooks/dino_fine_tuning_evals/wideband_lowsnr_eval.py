@@ -16,6 +16,7 @@
 
 # %%
 from pathlib import Path
+import os
 import sys, warnings
 import numpy as np
 import pandas as pd
@@ -24,11 +25,13 @@ from IPython.display import display
 warnings.filterwarnings("ignore")
 
 FT_ROOT      = Path.home() / "Holohub-Signal-Detection/dino_fine_tuning"
+EVAL_ROOT    = Path(os.environ.get("DINO_EVAL_ROOT",
+                    str(Path.home() / "Holohub-Signal-Detection/notebooks/dino_fine_tuning_evals")))   # eval tables + mask-sweep dirs; override via env DINO_EVAL_ROOT
 DINO_REPO    = Path.home() / "dinov3"
 EVAL_DIR     = Path.home() / ("Holohub-Signal-Detection/applications/usrp_wideband_signal_detection"
                               "/infocom_evals/signal_detection_experiments")
-DETS_ROOT    = FT_ROOT / "notebooks/sweep_detectors"
-TABLES_DIR   = FT_ROOT / "notebooks/compare_tables_canonical"
+DETS_ROOT    = EVAL_ROOT / "sweeps" / "sweep_detectors"
+TABLES_DIR   = EVAL_ROOT / "compare_tables" / "compare_tables_canonical"
 CAPTURE_DIRS = [Path.home() / "captures"]
 FIG_DIR      = FT_ROOT / "reports/figs_wideband"; FIG_DIR.mkdir(parents=True, exist_ok=True)
 DET_THRESHOLD = 0.1
