@@ -311,6 +311,7 @@ endforeach()
     config_cuda_dino_performance_single_channel.yaml
     config_coherent_power_performance_single_channel_replay.yaml
     config_coherent_power_capture_chdr_single_channel.yaml
+    config_coherent_power_performance_emit_stride1_two_channel.yaml
   )
 
   set(USRP_WIDEBAND_CONFIG_OUTPUTS)

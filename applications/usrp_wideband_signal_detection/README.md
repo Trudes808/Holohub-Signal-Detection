@@ -49,6 +49,7 @@ as the working root; wrappers and helpers live in subfolders and are called with
 | `config_cuda_dino_performance_single_channel.yaml` | cuda_dino | Live CUDA DINO detector. |
 | `config_coherent_power_performance_single_channel_replay.yaml` | coherent_power | Cable-loopback replay of a captured SigMF file. |
 | `config_coherent_power_capture_chdr_single_channel.yaml` | coherent_power | Capture a frozen CHDR/IQ snapshot for offline replay. |
+| `config_coherent_power_performance_emit_stride1_two_channel.yaml` | coherent_power | Live **dual-channel** (two 500 Msps channels); binds NIC `0000:a2:00.1` with two flows (ch0→`udp_dst 1234`, ch1→`1235`). |
 
 Calibration configs live in `calibration/`; superseded configs live in `old_configs/`.
 
@@ -232,6 +233,65 @@ Dynamic-mode knobs (config block): `dynamic_floor_init_db` (40.0), `dynamic_floo
 `dynamic_floor_window_slots` (8), `dynamic_floor_slot_frames` (16, effective window =
 slots×slot_frames frames), `dynamic_floor_warmup_frames` (0). `per_freq_threshold_offset_db` sets
 the firing margin above the floor in every mode.
+
+---
+
+## Config reference
+
+Each config is a Holoscan YAML with the blocks below. Only the knobs you'd actually tune are
+listed; unlisted keys are structural. Detector blocks are read only for the active
+`pipeline.detector_type`.
+
+**`pipeline`** — `enable_spectrogram` / `enable_detector` (toggle stages); `detector_type`
+(`coherent_power` | `cuda_dino`); `log_from_spectrogram` (route the throughput logger off the
+spectrogram instead of FFT).
+
+**`advanced_network.cfg`** (DPDK ingest) — `interfaces[].address` (PCIe address of the NIC to
+bind, e.g. `0000:a2:00.0`); `interfaces[].rx.flows[].match.{udp_src,udp_dst}` (per-channel packet
+filter — ch0 `udp_dst 1234`, ch1 `1235`); `queues` / `memory_regions` (one RX queue + GPU/CPU
+buffer pools per channel).
+
+**`chdr_converter`** — `num_channels` (active RF channels; must equal the detector's
+`num_channels`); `channel_sample_rates_hz` / `channel_center_frequencies_hz` (per-channel rate/
+freq — must match the sender); `num_complex_samples_per_packet`, `num_packets_per_fft`,
+`num_ffts_per_batch`, `num_simul_batches` (ingest batching).
+
+**`fft`** — `span` (analyzed bandwidth in Hz — match the sender rate); `transform_points` (FFT
+size in bins); `resolution` (bin width ≈ `span / transform_points`); `reference_span_hz` /
+`reference_fft_size` (reference pair the runtime uses to scale the live FFT); see **Stream
+alignment**.
+
+**`visualization.renderer`** (display only — **no effect on detection**) — `output_width`/
+`output_height` + `holoviz.width`/`height` (window size); `db_floor` / `db_ceil` (spectrogram
+dB-normalization range — lower ceiling = more contrast); `blue_limit` / `red_limit` (color-scale
+clamps); `center_frequency_hz` (frequency-axis readout — keep matched to the sender `--freq`);
+`refresh_hz` (UI redraw rate); `demo_title` / `demo_subtitle` (on-screen titles); `rows_per_frame`
+/ `render_every_n_frames` (waterfall scroll cadence); `num_channels` (channels shown).
+
+**`coherent_power_signal_detector`** —
+- `fast_power_floor_db` / `fast_power_span_db` / `fast_score_threshold` — fast-path score
+  normalization window and detection threshold (the primary sensitivity knobs).
+- `fast_strong_rescue_enable` / `_excess_db` / `_min_time_bins` — OR strong, frequency-narrow
+  signals back in after morphology.
+- `per_freq_threshold_mode` (`calibrated` | `dynamic` | `static`) + `per_freq_threshold_offset_db`
+  + `per_freq_threshold_path` — per-frequency noise-floor fill; `dynamic_floor_*` tune the
+  live-learned mode. See **Coherent-power per-frequency floor modes** above.
+- `live_emit_freq_persistence_window` / `_min_hits` — temporal persistence gating on the mask.
+- `frontend_reference_q` / `_smooth_sigma` / `_max_boost_db` / `_signal_cap_db` — spectral
+  front-end correction.
+- `filter_detection_mask`, `emit_stride`, `ignore_sideband_hz` — mask post-filter, emit decimation,
+  edge guard.
+
+**`cuda_dino_detector`** —
+- `coherence_band_threshold` (+ `_threshold_quantile`, `_open_time_px`, `_min_area_px`) — coherence-band gate.
+- `dino_structure_open_len` / `dino_structure_threshold_quantile` — DINO structure mask.
+- `raw_dino_positional_template_path` / `_strength` / `raw_dino_positional_deweight` — positional (RoPE) template suppression.
+- `dino_coherence_gate_floor` / `_span_db` — coherence gate; `hybrid_fusion_mode`
+  (`coherence_primary`), `coherence_primary_legacy_score` (`max`), `dino_contribution_strength` —
+  fusion combine.
+- `chunk_bandwidth_hz` / `chunk_overlap_hz`, `input_height`/`input_width`, `patch_size`,
+  `max_tokens_per_inference`, `torch_dtype` — chunk tiling and model I/O.
+- `frontend_correction_*` — spectral front-end correction (same idea as the coherent one).
 
 ---
 
