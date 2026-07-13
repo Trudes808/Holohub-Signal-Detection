@@ -125,6 +125,10 @@ add_holohub_application(usrp_wideband_signal_detection DEPENDS
                         OPERATORS advanced_network
                                   cuda_dino_detector
                                   coherent_power_signal_detector
+                                  computer_vision_baseline
+                                  computer_vision_tuned
+                                  power_detection
+                                  power_detection_tuned
                                   fft
                                   spectrogram
                                   dinov3_signal_detector)

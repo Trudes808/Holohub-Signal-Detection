@@ -32,12 +32,14 @@ Backbone weights (DINOv3 ViT-B/16, pretrained):
 | **Wide-bandwidth low-SNR eval** (OFDM / 5G / 802.11ax) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/wideband_lowsnr_eval.ipynb` |
 | **LTE OOD eval** (unseen waveform; detection/recall/coverage/FP vs SNR) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/lte_ood_eval.ipynb` |
 | **Live-data M1/M2 masks** (unlabeled; spectrogram · M1 · M2) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/live_data_masks.ipynb` |
+| **Frozen vs. ft variants** (is unfreezing worth the compute?) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/finetuned_variants_eval.ipynb` |
 
 ### Reports & tables
 | item | absolute path |
 |---|---|
 | Results writeup (figures + narrative) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/reports/report.md` |
 | Pipeline / system documentation | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/reports/pipeline.md` |
+| Frozen-vs-ft (compute trade-off) report | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/reports/finetuned_variants_report.md` |
 | Canonical 4-detector metric tables | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/compare_tables_canonical/{region_metrics,frame_pixel_metrics}.csv` |
 | Per-model eval CSVs | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/eval_out/<model>/` |
 | Combined detector-mask run root (all 4 detectors) | `/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/notebooks/sweep_detectors/` |

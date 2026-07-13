@@ -191,7 +191,7 @@ print("\nDetection rate by waveform class (all attenuations):"); display(cls)
 
 
 # %% [markdown]
-# ## Caveats (read before quoting numbers)
+# ## 7. Caveats (read before quoting numbers)
 #
 # 1. **Metrics are identical across detectors** — all scored by `eval_detector_masks.py`
 #    over `sweep_20260630`; only the masks differ. Deployed detectors (coherent_power,
@@ -209,3 +209,101 @@ print("\nDetection rate by waveform class (all attenuations):"); display(cls)
 #    adaptive thresholds only).
 # 6. `DET_THRESHOLD` matches the original notebook (0.1). Rebuild tables via
 #    `src/assemble_six_detectors.py` (see the setup cell + `SIX_DETECTOR_WORKFLOW.md`).
+
+# %% [markdown]
+# ## 8. Why Power Detection underperforms — and how to improve it
+#
+# Power Detection sits at ~0.01 region-detection rate across the entire sweep (§6) — the
+# weakest of all six detectors, essentially flat and near-zero *even at the highest SNR*.
+# That is not a low-SNR problem; it is an algorithmic one. This section shows the
+# mechanism with data and lists concrete, code-level fixes.
+#
+# **The symptom.** The masks are not empty at random — the operator fires on almost every
+# frame, but lights up only a handful of pixels (mean box coverage ≈ 0.7 % at high SNR),
+# so a region almost never reaches the 10 %-coverage bar used to call it "detected." It
+# detects signal *edges*, not signal *bodies*.
+#
+# **The mechanism: CA-CFAR self-masking on wideband signals.** The operator
+# (`operators/power_detection/power_detection.cu`, `cfar_zscore_kernel`) runs a 1-D
+# *cell-averaging* CFAR **across frequency**: for each time–frequency cell it estimates a
+# local mean and standard deviation from `moving_average_window = 64` training bins on each
+# side (skipping `guard_bins = 4`) and flags the cell only when
+# `(x − mean) / σ > zscore_threshold = 6`. When a signal is wider than the guard region —
+# i.e. essentially every signal here except the very narrowest — the training window sits
+# **on the signal itself**. The local mean and σ rise *with* the signal, so the
+# cell-under-test no longer stands out and the z-score collapses. Only the signal's
+# leading/trailing edges (where one training window still lies in noise) or sub-window
+# narrowband spikes ever clear the threshold.
+#
+# The diagnostic below isolates this from SNR by looking only at the strongest signals
+# (attenuation ≤ 10 dB), broken out by occupied bandwidth:
+
+# %%
+# Diagnostic: isolate the self-masking mechanism from SNR by looking only at the
+# strongest signals (attenuation <= 10 dB). Detection collapses with signal WIDTH,
+# not signal strength -- the fingerprint of CA-CFAR self-masking.
+import pandas as pd
+_rdf = pd.DataFrame(region)
+_rdf["cov"]  = _rdf["coverage"].astype(float)
+_rdf["det"]  = _rdf["cov"] >= DET_THRESHOLD
+_rdf["attn"] = pd.to_numeric(_rdf["attenuation_db"], errors="coerce")
+_hi   = _rdf[_rdf["attn"] <= 10]
+_show = [d for d in ["power_detection", "coherent_power", "cuda_dino"] if d in set(_hi["detector"])]
+det_tab = (_hi.pivot_table(index="bandwidth", columns="detector", values="det", aggfunc="mean")
+              .reindex(pe.BW_ORDER)[_show].rename(columns=DET_LABEL).round(2))
+cov_tab = (_hi.pivot_table(index="bandwidth", columns="detector", values="cov", aggfunc="mean")
+              .reindex(pe.BW_ORDER)[_show].rename(columns=DET_LABEL).round(3))
+print("Detection rate by bandwidth at HIGH SNR (attenuation ≤ 10 dB):"); display(det_tab)
+print("Mean box coverage by bandwidth at HIGH SNR:"); display(cov_tab)
+print(f"Power Detection mean coverage over ALL high-SNR regions: "
+      f"{_hi.loc[_hi.detector=='power_detection','cov'].mean():.4f}  (edges only)")
+
+# %% [markdown]
+# The pattern is unambiguous: at high SNR, Power Detection detects ~10 % of the narrowest
+# (<1–2 MHz) signals and **0 %** of everything wider, while Coherent Power — which thresholds
+# against a global noise floor — detects 60–90 % across *all* bandwidths. The failure tracks
+# signal **width**, not signal **strength**: the fingerprint of CFAR self-masking (masking by
+# extended / interfering targets).
+#
+# **Two secondary contributors.** (1) `zscore_threshold = 6` is very conservative
+# (≈1e-9 false-alarm rate for Gaussian noise); even the narrowband signals that escape
+# self-masking clear it only ~10 % of the time. (2) The CFAR is single-frame and
+# frequency-only — it never integrates energy over time, so weak / low-SNR signals never
+# accumulate enough SNR to fire. Combined with the edge-only masks, this compounds against
+# the coverage ≥ 0.1 scoring (the sparse-mask penalty already noted in §7).
+#
+# ### How to improve it (roughly by impact; all within the statistical, system-agnostic brief)
+#
+# 1. **Replace the local training window with a robust global noise floor.** The noise floor
+#    is the dominant population in a frame, so estimate it per-frame (or per-time-row) with a
+#    robust statistic — median + k·MAD, or the mode / low percentile of the dB histogram — and
+#    flag `x > floor + k·MAD`. Because the reference is no longer a local window sitting on the
+#    signal, self-masking disappears and the whole signal body lights up (raising coverage
+#    directly). This is the single highest-leverage change, and it is essentially what makes
+#    Coherent Power work on this data.
+# 2. **If keeping a sliding window, use OS-CFAR or GO/SO-CFAR instead of cell-averaging.**
+#    Ordered-statistic CFAR takes the k-th ranked training cell rather than the mean, which is
+#    robust to signal energy leaking into the reference window. Cell-averaging (CA) is exactly
+#    the variant that self-masks on extended targets.
+# 3. **Lower / FAR-calibrate the threshold.** Drop `zscore_threshold` from 6 to ~3–4, or set it
+#    from a target false-alarm rate against the *robust* noise distribution rather than a fixed
+#    sigma.
+# 4. **Integrate over time and require persistence.** Non-coherently average power over several
+#    bursts before thresholding to raise SNR for weak signals, and/or require a bin to be flagged
+#    across consecutive time rows. This recovers low-SNR detections and fills the signal body
+#    while cutting isolated false alarms.
+# 5. **Prefer a self-calibrating per-bin noise floor over the current `baseline` mode.** The
+#    `baseline` mode learns a per-bin mean/σ from the first `baseline_frames` frames and only
+#    works if those frames are signal-free. A minimum-statistics estimator (track a running low
+#    percentile per frequency bin over time) self-calibrates even when signals are always present.
+# 6. *(Optional, cosmetic for the metric.)* A light morphological close on the thresholded mask
+#    converts edge pixels into filled regions so coverage-based scoring credits the detection —
+#    but fix #1 already lights up the body, which is the cleaner solution and avoids reinventing
+#    the Computer Vision baseline.
+#
+# **Bottom line.** Power Detection's poor score is dominated by a fixable design choice —
+# cell-averaging CFAR across frequency self-masks on the wideband signals that make up most of
+# this dataset — not by any pipeline or evaluation error. Swapping the local CA reference for a
+# robust global / temporal noise-floor estimate (and relaxing the 6σ threshold) should move it
+# from ~0.01 to a genuine traditional-baseline detection curve, most visibly on the ≥2 MHz
+# signals where it currently reads exactly zero.

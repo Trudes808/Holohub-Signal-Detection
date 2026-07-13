@@ -60,6 +60,8 @@ def main():
     ap.add_argument("--ft-eval-meta", default=str(FT_ROOT / "eval_out/M1_ft/eval_meta.json"),
                     help="eval_meta.json with the model's val-tuned decision threshold")
     ap.add_argument("--ref-detector", default="cuda_dino", help="detector to mirror GT/manifest from")
+    ap.add_argument("--deployed", default="coherent_power,cuda_dino",
+                    help="comma-separated deployed detectors to symlink into out-root ('' to skip)")
     ap.add_argument("--stems", default=None)
     args = ap.parse_args()
 
@@ -67,9 +69,9 @@ def main():
     out_root = Path(args.out_root)
     caps = [Path(args.captures_dir)]
 
-    # combined root: symlink the two deployed detectors, generate finetuned_dino
+    # combined root: optionally symlink deployed detectors, then generate the FT masks
     (out_root).mkdir(parents=True, exist_ok=True)
-    for d in ("coherent_power", "cuda_dino"):
+    for d in [x for x in args.deployed.split(",") if x]:
         _link(sweep / d, out_root / d)
 
     train_cfg = yaml.safe_load(open(FT_ROOT / "configs/train.yaml"))
