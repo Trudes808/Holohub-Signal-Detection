@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../usrp_freq_detection/CHDR_converter/chdr_rx.h"
 #include "fft_runtime_config.hpp"
+#include "sigmf_file_sink.hpp"
+#include "signal_snipper.hpp"
 #include "spectrogram_visualization.hpp"
 #include "advanced_network/common.h"
 #include <algorithm>
@@ -425,6 +427,12 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     const bool enable_spectrogram = from_config("pipeline.enable_spectrogram").as<bool>();
     const bool enable_detector = from_config("pipeline.enable_detector").as<bool>();
+    // Optional signal-snipper branch: cuts detected signals out of the stream and writes SigMF.
+    // Requires the detector (it consumes the detector mask). Defaults off so existing configs are
+    // unaffected.
+    const bool enable_signal_snipper =
+        enable_detector &&
+        usrp_wideband::from_config_or<bool>(*this, "pipeline.enable_signal_snipper", false);
     const std::string detector_type = from_config("pipeline.detector_type").as<std::string>();
     const bool log_from_spectrogram = from_config("pipeline.log_from_spectrogram").as<bool>();
     const bool enable_visualization = from_config("visualization.enable").as<bool>();
@@ -532,6 +540,22 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
               from_config("coherent_power_signal_detector"),
               holoscan::Arg("channel_filter") = channel_index));
         }
+      }
+    }
+
+    std::vector<std::shared_ptr<holoscan::Operator>> signalSnipperOps;
+    std::vector<std::shared_ptr<holoscan::Operator>> sigmfFileSinkOps;
+    if (enable_signal_snipper) {
+      signalSnipperOps.reserve(static_cast<size_t>(pipeline_channels));
+      sigmfFileSinkOps.reserve(static_cast<size_t>(pipeline_channels));
+      for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+        signalSnipperOps.push_back(make_operator<ops::SignalSnipperOp>(
+            std::string("signalSnipperOpCh") + std::to_string(channel_index),
+            from_config("signal_snipper"),
+            holoscan::Arg("channel_filter") = channel_index));
+        sigmfFileSinkOps.push_back(make_operator<ops::SigmfFileSinkOp>(
+            std::string("sigmfFileSinkOpCh") + std::to_string(channel_index),
+            from_config("sigmf_file_sink")));
       }
     }
 
@@ -695,6 +719,14 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     for (auto& op : logOps) {
       add_operator(op);
     }
+    if (enable_signal_snipper) {
+      for (auto& op : signalSnipperOps) {
+        add_operator(op);
+      }
+      for (auto& op : sigmfFileSinkOps) {
+        add_operator(op);
+      }
+    }
     if (unusedChdrOutputDropOp) {
       add_operator(unusedChdrOutputDropOp);
     }
@@ -741,6 +773,22 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         } else if (detector_type == "cuda_dino") {
           add_flow(detector_source, cudaDinoDetectorOps[static_cast<size_t>(channel_index)]);
         }
+      }
+
+      if (enable_signal_snipper) {
+        auto& snipperOp = signalSnipperOps[static_cast<size_t>(channel_index)];
+        // Tap the raw time-domain IQ upstream of the FFT (same port that feeds fftOp).
+        add_flow(chdrConverterOp, snipperOp, {{chdr_port, "iq_in"}});
+        // Feed the detector mask.
+        if (detector_type == "coherent_power") {
+          add_flow(coherentDetectorOps[static_cast<size_t>(channel_index)], snipperOp,
+                   {{"mask_out", "mask_in"}});
+        } else if (detector_type == "cuda_dino") {
+          add_flow(cudaDinoDetectorOps[static_cast<size_t>(channel_index)], snipperOp,
+                   {{"mask_out", "mask_in"}});
+        }
+        add_flow(snipperOp, sigmfFileSinkOps[static_cast<size_t>(channel_index)],
+                 {{"snippets_out", "in"}});
       }
 
       if (enable_logger_branch && effective_log_from_spectrogram) {
