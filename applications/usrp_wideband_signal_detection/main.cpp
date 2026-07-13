@@ -410,7 +410,37 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     g_pipeline_shutdown_term = pipeline_shutdown_term;
     HOLOSCAN_LOG_INFO("Configured pipeline_shutdown_term for chdrConverterOp");
 
-    const auto fft_runtime = usrp_wideband::resolve_fft_runtime_config(*this);
+    // Launch-time overrides so a new radio rate/center flows through the whole pipeline WITHOUT
+    // editing the config. Offline already derives these from the SigMF; for live/loopback the run
+    // wrapper (or user) can set USRP_SAMPLE_RATE_HZ / USRP_CENTER_FREQ_HZ (e.g. from the replayed
+    // SigMF's core:sample_rate/core:frequency, or the sender's actual usrp.get_rx_rate()). When set,
+    // the rate feeds the FFT bin derivation via the same explicit_span_hz fast-path used offline,
+    // and both rate + center are pushed into the CHDR converter so it stamps rx_sample_rate_hz /
+    // rx_center_frequency_hz metadata that the detector, visualizer and snipper read.
+    auto env_string = [](const char* name) -> std::optional<std::string> {
+      const char* value = std::getenv(name);
+      if (value != nullptr && value[0] != '\0') {
+        return std::string(value);
+      }
+      return std::nullopt;
+    };
+    const auto rate_override_str = env_string("USRP_SAMPLE_RATE_HZ");
+    const auto center_override_str = env_string("USRP_CENTER_FREQ_HZ");
+    std::optional<double> rate_override_hz;
+    if (rate_override_str.has_value()) {
+      try {
+        rate_override_hz = std::stod(*rate_override_str);
+        HOLOSCAN_LOG_INFO("USRP_SAMPLE_RATE_HZ override active: {} Hz (supersedes config channel_sample_rates_hz/fft.span)",
+                          *rate_override_hz);
+      } catch (const std::exception&) {
+        HOLOSCAN_LOG_WARN("Ignoring unparseable USRP_SAMPLE_RATE_HZ='{}'", *rate_override_str);
+      }
+    }
+    if (center_override_str.has_value()) {
+      HOLOSCAN_LOG_INFO("USRP_CENTER_FREQ_HZ override active: {} Hz", *center_override_str);
+    }
+
+    const auto fft_runtime = usrp_wideband::resolve_fft_runtime_config(*this, rate_override_hz);
     const auto fft_span_hz = fft_runtime.active_span_hz;
     const auto fft_span_metadata_hz = static_cast<uint64_t>(std::llround(fft_runtime.active_span_hz));
     if (fft_runtime.num_packets_per_fft > std::numeric_limits<uint16_t>::max()) {
@@ -418,11 +448,20 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
                          fft_runtime.num_packets_per_fft);
       exit(1);
     }
+    // Resolve the CHDR rate/center strings: env override wins, else the config value (empty = unset).
+    const std::string chdr_sample_rates =
+        rate_override_str.value_or(usrp_wideband::from_config_or<std::string>(
+            *this, "chdr_converter.channel_sample_rates_hz", std::string{}));
+    const std::string chdr_center_freqs =
+        center_override_str.value_or(usrp_wideband::from_config_or<std::string>(
+            *this, "chdr_converter.channel_center_frequencies_hz", std::string{}));
     auto chdrConverterOp = make_operator<ops::ChdrConverterOpRx>(
       "chdrConverterOp",
       pipeline_shutdown_term,
       from_config("chdr_converter"),
-      Arg("num_packets_per_fft") = static_cast<uint16_t>(fft_runtime.num_packets_per_fft));
+      Arg("num_packets_per_fft") = static_cast<uint16_t>(fft_runtime.num_packets_per_fft),
+      Arg("channel_sample_rates_hz") = chdr_sample_rates,
+      Arg("channel_center_frequencies_hz") = chdr_center_freqs);
     const int pipeline_channels = std::max(1, from_config("chdr_converter.num_channels").as<int>());
 
     const bool enable_spectrogram = from_config("pipeline.enable_spectrogram").as<bool>();

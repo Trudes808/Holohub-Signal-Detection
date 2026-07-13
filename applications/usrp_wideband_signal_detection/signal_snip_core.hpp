@@ -29,13 +29,22 @@ struct BoundingBox {
   int pixel_count = 0;
 };
 
+// Reusable scratch for label_components so it allocates nothing per frame (matters at emit_stride 1,
+// ~47 masks/s over ~5M pixels). Owned by the caller and passed in each call.
+struct CcScratch {
+  std::vector<uint8_t> visited;
+  std::vector<int> queue;  // flat pixel indices, used as a fixed-capacity FIFO (no std::queue churn)
+};
+
 // 4-connected connected-component labeling over a binary (0/non-zero) mask, returning one bounding
 // box per component with at least `min_pixels` pixels. Adapted from the detector's
-// label_mask_connected_components (coherent_power_signal_detector.cu).
+// label_mask_connected_components (coherent_power_signal_detector.cu). `scratch` is reused across
+// calls to avoid per-frame allocation.
 std::vector<BoundingBox> label_components(const std::vector<uint8_t>& mask,
                                           int rows,
                                           int cols,
-                                          int min_pixels);
+                                          int min_pixels,
+                                          CcScratch& scratch);
 
 // Coalesce boxes whose bounding boxes are within `gap_rows` / `gap_cols` of each other (in mask
 // pixels), summing pixel counts. Merges fragments of one signal split by small mask gaps; keeps
@@ -110,7 +119,8 @@ struct HostSnippet {
   std::vector<SnipComplex> iq;  // interleaved cf32 (I,Q) on host
   double sample_rate_hz = 0.0;
   double center_freq_hz = 0.0;
-  uint64_t orig_sample_start = 0;
+  uint64_t orig_sample_start = 0;   // full-rate global sample index of the first payload sample
+  uint64_t orig_sample_count = 0;   // full-rate span this snippet covers in the original stream
   double orig_sample_rate_hz = 0.0;
   uint64_t frame_number = 0;
   int channel = 0;
@@ -130,5 +140,12 @@ void write_sigmf_collection(const std::string& collection_stem,
 // sample rate, emitting one annotation per contained signal at the right sample offset. Returns the
 // .sigmf-data path.
 std::string write_sigmf_pack(const std::string& stem, const std::vector<HostSnippet>& snippets);
+
+// Write a single CONTAINER recording: all snippets concatenated regardless of (rate, center), one
+// annotation per snippet carrying its file offset + own rate/center/edges (wfgt:snippet_sample_rate
+// etc.). Global core:sample_rate is the original stream rate (reference); the per-annotation rate is
+// authoritative. ~one file per pack instead of one per signal -- the sustainable path for dense /
+// low-emit_stride capture. Returns the .sigmf-data path.
+std::string write_sigmf_container(const std::string& stem, const std::vector<HostSnippet>& snippets);
 
 }  // namespace holoscan::ops::snip

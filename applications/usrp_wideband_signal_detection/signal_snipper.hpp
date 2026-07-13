@@ -57,7 +57,10 @@ class SignalSnipperOp : public holoscan::Operator {
 
   void ingest_iq(holoscan::InputContext& op_input);
   RingEntry* find_ring_entry(uint64_t frame_number);
-  void process_mask(const DetectorMaskMessage& mask, holoscan::OutputContext& op_output);
+  // Snip one mask's signals and APPEND them to `batch` (no emit). All masks drained in a single
+  // compute() accumulate into one batch that is emitted exactly once -- Holoscan's transmitter
+  // stages one message per compute tick, so emitting per-mask would overflow it fatally.
+  void process_mask(const DetectorMaskMessage& mask, SnippetBatchMessage& batch);
   void prune_ring();
 
   // Parameters.
@@ -76,6 +79,9 @@ class SignalSnipperOp : public holoscan::Operator {
 
   // State.
   std::shared_ptr<DeviceBufferPool> pool_;
+  // Per-frame host scratch, reused to avoid reallocating ~5 MB buffers every masked frame.
+  std::vector<uint8_t> host_mask_;
+  snip::CcScratch cc_scratch_;
   std::deque<RingEntry> ring_;
   uint64_t iq_arrival_counter_ = 0;
   uint64_t last_processed_mask_frame_ = 0;

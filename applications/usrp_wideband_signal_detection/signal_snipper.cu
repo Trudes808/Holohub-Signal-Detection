@@ -24,7 +24,10 @@ void SignalSnipperOp::setup(holoscan::OperatorSpec& spec) {
   auto& mask_port = spec.input<DetectorMaskMessage>("mask_in", holoscan::IOSpec::IOSize{16});
   mask_port.condition(holoscan::ConditionType::kNone);
 
-  spec.output<SnippetBatchMessage>("snippets_out").condition(holoscan::ConditionType::kNone);
+  // Default (DownstreamMessageAffordable) condition + a deep queue: under live load the file sink
+  // can lag, so the snipper must throttle rather than overflow the transmitter (kNone would remove
+  // backpressure and make emit throw GXF_EXCEEDING_PREALLOCATED_SIZE fatally).
+  spec.output<SnippetBatchMessage>("snippets_out", holoscan::IOSpec::IOSize{16});
 
   spec.param(mode_, "mode", "Mode", "Snip mode: 'time_only' or 'frequency'.", std::string("time_only"));
   spec.param(oversample_percent_, "oversample_percent", "Oversample percent",
@@ -171,17 +174,27 @@ void SignalSnipperOp::compute(holoscan::InputContext& op_input,
   // IQ drives compute (leads the mask); buffer all available frames, then drain any masks whose IQ
   // is now buffered.
   ingest_iq(op_input);
+
+  // Drain every available mask into ONE batch, then emit exactly once (see process_mask note).
+  SnippetBatchMessage batch;
   while (true) {
     auto mask_in = op_input.receive<DetectorMaskMessage>("mask_in");
     if (!mask_in) {
       break;
     }
-    process_mask(mask_in.value(), op_output);
+    process_mask(mask_in.value(), batch);
+  }
+
+  if (!batch.snippets.empty()) {
+    // Ensure all copies / DDC on snip_stream_ completed before the batch (and its device buffers)
+    // travel downstream to the file sink, which reads them on its own stream.
+    cudaStreamSynchronize(snip_stream_);
+    snippets_emitted_ += batch.snippets.size();
+    op_output.emit(std::move(batch), "snippets_out");
   }
 }
 
-void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask,
-                                   holoscan::OutputContext& op_output) {
+void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask, SnippetBatchMessage& batch) {
   const int configured_channel = channel_filter_.get();
   if (configured_channel >= 0 && mask.channel >= 0 && mask.channel != configured_channel) {
     return;
@@ -205,21 +218,30 @@ void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask,
     return;
   }
 
-  // Resolve geometry. The configured sample_rate_hz wins when set (> 0): it is the TRUE delivered
-  // IQ rate, whereas pipeline metadata may carry the nominal FFT "span" (e.g. 500e6 while the radio
-  // actually delivers 245.76 Msps), which would scale every snipped frequency by ~2x. Fall back to
-  // metadata only when no explicit rate is configured.
+  // Resolve the TRUE delivered sample rate, preferring pipeline metadata so it flows automatically:
+  //   1. rx_sample_rate_hz  -- stamped by the CHDR converter when chdr_converter.channel_sample_rates_hz
+  //      is set (live/loopback); this is the actual radio rate.
+  //   2. configured sample_rate_hz (>0) -- explicit override, and the value the offline driver injects
+  //      from the SigMF core:sample_rate.
+  //   3. sample_rate_hz / span metadata -- the FFT's derived span (already the SigMF rate offline, or
+  //      the channel_sample_rates_hz-derived rate live). Only nominal (e.g. 500e6) if none of the
+  //      above provided a true rate.
   auto meta = metadata();
-  double sample_rate = sample_rate_hz_.get();
+  double sample_rate = 0.0;
+  if (meta && meta->has_key("rx_sample_rate_hz")) {
+    sample_rate = meta->get<double>("rx_sample_rate_hz", 0.0);
+  }
   if (sample_rate <= 0.0) {
-    if (meta && meta->has_key("sample_rate_hz")) {
+    sample_rate = sample_rate_hz_.get();
+  }
+  if (sample_rate <= 0.0 && meta) {
+    if (meta->has_key("sample_rate_hz")) {
       sample_rate = meta->get<double>("sample_rate_hz", 0.0);
-    } else if (meta && meta->has_key("rx_sample_rate_hz")) {
-      sample_rate = meta->get<double>("rx_sample_rate_hz", 0.0);
-    } else if (meta && meta->has_key("span")) {
+    } else if (meta->has_key("span")) {
       sample_rate = static_cast<double>(meta->get<uint64_t>("span", 0));
     }
   }
+  // Center frequency: prefer the CHDR-stamped RF center, else the configured fallback.
   double center_freq = center_frequency_hz_.get();
   if (meta && meta->has_key("rx_center_frequency_hz")) {
     center_freq = meta->get<double>("rx_center_frequency_hz", center_freq);
@@ -235,18 +257,19 @@ void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask,
       mask.file_offset_complex > 0 ? mask.file_offset_complex
                                    : (mask.frame_number > 0 ? (mask.frame_number - 1) * entry->n_iq : 0);
 
-  // Copy the small mask to the host and cluster it into per-signal boxes.
+  // Copy the small mask to the host (reused scratch) and cluster it into per-signal boxes.
   const size_t mask_bytes = static_cast<size_t>(mask.width) * static_cast<size_t>(mask.height);
-  std::vector<uint8_t> host_mask(mask_bytes, 0);
+  host_mask_.resize(mask_bytes);
   if (mask.device_pixels) {
-    cudaMemcpy(host_mask.data(), mask.device_pixels.get(), mask_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_mask_.data(), mask.device_pixels.get(), mask_bytes, cudaMemcpyDeviceToHost);
   } else if (mask.pixels.size() >= mask_bytes) {
-    std::copy_n(mask.pixels.begin(), mask_bytes, host_mask.begin());
+    std::copy_n(mask.pixels.begin(), mask_bytes, host_mask_.begin());
   } else {
     return;
   }
 
-  auto boxes = snip::label_components(host_mask, mask.height, mask.width, min_box_pixels_.get());
+  auto boxes =
+      snip::label_components(host_mask_, mask.height, mask.width, min_box_pixels_.get(), cc_scratch_);
   boxes = snip::merge_boxes(std::move(boxes), merge_gap_rows_.get(), merge_gap_cols_.get());
   if (boxes.empty()) {
     return;
@@ -268,7 +291,8 @@ void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask,
   const SnipComplex* frame_iq = entry->device_iq.get();
   const uint64_t frame_n = entry->n_iq;
 
-  SnippetBatchMessage batch;
+  // Stamp the batch with the most recent frame/channel processed this tick (each snippet also
+  // carries its own frame_number for downstream reassembly).
   batch.frame_number = mask.frame_number;
   batch.channel = mask.channel;
 
@@ -326,17 +350,9 @@ void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask,
     }
   }
 
-  // Ensure all copies / DDC on snip_stream_ have completed before the batch (and its device buffers)
-  // travel downstream to the file sink, which reads them on its own stream.
-  cudaStreamSynchronize(snip_stream_);
-
   ++masks_processed_;
-  snippets_emitted_ += batch.snippets.size();
-  if (!batch.snippets.empty()) {
-    op_output.emit(std::move(batch), "snippets_out");
-  }
-
-  // This frame's mask is done; drop it (and any older) from the ring.
+  // This frame's mask is done; drop it (and any older) from the ring. (The batch is emitted once,
+  // after all masks in this compute tick are processed -- see compute().)
   prune_ring();
 }
 

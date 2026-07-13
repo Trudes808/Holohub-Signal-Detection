@@ -87,19 +87,25 @@ namespace snip {
 std::vector<BoundingBox> label_components(const std::vector<uint8_t>& mask,
                                           int rows,
                                           int cols,
-                                          int min_pixels) {
+                                          int min_pixels,
+                                          CcScratch& scratch) {
   std::vector<BoundingBox> boxes;
   if (mask.empty() || rows <= 0 || cols <= 0) {
     return boxes;
   }
 
-  std::vector<uint8_t> visited(mask.size(), 0);
-  const std::array<std::pair<int, int>, 4> neighbors{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}};
-  auto flat = [cols](int r, int c) { return static_cast<size_t>(r) * static_cast<size_t>(cols) + c; };
+  const size_t n = mask.size();
+  // Reused, allocation-free scratch: visited flags + a flat-index FIFO (head/tail into `queue`).
+  scratch.visited.assign(n, 0);
+  if (scratch.queue.size() < n) {
+    scratch.queue.resize(n);
+  }
+  uint8_t* visited = scratch.visited.data();
+  int* queue = scratch.queue.data();
 
   for (int row = 0; row < rows; ++row) {
     for (int col = 0; col < cols; ++col) {
-      const size_t seed = flat(row, col);
+      const int seed = row * cols + col;
       if (!mask[seed] || visited[seed]) {
         continue;
       }
@@ -108,29 +114,35 @@ std::vector<BoundingBox> label_components(const std::vector<uint8_t>& mask,
       box.col0 = box.col1 = col;
       box.pixel_count = 0;
 
-      std::queue<std::pair<int, int>> queue;
-      queue.push({row, col});
+      int head = 0;
+      int tail = 0;
+      queue[tail++] = seed;
       visited[seed] = 1;
-      while (!queue.empty()) {
-        const auto [cr, cc] = queue.front();
-        queue.pop();
+      while (head < tail) {
+        const int idx = queue[head++];
+        const int cr = idx / cols;
+        const int cc = idx - cr * cols;
         ++box.pixel_count;
         box.row0 = std::min(box.row0, cr);
         box.row1 = std::max(box.row1, cr);
         box.col0 = std::min(box.col0, cc);
         box.col1 = std::max(box.col1, cc);
-        for (const auto& [dr, dc] : neighbors) {
-          const int nr = cr + dr;
-          const int nc = cc + dc;
-          if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) {
-            continue;
-          }
-          const size_t nidx = flat(nr, nc);
-          if (!mask[nidx] || visited[nidx]) {
-            continue;
-          }
-          visited[nidx] = 1;
-          queue.push({nr, nc});
+        // 4-connected neighbors (inlined to avoid per-pixel array iteration).
+        if (cr + 1 < rows) {
+          const int ni = idx + cols;
+          if (mask[ni] && !visited[ni]) { visited[ni] = 1; queue[tail++] = ni; }
+        }
+        if (cr - 1 >= 0) {
+          const int ni = idx - cols;
+          if (mask[ni] && !visited[ni]) { visited[ni] = 1; queue[tail++] = ni; }
+        }
+        if (cc + 1 < cols) {
+          const int ni = idx + 1;
+          if (mask[ni] && !visited[ni]) { visited[ni] = 1; queue[tail++] = ni; }
+        }
+        if (cc - 1 >= 0) {
+          const int ni = idx - 1;
+          if (mask[ni] && !visited[ni]) { visited[ni] = 1; queue[tail++] = ni; }
         }
       }
 
@@ -242,14 +254,33 @@ std::vector<float> design_lowpass(int num_taps, double cutoff_norm) {
   return taps;
 }
 
-__global__ void ddc_kernel(const SnipComplex* __restrict__ x,
+// Mix to baseband: one sincos per INPUT sample (parallelized), written to a scratch buffer. This is
+// the key efficiency point -- the old fused kernel recomputed the phase inside the FIR loop, i.e.
+// num_taps sincos per OUTPUT sample (n_out * num_taps total). Mixing once first makes it n_in.
+__global__ void mix_kernel(const SnipComplex* __restrict__ x,
                            int n_in,
-                           const float* __restrict__ taps,
-                           int num_taps,
-                           int decim,
                            float omega,  // = -2*pi*f_offset/fs
-                           SnipComplex* __restrict__ y,
-                           int n_out) {
+                           SnipComplex* __restrict__ mixed) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_in) {
+    return;
+  }
+  float sn;
+  float cs;
+  sincosf(omega * static_cast<float>(i), &sn, &cs);
+  const SnipComplex s = x[i];
+  mixed[i] = SnipComplex(s.real() * cs - s.imag() * sn, s.real() * sn + s.imag() * cs);
+}
+
+// Decimating low-pass FIR over the already-mixed signal: MACs only, no transcendentals. Taps are
+// symmetric type-I; `mid` centers the window. Output m samples the mixed stream at m*decim.
+__global__ void fir_decim_kernel(const SnipComplex* __restrict__ mixed,
+                                 int n_in,
+                                 const float* __restrict__ taps,
+                                 int num_taps,
+                                 int decim,
+                                 SnipComplex* __restrict__ y,
+                                 int n_out) {
   const int m = blockIdx.x * blockDim.x + threadIdx.x;
   if (m >= n_out) {
     return;
@@ -263,16 +294,10 @@ __global__ void ddc_kernel(const SnipComplex* __restrict__ x,
     if (idx < 0 || idx >= n_in) {
       continue;
     }
-    const SnipComplex sample = x[idx];
-    // Mix to baseband: sample * exp(j * omega * idx).
-    float sn;
-    float cs;
-    sincosf(omega * static_cast<float>(idx), &sn, &cs);
-    const float mre = sample.real() * cs - sample.imag() * sn;
-    const float mim = sample.real() * sn + sample.imag() * cs;
+    const SnipComplex s = mixed[idx];
     const float h = taps[k];
-    acc_re += h * mre;
-    acc_im += h * mim;
+    acc_re += h * s.real();
+    acc_im += h * s.imag();
   }
   y[m] = SnipComplex(acc_re, acc_im);
 }
@@ -319,25 +344,32 @@ SnippetIq ddc_extract(const SnipComplex* frame_iq,
   const double f_offset = region.freq_center_hz - region.center_freq_hz;
   const float omega = (fs > 0.0) ? static_cast<float>(-2.0 * M_PI * f_offset / fs) : 0.0f;
 
-  // Upload taps to the device (small).
+  // Upload taps to the device (small, stream-ordered).
   float* taps_device = nullptr;
   if (cudaMallocAsync(&taps_device, num_taps * sizeof(float), stream) != cudaSuccess) {
     throw std::runtime_error("ddc_extract: cudaMallocAsync taps failed");
   }
   cudaMemcpyAsync(taps_device, taps.data(), num_taps * sizeof(float), cudaMemcpyHostToDevice, stream);
 
-  auto device_out = pool.acquire(n_out);
   const int threads = 256;
-  const int blocks = static_cast<int>((n_out + threads - 1) / threads);
-  ddc_kernel<<<blocks, threads, 0, stream>>>(frame_iq + region.local_start,
-                                             static_cast<int>(n_in),
-                                             taps_device,
-                                             num_taps,
-                                             decim,
-                                             omega,
-                                             device_out.get(),
-                                             static_cast<int>(n_out));
+  // Mix once (n_in sincos), then decimating FIR (MACs only).
+  auto mixed = pool.acquire(n_in);
+  const int mix_blocks = static_cast<int>((n_in + threads - 1) / threads);
+  mix_kernel<<<mix_blocks, threads, 0, stream>>>(frame_iq + region.local_start,
+                                                 static_cast<int>(n_in), omega, mixed.get());
+
+  auto device_out = pool.acquire(n_out);
+  const int fir_blocks = static_cast<int>((n_out + threads - 1) / threads);
+  fir_decim_kernel<<<fir_blocks, threads, 0, stream>>>(mixed.get(),
+                                                       static_cast<int>(n_in),
+                                                       taps_device,
+                                                       num_taps,
+                                                       decim,
+                                                       device_out.get(),
+                                                       static_cast<int>(n_out));
   cudaFreeAsync(taps_device, stream);
+  // `mixed` returns to the pool when this shared_ptr drops; the FIR above has been enqueued on the
+  // same stream, so its reads are ordered before any later reuse of the buffer on that stream.
 
   out.device_iq = std::move(device_out);
   out.n_iq = n_out;
@@ -431,20 +463,37 @@ void write_iq_file(const std::filesystem::path& path, const std::vector<SnipComp
   }
 }
 
-// Emit one SigMF annotation object. `sample_start`/`sample_count` are in the recording's own
-// (payload) sample space.
-void append_annotation(std::ostringstream& meta,
-                       const SnipAnnotation& ann,
-                       uint64_t sample_start,
-                       uint64_t sample_count,
-                       bool last) {
+// One annotation to emit: its position within THIS recording (core:sample_start/count) plus the
+// provenance in the ORIGINAL full-rate stream (wfgt:orig_*), so a downstream ingestor of a packed
+// recording can tell which chunks belong together (same frame_number / contiguous orig range) and
+// where each came from.
+struct MetaAnn {
+  SnipAnnotation ann;
+  uint64_t file_sample_start = 0;   // within this recording's payload
+  uint64_t file_sample_count = 0;
+  uint64_t orig_sample_start = 0;   // original full-rate stream
+  uint64_t orig_sample_count = 0;
+  uint64_t frame_number = 0;
+  double center_freq_hz = 0.0;
+  double sample_rate_hz = 0.0;      // this snippet's own (decimated) rate
+};
+
+void append_annotation(std::ostringstream& meta, const MetaAnn& a, bool last) {
   meta << "    {\n";
-  meta << "      \"core:sample_start\": " << sample_start << ",\n";
-  meta << "      \"core:sample_count\": " << sample_count << ",\n";
-  meta << "      \"core:freq_lower_edge\": " << ann.freq_lower_hz << ",\n";
-  meta << "      \"core:freq_upper_edge\": " << ann.freq_upper_hz << ",\n";
-  meta << "      \"core:label\": \"" << json_escape(ann.label) << "\",\n";
-  meta << "      \"wfgt:kind\": \"" << json_escape(ann.kind) << "\"\n";
+  meta << "      \"core:sample_start\": " << a.file_sample_start << ",\n";
+  meta << "      \"core:sample_count\": " << a.file_sample_count << ",\n";
+  meta << "      \"core:freq_lower_edge\": " << a.ann.freq_lower_hz << ",\n";
+  meta << "      \"core:freq_upper_edge\": " << a.ann.freq_upper_hz << ",\n";
+  meta << "      \"core:label\": \"" << json_escape(a.ann.label) << "\",\n";
+  meta << "      \"wfgt:kind\": \"" << json_escape(a.ann.kind) << "\",\n";
+  // Original-stream provenance (which packets are together) + this chunk's own rate/center. The
+  // per-annotation rate is authoritative in a container recording (mixed rates concatenated).
+  meta << "      \"wfgt:frame_number\": " << a.frame_number << ",\n";
+  meta << "      \"wfgt:orig_sample_start\": " << a.orig_sample_start << ",\n";
+  meta << "      \"wfgt:orig_sample_count\": " << a.orig_sample_count << ",\n";
+  meta << "      \"wfgt:orig_sample_end\": " << (a.orig_sample_start + a.orig_sample_count) << ",\n";
+  meta << "      \"wfgt:center_frequency\": " << a.center_freq_hz << ",\n";
+  meta << "      \"wfgt:snippet_sample_rate\": " << a.sample_rate_hz << "\n";
   meta << "    }" << (last ? "\n" : ",\n");
 }
 
@@ -452,7 +501,8 @@ std::string build_meta(double sample_rate_hz,
                        double center_freq_hz,
                        uint64_t orig_sample_start,
                        double orig_sample_rate_hz,
-                       const std::vector<std::pair<SnipAnnotation, std::pair<uint64_t, uint64_t>>>& anns) {
+                       const std::vector<MetaAnn>& anns,
+                       bool container = false) {
   std::ostringstream meta;
   // Default float formatting with high precision so large Hz values (e.g. 2.4 GHz +/- kHz edges)
   // are written exactly rather than rounded to ~6 significant digits.
@@ -464,6 +514,13 @@ std::string build_meta(double sample_rate_hz,
   meta << "    \"core:version\": \"1.0.0\",\n";
   meta << "    \"core:num_channels\": 1,\n";
   meta << "    \"core:description\": \"usrp_wideband signal_snipper cutout\",\n";
+  if (container) {
+    // Non-standard container: many variable-rate snippets concatenated end-to-end. core:sample_rate
+    // above is the ORIGINAL stream rate (a reference clock); each annotation's
+    // wfgt:snippet_sample_rate is the authoritative rate for its [core:sample_start,+count) slice.
+    meta << "    \"wfgt:container\": true,\n";
+    meta << "    \"wfgt:layout\": \"concatenated_variable_rate\",\n";
+  }
   meta << "    \"wfgt:orig_sample_start\": " << orig_sample_start << ",\n";
   meta << "    \"wfgt:orig_sample_rate\": " << orig_sample_rate_hz << "\n";
   meta << "  },\n";
@@ -475,8 +532,7 @@ std::string build_meta(double sample_rate_hz,
   meta << "  ],\n";
   meta << "  \"annotations\": [\n";
   for (size_t i = 0; i < anns.size(); ++i) {
-    append_annotation(meta, anns[i].first, anns[i].second.first, anns[i].second.second,
-                      i + 1 == anns.size());
+    append_annotation(meta, anns[i], i + 1 == anns.size());
   }
   meta << "  ]\n";
   meta << "}\n";
@@ -491,9 +547,18 @@ std::string write_sigmf_recording(const std::string& stem, const HostSnippet& sn
 
   write_iq_file(data_path, snippet.iq);
 
-  std::vector<std::pair<SnipAnnotation, std::pair<uint64_t, uint64_t>>> anns;
+  std::vector<MetaAnn> anns;
   for (const auto& ann : snippet.annotations) {
-    anns.emplace_back(ann, std::make_pair<uint64_t, uint64_t>(0, static_cast<uint64_t>(snippet.iq.size())));
+    MetaAnn m;
+    m.ann = ann;
+    m.file_sample_start = 0;
+    m.file_sample_count = static_cast<uint64_t>(snippet.iq.size());
+    m.orig_sample_start = snippet.orig_sample_start;
+    m.orig_sample_count = snippet.orig_sample_count;
+    m.frame_number = snippet.frame_number;
+    m.center_freq_hz = snippet.center_freq_hz;
+    m.sample_rate_hz = snippet.sample_rate_hz;
+    anns.push_back(std::move(m));
   }
   const std::string meta = build_meta(snippet.sample_rate_hz,
                                       snippet.center_freq_hz,
@@ -508,9 +573,10 @@ std::string write_sigmf_pack(const std::string& stem, const std::vector<HostSnip
   const std::filesystem::path data_path(stem + ".sigmf-data");
   const std::filesystem::path meta_path(stem + ".sigmf-meta");
 
-  // Concatenate IQ; every member must share the same sample rate (enforced by the caller).
+  // Concatenate IQ; every member shares the same (rate, center) group (enforced by the caller). Each
+  // chunk's annotation records both its slot in this file and its original-stream provenance.
   std::vector<SnipComplex> combined;
-  std::vector<std::pair<SnipAnnotation, std::pair<uint64_t, uint64_t>>> anns;
+  std::vector<MetaAnn> anns;
   double sample_rate_hz = snippets.empty() ? 0.0 : snippets.front().sample_rate_hz;
   double center_freq_hz = snippets.empty() ? 0.0 : snippets.front().center_freq_hz;
   uint64_t offset = 0;
@@ -518,7 +584,16 @@ std::string write_sigmf_pack(const std::string& stem, const std::vector<HostSnip
     combined.insert(combined.end(), snippet.iq.begin(), snippet.iq.end());
     const uint64_t count = static_cast<uint64_t>(snippet.iq.size());
     for (const auto& ann : snippet.annotations) {
-      anns.emplace_back(ann, std::make_pair(offset, count));
+      MetaAnn m;
+      m.ann = ann;
+      m.file_sample_start = offset;
+      m.file_sample_count = count;
+      m.orig_sample_start = snippet.orig_sample_start;
+      m.orig_sample_count = snippet.orig_sample_count;
+      m.frame_number = snippet.frame_number;
+      m.center_freq_hz = snippet.center_freq_hz;
+      m.sample_rate_hz = snippet.sample_rate_hz;
+      anns.push_back(std::move(m));
     }
     offset += count;
   }
@@ -527,6 +602,47 @@ std::string write_sigmf_pack(const std::string& stem, const std::vector<HostSnip
   const std::string meta = build_meta(sample_rate_hz, center_freq_hz,
                                       snippets.empty() ? 0 : snippets.front().orig_sample_start,
                                       sample_rate_hz, anns);
+  write_text_file(meta_path, meta);
+  return data_path.string();
+}
+
+std::string write_sigmf_container(const std::string& stem, const std::vector<HostSnippet>& snippets) {
+  const std::filesystem::path data_path(stem + ".sigmf-data");
+  const std::filesystem::path meta_path(stem + ".sigmf-meta");
+
+  // One file holding ALL snippets concatenated end-to-end regardless of their (rate, center). Each
+  // annotation self-describes its slice: core:sample_start/count locate the chunk in this file, and
+  // wfgt:snippet_sample_rate / wfgt:center_frequency / freq edges give its true rate + placement.
+  // A downstream ingestor slices each annotation and reads it at its own rate. This trades strict
+  // SigMF conformance (one global rate) for ~one file per pack instead of one per signal.
+  std::vector<SnipComplex> combined;
+  std::vector<MetaAnn> anns;
+  const double orig_rate = snippets.empty() ? 0.0 : snippets.front().orig_sample_rate_hz;
+  const double center = snippets.empty() ? 0.0 : snippets.front().center_freq_hz;
+  uint64_t offset = 0;
+  for (const auto& snippet : snippets) {
+    combined.insert(combined.end(), snippet.iq.begin(), snippet.iq.end());
+    const uint64_t count = static_cast<uint64_t>(snippet.iq.size());
+    for (const auto& ann : snippet.annotations) {
+      MetaAnn m;
+      m.ann = ann;
+      m.file_sample_start = offset;
+      m.file_sample_count = count;
+      m.orig_sample_start = snippet.orig_sample_start;
+      m.orig_sample_count = snippet.orig_sample_count;
+      m.frame_number = snippet.frame_number;
+      m.center_freq_hz = snippet.center_freq_hz;
+      m.sample_rate_hz = snippet.sample_rate_hz;
+      anns.push_back(std::move(m));
+    }
+    offset += count;
+  }
+
+  write_iq_file(data_path, combined);
+  // Global core:sample_rate = the original stream rate (reference); per-annotation rates are truth.
+  const std::string meta = build_meta(orig_rate, center,
+                                      snippets.empty() ? 0 : snippets.front().orig_sample_start,
+                                      orig_rate, anns, /*container=*/true);
   write_text_file(meta_path, meta);
   return data_path.string();
 }

@@ -84,6 +84,13 @@ chdr_converter:
   num_ffts_per_batch: 512
   num_simul_batches: 4
   num_channels: 1
+  # Single source of truth for the delivered stream. Setting these makes the whole pipeline derive
+  # from the TRUE radio rate/center instead of the nominal fft.span: the FFT auto-sizes its bin
+  # count/resolution, and the CHDR converter stamps rx_sample_rate_hz / rx_center_frequency_hz into
+  # metadata so the snipper (and any downstream) pick them up automatically. The X410 delivers
+  # 245.76 Msps even when the sender requests 500e6 -- set the actual delivered rate here.
+  channel_sample_rates_hz: "245.76e6"
+  channel_center_frequencies_hz: "2400e6"
   log_packets: false
   log_data: false
   partial_batch_drop_timeout_ms: 250
@@ -118,7 +125,10 @@ logger:
   log_interval: 5
 
 visualization:
-  enable: true
+  # Off for the snip-focused capture profile: on the RTX 4000 Ada the visualizer + FFT + detector +
+  # snipper together cannot sustain 245 MSps. Set true to see the live spectrum (expect reduced
+  # throughput / dropped packets on a modest GPU). The snipper/sink do not depend on it.
+  enable: false
   renderer:
     num_channels: 1
     history_frames: 1
@@ -176,7 +186,10 @@ coherent_power_signal_detector:
   fast_strong_rescue_min_time_bins: 3
   per_freq_threshold_offset_db: 2.0
   per_freq_threshold_path: "/workspace/holohub/applications/usrp_wideband_signal_detection/calibration/coherent_power_per_freq_floor.npy"
-  per_freq_threshold_mode: "calibrated"
+  # Dynamic mode learns a per-bin noise floor live and auto-resizes to the runtime FFT bin count, so
+  # it works at any sample rate without a fixed-length calibration .npy (the calibrated .npy must
+  # match the bin count exactly, which broke when the live FFT size changed). No calibration needed.
+  per_freq_threshold_mode: "dynamic"
   dynamic_floor_init_db: 40.0
   dynamic_floor_std_k: 2.0
   dynamic_floor_warmup_frames: 0
@@ -186,6 +199,10 @@ coherent_power_signal_detector:
   live_emit_mask_cols: 512
   live_emit_freq_persistence_window: 45
   live_emit_freq_persistence_min_hits: 11
+  # emit_stride=1 snips every frame (full temporal coverage). Sustainable now that (a) the DDC/CC are
+  # optimized, visualization is off, and (b) the sink writes ONE container file per pack instead of
+  # one file per signal. Raise this if the GPU still falls behind, or if disk can't keep the snippet
+  # BYTE rate (watch for OVERFLOW in the sink log). Keep ring_depth >= ~2*emit_stride + lag.
   emit_stride: 1
   log_detections: true
   save_performance_path_artifacts: false
@@ -221,23 +238,25 @@ signal_snipper:
   merge_gap_rows: 16
   merge_gap_cols: 80
   fir_num_taps: 129
-  # Max full-rate IQ frames buffered awaiting their mask. Must exceed the detector-pipeline lag; the
-  # offline greedy scheduler can run the source ~15-20 frames ahead, so keep this >= ~24. Live needs
-  # far less (~4-8). Each buffered frame is ~num_bursts*burst_size complex samples (tens of MB).
+  # Max full-rate IQ frames buffered awaiting their mask. Must exceed (a) the offline greedy
+  # scheduler's ~15-20 frame source lead, AND (b) the mask spacing when strided: with
+  # coherent_power_signal_detector.emit_stride=N, masks are N frames apart, so keep this >= ~2*N + lag
+  # (here 2*16 = 32). Each buffered frame is ~num_bursts*burst_size complex samples (tens of MB), so
+  # raising it costs device memory.
   ring_depth: 32
-  # center_frequency_hz: RF center of the band (used unless CHDR metadata provides one).
-  center_frequency_hz: 2400000000.0
-  # sample_rate_hz: the TRUE delivered IQ rate. The X410 delivers 245.76 Msps even though the FFT
-  # span metadata is 500e6, so set the real rate here for physically-correct SigMF frequencies.
-  # (Set > 0 to override the nominal FFT span metadata; 0 = fall back to metadata.)
-  sample_rate_hz: 245760000.0
+  # Both default to 0 = auto: the snipper reads the true rate/center from pipeline metadata
+  # (rx_sample_rate_hz / rx_center_frequency_hz, stamped by the CHDR converter from the
+  # channel_sample_rates_hz / channel_center_frequencies_hz above; from the SigMF core:sample_rate
+  # offline). Set > 0 only to force a value when no metadata is available.
+  center_frequency_hz: 0.0
+  sample_rate_hz: 0.0
 
 # --- SigMF file sink ----------------------------------------------------------------------------
 sigmf_file_sink:
   # "per_signal": one SigMF recording per snippet, written as they arrive.
-  # "pack": accumulate `pack_frames` frames, then flush; snippets are grouped by sample rate into
-  #   per-rate recordings, tied by a .sigmf-collection when the pack spans multiple rates.
-  mode: "per_signal"
+  # "pack": accumulate `pack_frames` frames, then flush; snippets are grouped by (rate, center) into
+  #   concatenated recordings, tied by a .sigmf-collection when a pack spans multiple groups.
+  mode: "pack"
   pack_frames: 16
   output_dir: "/workspace/spectrograms/snippets"
   filename_prefix: "snip"

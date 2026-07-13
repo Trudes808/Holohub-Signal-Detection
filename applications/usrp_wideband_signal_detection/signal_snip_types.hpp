@@ -35,7 +35,12 @@ struct SnipAnnotation {
 };
 
 // A single snipped signal (frequency mode) or a single time interval containing one or more signals
-// (time-only mode). The IQ payload lives on the device in `device_iq` (interleaved complex float).
+// (time-only mode). The IQ payload lives on the DEVICE in `device_iq` (interleaved complex float),
+// so a downstream classifier subscribing to the snippets_out port consumes it directly from GPU
+// memory with zero copy -- everything it needs (rate, center, dims, annotations) travels with the
+// descriptor. The buffer is a pooled shared_ptr, so it fans out safely to multiple consumers (e.g. a
+// classifier AND the file sink) and recycles once the last reference drops. Only the file sink ever
+// copies to host; nothing here forces a device->host transfer.
 struct SignalSnippet {
   // Provenance / placement in the ORIGINAL full-rate stream.
   uint64_t frame_number = 0;
