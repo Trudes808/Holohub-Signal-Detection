@@ -76,3 +76,9 @@ dino_fine_tuning/notebooks/sweep*
 
 # claude dump files
 .claude/
+
+# YOLO training artifacts (datasets, training runs, weights, downloaded checkpoints)
+yolo_training/data/
+yolo_training/runs/
+yolo_training/weights/
+yolo_training/**/*.pt

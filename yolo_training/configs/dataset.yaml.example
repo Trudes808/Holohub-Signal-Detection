@@ -1,0 +1,12 @@
+# Ultralytics YOLO dataset config for RF-spectrogram signal detection.
+# Binary task (signal vs noise), matching the DINO fine-tuning setup.
+# Expected on-disk layout (Ultralytics convention):
+#   <path>/images/train/*.png   <path>/labels/train/*.txt
+#   <path>/images/val/*.png     <path>/labels/val/*.txt
+# Detection label line:  "0 cx cy w h"            (normalized 0-1, one per signal box)
+# Segmentation label:    "0 x1 y1 x2 y2 ... xn yn" (normalized polygon, for -seg models)
+path: /home/bqn82/Holohub-Signal-Detection/yolo_training/data/rf_spectrograms
+train: images/train
+val: images/val
+names:
+  0: signal
