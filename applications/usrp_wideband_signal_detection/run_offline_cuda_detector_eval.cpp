@@ -5,6 +5,8 @@
 #include <cuda/std/__algorithm/max.h>
 
 #include "fft_runtime_config.hpp"
+#include "sigmf_file_sink.hpp"
+#include "signal_snipper.hpp"
 #include "spectrogram_visualization.hpp"
 
 #include <coherent_power_signal_detector.hpp>
@@ -2230,6 +2232,26 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
     add_flow(spectrogram, spectrogram_sink);
     add_flow(spectrogram, detector);
     add_flow(detector, mask_sink, {{"mask_out", "in"}});
+
+    // Optional signal-snipper branch: tap the source IQ and the detector mask, cut signals out, and
+    // write SigMF. Enabled by the config flag; the same operators as the live graph.
+    if (usrp_wideband::from_config_or<bool>(*this, "pipeline.enable_signal_snipper", false)) {
+      auto snipper = make_operator<holoscan::ops::SignalSnipperOp>(
+          "signalSnipperOpCh0",
+          from_config("signal_snipper"),
+          Arg("channel_filter") = overrides_.channel_number,
+          Arg("center_frequency_hz") = overrides_.input_center_frequency_hz,
+          Arg("sample_rate_hz") =
+              (overrides_.input_sample_rate_hz > 0.0 ? overrides_.input_sample_rate_hz
+                                                     : overrides_.span_hz));
+      auto snip_sink = make_operator<holoscan::ops::SigmfFileSinkOp>(
+          "sigmfFileSinkOpCh0",
+          from_config("sigmf_file_sink"),
+          Arg("output_dir") = (overrides_.output_root / "snippets").string());
+      add_flow(source, snipper, {{"out", "iq_in"}});
+      add_flow(detector, snipper, {{"mask_out", "mask_in"}});
+      add_flow(snipper, snip_sink, {{"snippets_out", "in"}});
+    }
   }
 
  private:

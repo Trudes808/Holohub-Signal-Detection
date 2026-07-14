@@ -31,6 +31,8 @@ LEN_ORDER = ["<10k", "10k-100k", "100k-1M", "1M-5M", ">=5M"]
 DETECTOR_STYLE = {  # consistent colors/markers across all figures
     "coherent_power": {"color": "#1f77b4", "marker": "o"},
     "cuda_dino": {"color": "#d62728", "marker": "s"},
+    "3dB_power": {"color": "#2ca02c", "marker": "^"},       # baseline: moving-average power
+    "blob_detection": {"color": "#9467bd", "marker": "D"},  # baseline: image-processing blobs
 }
 
 

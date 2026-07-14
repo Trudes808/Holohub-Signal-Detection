@@ -51,6 +51,9 @@ from typing import Optional
 import numpy as np
 
 # --- Constants matching the live CHDR/config contract ----------------------
+# Sidecar consumed by the wideband run wrapper so the receiving pipeline auto-adopts the replayed
+# stream's rate/center (keep in sync with rx_to_remote_udp.py + run_torchscript_performance_test.sh).
+STREAM_PARAMS_SIDECAR = "/tmp/usrp_stream_params.json"
 SAMPLES_PER_PACKET = 1024          # chdr_converter.num_complex_samples_per_packet
 BYTES_PER_SAMPLE = 4               # sc16: int16 I + int16 Q
 PAYLOAD_BYTES = SAMPLES_PER_PACKET * BYTES_PER_SAMPLE      # 4096
@@ -276,6 +279,18 @@ def main() -> int:
     sample_rate = float(glob.get("core:sample_rate", 0.0))
     captures = meta.get("captures", [{}])
     center_freq = float(captures[0].get("core:frequency", 0.0)) if captures else 0.0
+
+    # Sidecar so the receiving Holoscan pipeline auto-adopts this recording's rate/center (matches
+    # rx_to_remote_udp.py; read by run_torchscript_performance_test.sh into USRP_*_HZ env vars).
+    try:
+        with open(STREAM_PARAMS_SIDECAR, "w") as sidecar:
+            json.dump(
+                {"sample_rate_hz": sample_rate, "center_freq_hz": center_freq, "source": "replay_rx_to_buff"},
+                sidecar,
+            )
+        print(f"  stream params sidecar : {STREAM_PARAMS_SIDECAR}")
+    except OSError as exc:
+        print(f"  Warning: could not write stream params sidecar {STREAM_PARAMS_SIDECAR}: {exc}")
 
     gain_lin = 10.0 ** (cfg.gain_db / 20.0)
     effective_scale = cfg.scale * gain_lin

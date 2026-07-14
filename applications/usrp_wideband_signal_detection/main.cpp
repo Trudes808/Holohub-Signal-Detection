@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../usrp_freq_detection/CHDR_converter/chdr_rx.h"
 #include "fft_runtime_config.hpp"
+#include "sigmf_file_sink.hpp"
+#include "signal_snipper.hpp"
 #include "spectrogram_visualization.hpp"
 #include "advanced_network/common.h"
 #include <algorithm>
@@ -408,7 +410,37 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     g_pipeline_shutdown_term = pipeline_shutdown_term;
     HOLOSCAN_LOG_INFO("Configured pipeline_shutdown_term for chdrConverterOp");
 
-    const auto fft_runtime = usrp_wideband::resolve_fft_runtime_config(*this);
+    // Launch-time overrides so a new radio rate/center flows through the whole pipeline WITHOUT
+    // editing the config. Offline already derives these from the SigMF; for live/loopback the run
+    // wrapper (or user) can set USRP_SAMPLE_RATE_HZ / USRP_CENTER_FREQ_HZ (e.g. from the replayed
+    // SigMF's core:sample_rate/core:frequency, or the sender's actual usrp.get_rx_rate()). When set,
+    // the rate feeds the FFT bin derivation via the same explicit_span_hz fast-path used offline,
+    // and both rate + center are pushed into the CHDR converter so it stamps rx_sample_rate_hz /
+    // rx_center_frequency_hz metadata that the detector, visualizer and snipper read.
+    auto env_string = [](const char* name) -> std::optional<std::string> {
+      const char* value = std::getenv(name);
+      if (value != nullptr && value[0] != '\0') {
+        return std::string(value);
+      }
+      return std::nullopt;
+    };
+    const auto rate_override_str = env_string("USRP_SAMPLE_RATE_HZ");
+    const auto center_override_str = env_string("USRP_CENTER_FREQ_HZ");
+    std::optional<double> rate_override_hz;
+    if (rate_override_str.has_value()) {
+      try {
+        rate_override_hz = std::stod(*rate_override_str);
+        HOLOSCAN_LOG_INFO("USRP_SAMPLE_RATE_HZ override active: {} Hz (supersedes config channel_sample_rates_hz/fft.span)",
+                          *rate_override_hz);
+      } catch (const std::exception&) {
+        HOLOSCAN_LOG_WARN("Ignoring unparseable USRP_SAMPLE_RATE_HZ='{}'", *rate_override_str);
+      }
+    }
+    if (center_override_str.has_value()) {
+      HOLOSCAN_LOG_INFO("USRP_CENTER_FREQ_HZ override active: {} Hz", *center_override_str);
+    }
+
+    const auto fft_runtime = usrp_wideband::resolve_fft_runtime_config(*this, rate_override_hz);
     const auto fft_span_hz = fft_runtime.active_span_hz;
     const auto fft_span_metadata_hz = static_cast<uint64_t>(std::llround(fft_runtime.active_span_hz));
     if (fft_runtime.num_packets_per_fft > std::numeric_limits<uint16_t>::max()) {
@@ -416,15 +448,30 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
                          fft_runtime.num_packets_per_fft);
       exit(1);
     }
+    // Resolve the CHDR rate/center strings: env override wins, else the config value (empty = unset).
+    const std::string chdr_sample_rates =
+        rate_override_str.value_or(usrp_wideband::from_config_or<std::string>(
+            *this, "chdr_converter.channel_sample_rates_hz", std::string{}));
+    const std::string chdr_center_freqs =
+        center_override_str.value_or(usrp_wideband::from_config_or<std::string>(
+            *this, "chdr_converter.channel_center_frequencies_hz", std::string{}));
     auto chdrConverterOp = make_operator<ops::ChdrConverterOpRx>(
       "chdrConverterOp",
       pipeline_shutdown_term,
       from_config("chdr_converter"),
-      Arg("num_packets_per_fft") = static_cast<uint16_t>(fft_runtime.num_packets_per_fft));
+      Arg("num_packets_per_fft") = static_cast<uint16_t>(fft_runtime.num_packets_per_fft),
+      Arg("channel_sample_rates_hz") = chdr_sample_rates,
+      Arg("channel_center_frequencies_hz") = chdr_center_freqs);
     const int pipeline_channels = std::max(1, from_config("chdr_converter.num_channels").as<int>());
 
     const bool enable_spectrogram = from_config("pipeline.enable_spectrogram").as<bool>();
     const bool enable_detector = from_config("pipeline.enable_detector").as<bool>();
+    // Optional signal-snipper branch: cuts detected signals out of the stream and writes SigMF.
+    // Requires the detector (it consumes the detector mask). Defaults off so existing configs are
+    // unaffected.
+    const bool enable_signal_snipper =
+        enable_detector &&
+        usrp_wideband::from_config_or<bool>(*this, "pipeline.enable_signal_snipper", false);
     const std::string detector_type = from_config("pipeline.detector_type").as<std::string>();
     const bool log_from_spectrogram = from_config("pipeline.log_from_spectrogram").as<bool>();
     const bool enable_visualization = from_config("visualization.enable").as<bool>();
@@ -532,6 +579,22 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
               from_config("coherent_power_signal_detector"),
               holoscan::Arg("channel_filter") = channel_index));
         }
+      }
+    }
+
+    std::vector<std::shared_ptr<holoscan::Operator>> signalSnipperOps;
+    std::vector<std::shared_ptr<holoscan::Operator>> sigmfFileSinkOps;
+    if (enable_signal_snipper) {
+      signalSnipperOps.reserve(static_cast<size_t>(pipeline_channels));
+      sigmfFileSinkOps.reserve(static_cast<size_t>(pipeline_channels));
+      for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+        signalSnipperOps.push_back(make_operator<ops::SignalSnipperOp>(
+            std::string("signalSnipperOpCh") + std::to_string(channel_index),
+            from_config("signal_snipper"),
+            holoscan::Arg("channel_filter") = channel_index));
+        sigmfFileSinkOps.push_back(make_operator<ops::SigmfFileSinkOp>(
+            std::string("sigmfFileSinkOpCh") + std::to_string(channel_index),
+            from_config("sigmf_file_sink")));
       }
     }
 
@@ -695,6 +758,14 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     for (auto& op : logOps) {
       add_operator(op);
     }
+    if (enable_signal_snipper) {
+      for (auto& op : signalSnipperOps) {
+        add_operator(op);
+      }
+      for (auto& op : sigmfFileSinkOps) {
+        add_operator(op);
+      }
+    }
     if (unusedChdrOutputDropOp) {
       add_operator(unusedChdrOutputDropOp);
     }
@@ -741,6 +812,22 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         } else if (detector_type == "cuda_dino") {
           add_flow(detector_source, cudaDinoDetectorOps[static_cast<size_t>(channel_index)]);
         }
+      }
+
+      if (enable_signal_snipper) {
+        auto& snipperOp = signalSnipperOps[static_cast<size_t>(channel_index)];
+        // Tap the raw time-domain IQ upstream of the FFT (same port that feeds fftOp).
+        add_flow(chdrConverterOp, snipperOp, {{chdr_port, "iq_in"}});
+        // Feed the detector mask.
+        if (detector_type == "coherent_power") {
+          add_flow(coherentDetectorOps[static_cast<size_t>(channel_index)], snipperOp,
+                   {{"mask_out", "mask_in"}});
+        } else if (detector_type == "cuda_dino") {
+          add_flow(cudaDinoDetectorOps[static_cast<size_t>(channel_index)], snipperOp,
+                   {{"mask_out", "mask_in"}});
+        }
+        add_flow(snipperOp, sigmfFileSinkOps[static_cast<size_t>(channel_index)],
+                 {{"snippets_out", "in"}});
       }
 
       if (enable_logger_branch && effective_log_from_spectrogram) {

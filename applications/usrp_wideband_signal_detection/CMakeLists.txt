@@ -153,6 +153,9 @@ add_executable(usrp_wideband_signal_detection
   main.cpp
   spectrogram_visualization.cu
   screenshot_sink.cpp
+  signal_snip_core.cu
+  signal_snipper.cu
+  sigmf_file_sink.cpp
 )
 target_link_libraries(usrp_wideband_signal_detection
   PRIVATE
@@ -190,9 +193,14 @@ add_executable(offline_cuda_dino_operator_replay
 
 add_executable(run_offline_cuda_detector_eval
   run_offline_cuda_detector_eval.cpp
+  signal_snip_core.cu
+  signal_snipper.cu
+  sigmf_file_sink.cpp
 )
 
 set_source_files_properties(run_offline_cuda_detector_eval.cpp PROPERTIES LANGUAGE CUDA)
+# sigmf_file_sink.cpp uses cuda::std::complex + cudaMemcpy; compile it with the CUDA toolchain.
+set_source_files_properties(sigmf_file_sink.cpp PROPERTIES LANGUAGE CUDA)
 
 target_compile_definitions(offline_cuda_dino_operator_replay
   PRIVATE
@@ -312,6 +320,7 @@ endforeach()
     config_coherent_power_performance_single_channel_replay.yaml
     config_coherent_power_capture_chdr_single_channel.yaml
     config_coherent_power_performance_emit_stride1_two_channel.yaml
+    config_signal_snipper_single_channel.yaml
   )
 
   set(USRP_WIDEBAND_CONFIG_OUTPUTS)

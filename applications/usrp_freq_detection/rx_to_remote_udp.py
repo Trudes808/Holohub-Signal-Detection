@@ -33,6 +33,7 @@ rx_to_remote_udp.py --args addr=192.168.10.2 --rate 1e6 --freq 2.4e9 --gain 10
 """
 
 import argparse
+import json
 import sys
 import time
 from typing import Optional
@@ -40,6 +41,26 @@ from typing import Optional
 import uhd
 
 INIT_DELAY = 0.05  # 50mS initial delay before receive
+
+# Sidecar consumed by the wideband run wrapper so the receiving pipeline auto-adopts the true
+# stream rate/center (keep in sync with replay_rx_to_buff.py and run_torchscript_performance_test.sh).
+STREAM_PARAMS_SIDECAR = "/tmp/usrp_stream_params.json"
+
+
+def write_stream_params_sidecar(sample_rate_hz: float, center_freq_hz: float, source: str) -> None:
+    """Write the delivered stream rate/center so the downstream pipeline can pick them up."""
+    try:
+        with open(STREAM_PARAMS_SIDECAR, "w") as sidecar:
+            json.dump(
+                {"sample_rate_hz": sample_rate_hz, "center_freq_hz": center_freq_hz, "source": source},
+                sidecar,
+            )
+        print(
+            f"Wrote stream params sidecar {STREAM_PARAMS_SIDECAR} "
+            f"(rate={sample_rate_hz/1e6:.6g} Msps, center={center_freq_hz/1e6:.6g} MHz)."
+        )
+    except OSError as exc:
+        print(f"Warning: could not write stream params sidecar {STREAM_PARAMS_SIDECAR}: {exc}")
 
 
 class Config(argparse.Namespace):
@@ -201,6 +222,10 @@ def main():
     actual_freqs = [usrp.get_rx_freq(chan) for chan in channels]
     for chan, actual_freq in zip(channels, actual_freqs):
         print(f"Actual center frequency for channel {chan}: {actual_freq/1e6} MHz.")
+    # Sidecar so the receiving Holoscan pipeline can auto-adopt the TRUE delivered rate/center
+    # (the USRP quantizes the requested rate). The wideband run wrapper reads this into
+    # USRP_SAMPLE_RATE_HZ / USRP_CENTER_FREQ_HZ. Uses channel 0 (the pipeline's primary channel).
+    write_stream_params_sidecar(float(actual_rates[0]), float(actual_freqs[0]), "rx_to_remote_udp")
     print(f"Requesting gain {args.gain} dB...")
     for chan in channels:
         usrp.set_rx_gain(args.gain, chan)

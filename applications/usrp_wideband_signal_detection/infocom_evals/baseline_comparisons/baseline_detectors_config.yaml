@@ -1,0 +1,46 @@
+# Baseline (non-ML) detector configuration for the offline mask evaluation.
+#
+# Consumed by run_baseline_offline.py. These detectors do NOT run the C++/CUDA
+# pipeline; they read the ground truth + spectrograms produced by an existing
+# `run_offline_cuda_detector_eval` batch run (see README.md) and emit masks on the
+# identical FFT grid, so `eval_detector_masks.py` + the notebook compare them
+# directly against coherent_power / cuda_dino.
+#
+# Each key under `detectors:` is a detector_type; its value is the parameter block
+# passed straight to that detector (see baseline_detectors.py for the fields).
+
+baseline_eval:
+  # Existing batch-eval root laid out <root>/<detector>/<file_stem>/ that carries
+  # the ground truth (and, ideally, saved spectrogram tensors). Override on the CLI
+  # with --source-batch-root. Relative paths are resolved from the working dir
+  # (batch_runs/ lives under the sibling signal_detection_experiments/ folder).
+  source_batch_root: ../signal_detection_experiments/batch_runs/CHANGE_ME
+
+  # Where baseline detector directories are written. Default (null) = write them as
+  # siblings inside source_batch_root, so one eval_detector_masks.py run scores the
+  # baselines next to the trained detectors.
+  out_batch_root: null
+
+  # Detector to read GT / spectrogram tensors from (null = first one found).
+  source_detector: null
+
+  detectors:
+
+    # --- Static single-threshold power detector --------------------------------
+    # ONE threshold value for the whole frame (not per frequency bin): a single
+    # scalar noise-floor reference + threshold_db. A bin is ON above that one value.
+    3dB_power:
+      threshold_db: 3.0       # trigger this many dB above the reference floor
+      noise_percentile: 50.0  # single per-frame floor = this percentile of the whole frame (dB)
+      floor_db: null          # if set, use this ABSOLUTE floor (truly static across frames)
+
+    # --- Traditional edge-detection-based blob detection -----------------------
+    # Generic textbook CV pipeline (NOT tuned to the data): Gaussian smooth -> Sobel
+    # gradient (edges) -> percentile threshold -> morphological closing -> fill
+    # enclosed regions -> connected-component label -> keep blobs above min area.
+    blob_detection:
+      smooth_sigma: 1.0                 # Gaussian pre-smoothing before the edge operator
+      edge_percentile: 90.0             # keep gradient magnitudes above this percentile
+      close_iters: 2                    # binary-closing iterations to link edge fragments
+      fill_holes: true                  # fill regions enclosed by edges -> solid blobs
+      min_blob_area: 64                 # discard connected components smaller than this (px)

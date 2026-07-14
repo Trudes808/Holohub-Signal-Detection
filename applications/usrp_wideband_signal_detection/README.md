@@ -50,6 +50,7 @@ as the working root; wrappers and helpers live in subfolders and are called with
 | `config_coherent_power_performance_single_channel_replay.yaml` | coherent_power | Cable-loopback replay of a captured SigMF file. |
 | `config_coherent_power_capture_chdr_single_channel.yaml` | coherent_power | Capture a frozen CHDR/IQ snapshot for offline replay. |
 | `config_coherent_power_performance_emit_stride1_two_channel.yaml` | coherent_power | Live **dual-channel** (two 500 Msps channels); binds NIC `0000:a2:00.1` with two flows (ch0→`udp_dst 1234`, ch1→`1235`). |
+| `config_signal_snipper_single_channel.yaml` | coherent_power | Live **signal snipper**: cuts each detected signal out of the stream and writes it (or hands it to a downstream classifier). Dynamic floor, visualization off, `emit_stride: 1`. See [Signal snipper](#signal-snipper-cutting-signals-out-of-the-stream). |
 
 Calibration configs live in `calibration/`; superseded configs live in `old_configs/`.
 
@@ -187,6 +188,99 @@ CONFIG_NAME=config_coherent_power_performance_single_channel_replay.yaml sudo ./
 To first **capture** a frozen snapshot for later replay, run live with
 `config_coherent_power_capture_chdr_single_channel.yaml`; snapshots land under
 `/tmp/usrp_spectrograms` (host).
+
+---
+
+## Signal snipper: cutting signals out of the stream
+
+The **signal snipper** turns the detector mask into actual extracted signals. It clusters the mask
+into per-signal boxes, cuts the corresponding IQ out of the wideband stream, and emits a batch of
+self-describing signal cutouts that are either written to disk (SigMF) or consumed by a downstream
+classifier. Two operators implement this (`signal_snipper` → `sigmf_file_sink`), added to the graph
+when `pipeline.enable_signal_snipper: true`.
+
+Run it (live; also works over cable-loopback replay or the offline path):
+
+```bash
+cd applications/usrp_wideband_signal_detection
+sudo ./bash_scripts/run_torchscript_performance_test.sh config_signal_snipper_single_channel.yaml
+```
+
+Offline against a capture (the snipper + sink run in the offline eval graph too):
+
+```bash
+python3 run_cuda_dino_offline_file.py <file.sigmf-data> \
+  --detector coherent_power --config config_signal_snipper_single_channel.yaml \
+  --output-root /tmp/usrp_spectrograms/snip_test
+```
+
+Snipped files land under the `sigmf_file_sink.output_dir` (default `/workspace/spectrograms/snippets`
+→ host `/tmp/usrp_spectrograms/snippets`).
+
+### Modes (`signal_snipper:` config block)
+
+- **`mode: time_only`** — keep the time regions that contain any signal (full bandwidth, full rate);
+  each emitted snippet is a full-band IQ slice annotated with every signal's freq edges in that
+  interval. Tosses the signal-free time.
+- **`mode: frequency`** — additionally isolate each signal: digital down-convert to baseband,
+  low-pass to the detected bandwidth, and decimate to the minimum rate that preserves it plus
+  `oversample_percent`. Each signal becomes its own baseband IQ stream at its own (lower) rate.
+- Clustering knobs: `min_box_pixels` (speckle filter), `merge_gap_rows` / `merge_gap_cols` (coalesce
+  fragments of one signal). `emit_stride` on the detector controls how often snipping runs.
+
+### Output data format
+
+The sink writes **SigMF** (`cf32_le`, interleaved I/Q float32). `sigmf_file_sink.mode`:
+
+- **`per_signal`** — one `.sigmf-data` + `.sigmf-meta` per snippet.
+- **`pack`** (default) — accumulate `pack_frames` frames and write **one file per pack**. If every
+  snippet in the pack shares one (rate, center) — e.g. `time_only` — it is a standard concatenated
+  SigMF recording. Otherwise (frequency mode: every signal a different rate) it is a **variable-rate
+  container**: all snippets concatenated into one `.sigmf-data`, with the global `core:sample_rate`
+  as a reference clock and `wfgt:container: true` / `wfgt:layout: concatenated_variable_rate`. This
+  is what makes `emit_stride: 1` sustainable (one file per pack, not one per signal).
+
+Every annotation is self-describing, so a downstream ingestor can split a pack/container:
+
+| Field | Meaning |
+| --- | --- |
+| `core:sample_start`, `core:sample_count` | the snippet's slice **within this file** |
+| `wfgt:snippet_sample_rate` | the snippet's own (decimated) rate — **authoritative** in a container |
+| `wfgt:center_frequency` | the snippet's RF center |
+| `core:freq_lower_edge`, `core:freq_upper_edge` | detected band edges (RF Hz) |
+| `wfgt:frame_number`, `wfgt:orig_sample_start`, `wfgt:orig_sample_count`, `wfgt:orig_sample_end` | provenance in the original full-rate stream (which chunks belong together / span frames) |
+
+To read a container: iterate `annotations`, slice `[core:sample_start, +core:sample_count)` from the
+`.sigmf-data`, and interpret each slice at its `wfgt:snippet_sample_rate` (fall back to the standard
+single global `core:sample_rate` when `wfgt:container` is absent).
+
+If disk can't keep the snippet byte rate the sink logs `OVERFLOW` and drops whole batches (reporting
+signals / IQ samples / original-rate samples lost) rather than stalling the pipeline; raise
+`emit_stride`, raise `max_queued_batches`, or point `output_dir` at faster storage (e.g. `/dev/shm`).
+
+### Hooking up a classifier instead of the file sink
+
+The snipper emits a `holoscan::ops::SnippetBatchMessage` (defined in `signal_snip_types.hpp`) on its
+`snippets_out` port. Each `SignalSnippet` carries its IQ **on the GPU** (`device_iq`, a pooled
+`shared_ptr<cuda::std::complex<float>>`) plus `n_iq`, `sample_rate_hz`, `center_freq_hz`, the
+original-stream provenance, and its `annotations` — so a classifier consumes it **directly from GPU
+memory, zero-copy**. Only the file sink ever copies to host.
+
+To classify instead of (or alongside) writing files, add your operator and wire it to `snippets_out`
+in `main.cpp` exactly like the sink:
+
+```cpp
+// in compose(), where sigmfFileSinkOps are created/wired:
+auto classifier = make_operator<ops::MySignalClassifier>("signalClassifierOpCh0", from_config("signal_classifier"));
+add_operator(classifier);
+add_flow(signalSnipperOps[ch], classifier, {{"snippets_out", "in"}});   // fans out; can coexist with the sink
+```
+
+Your operator's input port is typed `spec.input<holoscan::ops::SnippetBatchMessage>("in")`; in
+`compute`, iterate `batch.snippets` and run inference on each `snippet.device_iq` (already on the
+device) using `snippet.n_iq` / `sample_rate_hz` / `center_freq_hz`. The port fans out, so a classifier
+and the file sink can both consume the same batch (the pooled buffer refcounts and recycles when the
+last consumer is done).
 
 ---
 
