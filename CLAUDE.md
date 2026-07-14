@@ -44,6 +44,7 @@ when adding files, and update references when moving anything:
 - Coherent live (calibrated per-freq): `config_coherent_power_perf_perfreq_single_channel.yaml`
 - Coherent live (dynamic floor): `config_coherent_power_perf_dynamic_single_channel.yaml`
 - DINO live: `config_cuda_dino_performance_single_channel.yaml`
+- Signal snipper (cut detected signals to SigMF / classifier): `config_signal_snipper_single_channel.yaml`
 - Cable-loopback replay: `config_coherent_power_performance_single_channel_replay.yaml`
 - Frozen-input capture: `config_coherent_power_capture_chdr_single_channel.yaml`
 - Offline eval (both detectors, same operators as live): `python3 run_cuda_dino_offline_file.py <file.sigmf-data> --detector {coherent_power|cuda_dino} --config <cfg>`, or the notebook `infocom_evals/signal_detection_experiments/debugging_signal_detection_eval.ipynb`.
