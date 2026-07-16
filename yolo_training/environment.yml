@@ -1,0 +1,21 @@
+# Conda env for training/running Ultralytics YOLO26 on RF spectrograms.
+# GPU: RTX 4000 Ada (sm_89), driver CUDA 12.4 -> cu124 torch wheels (matches the dinov3 env).
+# Create with:  mamba env create -f environment.yml   (or ./scripts/setup_env.sh)
+name: yolo
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch
+      - torchvision
+      - ultralytics          # provides YOLO26 (pip install -U ultralytics)
+      - jupyter
+      - ipykernel
+      - jupytext
+      - numpy
+      - pandas
+      - matplotlib
+      - pillow
