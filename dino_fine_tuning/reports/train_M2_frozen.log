@@ -1,0 +1,25 @@
+[train] M2_frozen: train=14588 (atten_max=None) val=3038
+[train] trainable params: 1.96M  (mode=frozen)
+[train] ep00 loss=0.9832 val_IoU=0.5662 F1=0.7230 P=0.632 R=0.845 (244s)
+[train]   new best val_IoU=0.5662 -> best.pt
+[train] ep01 loss=0.6083 val_IoU=0.7673 F1=0.8683 P=0.925 R=0.818 (243s)
+[train]   new best val_IoU=0.7673 -> best.pt
+[train] ep02 loss=0.5166 val_IoU=0.7771 F1=0.8746 P=0.911 R=0.841 (243s)
+[train]   new best val_IoU=0.7771 -> best.pt
+[train] ep03 loss=0.4846 val_IoU=0.4192 F1=0.5908 P=0.435 R=0.918 (243s)
+[train] ep04 loss=0.4581 val_IoU=0.6167 F1=0.7629 P=0.656 R=0.911 (243s)
+[train] ep05 loss=0.4492 val_IoU=0.7729 F1=0.8719 P=0.871 R=0.873 (243s)
+[train] ep06 loss=0.4287 val_IoU=0.7564 F1=0.8613 P=0.833 R=0.891 (243s)
+[train] ep07 loss=0.4217 val_IoU=0.7732 F1=0.8721 P=0.865 R=0.879 (243s)
+[train] ep08 loss=0.4133 val_IoU=0.7513 F1=0.8580 P=0.823 R=0.896 (243s)
+[train] ep09 loss=0.5275 val_IoU=0.7156 F1=0.8342 P=0.773 R=0.906 (243s)
+[train] ep10 loss=0.5007 val_IoU=0.8240 F1=0.9035 P=0.943 R=0.867 (243s)
+[train]   new best val_IoU=0.8240 -> best.pt
+[train] ep11 loss=0.4732 val_IoU=0.7449 F1=0.8538 P=0.811 R=0.901 (243s)
+[train] ep12 loss=0.4481 val_IoU=0.7520 F1=0.8584 P=0.816 R=0.905 (243s)
+[train] ep13 loss=0.4311 val_IoU=0.7857 F1=0.8800 P=0.867 R=0.894 (243s)
+[train] ep14 loss=0.4296 val_IoU=0.7932 F1=0.8846 P=0.873 R=0.897 (243s)
+[train] ep15 loss=0.4137 val_IoU=0.7994 F1=0.8885 P=0.878 R=0.899 (243s)
+[train] ep16 loss=0.3807 val_IoU=0.7875 F1=0.8811 P=0.860 R=0.903 (243s)
+[train] ep17 loss=0.3830 val_IoU=0.7796 F1=0.8762 P=0.849 R=0.906 (243s)
+[train] DONE M2_frozen: best val_IoU=0.8240

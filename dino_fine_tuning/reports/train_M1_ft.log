@@ -1,0 +1,34 @@
+[train] M1_ft: train=8336 (atten_max=30) val=3038
+[train] trainable params: 30.32M  (mode=ft_lastN)
+[train] ep00 loss=0.8672 val_IoU=0.6762 F1=0.8068 P=0.882 R=0.743 (222s)
+[train]   new best val_IoU=0.6762 -> best.pt
+[train] ep01 loss=0.4496 val_IoU=0.7239 F1=0.8398 P=0.969 R=0.741 (221s)
+[train]   new best val_IoU=0.7239 -> best.pt
+[train] ep02 loss=0.3290 val_IoU=0.7282 F1=0.8427 P=0.960 R=0.751 (221s)
+[train]   new best val_IoU=0.7282 -> best.pt
+[train] ep03 loss=0.2843 val_IoU=0.7333 F1=0.8461 P=0.966 R=0.752 (221s)
+[train]   new best val_IoU=0.7333 -> best.pt
+[train] ep04 loss=0.2628 val_IoU=0.7334 F1=0.8462 P=0.980 R=0.744 (221s)
+[train]   new best val_IoU=0.7334 -> best.pt
+[train] ep05 loss=0.2477 val_IoU=0.7415 F1=0.8515 P=0.959 R=0.766 (221s)
+[train]   new best val_IoU=0.7415 -> best.pt
+[train] ep06 loss=0.2375 val_IoU=0.7407 F1=0.8511 P=0.979 R=0.752 (221s)
+[train] ep07 loss=0.2279 val_IoU=0.7422 F1=0.8520 P=0.985 R=0.751 (221s)
+[train]   new best val_IoU=0.7422 -> best.pt
+[train] ep08 loss=0.1085 val_IoU=0.7360 F1=0.8479 P=0.973 R=0.751 (221s)
+[train] ep09 loss=0.0178 val_IoU=0.7454 F1=0.8541 P=0.983 R=0.755 (221s)
+[train]   new best val_IoU=0.7454 -> best.pt
+[train] ep10 loss=0.0118 val_IoU=0.7490 F1=0.8565 P=0.983 R=0.759 (221s)
+[train]   new best val_IoU=0.7490 -> best.pt
+[train] ep11 loss=0.0094 val_IoU=0.7489 F1=0.8564 P=0.978 R=0.761 (221s)
+[train] ep12 loss=0.0077 val_IoU=0.7516 F1=0.8582 P=0.982 R=0.762 (221s)
+[train]   new best val_IoU=0.7516 -> best.pt
+[train] ep13 loss=0.0068 val_IoU=0.7535 F1=0.8594 P=0.985 R=0.762 (221s)
+[train]   new best val_IoU=0.7535 -> best.pt
+[train] ep14 loss=0.0061 val_IoU=0.7515 F1=0.8581 P=0.990 R=0.757 (221s)
+[train] ep15 loss=0.0054 val_IoU=0.7547 F1=0.8602 P=0.989 R=0.761 (221s)
+[train]   new best val_IoU=0.7547 -> best.pt
+[train] ep16 loss=0.0052 val_IoU=0.7549 F1=0.8603 P=0.990 R=0.761 (221s)
+[train]   new best val_IoU=0.7549 -> best.pt
+[train] ep17 loss=0.0051 val_IoU=0.7547 F1=0.8602 P=0.990 R=0.760 (221s)
+[train] DONE M1_ft: best val_IoU=0.7549

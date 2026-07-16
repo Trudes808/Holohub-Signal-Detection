@@ -1,0 +1,9 @@
+[eval] wrote 3150 frame rows, 1336 region rows -> eval_out/energy
+[eval] tuned threshold=0.20 (val micro-F1=0.854)
+[eval] wrote 3150 frame rows, 1336 region rows -> eval_out/M1_frozen
+[eval] tuned threshold=0.45 (val micro-F1=0.860)
+[eval] wrote 3150 frame rows, 1336 region rows -> eval_out/M1_ft
+[eval] tuned threshold=0.70 (val micro-F1=0.906)
+[eval] wrote 3150 frame rows, 1336 region rows -> eval_out/M2_frozen
+[eval] tuned threshold=0.85 (val micro-F1=0.908)
+[eval] wrote 3150 frame rows, 1336 region rows -> eval_out/M2_ft

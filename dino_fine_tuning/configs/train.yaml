@@ -1,0 +1,19 @@
+# Training configuration (shared by all experiments; overridden on CLI).
+weights_path: /home/bqn82/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+feat_layers: [2, 5, 8, 11]
+
+epochs: 18
+batch_size: 16
+lr_head: 3.0e-4
+lr_backbone: 1.0e-5        # only used in ft_lastN mode
+weight_decay: 0.05
+unfreeze_last_n: 4         # ft_lastN mode
+warmup_frac: 0.05
+amp: true                  # bf16 autocast
+pos_weight: 3.0            # signal pixels are the minority
+dice_w: 1.0
+bce_w: 1.0
+augment: true
+num_workers: 4
+seed: 7
+threshold: 0.5             # decision threshold for val IoU/F1

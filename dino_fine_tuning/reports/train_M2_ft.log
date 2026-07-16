@@ -1,0 +1,25 @@
+[train] M2_ft: train=14588 (atten_max=None) val=3038
+[train] trainable params: 30.32M  (mode=ft_lastN)
+[train] ep00 loss=0.9654 val_IoU=0.4646 F1=0.6344 P=0.498 R=0.873 (360s)
+[train]   new best val_IoU=0.4646 -> best.pt
+[train] ep01 loss=0.6082 val_IoU=0.7720 F1=0.8713 P=0.949 R=0.805 (360s)
+[train]   new best val_IoU=0.7720 -> best.pt
+[train] ep02 loss=0.5124 val_IoU=0.6039 F1=0.7530 P=0.666 R=0.866 (360s)
+[train] ep03 loss=0.4707 val_IoU=0.2685 F1=0.4234 P=0.273 R=0.947 (360s)
+[train] ep04 loss=0.4425 val_IoU=0.7623 F1=0.8651 P=0.841 R=0.891 (360s)
+[train] ep05 loss=0.4290 val_IoU=0.6121 F1=0.7594 P=0.654 R=0.905 (360s)
+[train] ep06 loss=0.4186 val_IoU=0.6646 F1=0.7985 P=0.713 R=0.908 (360s)
+[train] ep07 loss=0.4363 val_IoU=0.7778 F1=0.8750 P=0.856 R=0.895 (360s)
+[train]   new best val_IoU=0.7778 -> best.pt
+[train] ep08 loss=0.5738 val_IoU=0.7981 F1=0.8877 P=0.897 R=0.879 (360s)
+[train]   new best val_IoU=0.7981 -> best.pt
+[train] ep09 loss=0.5495 val_IoU=0.6884 F1=0.8154 P=0.741 R=0.906 (360s)
+[train] ep10 loss=0.4749 val_IoU=0.7351 F1=0.8474 P=0.811 R=0.887 (360s)
+[train] ep11 loss=0.5068 val_IoU=0.7741 F1=0.8727 P=0.858 R=0.888 (360s)
+[train] ep12 loss=0.4682 val_IoU=0.6028 F1=0.7522 P=0.635 R=0.922 (360s)
+[train] ep13 loss=0.4485 val_IoU=0.7364 F1=0.8482 P=0.800 R=0.902 (360s)
+[train] ep14 loss=0.4237 val_IoU=0.7124 F1=0.8320 P=0.769 R=0.906 (360s)
+[train] ep15 loss=0.4310 val_IoU=0.7751 F1=0.8733 P=0.854 R=0.894 (360s)
+[train] ep16 loss=0.4144 val_IoU=0.7331 F1=0.8460 P=0.800 R=0.897 (360s)
+[train] ep17 loss=0.4190 val_IoU=0.7352 F1=0.8474 P=0.803 R=0.897 (360s)
+[train] DONE M2_ft: best val_IoU=0.7981

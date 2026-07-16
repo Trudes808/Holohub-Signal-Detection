@@ -60,9 +60,19 @@ rti_license.dat
 
 # Notebook-generated validator artifacts
 notebooks/validator_artifacts/
+notebooks/dino_fine_tuning_evals/compare_tables/
+notebooks/dino_fine_tuning_evals/sweeps/
 applications/usrp_wideband_signal_detection/chunk_compare_artifacts/
 applications/usrp_wideband_signal_detection/generated_inputs/
 applications/usrp_wideband_signal_detection/generated_configs/
 
 # Batch offline-eval outputs (masks/GT/manifests + state + metrics tables) — large, regenerable
 applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_experiments/batch_runs/
+
+# dino fine tuning artifacts
+dino_fine_tuning/checkpoints/
+dino_fine_tuning/eval_out/
+dino_fine_tuning/notebooks/sweep*
+
+# claude dump files
+.claude/
