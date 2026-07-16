@@ -53,7 +53,7 @@ tmp/
 .viminfo
 .lesshst
 CLAUDE.local.md
-.claude/settings.local.json
+.claude/
 
 # Licenses
 rti_license.dat
