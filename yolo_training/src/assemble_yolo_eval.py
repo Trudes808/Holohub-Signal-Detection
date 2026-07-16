@@ -45,8 +45,8 @@ def link(src: Path, dst: Path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sweep", default=str(YT / "eval/sweeps/sweep_all"))
-    ap.add_argument("--tables-dir", default=str(YT / "eval/compare_tables"))
+    ap.add_argument("--sweep", default=str(Path("/home/bqn82/Holohub-Signal-Detection/notebooks/yolo_evals/sweeps/sweep_all")))
+    ap.add_argument("--tables-dir", default=str(Path("/home/bqn82/Holohub-Signal-Detection/notebooks/yolo_evals/compare_tables")))
     ap.add_argument("--dino-sweep", default=str(DINO_SWEEP))
     ap.add_argument("--captures-dir", default="/home/bqn82/captures")
     ap.add_argument("--conf", type=float, default=0.25)

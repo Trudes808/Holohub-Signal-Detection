@@ -37,8 +37,8 @@ def link(src, dst):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sweep", default=str(YT / "eval/sweeps/sweep_lte"))
-    ap.add_argument("--tables-dir", default=str(YT / "eval/compare_tables_lte"))
+    ap.add_argument("--sweep", default=str(Path("/home/bqn82/Holohub-Signal-Detection/notebooks/yolo_evals/sweeps/sweep_lte")))
+    ap.add_argument("--tables-dir", default=str(Path("/home/bqn82/Holohub-Signal-Detection/notebooks/yolo_evals/compare_tables_lte")))
     ap.add_argument("--captures-dir", default="/home/bqn82/captures/lte")
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--coverage-threshold", type=float, default=0.1)

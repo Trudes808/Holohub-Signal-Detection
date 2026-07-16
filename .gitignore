@@ -84,3 +84,6 @@ yolo_training/weights/
 yolo_training/**/*.pt
 yolo_training/eval/
 yolo_training/configs/dataset.yaml
+notebooks/yolo_evals/compare_tables/
+notebooks/yolo_evals/compare_tables_lte/
+notebooks/yolo_evals/sweeps/
