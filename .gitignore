@@ -82,3 +82,5 @@ yolo_training/data/
 yolo_training/runs/
 yolo_training/weights/
 yolo_training/**/*.pt
+yolo_training/eval/
+yolo_training/configs/dataset.yaml

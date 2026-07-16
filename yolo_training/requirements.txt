@@ -87,6 +87,7 @@ nvidia-nvtx-cu12==12.4.127
 opencv-python==5.0.0.93
 overrides==7.7.0
 packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1777103621/work
+pandas==3.0.3
 pandocfilters==1.5.1
 parso==0.8.7
 pexpect==4.9.0

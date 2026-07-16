@@ -14,7 +14,7 @@ conda activate "${ENV_NAME}"
 echo "[setup] installing torch (cu124) + ultralytics (YOLO26) + jupyter"
 pip install --upgrade pip
 pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision
-pip install -U ultralytics jupyter ipykernel jupytext
+pip install -U ultralytics jupyter ipykernel jupytext pandas numpy matplotlib
 python -m ipykernel install --user --name yolo --display-name "Python (yolo)"
 echo "[setup] freezing exact versions -> requirements.txt"
 pip freeze > "$(dirname "$0")/../requirements.txt"

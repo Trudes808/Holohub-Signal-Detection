@@ -38,9 +38,21 @@ versions into `requirements.txt`.
    (nfft=1024) as `dino_fine_tuning`, so labels, geometry, and the eval display grid align.
 
 
-## TODO pipeline (after decisions)
-- [ ] Dataset builder: SigMF captures → YOLO-format images+labels (reuse `dino_fine_tuning` framing).
-- [ ] Train fine-tuned YOLO26 detection (signal/noise).
-- [ ] Mask emitter → batch-eval run dir (mirrors `src/gen_finetuned_run.py`).
-- [ ] `eval_detector_masks.py` → `compare_tables_yolo` (+ combined table for comparison).
-- [ ] Notebooks: `yolo_eval.ipynb` (YOLO-only) + comparison notebook.
+## Pipeline status
+- [x] **Dataset builder** (`src/build_yolo_dataset.py`) — DINO frames+boxes+splits → YOLO format (14588/3038/3150).
+- [~] **Train** fine-tuned YOLO26 detection (signal/noise): `scripts/train_both.sh` runs yolo26s + yolo26m — *in progress*.
+- [x] **Mask emitter** (`src/yolo_infer.py` + `src/gen_yolo_run.py`) — YOLO boxes → binary masks on the batch grid
+      (`to_display_grid`, verbatim from the DINO path). Geometry validated.
+- [x] **Assembler + eval** (`src/assemble_yolo_eval.py`) — materialize YOLO masks + symlink the DINO/deployed
+      detectors into one sweep root, run `eval_detector_masks.py` → `eval/compare_tables/`.
+- [x] **Notebooks** — `notebooks/yolo_eval.ipynb` (YOLO-only) + `notebooks/yolo_vs_dino_comparison.ipynb`
+      (vs coherent / zero-shot DINO / fine-tuned DINO). Kernel "Python (yolo)".
+
+## Run the eval (after training finishes)
+```bash
+conda activate yolo
+python src/assemble_yolo_eval.py          # YOLO masks (both sizes) + DINO dirs -> eval_detector_masks -> eval/compare_tables
+```
+Then open the two notebooks (kernel **Python (yolo)**) and Run All. Weights are auto-located by glob
+(`runs/**/yolo26{s,m}_signal/weights/best.pt`), so the nested Ultralytics run path doesn't matter.
+Relocate eval artifacts by setting `YOLO_EVAL_ROOT`.
