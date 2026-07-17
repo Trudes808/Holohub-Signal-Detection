@@ -87,3 +87,6 @@ yolo_training/configs/dataset.yaml
 notebooks/yolo_evals/compare_tables/
 notebooks/yolo_evals/compare_tables_lte/
 notebooks/yolo_evals/sweeps/
+
+# Extracted plot-regeneration metrics (small tables + SnrResults; regenerable)
+applications/usrp_wideband_signal_detection/infocom_evals/baseline_comparisons/saved_results/
