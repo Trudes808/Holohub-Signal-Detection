@@ -28,12 +28,32 @@ import numpy as np
 # canonical bucket orderings (BUCKETERS produce these labels)
 BW_ORDER = ["<2MHz", "2-10MHz", "10-25MHz", "25-60MHz", ">=60MHz"]
 LEN_ORDER = ["<10k", "10k-100k", "100k-1M", "1M-5M", ">=5M"]
-DETECTOR_STYLE = {  # consistent colors/markers across all figures
+DETECTOR_STYLE = {  # consistent colors/markers across every figure (attenuation + SNR)
+    # trained / deployed
     "coherent_power": {"color": "#1f77b4", "marker": "o"},
-    "cuda_dino": {"color": "#d62728", "marker": "s"},
-    "3dB_power": {"color": "#2ca02c", "marker": "^"},       # baseline: moving-average power
-    "blob_detection": {"color": "#9467bd", "marker": "D"},  # baseline: image-processing blobs
+    "cuda_dino": {"color": "#d62728", "marker": "s"},       # zero-shot DINOv3
+    # non-ML baselines
+    "3dB_power": {"color": "#2ca02c", "marker": "^"},        # moving-average power
+    "blob_detection": {"color": "#9467bd", "marker": "D"},   # image-processing blobs
+    # fine-tuned ML models
+    "yolo": {"color": "#ff7f0e", "marker": "v"},             # fine-tuned YOLO26
+    "dino_finetuned": {"color": "#8c564b", "marker": "P"},   # fine-tuned DINOv3
 }
+# aliases so the styles hold no matter which run-dir name a detector was written under
+_STYLE_ALIASES = {
+    "yolo26m": "yolo", "yolo26s": "yolo",
+    "finetuned_dino": "dino_finetuned", "finetuned_dino_m2": "dino_finetuned",
+}
+# canonical left-to-right / legend order (unknown detectors sort to the end, by name)
+DETECTOR_ORDER = ["coherent_power", "cuda_dino", "3dB_power", "blob_detection",
+                  "yolo", "dino_finetuned"]
+# display labels for plots (internal run-dir names stay as-is everywhere else).
+# Keep in sync with plot_snr_results.DETECTOR_LABELS + eval_viz.DETECTOR_LABELS.
+DETECTOR_LABELS = {"cuda_dino": "zero_shot_dino"}
+
+
+def label_for(det) -> str:
+    return DETECTOR_LABELS.get(det, det)
 
 
 def _f(x):
@@ -108,12 +128,20 @@ def _attn_axis(rows):
     return sorted({r["attenuation_db"] for r in rows if r["attenuation_db"] is not None})
 
 
+def order_detectors(dets) -> list:
+    """Sort detectors by DETECTOR_ORDER (canonical), unknowns alphabetically after."""
+    dets = list(dets)
+    return sorted(dets, key=lambda d: (DETECTOR_ORDER.index(d) if d in DETECTOR_ORDER
+                                       else len(DETECTOR_ORDER), d))
+
+
 def _detectors(rows):
-    return sorted({r["detector"] for r in rows})
+    return order_detectors({r["detector"] for r in rows})
 
 
 def _style(det):
-    return DETECTOR_STYLE.get(det, {"color": None, "marker": "^"})
+    return DETECTOR_STYLE.get(det, DETECTOR_STYLE.get(_STYLE_ALIASES.get(det, ""),
+                                                      {"color": None, "marker": "x"}))
 
 
 # --------------------------------------------------------------------------- #
@@ -136,7 +164,7 @@ def fig_rate_vs_power_by(region, facet_key, facet_order=None, threshold=0.1, tit
         ax = axes[i // ncol][i % ncol]
         for det in dets:
             ys = [agg.get((det, fv, a), (np.nan, 0))[0] for a in attn]
-            ax.plot(attn, ys, label=det, **_style(det))
+            ax.plot(attn, ys, label=label_for(det), **_style(det))
         ax.set_title(f"{facet_key}={fv}", fontsize=9)
         ax.set_xlabel("attenuation (dB)  [louder → quieter]", fontsize=8)
         ax.set_ylabel(f"detection rate (cov≥{threshold})", fontsize=8)
@@ -163,7 +191,7 @@ def fig_metric_vs_bucket(region, bucket_key, bucket_order, threshold=0.1, title=
     for ax, (ylabel, agg) in zip(axes[0], panels):
         for det in dets:
             ys = [agg.get((det, b), (np.nan, 0))[0] for b in buckets]
-            ax.plot(x, ys, label=det, **_style(det))
+            ax.plot(x, ys, label=label_for(det), **_style(det))
         ax.set_xticks(x); ax.set_xticklabels(buckets, rotation=30, ha="right", fontsize=8)
         ax.set_ylabel(ylabel, fontsize=9); ax.set_ylim(-0.02, 1.02); ax.grid(alpha=0.3)
     axes[0][0].set_xlabel(bucket_key); axes[0][0].legend(fontsize=8)
@@ -185,7 +213,7 @@ def fig_frame_metrics_vs_power(frame, title=None):
         agg = mean_metric(frame, ("detector", "attenuation_db"), field)
         for det in dets:
             ys = [agg.get((det, a), (np.nan, 0))[0] for a in attn]
-            ax.plot(attn, ys, label=det, **_style(det))
+            ax.plot(attn, ys, label=label_for(det), **_style(det))
         ax.set_title(label, fontsize=9)
         ax.set_xlabel("attenuation (dB)", fontsize=8)
         ax.grid(alpha=0.3)

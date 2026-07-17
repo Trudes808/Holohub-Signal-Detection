@@ -1,0 +1,93 @@
+# Unified 6-detector offline comparison config (SNR-axis).
+#
+# One source of truth for the whole comparison, consumed by:
+#   * run_full_comparison.py       (orchestrates every stage below)
+#   * run_ml_detectors_offline.py  (the yolo + dino_finetuned stage)
+#   * run_baseline_offline.py      (the 3dB_power + blob_detection stage; reads
+#                                   the `baselines:` block via --config this file)
+#
+# The six detectors compared, and where each comes from:
+#   coherent_power  cuda_dino   -- trained/deployed; produced by the C++ offline
+#                                  binary via run_batch_offline_eval.py (needs the
+#                                  demo container). These populate the batch root
+#                                  and carry the ground truth + frame manifests.
+#   3dB_power       blob_detection -- non-ML baselines (baseline_detectors.py).
+#   yolo            dino_finetuned -- fine-tuned ML models (run_ml_detectors_offline.py),
+#                                  scored on the identical frames/GT.
+#
+# Everything downstream (eval_detector_masks.py -> build_snr_results.py ->
+# plot_snr_results.py + the review notebook) is detector-agnostic: any dir under
+# the batch root that has mask_arrays/ + a (symlinked) manifest + GT is scored and
+# plotted automatically, on the shared SNR axis (-20..+40 dB).
+
+comparison_eval:
+
+  # ------------------------------------------------------------------ paths --- #
+  # The batch-eval root laid out <root>/<detector>/<file_stem>/. Produced by the
+  # trained sweep (run_batch_offline_eval.py --run-id <id> ...). Override on the
+  # CLI with --batch-root. Relative paths resolve from the working dir.
+  batch_root: ../signal_detection_experiments/batch_runs/3db_blob_coherent_yolo_dino_all6_0_60dBFiles
+
+  # Source SigMF captures (the ML detectors reconstruct each frame's spectrogram
+  # from raw IQ; the baselines fall back to this when spectrogram tensors are absent).
+  captures_dir: /home/bqn82/captures
+
+  # Detector whose GT + frame_manifest.csv the ML detectors mirror (GT is
+  # detector-independent). Must exist in the batch root before the ML stage runs.
+  ref_detector: cuda_dino
+
+  # dinov3 repo for the fine-tuned DINO backbone (put on sys.path at run time).
+  dinov3_repo: /home/bqn82/dinov3
+
+  # Trained detectors expected in the batch root (checked/reported by the
+  # orchestrator; produced by the container sweep, not by these Python scripts).
+  trained_detectors: [coherent_power, cuda_dino]
+
+  # ------------------------------------------------- non-ML baseline block --- #
+  # Consumed by run_baseline_offline.py (it reads `baselines:` here as its
+  # `detectors:` map). Params match baseline_detectors.py dataclasses.
+  baselines:
+    3dB_power:
+      threshold_db: 3.0
+      noise_percentile: 50.0
+      floor_db: null
+    blob_detection:
+      smooth_sigma: 1.0
+      edge_percentile: 90.0
+      close_iters: 2
+      fill_holes: true
+      min_blob_area: 64
+
+  # ------------------------------------------------------- ML detector block - #
+  # Each key is the run-dir (detector) name that appears in plots/legends. `kind`
+  # selects the family. Trained artifacts default to the /home/bqn82 tree where
+  # they were trained; edit if yours live elsewhere.
+  ml_detectors:
+
+    # Fine-tuned YOLO26-m (Ultralytics boxes -> filled binary mask).
+    yolo:
+      kind: yolo
+      ckpt: /home/bqn82/Holohub-Signal-Detection/yolo_training/runs/detect/yolo26m_signal/weights/best.pt
+      dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
+      conf: 0.25
+      imgsz: 1024
+      device: cuda
+
+    # Fine-tuned DINOv3 segmenter, M2_ft (backbone last-4 unfrozen, trained on all
+    # attenuations). Decision threshold read from its eval_meta.json (val-tuned).
+    dino_finetuned:
+      kind: dino_finetuned
+      ckpt: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/checkpoints/M2_ft/best.pt
+      eval_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/eval_out/M2_ft/eval_meta.json
+      train_cfg: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/configs/train.yaml
+      dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
+      device: cuda
+
+  # --------------------------------------------------------- SNR axis knobs -- #
+  # build_snr_results.py calibrates SNR from the 0 dB capture; plot_snr_results.py
+  # pins the shared x-axis. These defaults match the agreed method.
+  snr:
+    zero_db_stem: attenuation_dB_0
+    snr_bin_width: 5.0        # dB (== physical attenuator step)
+    snr_range: [-20.0, 40.0]  # shared x-axis for every SNR figure
+    det_threshold: 0.1        # region 'detected' if box coverage >= this

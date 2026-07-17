@@ -277,6 +277,15 @@ def _load_or_reconstruct_spectrogram(run_dir, row, file_stem, fft_rows, fft_cols
 # --------------------------------------------------------------------------- #
 # Plotting
 # --------------------------------------------------------------------------- #
+# display labels for panels/plots (internal run-dir names stay as-is everywhere else).
+# Keep in sync with plot_snr_results.DETECTOR_LABELS + plot_eval_results.DETECTOR_LABELS.
+DETECTOR_LABELS = {"cuda_dino": "zero_shot_dino"}
+
+
+def label_for(det) -> str:
+    return DETECTOR_LABELS.get(det, det)
+
+
 def _db_limits(spectrogram_db: np.ndarray, lo_q=5.0, hi_q=99.5) -> tuple[float, float]:
     finite = spectrogram_db[np.isfinite(spectrogram_db)]
     if finite.size == 0:
@@ -359,14 +368,14 @@ def plot_frame_panels(
 
     # Detector panels
     for idx, detector in enumerate(detectors, start=1):
-        draw_spectrogram(axes[idx], f"{detector} mask")
+        draw_spectrogram(axes[idx], f"{label_for(detector)} mask")
         mask = bundle.detector_masks.get(detector)
         if mask is not None:
             overlay_mask(axes[idx], mask, mask_color)
             cov = float((mask != 0).sum()) / mask.size
-            axes[idx].set_title(f"{detector} mask  (on={cov*100:.2f}% of grid)")
+            axes[idx].set_title(f"{label_for(detector)} mask  (on={cov*100:.2f}% of grid)")
         else:
-            axes[idx].set_title(f"{detector} mask (MISSING)")
+            axes[idx].set_title(f"{label_for(detector)} mask (MISSING)")
 
     # Pin identical limits on every panel so an overlay/box can never autoscale one
     # panel out of sync with the others (this is what made masks look 'misaligned').

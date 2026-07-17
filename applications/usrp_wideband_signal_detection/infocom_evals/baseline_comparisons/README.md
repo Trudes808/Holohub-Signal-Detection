@@ -1,29 +1,78 @@
-# Baseline detector comparisons (non-ML)
+# Detector comparisons — six detectors on a shared SNR axis
 
-Two classic, **no-machine-learning** signal detectors evaluated on the *same*
-frames, ground truth, and metrics as the trained `coherent_power` / `cuda_dino`
-detectors — so you can see how far simple signal/image processing gets, and how it
-degrades vs SNR.
+**Six** signal detectors evaluated on the *same* frames, ground truth, and metrics,
+then plotted against a physically-meaningful **SNR (dB)** axis (shared −20…+40 dB
+range) so you can see how classic signal/image processing, the deployed detectors,
+and the fine-tuned ML models each degrade with SNR — all fairly comparable because
+every detector is scored by one identical `eval_detector_masks.py` code path.
 
-| `detector_type`   | What it does |
-|-------------------|--------------|
-| `3dB_power`       | Static single-threshold power detector. Uses **one** threshold value for the whole frame (not per frequency bin): a single scalar noise-floor reference plus `threshold_db` (default 3 dB). A bin is ON above that one value. The floor is a per-frame percentile of the dB power by default, or an absolute `floor_db` for a threshold that is fully fixed across frames. |
-| `blob_detection`  | Traditional edge-detection-based blob detection (a generic textbook CV pipeline, deliberately **not** tuned to the data): Gaussian smooth → Sobel gradient magnitude (edges) → percentile threshold → morphological closing → fill enclosed regions → connected-component label, keep blobs above a minimum area. The filled regions are the mask. |
+| `detector_type`   | Family | What it is |
+|-------------------|--------|------------|
+| `coherent_power`  | deployed | Coherent power detector (C++/CUDA offline binary). |
+| `cuda_dino`       | deployed | Zero-shot DINOv3 (C++/CUDA offline binary). |
+| `3dB_power`       | baseline (non-ML) | Static single-threshold power detector. **One** threshold for the whole frame (not per bin): a scalar noise-floor reference + `threshold_db` (default 3 dB). Floor = per-frame percentile of dB power by default, or an absolute `floor_db`. |
+| `blob_detection`  | baseline (non-ML) | Textbook edge-based CV, deliberately **not** tuned: Gaussian smooth → Sobel gradient (edges) → percentile threshold → morphological closing → fill enclosed regions → connected components ≥ min area. |
+| `yolo`            | fine-tuned ML | Fine-tuned YOLO26 (Ultralytics); detection boxes rasterized to a binary mask. |
+| `dino_finetuned`  | fine-tuned ML | Fine-tuned DINOv3 segmenter (M2_ft: last-4 blocks unfrozen, trained on all attenuations). |
 
-Both consume the `(time, freq)` spectrogram in dB power and emit a binary `uint8`
-mask on the **identical FFT grid** as the trained detectors, so the entire
-downstream evaluation (`eval_detector_masks.py` → `plot_eval_results.py` → the
-notebook) is reused unchanged. Everything here is pure Python (numpy + scipy) — **no
-container rebuild, no GPU, no Holoscan**.
+Every detector emits a binary `uint8` mask on the **identical FFT grid** as the
+trained detectors, dropped into the batch root as a sibling `<detector>/` dir, so the
+entire downstream chain (`eval_detector_masks.py` → `build_snr_results.py` →
+`plot_snr_results.py` → the notebook) is detector-agnostic and reused unchanged.
+The baselines are pure Python (numpy + scipy, no GPU); the ML detectors need a GPU +
+their trained weights; the deployed detectors need the demo container.
 
 ## Files
 
-- `baseline_detectors.py` — the two detector algorithms + a `detector_type` registry.
-- `run_baseline_offline.py` — driver: reads an existing batch-eval tree, runs the
-  baselines, writes them as sibling detector dirs.
-- `baseline_detectors_config.yaml` — detector parameters + source/output paths.
-- `baseline_eval_review.ipynb` — visual review + performance-vs-SNR plots (mirrors
-  the parent `batch_eval_review.ipynb`).
+- `run_full_comparison.py` — **top-level orchestrator**: runs every stage below over
+  one batch root (idempotent, resumable, per-stage flags). Start here.
+- `comparison_config.yaml` — **single source of truth**: batch root, captures, all
+  six detectors' params/weights/paths, and the SNR-axis knobs.
+- `run_ml_detectors_offline.py` — driver for the two fine-tuned ML detectors
+  (`yolo`, `dino_finetuned`); path-robust wrapper around the colleague's
+  `yolo_infer` / `finetuned_infer` classes (see "Why this, not gen_*_run.py" below).
+- `baseline_detectors.py` — the two non-ML detector algorithms + a registry.
+- `run_baseline_offline.py` — driver for the non-ML baselines.
+- `baseline_detectors_config.yaml` — standalone baseline params (still usable on its
+  own; the orchestrator synthesizes an equivalent from `comparison_config.yaml`).
+- `snr_measurement.py` / `build_snr_results.py` — SNR calibration + the serialized
+  `SnrResults` object.
+- `plot_snr_results.py` — SNR-axis figures (shared −20…+40 dB axis, consistent
+  per-detector colors/markers).
+- `baseline_eval_review.ipynb` — visual review + the SNR-axis 6-detector comparison.
+
+## Quick start — the full 6-way sweep
+
+```bash
+cd infocom_evals/baseline_comparisons
+# 1. edit comparison_config.yaml: set batch_root (a run id), captures_dir, and the
+#    ml_detectors weight paths (defaults point at the /home/bqn82 trained tree).
+# 2. produce the trained detectors first (needs the demo container; run_full_comparison
+#    prints the exact command if they're missing), then run everything else headless:
+python3 run_full_comparison.py --config comparison_config.yaml \
+    --batch-root ../signal_detection_experiments/batch_runs/<run_id>
+```
+
+Stages (each idempotent; select with `--stages`, skip with `--skip`):
+`preflight` (verify trained detectors present) → `baselines` (3dB_power, blob_detection)
+→ `ml` (yolo, dino_finetuned; GPU) → `eval` (score all six) → `snr` (calibrate + join)
+→ `plots` (SNR figures). When it finishes it prints the `BATCH_ROOT` / `RESULTS`
+lines to paste into the notebook's first cell.
+
+The GPU stages (`ml`, and the trained sweep flagged by `preflight`) run where the
+weights + container live; the CPU stages (`baselines`, `eval`, `snr`, `plots`) run
+anywhere. Re-invoke with `--stages ml eval snr plots` to resume after producing the
+trained detectors, etc.
+
+### Why `run_ml_detectors_offline.py` instead of the colleague's `gen_*_run.py`
+
+`yolo_training/src/gen_yolo_run.py` and `dino_fine_tuning/src/gen_finetuned_run.py`
+hardcode `/home/bqn82/Holohub-Signal-Detection` on `sys.path` for the **shared** eval
+modules (`eval_viz`, `mask_eval_metrics`), so running them from this branch would
+score the ML detectors with a *different* checkout's code than the baselines. The
+unified driver resolves those shared modules (and `rfdata` / `model`) from **this**
+branch and only reads the trained artifacts (weights, dB calibration, dinov3 backbone)
+from wherever they live — one identical scoring path for all six detectors.
 
 ## How it fits together
 
@@ -40,17 +89,26 @@ tensors:
     mask_arrays/         mask_ch<c>_f<f>_<H>x<W>.npy
 ```
 
-`run_baseline_offline.py` reuses that ground truth + those spectrograms and writes
-the baselines as **new sibling detector dirs in the same batch root**:
+`run_baseline_offline.py` (baselines) and `run_ml_detectors_offline.py` (ML) each
+reuse that ground truth and write their detectors as **new sibling detector dirs in
+the same batch root**:
 
 ```
-<batch_root>/3dB_power/<file_stem>/ ...
-<batch_root>/blob_detection/<file_stem>/ ...
+<batch_root>/coherent_power/<file_stem>/ ...   # trained (C++ binary)
+<batch_root>/cuda_dino/<file_stem>/ ...         # trained (C++ binary)
+<batch_root>/3dB_power/<file_stem>/ ...         # run_baseline_offline.py
+<batch_root>/blob_detection/<file_stem>/ ...    # run_baseline_offline.py
+<batch_root>/yolo/<file_stem>/ ...              # run_ml_detectors_offline.py
+<batch_root>/dino_finetuned/<file_stem>/ ...    # run_ml_detectors_offline.py
 ```
 
-(the shared `gt_masks/`, `gt_annotations/`, `spectrogram_tensors/` are symlinked, so
-no data is duplicated). A single `eval_detector_masks.py --batch-root <batch_root>`
-then scores baselines *and* trained detectors together into one set of fact tables.
+(the shared `frame_manifest.csv`, `gt_masks/`, `gt_annotations/`,
+`spectrogram_tensors/` are symlinked from a reference detector, so no data is
+duplicated — GT is detector-independent). A single
+`eval_detector_masks.py --batch-root <batch_root>` then scores **all six** detectors
+together into one set of fact tables. The ML detectors reconstruct each frame's
+spectrogram from the source SigMF IQ at the model's native geometry (nfft=1024,
+256-row tiles), then max-pool the mask onto the shared display/GT grid.
 
 **Spectrogram source.** The driver prefers a saved `spectrogram_tensors/*.npy`
 (`<c8`); if tensors were not saved it reconstructs the spectrogram from the source
@@ -135,6 +193,69 @@ python3 plot_eval_results.py --tables-dir batch_runs/<run_id> --det-threshold 0.
 or open `baseline_comparisons/baseline_eval_review.ipynb`, set `BATCH_ROOT` to the
 run, and run all cells for the performance-vs-SNR curves and per-frame overlays
 (GT vs each detector's mask).
+
+### 5. SNR-axis analysis (physical SNR instead of attenuation)
+
+`attenuation_dB_<N>` is a knob, not a physical quantity: 20 dB of attenuation puts a
+wideband 5G burst and a narrowband FM tone at very different signal-to-noise ratios.
+`snr_measurement.py` + `build_snr_results.py` re-express the fact tables on a real
+**SNR (dB)** axis.
+
+How SNR is defined (see `snr_measurement.py`):
+
+- Measured **once, on the 0 dB capture**, per signal instance:
+  - *peak* = mean of the top **2%** of linear FFT power **inside the signal's
+    bounding box** (its time rows × its `freq_lower..freq_upper` column band), in dB.
+  - *noise* = mean FFT power in the **same frequency band**, in a quiet window
+    **3 → 1 ms before that burst's Zadoff-Chu preamble** (`wfgt:zc_sample`), in dB.
+  - `snr0_db = peak_db − noise_db`, aggregated (median) per `(signal_class, occupied_bw_hz)`.
+- Every other capture is a **physical attenuator step** on the same emitter, so the
+  signal drops 1:1 with attenuation while the noise floor is unchanged:
+  `snr_db(class, bw, A) = snr0_db(class, bw) − A`. This avoids measuring a peak
+  buried in noise at high attenuation.
+
+Build the serialized, reloadable results object (NPZ arrays + JSON sidecar):
+
+```bash
+cd infocom_evals/baseline_comparisons
+python3 build_snr_results.py \
+    --tables-dir ../signal_detection_experiments/batch_runs/<run_id> \
+    --captures-dir /home/bqn82/captures \
+    --out ../signal_detection_experiments/batch_runs/<run_id>/snr_results
+# knobs (defaults = the method above): --peak-top-fraction, --noise-pre-zc-start-ms,
+#   --noise-pre-zc-stop-ms, --fft-cols, --max-peak-rows, --max-instances-per-key
+```
+
+This writes `snr_results.npz` (region + frame columns, joined with `snr_db` /
+`frame_snr_db`) and `snr_results.json` (the per-`(class, bw)` calibration table +
+the params/provenance). Frame-level pixel metrics use the **per-frame mean-signal
+SNR** (mean SNR of the signals present in the frame).
+
+Plot straight from the object — **no recompute** needed to re-bin, restyle, or add
+lines:
+
+```bash
+python3 plot_snr_results.py --results ../signal_detection_experiments/batch_runs/<run_id>/snr_results \
+    --det-threshold 0.1 --snr-bin-width 5 --snr-range -20 40
+```
+
+Every figure shares the `--snr-range` x-axis (default **-20 to 40 dB**) and omits data
+outside it, so panels and figures line up for visual comparison; widen it with e.g.
+`--snr-range -30 50`. Figures: `rate_vs_snr_by_class`, `rate_vs_snr_by_bandwidth`,
+`rate_vs_snr_overall`, `frame_metrics_vs_snr`. From a notebook, reload and tweak
+without rerunning:
+
+```python
+import snr_measurement as sm, plot_snr_results as psr
+res = sm.SnrResults.load(".../snr_results")     # cheap; no captures touched
+figs = psr.make_all_figures(res, threshold=0.1, snr_bin_width=2.5,
+                            snr_range=(-20, 40))  # re-bin / re-range freely
+# pass snr_range=None to auto-fit each axis; or build a custom aggregate straight
+# off res.region / res.frame column arrays
+```
+
+To add another detector's line, just re-run the eval + `build_snr_results.py`; the
+object is rebuilt but plotting stays instant.
 
 ## Tuning
 
