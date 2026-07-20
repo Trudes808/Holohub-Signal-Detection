@@ -302,6 +302,7 @@ def plot_frame_panels(
     box_color=(1.0, 0.0, 0.0),
     figsize_per_panel=(6.0, 5.0),
     show_gt_boxes: bool = True,
+    mask_alpha: float = 0.45,
 ):
     """Render [GT | detector_1 | ... | detector_N] panels for one frame.
 
@@ -333,15 +334,19 @@ def plot_frame_panels(
         ax.set_xlabel("frequency (MHz, baseband)")
         ax.set_ylabel("time (ms)")
 
-    def overlay_mask(ax, mask, rgb):
+    def overlay_mask(ax, mask, rgb, alpha=mask_alpha):
+        # Set the color across the whole array and vary only alpha, so transparent
+        # pixels never blend to black under imshow resampling. Accepts hex or RGB.
+        r, g, b = mcolors.to_rgb(rgb)
         rgba = np.zeros((*mask.shape, 4), dtype=np.float32)
-        rgba[..., 0], rgba[..., 1], rgba[..., 2] = rgb
-        rgba[..., 3] = (mask != 0).astype(np.float32) * 0.45
+        rgba[..., 0], rgba[..., 1], rgba[..., 2] = r, g, b
+        rgba[..., 3] = (mask != 0).astype(np.float32) * alpha
         ax.imshow(rgba, aspect="auto", extent=extent, origin="upper")
 
-    # Panel 0: GT
+    # Panel 0: GT (keep the filled GT overlay faint regardless of mask_alpha; the
+    # magenta detector masks would otherwise bury the signal inside the GT box)
     draw_spectrogram(axes[0], f"{bundle.file_stem}\nframe {bundle.frame_number} — ground truth")
-    overlay_mask(axes[0], bundle.gt_mask, gt_color)
+    overlay_mask(axes[0], bundle.gt_mask, gt_color, alpha=min(mask_alpha, 0.40))
     if show_gt_boxes:
         # Draw boxes from the row/col grid indices (frame-relative, same grid as the
         # mask) — NOT from x_ms/y_mhz: x_ms is absolute capture time, which would push
