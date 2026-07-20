@@ -1,0 +1,173 @@
+% =====================================================================
+% REWRITTEN SECTIONS for the STRIPE paper, grounded in the actual pipeline
+% (config_coherent_power_perf_perfreq_single_channel.yaml and the operator graph).
+%
+% PART A  -> additions to \section{End-to-End System Architecture}:
+%             (A1) a real-time framing paragraph to open the section, and
+%             (A2) a new \subsection on offline replay + loopback validation.
+%           The existing ingest/FFT/detector/visualization subsections are
+%           accurate as written; keep them (see the accuracy notes in chat).
+%
+% PART B  -> a single \section{Detector Variants} that REPLACES both the old
+%           \section{Coherent-Power Detector} (Sec.~IV) and the old
+%           \section{Detector Variants} (Sec.~V); coherent power is folded in
+%           as its real-time-default subsection.
+% =====================================================================
+
+
+% =====================================================================
+% PART A1 -- opening paragraph for \section{End-to-End System Architecture}
+% (insert immediately after \label{sec:system}, before the Fig. reference)
+% =====================================================================
+
+STRIPE is designed to run \emph{at line rate} on the streaming data path: the
+detector consumes complex FFT frames as they are produced, and no stage stages the
+raw sample firehose through host memory or disk. Our reference real-time
+configuration is the single-channel, calibrated per-frequency coherent-power profile
+(\texttt{config\_coherent\_power\_perf\_perfreq\_single\_channel.yaml}), which
+sustains a \SI{500}{MS/s} complex stream end-to-end on a single GPU. Multi-channel
+operation instantiates one replicated graph per channel, unless a detector variant
+explicitly consumes cross-channel features. The active operator chain is CHDR
+ingest $\rightarrow$ wideband FFT $\rightarrow$ detector, with mask preview,
+spectrogram preview, and logging attached as non-blocking downstream consumers;
+the display spectrogram is a consumer-side product, not an intermediate on the hot
+path.
+
+
+% =====================================================================
+% PART A2 -- NEW subsection (append at the end of \section{End-to-End System Architecture})
+% =====================================================================
+
+\subsection{Offline Replay and Loopback Validation}
+\label{sec:replay}
+
+Because the same operator graph is used online and offline, STRIPE supports two
+complementary replay modes for controlled, reproducible experiments.
+
+\emph{(i) File replay for detector evaluation.} A stored SigMF capture is streamed
+through the graph in software: the FFT geometry is derived from the file's sample
+rate, frames are reconstructed identically to the live path, and any detector
+operator is run over them at sub-real-time pace. Because the FFT, detector, and
+scoring code are shared with the deployed graph, this isolates the \emph{detector}
+as the only variable, so competing detectors are compared on byte-identical input
+against SigMF ground truth. All quantitative results in Sec.~\ref{sec:eval} use this
+mode.
+
+\emph{(ii) Cable loopback for full-system validation.} A known waveform is
+transmitted from the USRP and received back through the complete RF front end and
+the \emph{same} DPDK/GPUDirect CHDR ingest path used in deployment, then processed
+by the live FFT and detector operators. Unlike file replay, this exercises the
+entire end-to-end pathway---packetization, GPU DMA, batch assembly, timing and
+frequency metadata, and soft-resync recovery---on a reproducible, physically
+transmitted signal (the ingest stage merely relaxes its partial-batch timeout to
+tolerate replay pacing). Loopback thus validates that the online system reproduces
+the behavior measured offline, closing the loop between controlled evaluation and
+real-time deployment.
+
+
+% =====================================================================
+% PART B -- REPLACEMENT for old Sec.~IV (Coherent-Power Detector) AND
+%           old Sec.~V (Detector Variants).
+% =====================================================================
+
+\section{Detector Variants}
+\label{sec:variants}
+
+STRIPE is detector-agnostic: any operator that consumes a complex FFT frame (or a
+derived feature tensor) and emits a full-resolution binary mask plugs into the graph
+behind a common interface, so the detector becomes a runtime systems knob. We
+implement and evaluate three families spanning the accuracy--compute tradeoff: a
+deployed coherent-power detector as the low-cost real-time default, classical
+signal-processing baselines, and learned (foundation-model and object-detector)
+variants. Two families run as live GPU operators (\emph{coherent\_power} and
+zero-shot DINO); the remaining variants are evaluated through the offline file-replay
+path (Sec.~\ref{sec:replay}) on identical input, so all comparisons in
+Sec.~\ref{sec:eval} are apples-to-apples.
+
+\subsection{Coherent-Power Detector (Real-Time Default)}
+\label{sec:coherent}
+
+The deployed real-time detector is a hybrid image/power algorithm implemented as CUDA
+kernels; it treats the dB-power spectrogram both as a 2-D image and as a bank of
+calibrated per-frequency power channels, and emits the union of the two views after
+morphological cleanup. From a complex frame $X[f,t]$ it forms
+$P_{\db}=10\log_{10}(|X|^2+10^{-12})$; an optional per-frequency front-end
+equalization (Gaussian row-mean smoothing, $\sigma=12$ bins) is available but clamped
+to \SI{0}{dB} in the real-time profile.
+
+\emph{Image view (local support).} A separable box filter estimates a local
+background $B[f,t]$ over a $\pm10$-bin time and $\pm8$-bin frequency window; the
+normalized excess $S=P_{\db}-B$ is thresholded (floor \SI{0.5}{dB}, span \SI{3}{dB},
+$\tau=0.4$), admitting pixels roughly \SI{1.7}{dB} above their local neighborhood.
+This CFAR-like test tracks slow gain variation but hollows the interior of signals
+wider than the box.
+
+\emph{Power view (fill + rescue).} Two absolute-power tests fill those gaps. A
+\emph{per-frequency fill} admits any pixel exceeding a calibrated per-bin noise floor
+$F[f]$ by \SI{2}{dB}, solidifying wideband bodies; a \emph{strong-signal rescue}
+flags pixels \SI{8}{dB} above a re-estimated floor with a $\ge 3$-bin time-persistence
+guard, recovering strong but frequency-narrow carriers.
+
+\emph{Morphology and persistence.} The unioned mask is cleaned with a $3\times3$
+majority filter, a $3\times7$ opening, and a $5\times21$ closing, followed by a
+frequency-persistence test (keep a pixel only if $\ge 11$ of $45$ neighboring bins on
+its time row are active); the strong-rescue mask is then OR-ed back to preserve
+narrowband hits. A \SI{7}{MHz} sideband guard is applied per edge. The result is a
+device-resident, full-frequency-resolution mask with population statistics attached as
+metadata. The calibrated per-frequency floor makes this detector deterministic and
+inexpensive, which is why it is the default operating point for real-time and
+resource-constrained deployment; Table~\ref{tab:params} lists the active parameters.
+
+\begin{table}[t]
+\centering
+\caption{Active coherent-power detector parameters (real-time single-channel
+profile).}
+\label{tab:params}
+\scriptsize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Stage & Parameter & Value \\
+\midrule
+Front end & noise smoothing $\sigma$ & 12 bins \\
+          & max boost / signal cap & 0 dB (disabled) \\
+Local background & time / frequency box radius & $\pm10$ / $\pm8$ bins \\
+Support test & floor / span / threshold & 0.5 dB / 3 dB / 0.4 \\
+Per-frequency fill & offset $\Delta_{\mathrm{fill}}$ & 2 dB \\
+Strong rescue & excess / min.\ time bins & 8 dB / 3 \\
+Morphology & opening / closing SE & $3\times7$ / $5\times21$ \\
+           & majority filter & $3\times3$ \\
+Persistence & window / minimum hits & 45 / 11 bins \\
+Sideband guard & ignored per side & 7 MHz \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Classical Baselines}
+\label{sec:baselines}
+
+Two non-learned detectors provide interpretable, low-cost reference points that run
+directly on the dB-power frame. \emph{3dB\_power} is a single global threshold: a
+per-frame scalar noise reference plus a fixed margin, flagging every bin above it.
+\emph{blob\_detection} is a textbook computer-vision pipeline---Gaussian smoothing,
+Sobel-gradient edges, percentile thresholding, morphological closing, hole filling,
+and connected-component area filtering---deliberately left untuned. These establish
+whether the coherent detector's added calibration, fill, and rescue machinery earns
+its complexity over plain power thresholding and generic image processing.
+
+\subsection{Learned Detectors}
+\label{sec:learned}
+
+Learned variants target the low-SNR, short-burst, and crowded regimes where fixed
+power/morphology rules degrade. \emph{Zero-shot DINO} applies a frozen DINOv3
+backbone to spectrogram tiles with no RF-specific training and runs as a live GPU
+operator, testing whether generic self-supervised features transfer to RF as-is.
+\emph{Fine-tuned DINOv3} adapts that backbone to RF: it trains a lightweight
+segmentation head for dense signal/no-signal prediction \emph{and} fine-tunes the last
+four transformer blocks and final norm of the backbone (at a reduced learning rate),
+using captures spanning all attenuation levels. This head-plus-last-blocks adaptation
+forms the high-recall operating point of the accuracy--compute knob. \emph{Fine-tuned YOLO} is a supervised object detector whose predicted boxes
+are rasterized into the common mask, providing a strong discriminative-detector
+comparison. All learned detectors emit the same mask interface and are scored
+identically to the deployed detectors; Sec.~\ref{sec:eval} quantifies their
+accuracy--compute tradeoff and their robustness under distribution shift.
