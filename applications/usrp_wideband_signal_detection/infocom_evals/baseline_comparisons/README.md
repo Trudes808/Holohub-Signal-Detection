@@ -38,8 +38,16 @@ their trained weights; the deployed detectors need the demo container.
 - `snr_measurement.py` / `build_snr_results.py` — SNR calibration + the serialized
   `SnrResults` object.
 - `plot_snr_results.py` — SNR-axis figures (shared −20…+40 dB axis, consistent
-  per-detector colors/markers).
+  per-detector colors/markers; `cuda_dino` is labelled `zero_shot_dino` in plots).
 - `baseline_eval_review.ipynb` — visual review + the SNR-axis 6-detector comparison.
+- `OTA_eval.ipynb` — qualitative review on known captures + a live over-the-air (OTA)
+  collection: per-detector spectrogram/mask panels (Cases 1–3) plus a compact,
+  one-column composite (`compact_grid()`) for the paper.
+- `save_plot_data.py` — extract the small plot-regeneration artifacts (metrics CSVs +
+  the `SnrResults` object) into `saved_results/<run_id>/` so the large per-frame mask
+  arrays can be deleted without losing the ability to regenerate/tweak the plots.
+- `evaluation_section.tex`, `paper_sections_system_detectors.tex`, `figs/` — LaTeX for
+  the paper's evaluation and system/detector sections, plus the generated figures.
 
 ## Quick start — the full 6-way sweep
 
@@ -256,6 +264,32 @@ figs = psr.make_all_figures(res, threshold=0.1, snr_bin_width=2.5,
 
 To add another detector's line, just re-run the eval + `build_snr_results.py`; the
 object is rebuilt but plotting stays instant.
+
+### 6. Qualitative review (`OTA_eval.ipynb`)
+
+`OTA_eval.ipynb` renders per-detector **spectrogram + mask** panels for a few hand-picked
+cases — a controlled signal frame, a noise-only frame, and a live OTA capture (2.4 GHz
+ISM). For the OTA file the notebook loads the two container detectors from a
+`live_ota` batch (if present) and fills the four in-notebook detectors live, so all six
+can be shown; otherwise it shows the four Python detectors. `compact_grid()` builds the
+one-column composite (ground truth on top, detectors as rows, cases as columns) used in
+the paper.
+
+### 7. Preserving results for later (`save_plot_data.py`)
+
+The batch runs are hundreds of GB (mostly per-frame masks), but regenerating/tweaking
+the aggregate plots needs only a few small files (the metrics CSVs + the `SnrResults`
+NPZ/JSON). Extract them so the masks can be deleted to reclaim disk:
+
+```bash
+python3 save_plot_data.py             # the config's batch_root
+python3 save_plot_data.py --all       # every run under batch_runs/ with metrics
+```
+
+This copies the artifacts into `saved_results/<run_id>/` (each with a `MANIFEST.json`
+giving the exact regenerate commands). The plots then rebuild from `saved_results/`
+alone; the per-frame overlay panels (this notebook / `OTA_eval` Cases 2–3) still need
+the masks, so only delete those once you no longer need the visual panels.
 
 ## Tuning
 
