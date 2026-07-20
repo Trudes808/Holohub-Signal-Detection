@@ -1,0 +1,142 @@
+{
+  "cell_columns": [
+    "detector",
+    "sample_rate_hz",
+    "fft_size",
+    "samples_per_frame",
+    "frame_budget_ms",
+    "device",
+    "n_reps",
+    "lat_mean_ms",
+    "lat_median_ms",
+    "lat_p05_ms",
+    "lat_p95_ms",
+    "lat_min_ms",
+    "lat_std_ms",
+    "gflops",
+    "peak_mem_mb"
+  ],
+  "sample_columns": [
+    "cell_index",
+    "latency_ms"
+  ],
+  "geometry": {
+    "20000000": {
+      "sample_rate_hz": 20000000.0,
+      "actual_fft_size": 1024,
+      "num_ffts_per_batch": 512,
+      "samples_per_frame": 524288,
+      "resolution_hz": 19531.25,
+      "frame_budget_s": 0.0262144,
+      "frame_budget_ms": 26.214399999999998
+    },
+    "100000000": {
+      "sample_rate_hz": 100000000.0,
+      "actual_fft_size": 5120,
+      "num_ffts_per_batch": 512,
+      "samples_per_frame": 2621440,
+      "resolution_hz": 19531.25,
+      "frame_budget_s": 0.0262144,
+      "frame_budget_ms": 26.214399999999998
+    },
+    "250000000": {
+      "sample_rate_hz": 250000000.0,
+      "actual_fft_size": 10240,
+      "num_ffts_per_batch": 512,
+      "samples_per_frame": 5242880,
+      "resolution_hz": 24414.0625,
+      "frame_budget_s": 0.02097152,
+      "frame_budget_ms": 20.97152
+    },
+    "500000000": {
+      "sample_rate_hz": 500000000.0,
+      "actual_fft_size": 20480,
+      "num_ffts_per_batch": 512,
+      "samples_per_frame": 10485760,
+      "resolution_hz": 24414.0625,
+      "frame_budget_s": 0.02097152,
+      "frame_budget_ms": 20.97152
+    }
+  },
+  "params": {
+    "target_sample_rates_hz": [
+      20000000.0,
+      100000000.0,
+      250000000.0,
+      500000000.0
+    ],
+    "devices": [
+      "cpu",
+      "cuda"
+    ],
+    "num_ffts_per_batch": 512,
+    "reference_span_hz": 500000000.0,
+    "reference_fft_size": 20480,
+    "packet_samples": 1024,
+    "warmup_reps": 5,
+    "min_reps": 20,
+    "max_reps": 200,
+    "time_budget_s": 8.0,
+    "hard_cap_s": 30.0,
+    "detector_params": {
+      "3dB_power": {
+        "params": {
+          "threshold_db": 3.0,
+          "noise_percentile": 50.0
+        }
+      },
+      "blob_detection": {
+        "params": {
+          "smooth_sigma": 1.0,
+          "edge_percentile": 90.0,
+          "close_iters": 2,
+          "min_blob_area": 64
+        }
+      },
+      "coherent_power": {
+        "params": {
+          "box_bins": 65,
+          "support_threshold": 0.5,
+          "power_offset_db": 2.0,
+          "rescue_offset_db": 8.0
+        }
+      },
+      "cuda_dino": {
+        "weights_path": "/home/bqn82/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+        "params": {
+          "chunk_rows": 256,
+          "chunk_cols": 512,
+          "vmin": -46.93,
+          "vmax": 19.56,
+          "feat_layer": 11,
+          "max_batch": 8,
+          "score_percentile": 90.0
+        }
+      },
+      "yolo": {
+        "kind": "yolo",
+        "ckpt": "/home/bqn82/Holohub-Signal-Detection/yolo_training/runs/detect/yolo26m_signal/weights/best.pt",
+        "dataset_meta": "/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json",
+        "conf": 0.25,
+        "imgsz": 1024
+      },
+      "dino_finetuned": {
+        "kind": "dino_finetuned",
+        "ckpt": "/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/checkpoints/M2_ft/best.pt",
+        "dataset_meta": "/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json",
+        "train_cfg": "/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/configs/train.yaml",
+        "eval_meta": "/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/eval_out/M2_ft/eval_meta.json"
+      }
+    }
+  },
+  "provenance": {
+    "capture": "/home/bqn82/captures/attenuation_dB_20.sigmf-data",
+    "native_sample_rate_hz": 245760000.0,
+    "frame_offset_complex": 481030873,
+    "datatype": "cf32_le",
+    "host": "ecen-a58854",
+    "gpu": "NVIDIA RTX 4000 Ada Generation",
+    "torch": "2.6.0+cu124",
+    "elapsed_s": 541.4
+  }
+}

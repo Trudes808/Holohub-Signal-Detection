@@ -1,0 +1,81 @@
+# Per-frame latency + compute-load eval config (six detectors, CPU vs GPU).
+#
+# Consumed by run_latency_eval.py. One simulated frame from the 20 dB attenuation
+# capture is resampled to each target sample rate; every detector is then run on both
+# CPU and GPU at the FFT geometry the deployed pipeline would auto-select for that rate
+# (see fft_sizing.py, ported from fft_runtime_config.hpp).
+#
+# Two evals are produced from one run:
+#   1. compute load  -> FLOPs per frame + peak GPU memory per (detector, rate)
+#   2. latency       -> CPU and GPU per-frame latency samples (histogram) per detector,
+#                       with the real-time budget (samples_per_frame / sample_rate) drawn
+#                       as horizontal threshold lines.
+
+latency_eval:
+
+  # ---------------------------------------------------------------- source ---- #
+  # 20 dB attenuation test file (native 245.76 MS/s, cf32_le, fc = 2.0 GHz).
+  capture: /home/bqn82/captures/attenuation_dB_20.sigmf-data
+  capture_meta: /home/bqn82/captures/attenuation_dB_20.sigmf-meta
+  native_sample_rate_hz: 245760000.0
+  datatype: cf32_le
+  # Complex-sample offset into the file for the single frame we simulate (skip the
+  # very start; any signal-bearing region is fine for a load/latency measurement).
+  frame_offset_complex: 481030873
+
+  # ------------------------------------------------------- frame geometry ----- #
+  # These mirror the deployed fft: / chdr_converter: blocks. resample simulates each
+  # target rate by poly interpolation/decimation of the native IQ.
+  target_sample_rates_hz: [20000000.0, 100000000.0, 250000000.0, 500000000.0]
+  reference_span_hz: 500000000.0
+  reference_fft_size: 20480
+  packet_samples: 1024
+  num_ffts_per_batch: 512
+
+  # ---------------------------------------------------------- timing knobs ---- #
+  devices: [cpu, cuda]
+  warmup_reps: 5
+  min_reps: 20            # always collect at least this many latency samples per cell
+  max_reps: 200           # ...and never more than this
+  time_budget_s: 8.0      # ...stop after min_reps once this wall-clock elapses (bounds slow CPU cells)
+  hard_cap_s: 30.0        # ...and never spend longer than this on a cell even below min_reps
+                          #    (protects against very slow ML-on-CPU cells at high rates)
+
+  # dinov3 backbone repo (put on sys.path for the zero-shot cuda_dino + fine-tuned dino).
+  dinov3_repo: /home/bqn82/dinov3
+
+  # -------------------------------------------------------------- outputs ----- #
+  out_dir: saved_results/latency_run
+
+  # ------------------------------------------------------------ detectors ----- #
+  detectors:
+
+    # ---- non-ML power/CV baselines (numpy algorithms -> torch reference) -------
+    3dB_power:
+      params: {threshold_db: 3.0, noise_percentile: 50.0}
+    blob_detection:
+      params: {smooth_sigma: 1.0, edge_percentile: 90.0, close_iters: 2, min_blob_area: 64}
+
+    # ---- deployed detectors (C++/CUDA) -> device-switchable torch reference -----
+    coherent_power:
+      params: {box_bins: 65, support_threshold: 0.5, power_offset_db: 2.0, rescue_offset_db: 8.0}
+    cuda_dino:
+      # zero-shot frozen DINOv3 ViT-B/16 over 256x512 spectrogram chunks (deployed
+      # cuda_dino geometry: visualization.renderer.dino_chunk_rows/cols).
+      weights_path: /home/bqn82/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+      params: {chunk_rows: 256, chunk_cols: 512, vmin: -46.93, vmax: 19.56,
+               feat_layer: 11, max_batch: 8, score_percentile: 90.0}
+
+    # ---- fine-tuned ML models (exact deployed-sweep classes, reused) -----------
+    yolo:
+      kind: yolo
+      ckpt: /home/bqn82/Holohub-Signal-Detection/yolo_training/runs/detect/yolo26m_signal/weights/best.pt
+      dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
+      conf: 0.25
+      imgsz: 1024
+    dino_finetuned:
+      kind: dino_finetuned
+      ckpt: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/checkpoints/M2_ft/best.pt
+      dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
+      train_cfg: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/configs/train.yaml
+      eval_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/eval_out/M2_ft/eval_meta.json
