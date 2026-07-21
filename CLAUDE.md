@@ -43,7 +43,8 @@ when adding files, and update references when moving anything:
 
 - Coherent live (calibrated per-freq): `config_coherent_power_perf_perfreq_single_channel.yaml`
 - Coherent live (dynamic floor): `config_coherent_power_perf_dynamic_single_channel.yaml`
-- DINO live: `config_cuda_dino_performance_single_channel.yaml`
+- DINO live (zero-shot): `config_cuda_dino_performance_single_channel.yaml`
+- DINO live (fine-tuned segmenter): `config_cuda_dino_finetuned_performance_single_channel.yaml` (detector_type `cuda_dino_finetuned`; taps raw IQ + runs its own geometry-matched FFT; requires an exported `.ts`+`.meta.json` from `export_dinov3_finetuned_torchscript.py`; see the app README "Fine-tuned DINO detector")
 - Signal snipper (cut detected signals to SigMF / classifier): `config_signal_snipper_single_channel.yaml`
 - Cable-loopback replay: `config_coherent_power_performance_single_channel_replay.yaml`
 - Frozen-input capture: `config_coherent_power_capture_chdr_single_channel.yaml`

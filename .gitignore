@@ -73,6 +73,8 @@ applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_exper
 dino_fine_tuning/checkpoints/
 dino_fine_tuning/eval_out/
 dino_fine_tuning/notebooks/sweep*
+# exported TorchScript models (~335 MB each; regenerate via export_dinov3_finetuned_torchscript.py)
+dino_fine_tuning/weights/
 
 # claude dump files
 .claude/

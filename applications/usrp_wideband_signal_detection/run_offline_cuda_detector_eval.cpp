@@ -11,6 +11,7 @@
 
 #include <coherent_power_signal_detector.hpp>
 #include <cuda_dino_detector.hpp>
+#include <finetuned_dino_detector.hpp>
 #include <fft.hpp>
 #include <holoscan/holoscan.hpp>
 #include <spectrogram.hpp>
@@ -2079,6 +2080,11 @@ class MaskArtifactSinkOp : public holoscan::Operator {
 struct DetectorAdapter {
   std::string name;  // matches offline_eval.detector_type and the config block key
   std::function<std::shared_ptr<holoscan::Operator>(holoscan::Application&, const EvalOverrides&)> make_op;
+  // Most detectors consume the shared (pass-through) spectrogram on "in". The fine-tuned DINO
+  // detector instead taps the raw IQ ("iq_in") and runs its own dedicated FFT, so it wires from
+  // the source, not the spectrogram.
+  bool consumes_iq = false;
+  std::string input_port = "in";  // detector input port fed by its source
 };
 
 const std::vector<DetectorAdapter>& detector_adapter_table() {
@@ -2112,6 +2118,18 @@ const std::vector<DetectorAdapter>& detector_adapter_table() {
                 holoscan::Arg("channel_filter") = overrides.channel_number,
                 holoscan::Arg("emit_stride") = 1);
           }},
+      DetectorAdapter {
+          "cuda_dino_finetuned",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::FinetunedDinoDetector>(
+                "finetunedDinoDetectorOpCh0",
+                app.from_config("finetuned_dino_detector"),
+                holoscan::Arg("num_channels") = 1,
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          },
+          /*consumes_iq=*/true,
+          /*input_port=*/"iq_in"},
   };
   return table;
 }
@@ -2230,7 +2248,13 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
     add_flow(source, fft);
     add_flow(fft, spectrogram);
     add_flow(spectrogram, spectrogram_sink);
-    add_flow(spectrogram, detector);
+    // Detectors that consume the shared spectrogram wire from it; the fine-tuned DINO detector
+    // taps the raw source IQ and runs its own dedicated FFT to match its trained geometry.
+    if (detector_adapter->consumes_iq) {
+      add_flow(source, detector, {{"out", detector_adapter->input_port}});
+    } else {
+      add_flow(spectrogram, detector);
+    }
     add_flow(detector, mask_sink, {{"mask_out", "in"}});
 
     // Optional signal-snipper branch: tap the source IQ and the detector mask, cut signals out, and

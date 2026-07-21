@@ -18,6 +18,7 @@ APP_DIR = REPO_ROOT / "applications/usrp_wideband_signal_detection"
 # spectrogram / scheduler blocks. The offline_eval block is injected below.
 DETECTOR_BASE_CONFIGS = {
     "cuda_dino": APP_DIR / "config_cuda_dino_performance_single_channel.yaml",
+    "cuda_dino_finetuned": APP_DIR / "config_cuda_dino_finetuned_performance_single_channel.yaml",
     "coherent_power": APP_DIR / "config_coherent_power_perf_perfreq_single_channel.yaml",
 }
 DEFAULT_DETECTOR = "cuda_dino"

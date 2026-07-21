@@ -8,12 +8,16 @@ and renders a spectrum-analyzer-style visualization.
 chdrConverterOp → fftOp → (spectrogramOp) → detectorOp → visualization
 ```
 
-Two detectors are supported, selected per config via `pipeline.detector_type`:
+Three detectors are supported, selected per config via `pipeline.detector_type`:
 
 - **`coherent_power`** — CUDA coherent-power detector with a calibrated or live-learned
   per-frequency noise floor. Lowest latency; the default for live wideband sweeps.
-- **`cuda_dino`** — CUDA DINOv3 feature detector (TorchScript runtime) with coherence-gate
-  fusion, structure mask, and a positional template.
+- **`cuda_dino`** — CUDA DINOv3 feature detector (TorchScript runtime), **zero-shot** backbone
+  with coherence-gate fusion, structure mask, and a positional template.
+- **`cuda_dino_finetuned`** — CUDA **fine-tuned** DINOv3 segmenter (backbone + trained seg head).
+  Emits a mask directly (`sigmoid(model) ≥ threshold`), no fusion stack. Trained at a fixed
+  spectrogram geometry, so it taps raw IQ and runs its own dedicated FFT to reproduce that
+  geometry live. See [Fine-tuned DINO detector](#fine-tuned-dino-detector-cuda_dino_finetuned).
 
 Visualization is enabled by default on all of the current live configs.
 
@@ -46,7 +50,8 @@ as the working root; wrappers and helpers live in subfolders and are called with
 | --- | --- | --- |
 | `config_coherent_power_perf_perfreq_single_channel.yaml` | coherent_power | Live, calibrated per-frequency floor (`per_freq_threshold_mode: calibrated`). |
 | `config_coherent_power_perf_dynamic_single_channel.yaml` | coherent_power | Live, live-learned dynamic floor (`per_freq_threshold_mode: dynamic`; no calibration run needed). |
-| `config_cuda_dino_performance_single_channel.yaml` | cuda_dino | Live CUDA DINO detector. |
+| `config_cuda_dino_performance_single_channel.yaml` | cuda_dino | Live CUDA DINO detector (zero-shot). |
+| `config_cuda_dino_finetuned_performance_single_channel.yaml` | cuda_dino_finetuned | Live **fine-tuned** DINO segmenter. Geometry-matched dedicated FFT; see [Fine-tuned DINO detector](#fine-tuned-dino-detector-cuda_dino_finetuned). |
 | `config_coherent_power_performance_single_channel_replay.yaml` | coherent_power | Cable-loopback replay of a captured SigMF file. |
 | `config_coherent_power_capture_chdr_single_channel.yaml` | coherent_power | Capture a frozen CHDR/IQ snapshot for offline replay. |
 | `config_coherent_power_performance_emit_stride1_two_channel.yaml` | coherent_power | Live **dual-channel** (two 500 Msps channels); binds NIC `0000:a2:00.1` with two flows (ch0→`udp_dst 1234`, ch1→`1235`). |
@@ -121,8 +126,12 @@ CONFIG_NAME=config_coherent_power_perf_perfreq_single_channel.yaml sudo ./bash_s
 # Coherent power, dynamic (self-calibrating) floor:
 CONFIG_NAME=config_coherent_power_perf_dynamic_single_channel.yaml sudo ./bash_scripts/run_torchscript_performance_test.sh
 
-# CUDA DINO detector (this is the runner's default):
+# CUDA DINO detector, zero-shot (this is the runner's default):
 sudo ./bash_scripts/run_torchscript_performance_test.sh
+
+# CUDA fine-tuned DINO segmenter (requires the exported .ts + .meta.json in the container,
+# see "Fine-tuned DINO detector" below):
+CONFIG_NAME=config_cuda_dino_finetuned_performance_single_channel.yaml sudo ./bash_scripts/run_torchscript_performance_test.sh
 ```
 
 Convenience wrappers exist: `sudo ./bash_scripts/run_coherent_power_performance.sh` runs the
@@ -141,6 +150,128 @@ single-channel configs):
 
 For a second channel, use `--dest-port 1235` (→ `udp_dst: 1235`, X410 src `49154`). See
 **Stream alignment** below for the FFT-geometry details.
+
+---
+
+## Fine-tuned DINO detector (`cuda_dino_finetuned`)
+
+The `cuda_dino_finetuned` detector runs a **fine-tuned DINOv3 segmenter** (backbone + a trained
+segmentation head) that outputs a signal/noise mask directly — no coherence/structure/fusion stack.
+Offline it beats both the zero-shot `cuda_dino` and `coherent_power` detectors, especially at low
+SNR (see `dino_fine_tuning/reports/`).
+
+### Why this detector needs special handling
+
+The network input is **architecturally fixed** at `tile_rows × nfft` (patch 16 → a fixed token
+grid), and — more importantly — the fine-tune is tied to the **physical meaning of each pixel**:
+
+| axis | trained value (shipped model) | set by |
+| --- | --- | --- |
+| frequency | **240 kHz/bin** | `sample_rate / nfft` = 245.76e6 / 1024 |
+| time | **4.17 µs/row** | `nfft / sample_rate` = 1024 / 245.76e6 |
+
+The live app's wide analysis FFT (~20480-pt) has a *different* per-pixel physics, so the detector
+does **not** consume it. Instead it **taps the raw IQ** (like the signal snipper) and runs its own
+**dedicated `nfft`-point FFT**, reproducing the trained geometry exactly. Because the USRP X410
+delivers 245.76 MSps (see [Stream alignment](#stream-alignment)) — the same rate the model was
+trained on — this is an exact match at the documented receive setup.
+
+This means every checkpoint carries a **geometry contract**. The exporter writes it as a
+`<model>.meta.json` sidecar next to the `.ts`:
+
+```json
+{ "nfft": 1024, "tile_rows": 256, "sample_rate_hz": 245760000.0,
+  "bin_hz": 240000.0, "row_seconds": 4.167e-06,
+  "db_vmin": -46.934, "db_vmax": 19.557, "threshold": 0.85 }
+```
+
+The operator config **must match that contract** (`nfft`, `tile_rows`, `db_vmin`, `db_vmax`,
+`threshold`). "Use our model" vs. "retrain for a new setup" differ *only* in this contract.
+
+### Quick run (shipped model)
+
+1. **Export the checkpoint to TorchScript** (once). Use the repo's `.venv` (has torch + CUDA). The
+   repo lives under `/home/sat3737` (mode `750`), so a non-owner shell (e.g. `lab-admin`) must run it
+   under `sudo` and name the venv Python by **absolute path** (sudo ignores `PATH`). `--dinov3-repo`
+   puts the DINOv3 package on `sys.path` (it is not installed in the venv):
+
+   ```bash
+   sudo /home/sat3737/holohub-dev/.venv/bin/python \
+     /home/sat3737/holohub-dev/applications/usrp_wideband_signal_detection/export_dinov3_finetuned_torchscript.py \
+     --ckpt   /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/checkpoints/M2_ft/best.pt \
+     --tile-rows 256 --nfft 1024 --sample-rate-hz 245760000 \
+     --eval-meta /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/eval_out/M2_ft/eval_meta.json \
+     --dinov3-repo /home/bqn82/dinov3 \
+     --output /home/sat3737/holohub-dev/dino_fine_tuning/weights/finetuned_dino_m2.ts
+   ```
+
+   This writes `finetuned_dino_m2.ts` **and** `finetuned_dino_m2.meta.json`, and self-checks that the
+   traced mask matches the eager model (IoU ≈ 1). (If your shell owns the repo, drop `sudo` and just
+   use `.venv/bin/python`.)
+
+2. **Place the `.ts` where the config points** (container path
+   `/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m2.ts`), then rebuild + run:
+
+   ```bash
+   sudo ./bash_scripts/rebuild_demo_container_app.sh
+   CONFIG_NAME=config_cuda_dino_finetuned_performance_single_channel.yaml \
+     sudo ./bash_scripts/run_torchscript_performance_test.sh
+   ```
+
+The config field that selects the model is `finetuned_dino_detector.model_script_path`; the decision
+threshold is `finetuned_dino_detector.threshold` (M2_ft = 0.85, M1_ft = 0.45).
+
+### Fine-tuning process
+
+The fine-tuning pipeline lives in `dino_fine_tuning/` (see its `README.md` and
+`reports/pipeline.md`). It trains binary signal/noise segmentation on SigMF captures, on a single
+spectrogram grid so training, GT, and inference all share one geometry.
+
+**For our receive setup (245.76 MSps, 256×1024).** The shipped M1/M2 checkpoints were produced by
+`dino_fine_tuning/scripts/run_full.sh` at `nfft=1024, frame_rows=256`. To reproduce and export:
+
+```bash
+cd dino_fine_tuning
+bash scripts/run_full.sh                    # dataset -> models -> eval (resumable)
+# then export as in "Quick run" above.
+```
+
+**For a different sample rate / spectrogram settings.** Decide with this tree:
+
+1. **Same physics reachable?** If your receive rate lets `nfft` land near **240 kHz/bin** and
+   **4.17 µs/row** simultaneously (i.e. the rate is close to 245.76 MSps, or a near-integer
+   multiple/divisor), the **shipped model still applies** — just set `nfft` (and `sample_rate_hz` at
+   export) so the contract matches, and set `finetuned_dino_detector.nfft` in the config. **No
+   retrain.**
+2. **Otherwise, retrain** at the deployment's native geometry:
+   - Edit `dino_fine_tuning/configs/dataset.yaml`: set `nfft` and `frame_rows` (both multiples of 16)
+     to your target grid; leave `db_vmin/db_vmax: null` so the calibration pass re-estimates the dB
+     clip for the new geometry.
+   - Rebuild the dataset + retrain: `bash dino_fine_tuning/scripts/run_full.sh`.
+   - Export with the matching geometry:
+     `python export_dinov3_finetuned_torchscript.py --ckpt <new best.pt> --tile-rows <frame_rows>
+     --nfft <nfft> --sample-rate-hz <your_rate> --output <name>.ts`.
+   - Point the config at the new `.ts` and copy `tile_rows`/`nfft`/`db_vmin`/`db_vmax`/`threshold`
+     from the emitted `.meta.json`.
+
+### Adjusting the config
+
+Everything the operator needs is in the `finetuned_dino_detector:` block of
+`config_cuda_dino_finetuned_performance_single_channel.yaml`:
+
+| field | meaning |
+| --- | --- |
+| `tile_rows`, `nfft` | model input shape; **must** equal the checkpoint's `.meta.json` |
+| `db_vmin`, `db_vmax` | global dB→[0,1] clip from the training dataset calibration |
+| `threshold` | `sigmoid(logits) ≥ threshold` (M2_ft = 0.85, M1_ft = 0.45) |
+| `model_script_path` | container path to the exported `.ts` |
+| `torch_dtype` | `fp32` \| `fp16` |
+| `emit_stride` | process every Nth IQ frame |
+
+> **Target geometry change in progress:** this deployment is moving to a **512 time × 1024 freq**
+> input (keeps 240 kHz/bin, doubles time context to ~2.13 ms/frame). That needs a **retrain** at
+> `frame_rows: 512` (the 256×1024 checkpoints will not fit). Once trained, flip the config to
+> `tile_rows: 512` and point `model_script_path` at the 512×1024 `.ts`.
 
 ---
 
