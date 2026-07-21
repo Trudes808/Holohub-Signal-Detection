@@ -87,3 +87,9 @@ yolo_training/configs/dataset.yaml
 notebooks/yolo_evals/compare_tables/
 notebooks/yolo_evals/compare_tables_lte/
 notebooks/yolo_evals/sweeps/
+notebooks/data_saving_evals/compute_table.csv
+notebooks/data_saving_evals/*_table.csv
+notebooks/data_saving_evals/*.png
+
+# fine-tuned DINO exported torchscript (large; regenerate via dino_fine_tuning/export_finetuned_models.sh)
+dino_fine_tuning/weights/

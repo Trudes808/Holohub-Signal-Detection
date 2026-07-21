@@ -127,7 +127,9 @@ add_holohub_application(usrp_wideband_signal_detection DEPENDS
                                   coherent_power_signal_detector
                                   fft
                                   spectrogram
-                                  dinov3_signal_detector)
+                                  dinov3_signal_detector
+                                  finetuned_dino_detector
+                                  yolo_detector)
 
 add_holohub_application(velodyne_lidar_app DEPENDS
                         OPERATORS velodyne_lidar

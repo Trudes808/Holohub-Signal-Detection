@@ -11,6 +11,8 @@
 
 #include <coherent_power_signal_detector.hpp>
 #include <cuda_dino_detector.hpp>
+#include <finetuned_dino_detector.hpp>
+#include <yolo_detector.hpp>
 #include <fft.hpp>
 #include <holoscan/holoscan.hpp>
 #include <spectrogram.hpp>
@@ -2112,6 +2114,48 @@ const std::vector<DetectorAdapter>& detector_adapter_table() {
                 holoscan::Arg("channel_filter") = overrides.channel_number,
                 holoscan::Arg("emit_stride") = 1);
           }},
+      // Native fine-tuned DINO (M1/M2) + YOLO26 (s/m). These consume RAW IQ (see compose(): they get
+      // add_flow(source, detector)) and re-FFT at nfft=1024 in-operator to match their training geometry.
+      DetectorAdapter {
+          "finetuned_dino",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::FinetunedDinoDetector>(
+                "finetunedDinoDetectorOpCh0",
+                app.from_config("finetuned_dino_detector"),
+                holoscan::Arg("num_channels") = 1,
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          }},
+      DetectorAdapter {
+          "finetuned_dino_m2",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::FinetunedDinoDetector>(
+                "finetunedDinoM2DetectorOpCh0",
+                app.from_config("finetuned_dino_detector"),
+                holoscan::Arg("num_channels") = 1,
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          }},
+      DetectorAdapter {
+          "yolo26s",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::YoloDetector>(
+                "yolo26sDetectorOpCh0",
+                app.from_config("yolo_detector"),
+                holoscan::Arg("num_channels") = 1,
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          }},
+      DetectorAdapter {
+          "yolo26m",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            return app.make_operator<holoscan::ops::YoloDetector>(
+                "yolo26mDetectorOpCh0",
+                app.from_config("yolo_detector"),
+                holoscan::Arg("num_channels") = 1,
+                holoscan::Arg("channel_filter") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          }},
   };
   return table;
 }
@@ -2227,10 +2271,21 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
 
       std::fprintf(stderr, "[offline_cuda_detector_eval] compose: wiring flows\n");
 
+    // Native FT-DINO/YOLO detectors need RAW IQ (they re-FFT at nfft=1024 to match training); the
+    // cuda_dino/coherent detectors consume the nfft=10240 analysis spectrogram. Both mask_out paths
+    // are identical. NOTE(lab-admin): with the raw-IQ path the detector is one hop earlier than before,
+    // so the snipper's IQ<->mask lag changes -- validate signal_snipper.ring_depth if snipping these.
+    const std::string& dt = overrides_.detector_type;
+    const bool raw_iq_detector = (dt == "finetuned_dino" || dt == "finetuned_dino_m2" ||
+                                  dt == "yolo26s" || dt == "yolo26m");
     add_flow(source, fft);
     add_flow(fft, spectrogram);
     add_flow(spectrogram, spectrogram_sink);
-    add_flow(spectrogram, detector);
+    if (raw_iq_detector) {
+      add_flow(source, detector);       // raw IQ (num_bursts x burst_size complex)
+    } else {
+      add_flow(spectrogram, detector);  // nfft=10240 analysis spectrogram (complex)
+    }
     add_flow(detector, mask_sink, {{"mask_out", "in"}});
 
     // Optional signal-snipper branch: tap the source IQ and the detector mask, cut signals out, and

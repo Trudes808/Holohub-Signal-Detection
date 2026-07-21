@@ -19,6 +19,13 @@ APP_DIR = REPO_ROOT / "applications/usrp_wideband_signal_detection"
 DETECTOR_BASE_CONFIGS = {
     "cuda_dino": APP_DIR / "config_cuda_dino_performance_single_channel.yaml",
     "coherent_power": APP_DIR / "old_configs/config_coherent_power_performance_single_channel.yaml",
+    # Native fine-tuned DINO + YOLO26 detectors (operators in operators/{finetuned_dino_detector,
+    # yolo_detector}). Base configs are created alongside those operators; run_all_detectors.sh skips
+    # any whose config isn't present yet. See build_instructions.md.
+    "finetuned_dino": APP_DIR / "config_finetuned_dino_single_channel.yaml",
+    "finetuned_dino_m2": APP_DIR / "config_finetuned_dino_m2_single_channel.yaml",
+    "yolo26s": APP_DIR / "config_yolo26s_single_channel.yaml",
+    "yolo26m": APP_DIR / "config_yolo26m_single_channel.yaml",
 }
 DEFAULT_DETECTOR = "cuda_dino"
 DEFAULT_CONFIG_PATH = DETECTOR_BASE_CONFIGS[DEFAULT_DETECTOR]
@@ -227,8 +234,30 @@ def ensure_offline_eval_config(
         )
         config_text = config_text.rstrip() + "\n" + offline_eval_block
 
+    # When this config drives the signal_snipper (sigmf_file_sink present), redirect the sink to a
+    # per-capture, host-visible subdir under the run's output_root so snippets from different captures
+    # don't collide and the host can read their SigMF sizes (offline resample+filter data-saving eval).
+    if has_top_level_key(config_text, "sigmf_file_sink"):
+        snippet_container_dir = map_host_path_to_container(Path(output_root).expanduser() / "snippets")
+        config_text = set_block_scalar_values(
+            config_text, "sigmf_file_sink", {"output_dir": str(snippet_container_dir)}
+        )
+
     generated_path.write_text(config_text, encoding="utf-8")
     return generated_path
+
+
+def _copy_into_scratch_if_needed(src: Path, dst: Path) -> None:
+    """`sudo cp` src -> dst, but SKIP when dst already exists with the same size. Idempotent staging:
+    running many detectors over one capture reuses a single staged copy instead of re-copying ~14 GB
+    per detector (and avoids the previous double-copy per invocation)."""
+    try:
+        if dst.exists() and dst.stat().st_size == src.stat().st_size:
+            print(f"Staged (reused existing copy): {dst}")
+            return
+    except OSError:
+        pass
+    subprocess.run(["sudo", "cp", "-f", str(src), str(dst)], check=True)
 
 
 def stage_input_into_scratch(input_file_path: Path, meta_path: Path) -> tuple[Path, Path]:
@@ -236,8 +265,8 @@ def stage_input_into_scratch(input_file_path: Path, meta_path: Path) -> tuple[Pa
     subprocess.run(["sudo", "mkdir", "-p", str(staged_dir)], check=True)
     staged_input_path = staged_dir / input_file_path.name
     staged_meta_path = staged_dir / meta_path.name
-    subprocess.run(["sudo", "cp", "-f", str(input_file_path), str(staged_input_path)], check=True)
-    subprocess.run(["sudo", "cp", "-f", str(meta_path), str(staged_meta_path)], check=True)
+    _copy_into_scratch_if_needed(input_file_path, staged_input_path)
+    _copy_into_scratch_if_needed(meta_path, staged_meta_path)
     return staged_input_path, staged_meta_path
 
 
@@ -412,9 +441,9 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    for prep_command in prep_commands:
-        subprocess.run(prep_command, check=True)
-
+    # Ensure the output parent exists, then stage the input ONCE (idempotent -- reuses an existing
+    # staged copy, so many detectors over one capture copy it a single time, not once per detector).
+    subprocess.run(["sudo", "mkdir", "-p", str(output_root.parent)], check=True)
     staged_input_file_path, staged_sigmf_meta_path = stage_input_into_scratch(input_file_path, sigmf_meta_path)
 
     completed = subprocess.run(command, cwd=str(REPO_ROOT), check=False)
