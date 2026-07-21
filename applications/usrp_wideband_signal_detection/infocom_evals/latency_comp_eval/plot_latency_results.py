@@ -35,10 +35,12 @@ DETECTOR_STYLE = {
     "blob_detection": {"color": "#9467bd", "marker": "D"},
     "yolo": {"color": "#ff7f0e", "marker": "v"},
     "dino_finetuned": {"color": "#8c564b", "marker": "P"},
+    "dino_finetuned_opt": {"color": "#17becf", "marker": "*"},
 }
 DETECTOR_ORDER = ["coherent_power", "cuda_dino", "3dB_power", "blob_detection",
-                  "yolo", "dino_finetuned"]
-DETECTOR_LABELS = {"cuda_dino": "zero_shot_dino"}
+                  "yolo", "dino_finetuned", "dino_finetuned_opt"]
+DETECTOR_LABELS = {"cuda_dino": "zero_shot_dino",
+                   "dino_finetuned_opt": "dino_finetuned +compile"}
 # per-sample-rate colors (low -> high rate)
 RATE_COLORS = ["#4575b4", "#91bfdb", "#fc8d59", "#d73027"]
 # real-time budget lines are keyed to FFT bin size (frequency resolution), which sets the
@@ -47,6 +49,21 @@ DEFAULT_BUDGET_BINS_HZ = (20e3, 50e3, 100e3, 200e3)
 DEVICE_STYLE = {"cpu": {"color": "#d95f02", "hatch": "//"},
                 "cuda": {"color": "#1b9e77", "hatch": None}}
 DEVICE_LABEL = {"cpu": "CPU", "cuda": "GPU"}
+# Total device memory (GB) for the peak-GPU-memory reference lines. Distinct real SKUs so each
+# is its own line; edit / pass gpu_mem_gb= to fig_compute_load to change the reference set.
+# Jetson modules are unified LPDDR5 (shared CPU+GPU), i.e. the total system budget, not dedicated VRAM.
+GPU_MEM_GB = {
+    "Jetson Orin Nano 8 GB (edge)": 8,
+    "RTX 4000 Ada (this machine) 20 GB": 20,
+    "A100 40 GB": 40,
+    "H100 80 GB": 80,
+    "DGX Spark / Jetson AGX Thor 128 GB": 128,
+}
+# ESTIMATED live-pipeline-minus-detector GPU footprint (MB) per sample rate, for the grey
+# "pipeline (est.)" bars — an exemplary full-system load. From the cuda_dino config: CUDA context
+# ~625 MB + DPDK RX GPU region 512 MiB + display history 1024 MB (all ~fixed) + FFT/spectrogram
+# working tensors that scale with fft_size (~rate). NOT measured live; see latency_eval.tex.
+PIPELINE_MEM_MB_EST = {20e6: 2260.0, 100e6: 2340.0, 250e6: 2440.0, 500e6: 2640.0}
 
 
 def label_for(det: str) -> str:
@@ -218,7 +235,7 @@ def _budget0_ms(results: LatencyResults) -> float:
 
 
 def max_realtime_rate_mhz(results: LatencyResults, det: str, device: str = "cuda",
-                          metric: str = "lat_mean_ms") -> float:
+                          metric: str = "lat_min_ms") -> float:
     """Sample rate (MHz) at which the detector's latency reaches the real-time budget, from a
     log-log fit of measured latency vs rate. Interpolates within the tested range, extrapolates
     (power-law) beyond it. inf if the detector clears the budget with a non-positive slope."""
@@ -233,7 +250,7 @@ def max_realtime_rate_mhz(results: LatencyResults, det: str, device: str = "cuda
     return float(np.exp((np.log(_budget0_ms(results)) - c) / m) / 1e6)
 
 
-def fig_max_rate(results: LatencyResults, device: str = "cuda", metric: str = "lat_mean_ms",
+def fig_max_rate(results: LatencyResults, device: str = "cuda", metric: str = "lat_min_ms",
                  rate_cap_mhz: float = 3000.0):
     """Latency vs sample rate, all detectors overlaid on one device, with the ~constant frame
     real-time budget as a single horizontal line. Each detector's line crossing the budget =
@@ -262,19 +279,21 @@ def fig_max_rate(results: LatencyResults, device: str = "cuda", metric: str = "l
             if np.isfinite(mr) and mr <= xs.max():
                 ax.plot([mr], [B0], st["marker"], color=st["color"], ms=12, mec="k", mew=0.7, zorder=6)
     ax.axhline(B0, ls="--", lw=1.8, color="k", zorder=5)
-    ax.text(0.5, B0, f" real-time budget ≈ {B0:.0f} ms / frame (frame duration, ~constant vs rate) ",
+    ax.text(0.5, B0, f" real-time budget ~{B0:.0f} ms/frame* ",
             transform=ax.get_yaxis_transform(), va="bottom", ha="center", fontsize=9.5,
             bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.6", alpha=0.9))
+    ax.text(0.99, 0.02,
+            "* FFT size scales with sample rate to standardize the input time window,\n"
+            "  maintaining approximately 25 kHz per frequency bin.",
+            transform=ax.transAxes, va="bottom", ha="right", fontsize=8, color="0.3")
     for rm in rates / 1e6:
         ax.axvline(rm, color="0.85", lw=0.8, zorder=0)
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xticks([20, 100, 250, 500, 1000, 2000])
     ax.get_xaxis().set_major_formatter(plt.matplotlib.ticker.ScalarFormatter())
     ax.set_xlabel("sample rate (MS/s)")
-    ax.set_ylabel(f"{DEVICE_LABEL.get(device, device)} per-frame latency (ms) — detector only")
-    ax.set_title("Max real-time sample rate per detector\n"
-                 "(where each detector's latency crosses the real-time budget)",
-                 fontsize=12, fontweight="bold")
+    ax.set_ylabel("detector per-frame latency (ms)")
+    ax.set_title("Real-time sample rate per detector", fontsize=12, fontweight="bold")
     ax.legend(fontsize=8.5, title="detector — max real-time rate", loc="upper left", framealpha=0.9)
     ax.grid(True, which="both", alpha=0.18)
     return fig
@@ -295,11 +314,21 @@ def _cell_value(results: LatencyResults, det: str, rate_hz: float, column: str,
 
 
 def fig_compute_load(results: LatencyResults, device: str = "cuda",
-                     log_flops: bool = True, log_mem: bool = True):
+                     log_flops: bool = True, log_mem: bool = True,
+                     gpu_mem_gb: dict | None = None,
+                     pipeline_mem_mb: dict | None = None):
     """Two panels: FLOPs per frame (GFLOPs) and peak GPU memory (MB), grouped bars over
     detectors, one bar per sample rate. This is the compute-load eval. Both axes log by
-    default (values span ~5 orders of magnitude across detectors)."""
+    default (values span ~5 orders of magnitude across detectors). The peak-memory panel draws
+    horizontal reference lines for a few GPUs' total memory (``gpu_mem_gb``), and an extra grey
+    ``pipeline (est.)`` cluster (``pipeline_mem_mb``) showing the estimated live-pipeline-minus-
+    detector GPU footprint, so an example full-system load can be read alongside the detectors.
+    See latency_eval.tex for the memory accounting the bars omit."""
     import matplotlib.pyplot as plt
+    if gpu_mem_gb is None:
+        gpu_mem_gb = GPU_MEM_GB
+    if pipeline_mem_mb is None:
+        pipeline_mem_mb = PIPELINE_MEM_MB_EST
     dets = order_detectors(results.detectors())
     rates = results.sample_rates()
     fig, axes = plt.subplots(1, 2, figsize=(7.0 * 2, 4.6), layout="constrained")
@@ -308,17 +337,37 @@ def fig_compute_load(results: LatencyResults, device: str = "cuda",
 
     for panel, (col, title, ylabel, use_log) in enumerate(
             [("gflops", "Compute per frame", "GFLOPs / frame", log_flops),
-             ("peak_mem_mb", "Peak GPU memory per frame", "peak MB / frame", log_mem)]):
+             ("peak_mem_mb", "Peak GPU memory per frame", "GPU memory / frame (MB)", log_mem)]):
         ax = axes[panel]
         for i, r in enumerate(rates):
-            vals = [_cell_value(results, det, r, col, device) for det in dets]
-            ax.bar(x + (i - (len(rates) - 1) / 2) * w, vals, w,
-                   color=_rate_color(r, rates), label=f"{r/1e6:.0f} MHz")
+            off = (i - (len(rates) - 1) / 2) * w
+            vals = np.array([_cell_value(results, det, r, col, device) for det in dets])
+            ax.bar(x + off, vals, w, color=_rate_color(r, rates), label=f"{r/1e6:.0f} MHz", zorder=3)
+            if col == "peak_mem_mb" and pipeline_mem_mb:   # stack grey pipeline overhead on top
+                ov = float(pipeline_mem_mb.get(float(r), np.nan))
+                ax.bar(x + off, np.full(len(dets), ov), w, bottom=vals,
+                       color="0.6", edgecolor="0.4", linewidth=0.25, zorder=2,
+                       label=("pipeline additional overhead" if i == 0 else "_nolegend_"))
+        if col == "peak_mem_mb" and gpu_mem_gb:            # total-memory reference lines
+            tform = ax.get_yaxis_transform()
+            for name, gb in sorted(gpu_mem_gb.items(), key=lambda kv: kv[1]):
+                ax.axhline(gb * 1000.0, ls="--", lw=1.0, color="0.35", zorder=1)
+                ax.text(0.015, gb * 1000.0, f"{name}", transform=tform, va="bottom", ha="left",
+                        fontsize=7.0, color="0.2",
+                        bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.7))
         if use_log:
             ax.set_yscale("log")
         ax.set_xticks(x); ax.set_xticklabels([label_for(d) for d in dets], rotation=30, ha="right")
         ax.set_title(title, fontsize=11, fontweight="bold"); ax.set_ylabel(ylabel)
-        ax.legend(fontsize=8, title="sample rate"); ax.grid(True, axis="y", alpha=0.25)
+        if col == "peak_mem_mb":                    # move pipeline overhead to end; legend top-right
+            h, lab = ax.get_legend_handles_labels()
+            order = [k for k in range(len(lab)) if lab[k] != "pipeline additional overhead"] + \
+                    [k for k in range(len(lab)) if lab[k] == "pipeline additional overhead"]
+            ax.legend([h[k] for k in order], [lab[k] for k in order],
+                      fontsize=8, title="sample rate", loc="upper right")
+        else:
+            ax.legend(fontsize=8, title="sample rate", loc="lower right")
+        ax.grid(True, axis="y", alpha=0.25)
     fig.suptitle(f"Compute load per frame ({DEVICE_LABEL.get(device, device)})",
                  fontsize=12, fontweight="bold")
     return fig
@@ -349,12 +398,14 @@ def _draw_bin_budgets(ax, budgets: dict, fontsize: float = 8.0, alternate: bool 
                 bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
 
 
-def fig_latency_bars(results: LatencyResults, metric: str = "lat_mean_ms",
+def fig_latency_bars(results: LatencyResults, metric: str = "lat_min_ms",
                      devices=("cpu", "cuda"), log_y: bool = True,
-                     budget_bin_sizes_hz=DEFAULT_BUDGET_BINS_HZ):
-    """Average per-frame latency as clustered bars: one cluster per detector, and inside
-    each cluster a bar for every sample rate x device (CPU then GPU). The real-time budget
-    is drawn as horizontal dashed line(s), labeled on the plot.
+                     budget_bin_sizes_hz=DEFAULT_BUDGET_BINS_HZ, show_mean: bool = True):
+    """Steady-state per-frame latency as clustered bars: one cluster per detector, and inside
+    each cluster a bar for every sample rate x device (CPU then GPU). Bar height is the warm
+    **min** (best achievable) by default; a black tick overlays the **mean** of the timed reps
+    so you can see they agree (a large gap flags warmup/jitter). The real-time budget is drawn
+    as horizontal dashed line(s), labeled on the plot.
 
     Latency spans ~5 orders of magnitude (GPU sub-ms .. CPU seconds), so the y-axis is log
     by default; pass ``log_y=False`` for a linear axis.
@@ -375,6 +426,7 @@ def fig_latency_bars(results: LatencyResults, metric: str = "lat_mean_ms",
     for r in rates:                                   # sample rate outer, device inner (cpu then gpu)
         for dev in present:
             vals = np.array([_cell_value(results, det, r, metric, dev) for det in dets])
+            means = np.array([_cell_value(results, det, r, "lat_mean_ms", dev) for det in dets])
             finite = vals[np.isfinite(vals) & (vals > 0)]
             if finite.size:
                 vmin = min(vmin, float(finite.min()))
@@ -383,6 +435,9 @@ def fig_latency_bars(results: LatencyResults, metric: str = "lat_mean_ms",
                    alpha=0.55 if dev == "cpu" else 1.0,
                    hatch="////" if dev == "cpu" else None,
                    edgecolor="black", linewidth=0.3, zorder=3)
+            if show_mean:                             # mean overlay tick (should sit at bar top)
+                ax.scatter(x + offset, means, marker="_", s=90, color="black",
+                           linewidths=1.0, zorder=6)
             slot += 1
 
     if log_y:
@@ -393,10 +448,11 @@ def fig_latency_bars(results: LatencyResults, metric: str = "lat_mean_ms",
     _draw_bin_budgets(ax, _bin_budgets(results, budget_bin_sizes_hz))
 
     ax.set_xticks(x); ax.set_xticklabels([label_for(d) for d in dets], rotation=20, ha="right")
-    ax.set_ylabel("average per-frame latency (ms)")
-    ax.set_title("Average per-frame latency", fontsize=12, fontweight="bold")
+    ax.set_ylabel("per-frame latency (ms) — bar = warm min, tick = mean")
+    ax.set_title("Per-frame latency (steady-state min; mean tick)", fontsize=12, fontweight="bold")
     ax.grid(True, axis="y", alpha=0.25, zorder=0)
     # legend: rate colors + device (hatch)
+    from matplotlib.lines import Line2D
     rate_handles = [Patch(fc=_rate_color(r, rates), ec="black", lw=0.3, label=f"{r/1e6:.0f} MHz")
                     for r in rates]
     dev_handles = []
@@ -404,6 +460,8 @@ def fig_latency_bars(results: LatencyResults, metric: str = "lat_mean_ms",
         dev_handles.append(Patch(fc="0.7", hatch="////", ec="black", lw=0.3, alpha=0.55, label="CPU"))
     if "cuda" in present:
         dev_handles.append(Patch(fc="0.7", ec="black", lw=0.3, label="GPU"))
+    if show_mean:
+        dev_handles.append(Line2D([0], [0], marker="_", color="black", lw=0, mew=1.4, label="mean"))
     leg1 = ax.legend(handles=rate_handles, title="sample rate", fontsize=8,
                      loc="upper left", ncol=1)
     ax.add_artist(leg1)
@@ -422,6 +480,27 @@ def make_all_figures(results: LatencyResults) -> dict:
         "latency_vs_rate": fig_latency_vs_rate(results),
         "compute_load": fig_compute_load(results),
     }
+
+
+def print_min_vs_mean(results: LatencyResults, device: str = "cuda", warn_ratio: float = 1.25) -> None:
+    """Report warm min vs mean per (detector, rate) on one device to confirm they agree (a
+    large mean/min ratio flags residual warmup or run-to-run jitter, i.e. not steady state)."""
+    dets = order_detectors(results.detectors())
+    rates = results.sample_rates()
+    print(f"\nSteady-state check on {DEVICE_LABEL.get(device, device)} "
+          f"(mean/min > {warn_ratio:g} => not fully warm / jittery):")
+    print(f"  {'detector':22s} {'rate':>7} {'min ms':>10} {'mean ms':>10} {'mean/min':>9} {'n':>4}")
+    for det in dets:
+        for r in rates:
+            mn = _cell_value(results, det, r, "lat_min_ms", device)
+            me = _cell_value(results, det, r, "lat_mean_ms", device)
+            n = _cell_value(results, det, r, "n_reps", device)
+            if not np.isfinite(mn) or mn <= 0:
+                continue
+            ratio = me / mn
+            flag = "  <-- check" if ratio > warn_ratio else ""
+            print(f"  {label_for(det):22s} {r/1e6:>5.0f}MHz {mn:>10.3f} {me:>10.3f} "
+                  f"{ratio:>9.3f} {int(n):>4}{flag}")
 
 
 def print_summary(results: LatencyResults, budget_bin_sizes_hz=DEFAULT_BUDGET_BINS_HZ) -> None:

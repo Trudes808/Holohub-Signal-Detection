@@ -89,26 +89,51 @@ Power detectors scale with `nfft`; the ML detectors tile at their native geometr
 cost scales with **tile count → sample rate**. Both scalings match what the deployed system
 sees at each rate.
 
-## Run it
+## Run it / reproduce the plots
+
+All commands run from this folder:
 
 ```bash
 cd applications/usrp_wideband_signal_detection/infocom_evals/latency_comp_eval
+```
 
-# full run (all six detectors, CPU + GPU, all four rates) -> saved_results/latency_run.{npz,json}
+**1. Measure (writes `saved_results/latency_run.{npz,json}`):**
+
+```bash
+# full run: all six detectors, CPU + GPU, all four rates (~9 min; CPU-ML cells are hard-capped)
 python3 run_latency_eval.py --config latency_config.yaml
 
 # faster subsets
 python3 run_latency_eval.py --devices cuda                       # GPU only (skips slow ML-on-CPU cells)
 python3 run_latency_eval.py --detectors coherent_power 3dB_power --rates 20e6 500e6
-python3 run_latency_eval.py --max-reps 50 --time-budget-s 4      # shorter histograms
+python3 run_latency_eval.py --max-reps 50 --time-budget-s 4      # shorter runs
+```
 
-# render PNGs from a saved run
+**2. Render every figure to `saved_results/latency_plots/`:**
+
+```bash
 python3 plot_latency_results.py --results saved_results/latency_run
 ```
 
-Then open `latency_eval_review.ipynb` and point `RESULTS` at the run — it renders the
-compute-load bars, the per-rate CPU-vs-GPU latency histograms (with the real-time budget
-line), the across-rates histograms, and the latency-vs-rate summary.
+This writes the four default figures: `max_rate.png` (headline — max real-time rate per detector),
+`latency_bars.png` (per-rate CPU-vs-GPU average latency), `latency_vs_rate.png`, and
+`compute_load.png` (FLOPs + peak GPU memory, with total-memory reference lines for several GPUs).
+
+**3. (optional) dino_finetuned optimization comparison** — the `torch.compile`-optimized dino vs
+baseline (see `../../..`/notes on the `feature_improve_dino_finetuned_latency` branch):
+
+```bash
+# measure baseline vs compiled dino on GPU (compilation makes this slower)
+python3 run_latency_eval.py --detectors dino_finetuned dino_finetuned_opt --devices cuda \
+    --out saved_results/dino_opt_compare
+# throughput sweep -> peak tiles/s -> max sustainable rate
+python3 dino_throughput.py
+```
+
+**4. Interactive review:** open `latency_eval_review.ipynb` and point `RESULTS` at the run — it
+renders the max-rate figure, the compute-load bars (GPU-memory lines included), the clustered
+per-rate latency bars, and the latency-vs-rate summary, plus a raw per-cell table and the
+min-vs-mean steady-state check (`pl.print_min_vs_mean(results)`).
 
 ## Timing methodology
 
@@ -133,6 +158,28 @@ So for the power detectors — whose compute is FFT + pooling/elementwise — th
 is essentially the FFT term (why `coherent_power` and `3dB_power` report similar FLOPs);
 `blob_detection` adds its conv passes. For the ML detectors the conv/matmul that dominates is
 fully counted. Peak GPU memory captures the parts FLOPs miss.
+
+## Peak-memory accounting caveat (what "fits on a GPU" really means)
+
+The peak-memory panel stacks two things per bar: the detector's real **reserved** memory
+(`torch.cuda.max_memory_reserved`, colored) and an **estimated live-pipeline overhead** (grey) — so
+the bar top is a full-system footprint estimate. See `latency_eval.tex` for the full accounting and
+recommendations. We plot *reserved* (not `max_memory_allocated`) because allocated badly understates
+the `torch.compile`d model: `dino_finetuned` allocates only 560 MB but reserves ~4.9 GB of CUDA-graph
+pools (holds ~5.6 GB), i.e. comparable to zero-shot `cuda_dino` — not tiny. Still not fully captured:
+
+- **~0.6 GB CUDA context / cuBLAS-cuDNN baseline** (fixed per process). This roughly *triples* the
+  light detectors' number (e.g. 3dB_power 381 MB allocated → ~1.07 GB process-held) and adds ~15%
+  to the heavy ones (cuda_dino 4.6 GB → ~5.3 GB process-held).
+- **Allocator reserved-but-unused + fragmentation** (`max_memory_reserved` runs 10–40% above allocated).
+- **The rest of the live Holoscan pipeline** — FFT operator, spectrogram/display, visualization
+  renderer, and the DPDK GPU memory regions. The bars are detector-only; the whole app needs more.
+- **Channel/scale** — single channel; two channels ≈ doubles the detector portion.
+
+So the reference lines support the coarse conclusion — *these detectors need single-digit GB and run
+with large headroom on ≥20 GB GPUs* — but a bar sitting below a line does **not** by itself guarantee
+the full app fits, especially for the 8 GB unified-memory Jetson (shared with CPU/OS) where cuda_dino
+is marginal at best. Read the lines as "which class of device," not a pass/fail budget.
 
 ## Files
 

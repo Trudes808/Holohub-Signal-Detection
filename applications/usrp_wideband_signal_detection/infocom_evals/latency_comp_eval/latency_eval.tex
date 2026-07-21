@@ -1,0 +1,93 @@
+% Compute-load / GPU-memory analysis for the per-frame latency evaluation.
+% Section fragment (no \documentclass; plain-text units, no siunitx dependency).
+% Companion figure: compute_load.png (compute + peak GPU memory per frame).
+
+\section{Per-frame compute load and GPU memory footprint}
+\label{sec:compute-load}
+
+Alongside per-frame latency we report the per-frame \emph{compute load} of each detector:
+arithmetic work (GFLOPs) and peak GPU memory, at 20/100/250/500\,MS/s on an NVIDIA
+RTX~4000 Ada (20\,GB; 21{,}116\,MB visible via \texttt{cudaMemGetInfo}). The goal is to let a
+reader judge whether a given detector can run on a given GPU. Because a naive peak-memory number is
+easy to misread, we are explicit about what it does and does not include.
+
+\subsection{Maximum real-time sample rate}
+\label{sec:maxrate}
+
+Latency only matters relative to the deadline it must beat. Because the pipeline scales the FFT size
+with the sample rate to hold a roughly constant frequency resolution, the per-frame real-time budget
+is nearly constant at $\approx$21\,ms across 20--500\,MS/s: one 500\,MS/s frame is
+$N = 10{,}485{,}760$ complex samples, acquired in 20.97\,ms. Plotting each detector's (detector-only)
+per-frame latency against sample rate, the point where its curve crosses this budget is its
+\textbf{maximum real-time sample rate} --- the fastest stream it can process without falling behind
+(the maximum-rate figure).
+
+The most striking feature is the spread: the detectors span roughly five orders of magnitude in
+compute and, correspondingly, more than an order of magnitude in sustainable rate. The lightest
+deployed detector, \texttt{coherent\_power}, needs only 0.75\,GFLOPs and clears a full 500\,MS/s
+frame in 14.7\,ms --- comfortably inside the budget --- extrapolating to a $\approx$772\,MS/s ceiling.
+The heaviest, the fine-tuned segmenter \texttt{dino\_finetuned}, needs 9{,}021\,GFLOPs
+($\approx$12{,}000$\times$ more) at 235\,ms per frame, sustaining $\approx$33\,MS/s. A
+$\approx$23$\times$ difference in real-time reach between two detectors in the \emph{same} system is
+the headline: capability and throughput trade off sharply, and the right operating point is
+application-dependent.
+
+We therefore recommend treating this comparison as a design tool --- pick the lightest detector that
+meets the accuracy your environment demands. For line-rate region-of-interest gating a classical
+power detector keeps up at the full instrument bandwidth; where detection quality dominates and the
+instantaneous rate is lower, the learned segmenter is affordable.
+
+\paragraph{Future work.} We aim to raise \texttt{dino\_finetuned}'s real-time ceiling by
+\emph{parallelizing across frames}: pipelining and batching consecutive frames through the GPU so
+per-frame latency is amortized behind throughput rather than paid serially. An offline throughput
+sweep already shows the compiled model sustaining $\approx$1.5$\times$ its single-frame rate when
+batched, and we expect frame-parallel scheduling to push the $\approx$33\,MS/s ceiling substantially
+higher.
+
+\subsection{What the peak-memory bars measure --- and omit}
+\label{sec:mem-accounting}
+
+Each bar stacks two quantities: the detector's real \emph{reserved} GPU memory
+(\texttt{torch.cuda.max\_memory\_reserved}, colored; one channel, one frame) and the estimated
+live-pipeline overhead (grey; Sec.~\ref{sec:full-load}); the total is a full-system footprint
+estimate. We plot \emph{reserved} rather than the more common \emph{allocated} because allocated
+badly understates the compiled model --- for \texttt{dino\_finetuned} it reads 560\,MB while the
+process truly holds $\approx$5.6\,GB (Table~\ref{tab:mem}, Sec.~\ref{sec:compile-tradeoff}). Even
+so, the estimate simplifies in three ways:
+
+\begin{enumerate}
+  \item \textbf{Single channel, single frame.} Two channels roughly double the colored (detector)
+        portion; the grey pipeline portion is largely shared.
+  \item \textbf{The pipeline overhead is estimated} from the shipped configuration
+        (Sec.~\ref{sec:full-load}), not measured live, and the fixed CUDA context
+        ($\approx$625\,MB) is counted there (grey), not in the colored detector bar.
+  \item \textbf{Reserved varies run-to-run}, and on unified-memory edge parts the whole budget is
+        shared with CPU/OS (Sec.~\ref{sec:edge-recs}).
+\end{enumerate}
+
+For reference, Table~\ref{tab:mem} gives allocated vs.\ reserved vs.\ true process-held at
+500\,MS/s so the gap between the commonly-quoted allocated number and reality is explicit.
+
+\begin{table}[t]
+  \centering
+  \caption{GPU memory at 500\,MS/s, single channel, RTX~4000 Ada (20\,GB). ``Allocated'' is what
+    the figure plots; ``held'' is the true process footprint (\texttt{cudaMemGetInfo}).}
+  \label{tab:mem}
+  \begin{tabular}{lrrrr}
+    \hline
+    Detector & Alloc. & Reserved & Held & \% GPU \\
+             & (MB)   & (MB)     & (MB) &        \\
+    \hline
+    3\,dB power (baseline)               &  381 &  442 & 1074 &  5\% \\
+    dino\_finetuned (eager)              & 1884 & 2632 & 3285 & 16\% \\
+    dino\_finetuned (compiled)$^\dagger$ &  560 & 4897 & 5570 & 26\% \\
+    cuda\_dino (zero-shot)               & 4625 & 4672 & 5325 & 25\% \\
+    \hline
+  \end{tabular}
+  \\[2pt]
+  {\footnotesize $^\dagger$ our latency-optimized deployment (\texttt{torch.compile} max-autotune
+   $+$ CUDA graphs); see Sec.~\ref{sec:compile-tradeoff}.}
+\end{table}
+
+\subsection{How much of the GPU we use}
+\label{sec:percent}

@@ -137,6 +137,8 @@
     "host": "ecen-a58854",
     "gpu": "NVIDIA RTX 4000 Ada Generation",
     "torch": "2.6.0+cu124",
-    "elapsed_s": 541.4
+    "elapsed_s": 541.4,
+    "dino_finetuned_note": "cuda cells = torch.compile(max-autotune) optimized (feature_improve_dino_finetuned_latency)",
+    "peak_mem_metric": "max_memory_reserved (detector-only, GPU); dino_finetuned=compiled deployment"
   }
 }

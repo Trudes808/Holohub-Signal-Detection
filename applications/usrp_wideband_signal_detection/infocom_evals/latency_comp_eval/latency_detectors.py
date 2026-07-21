@@ -332,6 +332,8 @@ class MLReused(Detector):
         self.spec = spec
         self.dinov3_repo = dinov3_repo
         self.det = None
+        self.optimize = bool(spec.get("optimize", False))          # torch.compile + channels_last
+        self.compile_mode = spec.get("compile_mode", "max-autotune")
 
     def load(self, device):
         self._device = device
@@ -352,6 +354,18 @@ class MLReused(Detector):
             thr = fi.load_threshold(spec["eval_meta"]) if spec.get("eval_meta") else spec.get("threshold")
             self.det = fi.FinetunedDetector(spec["ckpt"], train_cfg, ds_meta,
                                             device=device, threshold=thr)
+            if self.optimize and device == "cuda":
+                # output-preserving latency opts: channels_last + torch.compile (backbone is
+                # ~86% of the time; compile fuses the ViT -> ~1.5x throughput / ~1.9x @ 500 MHz,
+                # masks unchanged/IoU~0.996). Raise the dynamo cache limit so per-rate shapes
+                # don't overflow it and silently fall back to (slow) eager.
+                import torch._dynamo as _dyn
+                _dyn.config.cache_size_limit = 64
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cuda.matmul.allow_tf32 = True
+                self.det.model = self.det.model.to(memory_format=torch.channels_last)
+                self.det.model = torch.compile(self.det.model, mode=self.compile_mode,
+                                               fullgraph=False)
         else:
             raise ValueError(f"unknown ML kind {spec['kind']!r}")
 
@@ -406,6 +420,8 @@ class MLReused(Detector):
         # dino_finetuned
         db = rf.frames_to_db(iqt[None], nfft, rows)[0]                     # front-end (untimed), device
 
+        channels_last = self.optimize and device == "cuda"
+
         @torch.no_grad()
         def run():                                                         # detector-only
             img = torch.clamp((db - det.vmin) / max(det.vmax - det.vmin, 1e-6), 0, 1)
@@ -417,16 +433,25 @@ class MLReused(Detector):
                     t = F.pad(t, (0, 0, 0, det.tile - t.shape[0]))
                 batch.append(t)
             x = torch.stack(batch)[:, None]
+            if channels_last:
+                x = x.contiguous(memory_format=torch.channels_last)
+            # optimized path runs all of a frame's tiles as ONE batch (one compiled shape per
+            # rate); baseline keeps chunks of 16 to bound memory.
+            step = x.shape[0] if self.optimize else 16
             out = []
-            for i in range(0, x.shape[0], 16):
+            for i in range(0, x.shape[0], step):
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=det.amp):
-                    logits = det.model(x[i:i + 16])
+                    logits = det.model(x[i:i + step])
                 out.append((torch.sigmoid(logits.float()) >= det.threshold)[:, 0].to(torch.uint8))
             pm = torch.cat(out)
             mask = torch.zeros((rows, nfft), dtype=torch.uint8, device=device)
             for k, (r0, r1) in enumerate(spans):
                 mask[r0:r1] = pm[k, :r1 - r0]
             return mask
+
+        if self.optimize and device == "cuda":     # trigger torch.compile OUTSIDE timing
+            for _ in range(3):
+                run(); torch.cuda.synchronize()
         return run
 
 
@@ -434,7 +459,7 @@ class MLReused(Detector):
 # Registry / factory
 # --------------------------------------------------------------------------- #
 CANONICAL_ORDER = ["coherent_power", "cuda_dino", "3dB_power", "blob_detection",
-                   "yolo", "dino_finetuned"]
+                   "yolo", "dino_finetuned", "dino_finetuned_opt"]
 
 
 def build_detectors(cfg: dict) -> dict[str, Detector]:
@@ -452,8 +477,10 @@ def build_detectors(cfg: dict) -> dict[str, Detector]:
         spec = dcfg["cuda_dino"]
         out["cuda_dino"] = ZeroShotDino(weights_path=spec["weights_path"],
                                         **spec.get("params", {}))
-    for mlname in ("yolo", "dino_finetuned"):
-        if mlname in dcfg:
-            out[mlname] = MLReused(mlname, dcfg[mlname], dinov3_repo)
-    # canonical order
-    return {k: out[k] for k in CANONICAL_ORDER if k in out}
+    for name, spec in dcfg.items():
+        if isinstance(spec, dict) and spec.get("kind") in ("yolo", "dino_finetuned"):
+            out[name] = MLReused(name, spec, dinov3_repo)
+    # canonical order (unknown names appended)
+    ordered = [k for k in CANONICAL_ORDER if k in out]
+    ordered += [k for k in out if k not in CANONICAL_ORDER]
+    return {k: out[k] for k in ordered}

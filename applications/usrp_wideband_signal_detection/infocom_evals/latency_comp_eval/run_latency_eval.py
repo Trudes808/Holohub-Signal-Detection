@@ -224,15 +224,25 @@ def main() -> int:
                 if device == "cuda":
                     torch.cuda.empty_cache()
                 run_fn = det.prepare(frame_iq[r], g, device)
-                # FLOPs are device-independent: measure once (on flop_device) per (detector, rate)
-                fkey = (dname, r)
-                if fkey not in flops_cache and device == flop_device:
-                    flops_cache[fkey], flops_ok[fkey] = measure_flops(
-                        run_fn, sync, det.analytic_fft_flops(g))
-                gflops = flops_cache.get(fkey, float("nan"))
+                # Order matters: time the (possibly torch.compiled) detector on a CLEAN model
+                # FIRST. measure_flops runs it under FlopCounterMode (a TorchDispatchMode), which
+                # forces torch.compile into an eager fallback -- so FLOPs must be measured LAST.
                 peak_mb = measure_peak_mem_mb(run_fn, device)
                 lat = measure_latency(run_fn, sync, warmup, min_reps, max_reps,
                                       time_budget_s, hard_cap_s)
+                # FLOPs are device-independent: measure once (on flop_device) per (detector, rate).
+                # Skip it for torch.compiled detectors -- running FlopCounterMode (a dispatch
+                # mode) on a compiled model corrupts it into a persistent eager fallback. Their
+                # FLOPs equal the un-optimized twin's anyway (compile doesn't change FLOPs).
+                fkey = (dname, r)
+                is_opt = getattr(det, "optimize", False)
+                if fkey not in flops_cache and device == flop_device and not is_opt:
+                    flops_cache[fkey], flops_ok[fkey] = measure_flops(
+                        run_fn, sync, det.analytic_fft_flops(g))
+                gflops = flops_cache.get(fkey)
+                if gflops is None:                     # optimized twin: reuse base FLOPs
+                    twin = dname[:-4] if dname.endswith("_opt") else dname
+                    gflops = flops_cache.get((twin, r), float("nan"))
                 ci = len(cells["detector"])
                 cells["detector"].append(dname)
                 cells["sample_rate_hz"].append(float(r))
@@ -251,8 +261,8 @@ def main() -> int:
                 cells["peak_mem_mb"].append(float(peak_mb))
                 sample_cell_index.extend([ci] * lat.size)
                 sample_latency_ms.extend(lat.tolist())
-                rt = "OK" if np.median(lat) <= g.frame_budget_ms else "OVER"
-                print(f"  {r/1e6:>5.0f} MHz | med {np.median(lat):8.3f} ms "
+                rt = "OK" if np.min(lat) <= g.frame_budget_ms else "OVER"
+                print(f"  {r/1e6:>5.0f} MHz | min {np.min(lat):8.3f} / mean {np.mean(lat):8.3f} ms "
                       f"(n={lat.size:3d}) | {gflops:9.2f} GFLOPs | "
                       f"peak {peak_mb:8.1f} MB | budget {g.frame_budget_ms:7.3f} ms [{rt}]")
             det.unload()

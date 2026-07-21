@@ -34,7 +34,7 @@ latency_eval:
 
   # ---------------------------------------------------------- timing knobs ---- #
   devices: [cpu, cuda]
-  warmup_reps: 5
+  warmup_reps: 10          # discard these before timing so we measure warm steady state
   min_reps: 20            # always collect at least this many latency samples per cell
   max_reps: 200           # ...and never more than this
   time_budget_s: 8.0      # ...stop after min_reps once this wall-clock elapses (bounds slow CPU cells)
@@ -75,6 +75,17 @@ latency_eval:
       imgsz: 1024
     dino_finetuned:
       kind: dino_finetuned
+      ckpt: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/checkpoints/M2_ft/best.pt
+      dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
+      train_cfg: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/configs/train.yaml
+      eval_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/eval_out/M2_ft/eval_meta.json
+
+    # torch.compile + channels_last optimized dino (output-preserving; ~1.9x, mask IoU ~0.996).
+    # Same checkpoint/threshold as dino_finetuned; compiled per input shape (warmed before timing).
+    dino_finetuned_opt:
+      kind: dino_finetuned
+      optimize: true
+      compile_mode: max-autotune
       ckpt: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/checkpoints/M2_ft/best.pt
       dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
       train_cfg: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/configs/train.yaml
