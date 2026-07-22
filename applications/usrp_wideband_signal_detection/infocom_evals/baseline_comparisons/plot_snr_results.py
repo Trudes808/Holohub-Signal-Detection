@@ -37,6 +37,7 @@ DETECTOR_STYLE = {  # consistent colors/markers across every figure + the notebo
     # fine-tuned ML models
     "yolo": {"color": "#ff7f0e", "marker": "v"},             # fine-tuned YOLO26
     "dino_finetuned": {"color": "#8c564b", "marker": "P"},   # fine-tuned DINOv3
+    "dino_finetuned_rt": {"color": "#17becf", "marker": "X"},  # real-time (downsample) DINOv3
 }
 # aliases so the styles hold no matter which run-dir name a detector was written under
 _STYLE_ALIASES = {
@@ -45,10 +46,12 @@ _STYLE_ALIASES = {
 }
 # canonical left-to-right / legend order (unknown detectors sort to the end, by name)
 DETECTOR_ORDER = ["coherent_power", "cuda_dino", "3dB_power", "blob_detection",
-                  "yolo", "dino_finetuned"]
+                  "yolo", "dino_finetuned", "dino_finetuned_rt"]
 # display labels for plots (internal run-dir names stay as-is everywhere else).
 # Keep in sync with plot_eval_results.DETECTOR_LABELS + eval_viz.DETECTOR_LABELS.
-DETECTOR_LABELS = {"cuda_dino": "zero_shot_dino"}
+DETECTOR_LABELS = {"cuda_dino": "zero_shot_dino",
+                   "dino_finetuned": "dino_finetuned (native)",
+                   "dino_finetuned_rt": "dino_finetuned_rt (real-time)"}
 
 
 def label_for(det) -> str:

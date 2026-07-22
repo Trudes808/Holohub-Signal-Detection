@@ -80,6 +80,16 @@ latency_eval:
       train_cfg: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/configs/train.yaml
       eval_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/eval_out/M2_ft/eval_meta.json
 
+    # Real-time (downsample) dino: wide FFT + gain-corrected -> bilinear resize freq to 1024 -> bf16.
+    # Same checkpoint/threshold as dino_finetuned; freq is always squashed to 1024 so the tile count
+    # (hence latency) is CONSTANT across sample rate -> stays under the real-time budget far past native.
+    dino_finetuned_rt:
+      kind: dino_finetuned_rt
+      ckpt: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/checkpoints/M2_ft/best.pt
+      dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
+      train_cfg: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/configs/train.yaml
+      eval_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/eval_out/M2_ft/eval_meta.json
+
     # torch.compile + channels_last optimized dino (output-preserving; ~1.9x, mask IoU ~0.996).
     # Same checkpoint/threshold as dino_finetuned; compiled per input shape (warmed before timing).
     dino_finetuned_opt:

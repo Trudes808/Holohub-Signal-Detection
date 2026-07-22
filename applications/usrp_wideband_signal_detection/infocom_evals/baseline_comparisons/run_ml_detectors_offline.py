@@ -132,8 +132,25 @@ def _build_detector(name: str, spec: dict):
         print(f"  [{name}] dino_finetuned ckpt={spec['ckpt']} threshold={det.threshold:.2f}")
         return det
 
+    if kind == "dino_finetuned_rt":
+        import yaml
+        import rfdata  # noqa: F401  pre-cache the branch copy
+        import model   # noqa: F401  pre-cache the branch copy
+        import finetuned_infer as fi  # noqa: F401  RealtimeFinetunedDetector composes it
+        from finetuned_rt_infer import RealtimeFinetunedDetector
+        train_cfg = yaml.safe_load(Path(spec["train_cfg"]).read_text())
+        thr = fi.load_threshold(spec["eval_meta"]) if spec.get("eval_meta") else spec.get("threshold")
+        det = RealtimeFinetunedDetector(spec["ckpt"], train_cfg, ds_meta,
+                                        device=spec.get("device", "cuda"), threshold=thr,
+                                        downsample_fft=int(spec.get("downsample_fft", 10240)),
+                                        amp_dtype=spec.get("amp_dtype", "bf16"))
+        det.name = name
+        print(f"  [{name}] dino_finetuned_rt (downsample) ckpt={spec['ckpt']} threshold={det.threshold:.2f} "
+              f"fft={det.fft_size} gain_corr={det.gain_offset_db:.2f}dB amp={spec.get('amp_dtype', 'bf16')}")
+        return det
+
     raise ValueError(f"unknown ML detector kind {kind!r} for {name!r} "
-                     "(expected 'yolo' or 'dino_finetuned')")
+                     "(expected 'yolo', 'dino_finetuned', or 'dino_finetuned_rt')")
 
 
 # --------------------------------------------------------------------------- #

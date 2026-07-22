@@ -83,6 +83,20 @@ comparison_eval:
       dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
       device: cuda
 
+    # Real-time (downsample) twin of dino_finetuned: the deployed operator's
+    # real_time_downsample path (wide FFT -> gain-corrected -> bilinear resize freq to 1024 ->
+    # bf16 forward). Same checkpoint/threshold/calibration as dino_finetuned; only the front-end
+    # differs, so scoring it here quantifies the accuracy cost of the real-time optimization.
+    dino_finetuned_rt:
+      kind: dino_finetuned_rt
+      ckpt: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/checkpoints/M2_ft/best.pt
+      eval_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/eval_out/M2_ft/eval_meta.json
+      train_cfg: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/configs/train.yaml
+      dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
+      downsample_fft: 10240     # wide FFT @ 245.76 MSps (matches the operator's auto size)
+      amp_dtype: bf16
+      device: cuda
+
   # --------------------------------------------------------- SNR axis knobs -- #
   # build_snr_results.py calibrates SNR from the 0 dB capture; plot_snr_results.py
   # pins the shared x-axis. These defaults match the agreed method.

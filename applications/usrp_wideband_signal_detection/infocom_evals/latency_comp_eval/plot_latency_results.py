@@ -35,11 +35,13 @@ DETECTOR_STYLE = {
     "blob_detection": {"color": "#9467bd", "marker": "D"},
     "yolo": {"color": "#ff7f0e", "marker": "v"},
     "dino_finetuned": {"color": "#8c564b", "marker": "P"},
-    "dino_finetuned_opt": {"color": "#17becf", "marker": "*"},
+    "dino_finetuned_rt": {"color": "#17becf", "marker": "X"},  # real-time (downsample); matches SNR plot
+    "dino_finetuned_opt": {"color": "#e377c2", "marker": "*"},
 }
 DETECTOR_ORDER = ["coherent_power", "cuda_dino", "3dB_power", "blob_detection",
-                  "yolo", "dino_finetuned", "dino_finetuned_opt"]
+                  "yolo", "dino_finetuned", "dino_finetuned_rt", "dino_finetuned_opt"]
 DETECTOR_LABELS = {"cuda_dino": "zero_shot_dino",
+                   "dino_finetuned_rt": "dino_finetuned_rt (real-time)",
                    "dino_finetuned_opt": "dino_finetuned +compile"}
 # per-sample-rate colors (low -> high rate)
 RATE_COLORS = ["#4575b4", "#91bfdb", "#fc8d59", "#d73027"]
@@ -247,7 +249,12 @@ def max_realtime_rate_mhz(results: LatencyResults, det: str, device: str = "cuda
     m, c = np.polyfit(np.log(rates[ok]), np.log(L[ok]), 1)
     if m <= 1e-9:
         return float("inf")
-    return float(np.exp((np.log(_budget0_ms(results)) - c) / m) / 1e6)
+    rate_mhz = float(np.exp((np.log(_budget0_ms(results)) - c) / m) / 1e6)
+    # A near-flat latency curve (bounded, rate-independent cost — e.g. the downsample path, whose
+    # tile count doesn't grow with rate) has a tiny positive slope from measurement noise, which
+    # extrapolates to an absurd crossing. Treat anything past a sane ceiling as effectively unbounded
+    # (real-time at all practical rates) rather than printing a meaningless number.
+    return float("inf") if rate_mhz > 1.0e4 else rate_mhz
 
 
 def fig_max_rate(results: LatencyResults, device: str = "cuda", metric: str = "lat_min_ms",
@@ -265,13 +272,13 @@ def fig_max_rate(results: LatencyResults, device: str = "cuda", metric: str = "l
     x_hi = min(rate_cap_mhz, max(finite) * 1.3) if finite else rates.max() / 1e6
     xs = np.logspace(np.log10(rates.min() / 1e6 * 0.8), np.log10(max(x_hi, rates.max() / 1e6 * 1.1)), 240)
 
-    fig, ax = plt.subplots(figsize=(11, 6.4), layout="constrained")
+    fig, ax = plt.subplots(figsize=(15, 8.7), layout="constrained")
     for det in dets:
         L = np.array([_cell_value(results, det, r, metric, device) for r in rates])
         ok = np.isfinite(L) & (L > 0)
         st = _style(det)
         mr = max_rates[det]
-        lbl = f"{label_for(det)}  —  ≤ {mr:.0f} MS/s" if np.isfinite(mr) else f"{label_for(det)}  —  >{x_hi:.0f}"
+        lbl = f"{label_for(det)}  —  ≤ {mr:.0f} MS/s" if np.isfinite(mr) else f"{label_for(det)}  —  n/a"
         ax.plot(rates[ok] / 1e6, L[ok], st["marker"] + "-", color=st["color"], ms=6, lw=1.9, label=lbl)
         if ok.sum() >= 2:
             m, c = np.polyfit(np.log(rates[ok]), np.log(L[ok]), 1)
@@ -280,21 +287,23 @@ def fig_max_rate(results: LatencyResults, device: str = "cuda", metric: str = "l
                 ax.plot([mr], [B0], st["marker"], color=st["color"], ms=12, mec="k", mew=0.7, zorder=6)
     ax.axhline(B0, ls="--", lw=1.8, color="k", zorder=5)
     ax.text(0.5, B0, f" real-time budget ~{B0:.0f} ms/frame* ",
-            transform=ax.get_yaxis_transform(), va="bottom", ha="center", fontsize=9.5,
+            transform=ax.get_yaxis_transform(), va="bottom", ha="center", fontsize=19,
             bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.6", alpha=0.9))
     ax.text(0.99, 0.02,
-            "* FFT size scales with sample rate to standardize the input time window,\n"
-            "  maintaining approximately 25 kHz per frequency bin.",
-            transform=ax.transAxes, va="bottom", ha="right", fontsize=8, color="0.3")
+            "* In our real-time pipeline we scale fft size with sample rate to standardize\n"
+            "  the input time window maintain approximately 25kHz per frequency bin",
+            transform=ax.transAxes, va="bottom", ha="right", fontsize=16, color="0.3")
     for rm in rates / 1e6:
         ax.axvline(rm, color="0.85", lw=0.8, zorder=0)
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xticks([20, 100, 250, 500, 1000, 2000])
     ax.get_xaxis().set_major_formatter(plt.matplotlib.ticker.ScalarFormatter())
-    ax.set_xlabel("sample rate (MS/s)")
-    ax.set_ylabel("detector per-frame latency (ms)")
-    ax.set_title("Real-time sample rate per detector", fontsize=12, fontweight="bold")
-    ax.legend(fontsize=8.5, title="detector — max real-time rate", loc="upper left", framealpha=0.9)
+    ax.tick_params(axis="both", which="major", labelsize=18)
+    ax.set_xlabel("sample rate (MS/s)", fontsize=20)
+    ax.set_ylabel("detector per-frame latency (ms)", fontsize=20)
+    ax.set_title("Real-time sample rate per detector", fontsize=24, fontweight="bold")
+    ax.legend(fontsize=13, title="detector — max real-time rate", title_fontsize=14,
+              loc="upper left", framealpha=0.9)
     ax.grid(True, which="both", alpha=0.18)
     return fig
 

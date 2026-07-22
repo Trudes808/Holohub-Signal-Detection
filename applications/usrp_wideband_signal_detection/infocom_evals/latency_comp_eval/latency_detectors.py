@@ -345,7 +345,7 @@ class MLReused(Detector):
             self.det = YoloDetector(spec["ckpt"], ds_meta, device=device,
                                     conf=float(spec.get("conf", 0.25)),
                                     imgsz=int(spec.get("imgsz", 1024)), name=self.name)
-        elif spec["kind"] == "dino_finetuned":
+        elif spec["kind"] in ("dino_finetuned", "dino_finetuned_rt"):
             import yaml
             import rfdata  # noqa: F401
             import model   # noqa: F401
@@ -374,6 +374,9 @@ class MLReused(Detector):
         super().unload()
 
     def fft_component(self, geom):
+        # The real-time downsample path FFTs at the app's dynamic (wide) size, not nfft=1024.
+        if self.spec.get("kind") == "dino_finetuned_rt":
+            return (geom.actual_fft_size, geom.num_ffts_per_batch)
         nfft = int(self.det.nfft) if self.det is not None else 1024
         rows = geom.samples_per_frame // nfft
         return (nfft, rows)
@@ -415,6 +418,42 @@ class MLReused(Detector):
                             tm[yi0:yi1, xi0:xi1] = 1
                     mask[r0:r1] = tm[:r1 - r0]
                 return mask
+            return run
+
+        if self.spec["kind"] == "dino_finetuned_rt":
+            # Real-time downsample path (mirrors the deployed operator): wide FFT + gain correction
+            # are the shared front-end (untimed); the TIMED region is resize freq -> model width,
+            # the 2-tile bf16 forward, and upsample. Because freq is always squashed to 1024 and rows
+            # stays num_ffts_per_batch (512), the tile count is CONSTANT (2) at every rate -> bounded
+            # per-frame latency, unlike native tiling whose tile count scales with the rate.
+            import math
+            model_nfft = int(det.nfft)                                     # 1024
+            wide = int(geom.actual_fft_size)
+            rows_w = int(geom.num_ffts_per_batch)                          # 512
+            tile = int(det.tile)                                           # 256
+            nw = rows_w * wide
+            iqw = torch.from_numpy(np.ascontiguousarray(iq_np[:nw].astype(np.complex64))).to(device)
+            db_w = rf.frames_to_db(iqw[None], wide, rows_w)[0]             # front-end (untimed), device
+            offset = 10.0 * math.log10(wide / model_nfft)                  # FFT-length gain correction
+            img_w = torch.clamp((db_w - (det.vmin + offset)) / max(det.vmax - det.vmin, 1e-6), 0, 1)
+
+            @torch.no_grad()
+            def run():                                                     # detector-only (timed)
+                img = F.interpolate(img_w[None, None], size=(rows_w, model_nfft),
+                                    mode="bilinear", align_corners=False)[0, 0]
+                B = (rows_w + tile - 1) // tile
+                pad = B * tile - rows_w
+                if pad > 0:
+                    img = F.pad(img, (0, 0, 0, pad))
+                x = img.view(B, 1, tile, model_nfft)
+                out = []
+                for i in range(0, B, 16):
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=det.amp):
+                        logits = det.model(x[i:i + 16])
+                    out.append((torch.sigmoid(logits.float()) >= det.threshold)[:, 0].to(torch.uint8))
+                pm = torch.cat(out).reshape(B * tile, model_nfft)[:rows_w]
+                return F.interpolate(pm[None, None].float(), size=(rows_w, wide),
+                                     mode="nearest")[0, 0].to(torch.uint8)
             return run
 
         # dino_finetuned
@@ -459,7 +498,7 @@ class MLReused(Detector):
 # Registry / factory
 # --------------------------------------------------------------------------- #
 CANONICAL_ORDER = ["coherent_power", "cuda_dino", "3dB_power", "blob_detection",
-                   "yolo", "dino_finetuned", "dino_finetuned_opt"]
+                   "yolo", "dino_finetuned", "dino_finetuned_rt", "dino_finetuned_opt"]
 
 
 def build_detectors(cfg: dict) -> dict[str, Detector]:
@@ -478,7 +517,7 @@ def build_detectors(cfg: dict) -> dict[str, Detector]:
         out["cuda_dino"] = ZeroShotDino(weights_path=spec["weights_path"],
                                         **spec.get("params", {}))
     for name, spec in dcfg.items():
-        if isinstance(spec, dict) and spec.get("kind") in ("yolo", "dino_finetuned"):
+        if isinstance(spec, dict) and spec.get("kind") in ("yolo", "dino_finetuned", "dino_finetuned_rt"):
             out[name] = MLReused(name, spec, dinov3_repo)
     # canonical order (unknown names appended)
     ordered = [k for k in CANONICAL_ORDER if k in out]
