@@ -76,6 +76,8 @@ class SpectrogramPreviewOp : public Operator {
   Parameter<int> output_height_;
   Parameter<float> db_floor_;
   Parameter<float> db_ceil_;
+  Parameter<int> fft_size_;             // actual runtime FFT size (freq bins)
+  Parameter<int> reference_fft_size_;   // FFT size the db_floor/db_ceil were tuned for (gain-normalizes across rates)
   Parameter<bool> timing_summary_enable_;
   Parameter<int> timing_summary_every_n_;
   uint64_t frames_seen_ = 0;
@@ -145,6 +147,18 @@ class MaskPreviewStoreOp : public Operator {
 
 struct ChannelVisualizationState;
 
+// Persistent per-channel dynamic color-limit calibration. Lives in the operator (NOT in
+// ChannelVisualizationState, which is resized/reset every compute tick), so the warmup histogram
+// survives startup churn and only resets on initialize() (app restart).
+struct DynamicColorCalib {
+  uint64_t hist[256] = {};
+  uint64_t pixels = 0;
+  int frames = 0;
+  bool frozen = false;
+  float eff_blue = 0.0f;
+  float eff_red = 1.0f;
+};
+
 class SpectrogramToHolovizOp : public Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(SpectrogramToHolovizOp)
@@ -168,6 +182,14 @@ class SpectrogramToHolovizOp : public Operator {
   Parameter<std::string> tensor_name_;
   Parameter<float> blue_limit_;
   Parameter<float> red_limit_;
+  // Per-run auto-calibrated color limits: over the first N frames, build a grayscale histogram, then
+  // freeze blue=low-percentile / red=high-percentile for the rest of the run (resets each launch).
+  // blue_limit_/red_limit_ are the fallback during warmup and when disabled.
+  Parameter<bool> dynamic_color_limits_;
+  Parameter<int> dynamic_color_warmup_frames_;
+  Parameter<float> dynamic_color_low_pct_;
+  Parameter<float> dynamic_color_high_pct_;
+  Parameter<float> dynamic_color_span_;   // >0: red = blue + span (reveals faint-above-floor); 0: use high_pct
   Parameter<float> overlay_alpha_;
   Parameter<bool> overlay_enable_;
   Parameter<std::string> detector_label_;
@@ -252,6 +274,7 @@ class SpectrogramToHolovizOp : public Operator {
   };
 
   std::vector<ChannelVisualizationState> channel_states_;
+  std::vector<DynamicColorCalib> color_calib_;   // persistent per-channel; reset only on initialize()
   std::mutex channel_states_mutex_;
   std::vector<VisualChannelResources> channel_resources_;
   std::vector<PendingChannelFrame> pending_channel_frames_;
@@ -440,6 +463,11 @@ struct ChannelVisualizationState {
   std::vector<float> max_hold_trace;
   std::vector<float> density_trace;
   size_t density_frames_seen = 0;
+  // Frozen dynamic color limits copied in from the operator's persistent calib each frame (this state
+  // is resized/reset per compute tick, so the calibration itself must NOT live here -- see the op).
+  bool color_frozen = false;
+  float eff_blue = 0.0f;
+  float eff_red = 1.0f;
   OfflinePgmFrame latest_mask;
   int64_t latest_mask_frame_number = -1;
   bool overlay_available = false;
@@ -505,6 +533,16 @@ void append_spectrogram_history(ChannelVisualizationState& state,
                                 int width,
                                 int height,
                                 int max_rows);
+
+// Per-run auto-calibration of the spectrogram color limits: accumulate a grayscale histogram over the
+// first warmup_frames, then freeze state.eff_blue/eff_red at the low/high percentiles for the run.
+void update_dynamic_color_limits(DynamicColorCalib& calib,
+                                 const std::vector<uint8_t>& grayscale,
+                                 bool enabled,
+                                 int warmup_frames,
+                                 float low_pct,
+                                 float high_pct,
+                                 float span);
 
 // std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualizationState>& channels,
 //                                                float blue_limit,

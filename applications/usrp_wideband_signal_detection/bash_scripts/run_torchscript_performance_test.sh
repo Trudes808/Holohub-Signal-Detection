@@ -42,10 +42,11 @@ sudo docker exec -u 0:0 "${CONTAINER_NAME}" bash -lc "mkdir -p '${XDG_RUNTIME_DI
 
 # Auto-adopt the stream rate/center from the sidecar written by rx_to_remote_udp.py (live) or
 # replay_rx_to_buff.py (loopback), unless already set explicitly in the environment. This is what
-# makes a new radio rate/center flow through the pipeline with no config edit. It is consumed once
-# (deleted after reading) so it is strictly a fresh handoff from the sender/replay to THIS launch and
-# never silently overrides a later run of a different config; when absent, the config's
-# channel_sample_rates_hz (else nominal fft.span) is used.
+# makes a new radio rate/center flow through the pipeline with no config edit. It is read
+# NON-destructively: the sender OWNS the sidecar (writes it on start, removes it on exit), so its
+# presence means "a stream is live". Reading without deleting lets THIS app be stopped/restarted
+# while the sender keeps running and re-adopt the same live rate/center each launch. When absent
+# (no sender running), the config's channel_sample_rates_hz (else nominal fft.span) is used.
 STREAM_PARAMS_SIDECAR="${USRP_STREAM_PARAMS_FILE:-/tmp/usrp_stream_params.json}"
 if [[ -f "${STREAM_PARAMS_SIDECAR}" ]]; then
 	if [[ -z "${USRP_SAMPLE_RATE_HZ:-}" ]]; then
@@ -54,8 +55,7 @@ if [[ -f "${STREAM_PARAMS_SIDECAR}" ]]; then
 	if [[ -z "${USRP_CENTER_FREQ_HZ:-}" ]]; then
 		USRP_CENTER_FREQ_HZ=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('center_freq_hz',''))" "${STREAM_PARAMS_SIDECAR}" 2>/dev/null || true)
 	fi
-	echo "Using stream params from ${STREAM_PARAMS_SIDECAR}: USRP_SAMPLE_RATE_HZ=${USRP_SAMPLE_RATE_HZ:-} USRP_CENTER_FREQ_HZ=${USRP_CENTER_FREQ_HZ:-} (consuming sidecar)"
-	sudo rm -f "${STREAM_PARAMS_SIDECAR}" 2>/dev/null || rm -f "${STREAM_PARAMS_SIDECAR}" 2>/dev/null || true
+	echo "Using stream params from ${STREAM_PARAMS_SIDECAR}: USRP_SAMPLE_RATE_HZ=${USRP_SAMPLE_RATE_HZ:-} USRP_CENTER_FREQ_HZ=${USRP_CENTER_FREQ_HZ:-} (sender-owned; not consuming)"
 fi
 
 exec sudo docker exec -it \

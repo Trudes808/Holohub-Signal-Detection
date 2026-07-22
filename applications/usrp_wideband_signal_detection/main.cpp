@@ -698,7 +698,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           Arg("output_width") = from_config("visualization.renderer.output_width").as<int>(),
           Arg("output_height") = from_config("visualization.renderer.rows_per_frame").as<int>(),
           Arg("db_floor") = from_config("visualization.renderer.db_floor").as<float>(),
-          Arg("db_ceil") = from_config("visualization.renderer.db_ceil").as<float>()));
+          Arg("db_ceil") = from_config("visualization.renderer.db_ceil").as<float>(),
+          Arg("fft_size") = fft_runtime.actual_fft_size,
+          Arg("reference_fft_size") = fft_runtime.reference_fft_size));
         visualMaskGateOps.push_back(make_operator<ops::MaskPreviewOp>(
             std::string("visualMaskGateOpCh") + std::to_string(channel_index),
           Arg("channel_index") = channel_index,

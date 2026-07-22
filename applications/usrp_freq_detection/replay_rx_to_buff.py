@@ -40,6 +40,7 @@ so packets are addressed to that port's MAC (e0:9d:73:e0:5b:6b), UDP 49153->1234
 """
 
 import argparse
+import atexit
 import json
 import os
 import socket
@@ -54,6 +55,19 @@ import numpy as np
 # Sidecar consumed by the wideband run wrapper so the receiving pipeline auto-adopts the replayed
 # stream's rate/center (keep in sync with rx_to_remote_udp.py + run_torchscript_performance_test.sh).
 STREAM_PARAMS_SIDECAR = "/tmp/usrp_stream_params.json"
+
+
+def _remove_stream_params_sidecar() -> None:
+    """Remove the sidecar when this replay exits so it only exists while the stream is live."""
+    try:
+        os.remove(STREAM_PARAMS_SIDECAR)
+        print(f"Removed stream params sidecar {STREAM_PARAMS_SIDECAR} (replay stopped).")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"Warning: could not remove stream params sidecar {STREAM_PARAMS_SIDECAR}: {exc}")
+
+
 SAMPLES_PER_PACKET = 1024          # chdr_converter.num_complex_samples_per_packet
 BYTES_PER_SAMPLE = 4               # sc16: int16 I + int16 Q
 PAYLOAD_BYTES = SAMPLES_PER_PACKET * BYTES_PER_SAMPLE      # 4096
@@ -289,6 +303,10 @@ def main() -> int:
                 sidecar,
             )
         print(f"  stream params sidecar : {STREAM_PARAMS_SIDECAR}")
+        # The sender OWNS the sidecar: it exists only while this replay is running, so the receiving
+        # app can restart and re-adopt these params. Removed on any normal exit (Ctrl-C / end / error);
+        # a SIGKILL bypasses this and can leave a stale sidecar for the next launch.
+        atexit.register(_remove_stream_params_sidecar)
     except OSError as exc:
         print(f"  Warning: could not write stream params sidecar {STREAM_PARAMS_SIDECAR}: {exc}")
 

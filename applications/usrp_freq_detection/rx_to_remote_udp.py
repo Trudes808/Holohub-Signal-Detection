@@ -33,7 +33,9 @@ rx_to_remote_udp.py --args addr=192.168.10.2 --rate 1e6 --freq 2.4e9 --gain 10
 """
 
 import argparse
+import atexit
 import json
+import os
 import sys
 import time
 from typing import Optional
@@ -61,6 +63,22 @@ def write_stream_params_sidecar(sample_rate_hz: float, center_freq_hz: float, so
         )
     except OSError as exc:
         print(f"Warning: could not write stream params sidecar {STREAM_PARAMS_SIDECAR}: {exc}")
+
+
+def remove_stream_params_sidecar() -> None:
+    """Remove the sidecar when streaming stops so a stopped sender never leaves stale params.
+
+    While this process lives, the sidecar's presence is the signal that the sender is active, so
+    the receiving app can be stopped/restarted and re-adopt the same live rate/center. On any
+    normal exit (Ctrl-C, duration end, uncaught error) it is cleaned up. NOTE: a SIGKILL (kill -9)
+    bypasses this, which can leave a stale sidecar for the next launch to pick up."""
+    try:
+        os.remove(STREAM_PARAMS_SIDECAR)
+        print(f"Removed stream params sidecar {STREAM_PARAMS_SIDECAR} (sender stopped).")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"Warning: could not remove stream params sidecar {STREAM_PARAMS_SIDECAR}: {exc}")
 
 
 class Config(argparse.Namespace):
@@ -226,6 +244,9 @@ def main():
     # (the USRP quantizes the requested rate). The wideband run wrapper reads this into
     # USRP_SAMPLE_RATE_HZ / USRP_CENTER_FREQ_HZ. Uses channel 0 (the pipeline's primary channel).
     write_stream_params_sidecar(float(actual_rates[0]), float(actual_freqs[0]), "rx_to_remote_udp")
+    # Clean the sidecar up when this sender exits (normal stop / Ctrl-C / error) so it only exists
+    # while the stream is live -> the receiving app can restart and re-adopt these live params.
+    atexit.register(remove_stream_params_sidecar)
     print(f"Requesting gain {args.gain} dB...")
     for chan in channels:
         usrp.set_rx_gain(args.gain, chan)

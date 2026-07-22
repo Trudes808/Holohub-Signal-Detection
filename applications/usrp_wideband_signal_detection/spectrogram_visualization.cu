@@ -1535,6 +1535,11 @@ void SpectrogramPreviewOp::setup(OperatorSpec& spec) {
   spec.param(output_height_, "output_height", "Output Height", "Preview height in rows.", 16);
   spec.param(db_floor_, "db_floor", "dB Floor", "Fixed dB floor for preview normalization.", -22.0f);
   spec.param(db_ceil_, "db_ceil", "dB Ceiling", "Fixed dB ceiling for preview normalization.", 35.0f);
+  spec.param(fft_size_, "fft_size", "FFT Size", "Actual runtime FFT size (freq bins).", 20480);
+  spec.param(reference_fft_size_, "reference_fft_size", "Reference FFT Size",
+             "FFT size the db_floor/db_ceil were tuned for; the dB window is shifted by "
+             "10*log10(fft_size/reference_fft_size) so the noise floor lands consistently across "
+             "sample rates (offset is 0 at the reference).", 20480);
   spec.param(timing_summary_enable_,
              "timing_summary_enable",
              "Timing Summary Enable",
@@ -1620,13 +1625,27 @@ void SpectrogramPreviewOp::compute(InputContext& op_input,
   cudaStreamWaitEvent(reduce_stream_, pipeline_done, 0);
   cudaEventDestroy(pipeline_done);
 
+  // Gain-normalize the dB window across sample rates: the grayscale is 10*log10(|FFT|^2) from an
+  // unnormalized N-pt FFT, whose noise floor scales as +10*log10(N). Shift db_floor/db_ceil by
+  // 10*log10(fft_size/reference_fft_size) so the floor lands where the tuned window expects it at any
+  // rate (offset == 0 at the reference size). First-principles, OTA-derivable from FFT sizes alone.
+  const int actual_fft_bins = std::max(1, fft_size_.get());
+  const int ref_fft_bins = std::max(1, reference_fft_size_.get());
+  const float gain_offset_db =
+      10.0f * std::log10(static_cast<float>(actual_fft_bins) / static_cast<float>(ref_fft_bins));
+  if (frame_number == 1 || frames_seen_ == 1) {
+    HOLOSCAN_LOG_INFO("Spectrogram preview dB window: db_floor={:.1f} db_ceil={:.1f} fft_size={} "
+                      "reference_fft_size={} -> gain-normalized {:.1f}/{:.1f} (offset {:.2f} dB)",
+                      db_floor_.get(), db_ceil_.get(), actual_fft_bins, ref_fft_bins,
+                      db_floor_.get() + gain_offset_db, db_ceil_.get() + gain_offset_db, gain_offset_db);
+  }
   reduce_spectrogram_to_grayscale_row_gpu(tensor,
                                           reduce_stream_,
                                           device_output_,
                                           preview_height,
                                           preview_width,
-                                          db_floor_.get(),
-                                          db_ceil_.get());
+                                          db_floor_.get() + gain_offset_db,
+                                          db_ceil_.get() + gain_offset_db);
   auto copy_result = cudaMemcpyAsync(pinned_output_, device_output_, bytes, cudaMemcpyDeviceToHost, reduce_stream_);
   if (copy_result != cudaSuccess) {
     throw std::runtime_error(std::string("Preview spectrogram copy failed: ") + cudaGetErrorString(copy_result));
@@ -2394,6 +2413,18 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
              std::string("spectrogram"));
   spec.param(blue_limit_, "blue_limit", "Blue Limit", "Lower color scale clamp in normalized units.", 0.10f);
   spec.param(red_limit_, "red_limit", "Red Limit", "Upper color scale clamp in normalized units.", 0.92f);
+  spec.param(dynamic_color_limits_, "dynamic_color_limits", "Dynamic color limits",
+             "Auto-calibrate blue/red from a warmup histogram, then freeze for the run (resets each "
+             "launch). blue_limit/red_limit are the fallback during warmup and when off.", false);
+  spec.param(dynamic_color_warmup_frames_, "dynamic_color_warmup_frames", "Warmup frames",
+             "Frames to accumulate before freezing the dynamic color limits.", 60);
+  spec.param(dynamic_color_low_pct_, "dynamic_color_low_pct", "Low percentile",
+             "Grayscale percentile mapped to blue (noise floor).", 0.50f);
+  spec.param(dynamic_color_high_pct_, "dynamic_color_high_pct", "High percentile",
+             "Grayscale percentile mapped to red when span<=0 (locks onto strong signals).", 0.995f);
+  spec.param(dynamic_color_span_, "dynamic_color_span", "Color span",
+             "If >0, red = blue + span (normalized units) to reveal faint signals just above the "
+             "noise floor; strong signals saturate. 0 = use high_pct instead.", 0.0f);
   spec.param(overlay_alpha_,
              "overlay_alpha",
              "Overlay Alpha",
@@ -2491,6 +2522,14 @@ void SpectrogramToHolovizOp::initialize() {
                     live_width,
                     live_rows);
   channel_states_.assign(channel_count, {});
+  // Reset the persistent dynamic color-limit calibration once per run (NOT per compute tick), so the
+  // warmup histogram survives channel_states_ churn and only recalibrates on (re)launch.
+  color_calib_.assign(channel_count, {});
+  HOLOSCAN_LOG_INFO("Dynamic color limits: enabled={} warmup_frames={} low_pct={:.2f} high_pct={:.3f} "
+                    "span={:.2f} (fallback blue={:.2f}/red={:.2f})",
+                    dynamic_color_limits_.get() ? "true" : "false", dynamic_color_warmup_frames_.get(),
+                    dynamic_color_low_pct_.get(), dynamic_color_high_pct_.get(),
+                    dynamic_color_span_.get(), blue_limit_.get(), red_limit_.get());
   for (size_t channel_index = 0; channel_index < channel_states_.size(); ++channel_index) {
     auto& state = channel_states_[channel_index];
     state.active = true;
@@ -2904,6 +2943,20 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
                                    std::max(1, spectrogram.width),
                                    std::max(1, spectrogram.height),
                                    snap_display_time_rows);
+        // Accumulate/freeze in the PERSISTENT per-channel calib (survives the per-tick channel_states_
+        // resize), then copy the frozen limits into the transient render state.
+        const size_t calib_ch = static_cast<size_t>(std::max(0, static_cast<int>(channel_index)));
+        if (color_calib_.size() <= calib_ch) {
+          color_calib_.resize(calib_ch + 1);
+        }
+        auto& calib = color_calib_[calib_ch];
+        update_dynamic_color_limits(calib, spectrogram.pixels, dynamic_color_limits_.get(),
+                                    dynamic_color_warmup_frames_.get(), dynamic_color_low_pct_.get(),
+                                    dynamic_color_high_pct_.get(), dynamic_color_span_.get());
+        state.color_frozen = calib.frozen;
+        state.eff_blue = calib.eff_blue;
+        state.eff_red = calib.eff_red;
+        const float density_red = state.color_frozen ? state.eff_red : red_limit_.get();
         state.current_psd_trace = compute_psd_trace(spectrogram.pixels,
                                                     std::max(1, spectrogram.width),
                                                     std::max(1, spectrogram.height));
@@ -2911,7 +2964,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
         update_density_history(compute_density_trace_from_grayscale(spectrogram.pixels,
                                                                     std::max(1, spectrogram.width),
                                                                     std::max(1, spectrogram.height),
-                                                                    red_limit_.get()),
+                                                                    density_red),
                                state.density_trace,
                                state.density_frames_seen);
 
@@ -3618,6 +3671,52 @@ void append_spectrogram_history(ChannelVisualizationState& state,
   write_history_rows(state, grayscale, width, height, state.info.frame_number);
 }
 
+void update_dynamic_color_limits(DynamicColorCalib& calib,
+                                 const std::vector<uint8_t>& grayscale,
+                                 bool enabled,
+                                 int warmup_frames,
+                                 float low_pct,
+                                 float high_pct,
+                                 float span) {
+  if (!enabled || calib.frozen || grayscale.empty()) {
+    return;
+  }
+  for (uint8_t v : grayscale) {
+    ++calib.hist[v];
+  }
+  calib.pixels += grayscale.size();
+  ++calib.frames;
+  if (calib.frames < std::max(1, warmup_frames) || calib.pixels == 0) {
+    if (calib.frames == 1 || calib.frames % 20 == 0) {
+      std::fprintf(stderr, "[spectrogram_viz] color warmup %d/%d frames\n",
+                   calib.frames, std::max(1, warmup_frames));
+    }
+    return;
+  }
+  auto pct_bin = [&](float p) -> int {
+    const uint64_t target = static_cast<uint64_t>(
+        std::clamp(p, 0.0f, 1.0f) * static_cast<double>(calib.pixels));
+    uint64_t cum = 0;
+    for (int b = 0; b < 256; ++b) {
+      cum += calib.hist[b];
+      if (cum >= target) return b;
+    }
+    return 255;
+  };
+  // blue = noise floor (low_pct). red = blue + span (span>0, reveals faint signals just above the
+  // floor by mapping a narrow band bright), else the high_pct percentile (locks onto strong signals).
+  const float b = static_cast<float>(pct_bin(low_pct)) / 255.0f;
+  float r = span > 0.0f ? (b + span) : (static_cast<float>(pct_bin(high_pct)) / 255.0f);
+  if (r < b + 0.02f) r = b + 0.02f;
+  r = std::min(1.0f, r);
+  calib.eff_blue = b;
+  calib.eff_red = r;
+  calib.frozen = true;
+  std::fprintf(stderr, "[spectrogram_viz] dynamic color limits frozen: blue=%.3f red=%.3f "
+               "(low=p%.0f, %s over %d frames)\n", b, r, low_pct * 100.0f,
+               span > 0.0f ? "span mode" : "high-pct mode", calib.frames);
+}
+
 std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualizationState>& channels,
                                                float blue_limit,
                                                float red_limit,
@@ -3920,8 +4019,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                   history_rows,
                                   channel.history_valid_rows,
                                   channel.history_write_row,
-                                  blue_limit,
-                                  red_limit);
+                                  channel.color_frozen ? channel.eff_blue : blue_limit,
+                                  channel.color_frozen ? channel.eff_red : red_limit);
     if (overlay_enabled) {
       overlay_mask_ring(canvas,
                         output_width,
