@@ -10,7 +10,7 @@ sample count). Rate check uses wfgt:snippet_sample_rate.
 Usage:
   python3 verify_snip.py [--snip-out /tmp/usrp_spectrograms/snipped]
                          [--captures-dir /home/bqn82/captures]
-                         [--cache <repo>/notebooks/data_saving_evals/ds_cache.csv]
+                         [--cache <repo>/applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/ds_cache.csv]
                          [--out real_snip_metrics.csv]
 """
 from __future__ import annotations
@@ -69,7 +69,7 @@ def main():
     ap.add_argument("--snip-out", type=Path, default=Path("/tmp/usrp_spectrograms/snipped"))
     ap.add_argument("--captures-dir", type=Path, default=Path("/home/bqn82/captures"))
     ap.add_argument("--cache", type=Path,
-                    default=Path("/home/bqn82/Holohub-Signal-Detection/notebooks/data_saving_evals/ds_cache.csv"))
+                    default=Path("/home/bqn82/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/ds_cache.csv"))
     ap.add_argument("--out", type=Path, default=None)
     a = ap.parse_args()
 

@@ -61,8 +61,8 @@ Heads-up: 14 captures × 2 detectors × ~14 GB each is a long replay. To start s
 
 ```bash
 source ~/miniforge3/etc/profile.d/conda.sh && conda activate yolo
-cd ~/Holohub-Signal-Detection/notebooks/data_saving_evals
-jupyter nbconvert --to notebook --execute --inplace data_reduction_eval.ipynb
+cd ~/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection/infocom_evals/snip_eval
+jupyter nbconvert --to notebook --execute --inplace data_saving_eval_review.ipynb
 ```
 The notebook reads the snippet SigMF sizes and updates:
 - `fig1_bytes_per_hour.png` — measured diamonds for `coherent_power` / `cuda_dino`,

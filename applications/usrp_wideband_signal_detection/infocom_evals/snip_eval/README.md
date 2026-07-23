@@ -29,7 +29,7 @@ snip_run/<detector>/<stem>/mask_arrays/   (.packed.npz symlinks + packed baselin
 <SNIP_OUT>/<mode>/<detector>/<stem>/snippets/*.sigmf-meta
         │  verify_snip.py
         ▼
-real_snip_metrics.csv   →   notebooks/data_saving_evals/plot_real_snip_figures.py  (figures)
+real_snip_metrics.csv   →   plot_data_saving.py  (figures in figs/)
 ```
 
 ## Scripts
@@ -71,6 +71,35 @@ and `~/captures` mounted read-only. Env knobs: `MODES` (default `frequency time_
 - **`real_snip_metrics.csv`** — the results (committed).
 - `snip_run/`, `detected/`, `gt_snip_run/` — large staged masks / analytic metas; **gitignored**,
   regenerable from the scripts above.
+
+## Notebook & figures
+`data_saving_eval_review.ipynb` (+ jupytext `.py`) is the self-documenting analysis notebook — data
+reduction vs save-all, the fidelity (signal-retention) trade-off, and per-detector compute cost — as
+hand-calcs over the attenuation sweep on a physical **SNR axis**. Kernel: **yolo** (pure analysis;
+loads no models). Baseline: 245.76 MHz `cf32` → **save-all = 7.08 TB/hour** (flat, SNR-independent).
+
+- **`build_ds_cache.py` → `ds_cache.csv`** — precomputes per-detector reduction / retention / TF-coverage
+  and the analytic snipper footprint once, so the notebook re-renders instantly (`DS_REBUILD=1` forces
+  a rebuild; knobs `DS_NFRAMES`, `DS_MIN_BOX_PIXELS`, `DS_SWEEP`).
+- **`plot_data_saving.py` → `figs/`** — the real-snip figures (Figs 1–3 × {all, curated}) from
+  `real_snip_metrics.csv`: GB/hour (log, plain-number) vs SNR. Standalone, ~2 s.
+- **`snr_calibration.json`** — `snr0_ref_db` for the attenuation→SNR mapping (`snr = snr0_ref − atten`).
+- **compute** — `compute_table.csv` (via `yolo_training/src/measure_compute.py`): FLOPs + measured GPU
+  memory + real-time factor per detector, for the compute figure.
+- **live-OTA** — `live_data_saving.csv` (via `yolo_training/src/measure_live_saving.py`) feeds the
+  live-OTA figure; `instructions.md` has the container replay that produces the OTA masks it reads.
+
+### Regenerate (run from the repo root)
+```bash
+cd ~/Holohub-Signal-Detection
+SE=applications/usrp_wideband_signal_detection/infocom_evals/snip_eval
+conda activate dinov3 && python $SE/plot_data_saving.py                    # real-snip figures -> figs/
+conda activate dinov3 && python yolo_training/src/measure_compute.py       # -> snip_eval/compute_table.csv
+conda activate yolo   && jupyter nbconvert --to notebook --execute --inplace $SE/data_saving_eval_review.ipynb
+```
+Tracked: the notebook (+`.py`), the scripts, `figs/`, `ds_cache.csv`, `real_snip_metrics.csv`,
+`snr_calibration.json`, `live_data_saving.csv`. Regenerable tables (`compute_table.csv`, `*_table.csv`)
+are gitignored.
 
 ## Fine-tuned DINO weights (provenance)
 The `finetuned_dino` (M1) and `finetuned_dino_m2` (M2) detector masks were produced upstream by the

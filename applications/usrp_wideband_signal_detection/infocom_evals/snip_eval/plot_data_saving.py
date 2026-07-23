@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
 HSD   = Path.home() / "Holohub-Signal-Detection"
-DS    = HSD / "notebooks/data_saving_evals"
+DS    = HSD / "applications/usrp_wideband_signal_detection/infocom_evals/snip_eval"
 METRICS = Path("/tmp/usrp_spectrograms/snip_eval/real_snip_metrics.csv")
 if not METRICS.exists():
     METRICS = HSD / "applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/real_snip_metrics.csv"

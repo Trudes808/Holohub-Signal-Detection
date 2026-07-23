@@ -93,7 +93,7 @@ plt.rcParams.update({
 })
 
 # Figures are written into ./figs next to the notebook (and still shown inline).
-FIGS = (HSD / "notebooks/data_saving_evals/figs"); FIGS.mkdir(exist_ok=True)
+FIGS = (HSD / "applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/figs"); FIGS.mkdir(exist_ok=True)
 def save_fig(fig, fname):
     """Save a figure into FIGS/ (publication dpi) and return the path."""
     p = FIGS / fname; fig.savefig(p); return p
@@ -173,11 +173,11 @@ def atten(stem):
 # at ds_cache.csv. Restyling any figure/table below re-reads this instantly. Set DS_REBUILD=1 to
 # force a rebuild (or run build_ds_cache.py directly after changing DS_NFRAMES / DS_MIN_BOX_PIXELS).
 import sys as _sys
-CACHE = Path(os.environ.get("DS_CACHE", str(HSD / "notebooks/data_saving_evals/ds_cache.csv")))
+CACHE = Path(os.environ.get("DS_CACHE", str(HSD / "applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/ds_cache.csv")))
 if (not CACHE.exists()) or os.environ.get("DS_REBUILD"):
     print(f"cache missing / DS_REBUILD set -> running build_ds_cache.py -> {CACHE}", flush=True)
     import subprocess
-    subprocess.run([_sys.executable, str(HSD / "notebooks/data_saving_evals/build_ds_cache.py")], check=True)
+    subprocess.run([_sys.executable, str(HSD / "applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/build_ds_cache.py")], check=True)
 _cache = pd.read_csv(CACHE)
 GT = _cache[_cache.detector == "ground_truth"].set_index("attenuation_db").sort_index()
 ds = _cache[_cache.detector.isin(DETS)].copy().reset_index(drop=True)
@@ -197,7 +197,7 @@ GT_SNIP_MEAN_TB = float(GT_SNIP_TB.mean())
 # SNR x-axis: physical attenuator identity SNR = snr0_ref - attenuation
 # (== baseline_comparisons/snr_measurement.snr_at_attenuation). Calibration is copied in-repo.
 import json as _json
-_snrcal = Path(os.environ.get("DS_SNR_CAL", str(HSD / "notebooks/data_saving_evals/snr_calibration.json")))
+_snrcal = Path(os.environ.get("DS_SNR_CAL", str(HSD / "applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/snr_calibration.json")))
 SNR0_REF = float(_json.load(open(_snrcal))["snr0_ref_db"]) if _snrcal.exists() else 54.0
 def snr_of(a):
     return SNR0_REF - np.asarray(a, dtype=float)

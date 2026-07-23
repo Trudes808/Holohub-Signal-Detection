@@ -39,7 +39,7 @@ rows=[dict(model="naive_save_all", timeslice_frac=1.0, tf_coverage=1.0,
            stored_TB_hr_timeslice=SAVE_ALL_TB_HR, stored_TB_hr_resample_proj=SAVE_ALL_TB_HR, status="baseline")]
 # Container detectors (coherent_power, zero-shot cuda_dino): auto-read their masks if a container
 # batch has produced them for the live captures; else mark pending. DROP-IN: run the container batch
-# with --output-root LIVE_CONTAINER (see notebooks/data_saving_evals/README.md) and re-run this script.
+# with --output-root LIVE_CONTAINER (see applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/README.md) and re-run this script.
 LIVE_CONTAINER = Path("/tmp/usrp_spectrograms/batch_eval/live_ota")
 def _load_mask(fp):
     z=np.load(fp); return np.unpackbits(z["packed"])[:int(z["rows"])*int(z["cols"])].reshape(int(z["rows"]),int(z["cols"]))
@@ -64,7 +64,7 @@ for name,a in acc.items():
     ts=float(np.mean(a["ts"])); cov=float(np.mean(a["cov"]))
     rows.append(dict(model=name, timeslice_frac=ts, tf_coverage=cov,
                      stored_TB_hr_timeslice=SAVE_ALL_TB_HR*ts, stored_TB_hr_resample_proj=SAVE_ALL_TB_HR*cov, status="offline"))
-out=Path("notebooks/data_saving_evals/live_data_saving.csv"); pd.DataFrame(rows).to_csv(out,index=False)
+out=Path("applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/live_data_saving.csv"); pd.DataFrame(rows).to_csv(out,index=False)
 print(f"\nSAVE-ALL(OTA)={SAVE_ALL_TB_HR:.2f} TB/hr  (frames/file={NPF})")
 print(pd.DataFrame(rows)[["model","timeslice_frac","tf_coverage","stored_TB_hr_timeslice","status"]].to_string(index=False))
 print(f"wrote {out}")

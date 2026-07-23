@@ -2,7 +2,7 @@
 GPU memory (measured for the offline-runnable models), FLOP estimates, and real-time
 throughput vs the 245.76 MS/s capture rate. Container-only detectors (coherent_power,
 zero-shot cuda_dino) get FLOP/mem ESTIMATES (noted). Run with the dinov3 env python
-(has torch + dinov3 + ultralytics). Writes notebooks/data_saving_evals/compute_table.csv.
+(has torch + dinov3 + ultralytics). Writes applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/compute_table.csv.
 """
 import sys, json, time, math
 from pathlib import Path
@@ -66,7 +66,7 @@ for r in rows:
     r["gflops_per_s_realtime"]=round(r["gflops_per_tile"]*TILES_PER_SEC,1)
     r["flops_note"]="est(ViT-B scaled)" if "dino" in r["model"] else ("ultralytics" if r["model"]=="yolo26m" else "est(FFT)")
 
-out=Path("notebooks/data_saving_evals/compute_table.csv")
+out=Path("applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/compute_table.csv")
 pd.DataFrame(rows).to_csv(out,index=False)
 print(f"tiles/s needed for real-time = {TILES_PER_SEC:.0f}\n")
 print(pd.DataFrame(rows)[["model","params_M","gflops_per_tile","gflops_per_s_realtime","gpu_mem_mb","tiles_per_s","realtime_x","src"]].to_string(index=False))

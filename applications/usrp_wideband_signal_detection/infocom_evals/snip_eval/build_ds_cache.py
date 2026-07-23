@@ -30,7 +30,7 @@ RATE, BPS, SEC_HR = 245.76e6, 8, 3600.0
 DETS = ["coherent_power", "cuda_dino", "finetuned_dino", "finetuned_dino_m2",
         "yolo26s", "yolo26m", "3dB_power", "blob_detection"]
 GT_REF = "cuda_dino"                       # GT masks are detector-independent; read them from here
-OUT = HSD / "notebooks/data_saving_evals/ds_cache.csv"
+OUT = HSD / "applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/ds_cache.csv"
 
 
 def denoise(m):
