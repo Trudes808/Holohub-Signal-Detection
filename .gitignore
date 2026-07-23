@@ -95,3 +95,19 @@ applications/usrp_wideband_signal_detection/infocom_evals/baseline_comparisons/s
 notebooks/data_saving_evals/compute_table.csv
 notebooks/data_saving_evals/*_table.csv
 notebooks/data_saving_evals/*.png
+
+# relocated baseline masks for the mask_replay snip (large; regenerable)
+applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_experiments/batch_runs/ds_snip_baselines/
+
+# detector-detection sigmf-meta + data-saving metrics from snip_data_metrics.py (~122 MB; regenerable)
+applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/detected/
+
+# staged GT/detector masks for the mask_replay snip eval (symlinks + transient .npy)
+applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/gt_snip_run/
+
+# unified staged masks for full snip run (symlinks + packed baselines)
+applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/snip_run/
+
+# fine-tuned DINOv3 TorchScript models (669 MB; produced the FT-DINO M1/M2 detector masks upstream,
+# not referenced by any runtime config; regenerable from dino_fine_tuning/ training)
+dino_fine_tuning/weights/

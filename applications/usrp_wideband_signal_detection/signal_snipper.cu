@@ -300,7 +300,7 @@ void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask, SnippetBatch
     SnipAnnotation ann;
     ann.freq_lower_hz = region.freq_lower_hz;
     ann.freq_upper_hz = region.freq_upper_hz;
-    ann.label = "DETECTION";
+    ann.label = "waveform_detection";
     ann.kind = "waveform";
     return ann;
   };

@@ -11,6 +11,7 @@
 
 #include <coherent_power_signal_detector.hpp>
 #include <cuda_dino_detector.hpp>
+#include <mask_replay_detector.hpp>
 #include <fft.hpp>
 #include <holoscan/holoscan.hpp>
 #include <spectrogram.hpp>
@@ -581,6 +582,7 @@ struct EvalOverrides {
   bool save_spectrogram_tensor = true;
   bool save_mask_preview = true;
   bool save_mask_npy = true;
+  bool save_ground_truth = true;  // false => skip writing gt_annotations/gt_masks (footprint-only snip)
   std::string input_datatype = "ci16_le";
   double input_sample_rate_hz = 0.0;
   uint64_t input_capture_sample_start = 0;
@@ -1264,6 +1266,7 @@ void write_ground_truth_artifacts(FrameArtifactRecord& record,
       gt_items.push_back(std::move(gt_item));
   }
 
+  if (overrides.save_ground_truth) {
   const auto gt_annotations_path = make_artifact_path(overrides.output_root,
                                                       "gt_annotations",
                                                       "ground_truth",
@@ -1293,6 +1296,7 @@ void write_ground_truth_artifacts(FrameArtifactRecord& record,
     throw std::runtime_error("failed to write ground-truth mask artifact: " + gt_mask_path.string());
   }
   record.gt_mask_npy_path = relative_to_output_root(gt_mask_path);
+  }
 }
 
 void write_manifest(const EvalOverrides& overrides) {
@@ -2112,6 +2116,19 @@ const std::vector<DetectorAdapter>& detector_adapter_table() {
                 holoscan::Arg("channel_filter") = overrides.channel_number,
                 holoscan::Arg("emit_stride") = 1);
           }},
+      DetectorAdapter {
+          "mask_replay",
+          [](holoscan::Application& app, const EvalOverrides& overrides) -> std::shared_ptr<holoscan::Operator> {
+            // Replays precomputed masks (mask_replay_detector.mask_dir) into the snipper. Uses the
+            // NORMAL spectrogram path -- add_flow(spectrogram, detector) -- consuming the spectrogram
+            // only for frame metadata; the mask pixels come from disk.
+            return app.make_operator<holoscan::ops::MaskReplayDetector>(
+                "maskReplayDetectorOpCh0",
+                app.from_config("mask_replay_detector"),
+                holoscan::Arg("num_channels") = 1,
+                holoscan::Arg("channel") = overrides.channel_number,
+                holoscan::Arg("emit_stride") = 1);
+          }},
   };
   return table;
 }
@@ -2297,6 +2314,8 @@ EvalOverrides load_overrides(holoscan::Application& app,
       usrp_wideband::from_config_or<bool>(app, "offline_eval.save_mask_preview", true);
   overrides.save_mask_npy =
       usrp_wideband::from_config_or<bool>(app, "offline_eval.save_mask_npy", true);
+  overrides.save_ground_truth =
+      usrp_wideband::from_config_or<bool>(app, "offline_eval.save_ground_truth", true);
   overrides.progress_every_n_frames =
       cli_options.progress_every_n_frames > 0
           ? cli_options.progress_every_n_frames

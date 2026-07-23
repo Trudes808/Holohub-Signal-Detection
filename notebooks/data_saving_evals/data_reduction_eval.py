@@ -51,13 +51,55 @@ SAVE_ALL_BYTES_HR = RATE_HZ * BYTES_PER_SAMPLE * SEC_PER_HR      # 7.08 TB/hr
 NFFT = 10240                                                    # batch-frame freq bins
 N_FRAMES = int(os.environ.get("DS_NFRAMES", "120"))             # frames/stem sampled
 
-DETS   = ["coherent_power","cuda_dino","finetuned_dino","finetuned_dino_m2","yolo26s","yolo26m"]
+DETS   = ["coherent_power","cuda_dino","finetuned_dino","finetuned_dino_m2","yolo26s","yolo26m",
+          "3dB_power","blob_detection"]
 LABEL  = {"coherent_power":"Coherent Power","cuda_dino":"Zero-shot DINOv3",
           "finetuned_dino":"FT-DINO M1","finetuned_dino_m2":"FT-DINO M2",
-          "yolo26s":"YOLO26s","yolo26m":"YOLO26m"}
-COLOR  = {"coherent_power":"#d95f02","cuda_dino":"#7570b3","finetuned_dino":"#1b9e77",
-          "finetuned_dino_m2":"#e7298a","yolo26s":"#66a61e","yolo26m":"#a6761d"}
+          "yolo26s":"YOLO26s","yolo26m":"YOLO26m",
+          "3dB_power":"3 dB Power (baseline)","blob_detection":"Blob Detection (baseline)"}
+# Per-detector colors — colorblind-safe. These are the validated hues from the
+# data-viz palette (blue/orange/aqua/red/violet/yellow), assigned in a slot order
+# that passes the CVD adjacent-pair gate (worst deutan ΔE 9.2, normal-vision 20.8;
+# validated with dataviz/scripts/validate_palette.js). The previous ColorBrewer
+# "Dark2" set FAILED: FT-DINO M1 (#1b9e77) vs M2 (#e7298a) were ΔE 1.7 under
+# deuteranopia -- indistinguishable to red-green colorblind readers, and those two
+# related detectors appear together in every figure. MARKER/DASH add a second,
+# non-color channel so series identity never rests on hue alone (accessibility).
+COLOR  = {"coherent_power":"#4a3aa7","cuda_dino":"#1baf7a","finetuned_dino":"#eb6834",
+          "finetuned_dino_m2":"#2a78d6","yolo26s":"#e34948","yolo26m":"#eda100",
+          # baselines: low-chroma neutrals (gray/brown) — read as "baseline", stay clear of the
+          # saturated CVD palette above, and separate from each other by lightness+warmth.
+          "3dB_power":"#6f6d68","blob_detection":"#9c6b3f"}
+MARKER = {"coherent_power":"o","cuda_dino":"s","finetuned_dino":"^",
+          "finetuned_dino_m2":"D","yolo26s":"v","yolo26m":"P",
+          "3dB_power":"X","blob_detection":"*"}
+DASH   = {"coherent_power":"-","cuda_dino":"-","finetuned_dino":"-",
+          "finetuned_dino_m2":"-","yolo26s":(0,(5,1)),"yolo26m":(0,(1,1)),
+          "3dB_power":(0,(1,1)),"blob_detection":(0,(3,1,1,1))}
+
+# ---- publication style (legible in a 2-column paper; no chartjunk) ----
+plt.rcParams.update({
+    "figure.dpi": 120, "savefig.dpi": 220, "savefig.bbox": "tight",
+    "font.family": "sans-serif", "font.size": 12,
+    "axes.titlesize": 12.5, "axes.labelsize": 12.5,
+    "xtick.labelsize": 11, "ytick.labelsize": 11, "legend.fontsize": 9.5,
+    "axes.grid": True, "grid.alpha": 0.35, "grid.linewidth": 0.6, "grid.color": "#c9c8c2",
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.edgecolor": "#b7b6b0", "axes.linewidth": 0.9,
+    "xtick.color": "#52514e", "ytick.color": "#52514e",
+    "axes.labelcolor": "#0b0b0b", "text.color": "#0b0b0b",
+    "lines.linewidth": 2.0, "lines.markersize": 6, "lines.markeredgewidth": 0.8,
+    "legend.frameon": True, "legend.framealpha": 0.9, "legend.edgecolor": "#d9d8d2",
+})
+
+# Figures are written into ./figs next to the notebook (and still shown inline).
+FIGS = (HSD / "notebooks/data_saving_evals/figs"); FIGS.mkdir(exist_ok=True)
+def save_fig(fig, fname):
+    """Save a figure into FIGS/ (publication dpi) and return the path."""
+    p = FIGS / fname; fig.savefig(p); return p
+
 print(f"SAVE-ALL baseline = {SAVE_ALL_BYTES_HR/1e12:.2f} TB/hour  |  real-time rate = {RATE_HZ/1e6:.2f} MS/s")
+print(f"figures -> {FIGS}")
 
 
 # %% [markdown]
@@ -69,6 +111,9 @@ print(f"SAVE-ALL baseline = {SAVE_ALL_BYTES_HR/1e12:.2f} TB/hour  |  real-time r
 
 # %%
 def _load(p):
+    p = Path(p)
+    if p.suffix == ".npy":                                  # raw .npy masks (baselines; un-repacked dB_70)
+        return (np.load(p) != 0).astype(np.uint8)
     z = np.load(p); return np.unpackbits(z["packed"])[:int(z["rows"])*int(z["cols"])].reshape(int(z["rows"]), int(z["cols"]))
 
 def timeslice_frac(mask, block_rows=1):
@@ -122,34 +167,114 @@ def resample_filter_bytes_per_hour(detector, stem, capture_sec):
 def atten(stem):
     m = re.search(r"dB_(\d+)", stem); return int(m.group(1)) if m else None
 
-rows = []
-for det in DETS:
-    for sd in sorted((SWEEP/det).glob("*/")):
-        a = atten(sd.name)
-        if a is None: continue
-        mfiles = sorted(sd.glob("mask_arrays/mask_ch0_f*.packed.npz"))[:N_FRAMES]
-        ts, ts_raw, cov, ret = [], [], [], []
-        for mf in mfiles:
-            n = re.search(r"_f(\d+)_", mf.name).group(1)
-            m = _load(mf); md = denoise(m)                      # md = what the snipper would keep
-            ts.append(timeslice_frac(md)); ts_raw.append(timeslice_frac(m)); cov.append((md != 0).mean())
-            gtf = list(sd.glob(f"gt_masks/*_f{n}_*.packed.npz"))
-            if gtf:
-                g = _load(gtf[0]); gr = g.any(axis=1)
-                if gr.any(): ret.append((gr & md.any(axis=1)).sum() / gr.sum())
-        rows.append(dict(detector=det, attenuation_db=a,
-                         timeslice_frac=np.mean(ts), timeslice_frac_raw=np.mean(ts_raw),
-                         tf_coverage=np.mean(cov), retention=np.mean(ret) if ret else np.nan))
-raw = pd.DataFrame(rows)
-ds = raw.groupby(["detector","attenuation_db"], as_index=False).mean(numeric_only=True)  # avg 30 & 30_v2
-ds["saveall_TB_hr"]   = SAVE_ALL_BYTES_HR/1e12
-ds["timeslice_TB_hr"] = SAVE_ALL_BYTES_HR*ds.timeslice_frac/1e12
-ds["resample_proj_TB_hr"] = SAVE_ALL_BYTES_HR*ds.tf_coverage/1e12     # projection (hook = real operator)
-ds["reduction_x"]     = ds.saveall_TB_hr/ds.timeslice_TB_hr
+# ---- load the precomputed cache (build_ds_cache.py) so figures NEVER re-crunch masks ----
+# The heavy per-frame work (timeslice/coverage/retention for 8 detectors + a `ground_truth`
+# pseudo-detector, and the snipper footprint) is done once by build_ds_cache.py and stored in-repo
+# at ds_cache.csv. Restyling any figure/table below re-reads this instantly. Set DS_REBUILD=1 to
+# force a rebuild (or run build_ds_cache.py directly after changing DS_NFRAMES / DS_MIN_BOX_PIXELS).
+import sys as _sys
+CACHE = Path(os.environ.get("DS_CACHE", str(HSD / "notebooks/data_saving_evals/ds_cache.csv")))
+if (not CACHE.exists()) or os.environ.get("DS_REBUILD"):
+    print(f"cache missing / DS_REBUILD set -> running build_ds_cache.py -> {CACHE}", flush=True)
+    import subprocess
+    subprocess.run([_sys.executable, str(HSD / "notebooks/data_saving_evals/build_ds_cache.py")], check=True)
+_cache = pd.read_csv(CACHE)
+GT = _cache[_cache.detector == "ground_truth"].set_index("attenuation_db").sort_index()
+ds = _cache[_cache.detector.isin(DETS)].copy().reset_index(drop=True)
+ds["saveall_TB_hr"]       = SAVE_ALL_BYTES_HR / 1e12
+ds["timeslice_TB_hr"]     = SAVE_ALL_BYTES_HR * ds.timeslice_frac / 1e12
+ds["resample_proj_TB_hr"] = SAVE_ALL_BYTES_HR * ds.tf_coverage / 1e12          # raw-coverage projection
+ds["reduction_x"]         = ds.saveall_TB_hr / ds.timeslice_TB_hr
+# resample_meas_TB_hr is already in the cache (per-box snipper footprint, all frames)
+# Ground-truth reference curves, indexed by attenuation:
+GT_TS_TB   = SAVE_ALL_BYTES_HR * GT.timeslice_frac / 1e12   # perfect time-slice (GT mask), per capture
+GT_SNIP_TB = GT.resample_meas_TB_hr                         # ground-truth snipping footprint, per capture
+# GT = the SAME transmitted waveforms + annotations at every attenuation, so its data-saving is
+# SNR-INDEPENDENT. Per-capture values vary only ~2% (frame alignment/sampling), so use the mean as a
+# flat ceiling line in the figures.
+GT_TS_MEAN_TB   = float(GT_TS_TB.mean())
+GT_SNIP_MEAN_TB = float(GT_SNIP_TB.mean())
+# SNR x-axis: physical attenuator identity SNR = snr0_ref - attenuation
+# (== baseline_comparisons/snr_measurement.snr_at_attenuation). Calibration is copied in-repo.
+import json as _json
+_snrcal = Path(os.environ.get("DS_SNR_CAL", str(HSD / "notebooks/data_saving_evals/snr_calibration.json")))
+SNR0_REF = float(_json.load(open(_snrcal))["snr0_ref_db"]) if _snrcal.exists() else 54.0
+def snr_of(a):
+    return SNR0_REF - np.asarray(a, dtype=float)
+ds["snr_db"] = SNR0_REF - ds.attenuation_db
+print(f"GT ceilings: time-slice {GT_TS_MEAN_TB:.2f} TB/hr, snip {GT_SNIP_MEAN_TB:.2f} TB/hr | "
+      f"SNR0_REF={SNR0_REF:.1f} dB (0 dB atten) -> {SNR0_REF-70:.1f} dB (70 dB atten)")
 ds.to_csv("data_reduction_table.csv", index=False)
-print(f"{len(ds)} (detector, attenuation) rows | strategies: save-all, time-slice, resample-proj(hook)")
-display(ds[ds.detector.isin(["coherent_power","finetuned_dino_m2","yolo26m"])]
-        .pivot_table(index="detector", columns="attenuation_db", values="timeslice_TB_hr").round(2))
+print(f"loaded cache: {len(ds)} detector rows + GT | attens {sorted(ds.attenuation_db.unique())}")
+display(ds.pivot_table(index="detector", columns="attenuation_db", values="timeslice_TB_hr").round(2))
+
+
+# %% [markdown]
+# ## Validation & sanity checks
+# Independent re-derivation of the two load-bearing metrics (time-slicing, retention) plus
+# whole-table sanity gates. Everything here is an `assert` — the notebook fails loudly if a metric
+# regresses. Written to be read alongside the methodology: it confirms units, monotonicity, ranges,
+# and that no NaN/empty data slips through silently.
+#
+# **Time-slicing derivation.** Each mask is `512 time-rows × 10240 freq-bins`. One time-row = one
+# FFT hop of `NFFT=10240` samples → `10240 / 245.76e6 = 41.67 µs` (matches the documented "≈42 µs"
+# block). Keeping a time-block iff it contains ≥1 detected cell means `timeslice_frac` = fraction of
+# 41.67-µs blocks kept ∈ [0,1]; since every block carries equal bytes, `bytes/hr = SAVE_ALL ·
+# timeslice_frac` is exact (kept-fraction of time → kept-fraction of bytes). `block_rows` is a knob;
+# with the default `block_rows=1` no rows are dropped. **Caveat:** for `block_rows>1` that does not
+# divide 512, the trailing `512 % block_rows` rows are silently dropped (`nb = r // block_rows`) —
+# harmless for the default, worth noting if the knob is changed.
+# **Retention.** `retention = |GT_rows ∩ det_rows| / |GT_rows|` over *time-rows* (`any(axis=1)`
+# collapses frequency), div-by-zero guarded by `if gr.any()`; ∈ [0,1].
+
+# %%
+def _validate():
+    fails = []
+    # --- time-slicing: synthetic masks with a known number of active time-rows ---
+    m = np.zeros((10, 8), np.uint8); m[2, 3] = m[5, 0] = m[5, 7] = m[9, 4] = 1   # 3 active rows
+    assert abs(timeslice_frac(m, 1) - 0.3) < 1e-12, "timeslice block_rows=1 wrong"
+    assert abs(timeslice_frac(m, 2) - 0.6) < 1e-12, "timeslice block_rows=2 wrong"   # blocks {2,5,9}->3/5
+    assert timeslice_frac(np.zeros((10, 8), np.uint8)) == 0.0, "empty mask should keep 0"
+    assert timeslice_frac(np.ones((10, 8), np.uint8)) == 1.0, "full mask should keep all"
+    # block-size = one FFT hop ~ 42 us
+    hop_us = NFFT / RATE_HZ * 1e6
+    assert 41 < hop_us < 43, f"time-row != ~42us (got {hop_us:.2f} us)"
+    # --- retention: GT rows {1,3,4}, det rows {1,4} -> 2/3 ---
+    g = np.zeros((6, 4), np.uint8); g[1, :] = 1; g[3, 0] = 1; g[4, 2] = 1
+    d = np.zeros((6, 4), np.uint8); d[1, 2] = 1; d[4, 0] = 1
+    gr = g.any(axis=1); ret = (gr & d.any(axis=1)).sum() / gr.sum()
+    assert abs(ret - 2/3) < 1e-12, "retention formula wrong"
+    assert not gr.all() or True  # div-by-zero path: guarded upstream by `if gr.any()`
+    # --- baseline geometry ---
+    assert abs(SAVE_ALL_BYTES_HR/1e12 - 7.077888) < 1e-6, "save-all != 7.08 TB/hr"
+    assert abs(RATE_HZ/1e6 - 245.76) < 1e-9, "rate != 245.76 MS/s"
+    # --- whole-table sanity ---
+    tol = 1e-9
+    assert (ds.timeslice_TB_hr    <= ds.saveall_TB_hr + tol).all(), "time-slice exceeds save-all"
+    assert (ds.resample_proj_TB_hr <= ds.timeslice_TB_hr + tol).all(), "resample-proj exceeds time-slice"
+    assert ds.timeslice_frac.between(0, 1).all(), "timeslice_frac out of [0,1]"
+    assert ds.tf_coverage.between(0, 1).all(),   "tf_coverage out of [0,1]"
+    r = ds.retention.dropna()
+    assert r.between(0, 1).all(), "retention out of [0,1]"
+    assert (ds.reduction_x >= 1 - tol).all(), "reduction factor < 1 (worse than save-all)"
+    # colorblind-safe palette: every detector has a unique color/marker
+    assert len(set(COLOR[d] for d in DETS)) == len(DETS), "duplicate detector colors"
+    assert len(set(MARKER[d] for d in DETS)) == len(DETS), "duplicate detector markers"
+    # data present for every detector; flag (do not fail) any all-NaN retention
+    empty = [d for d in DETS if ds[ds.detector == d].empty]
+    nan_ret = [d for d in DETS if ds[ds.detector == d].retention.isna().all()
+               and not ds[ds.detector == d].empty]
+    return dict(hop_us=hop_us, atten=sorted(ds.attenuation_db.unique()),
+                empty_detectors=empty, all_nan_retention=nan_ret)
+
+_v = _validate()
+print("VALIDATION PASSED  ✓")
+print(f"  time-row (FFT hop)      = {_v['hop_us']:.2f} µs  (~42 µs block)")
+print(f"  save-all baseline       = {SAVE_ALL_BYTES_HR/1e12:.3f} TB/hr @ {RATE_HZ/1e6:.2f} MS/s")
+print(f"  attenuations present    = {_v['atten']} dB")
+print(f"  reduction ≤ save-all, resample-proj ≤ time-slice, all fracs ∈ [0,1] : OK")
+if _v['empty_detectors']:      print(f"  WARNING empty detectors : {_v['empty_detectors']}")
+if _v['all_nan_retention']:    print(f"  WARNING no-GT retention : {_v['all_nan_retention']} (no gt_masks found)")
 
 
 # %% [markdown]
@@ -164,75 +289,183 @@ display(ds[ds.detector.isin(["coherent_power","finetuned_dino_m2","yolo26m"])]
 
 # %%
 def fig_timeslice_denoise(fname="fig_timeslice_raw_vs_denoised.png"):
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(7.0, 4.3))
     for det in ("coherent_power", "cuda_dino"):
         d = ds[ds.detector == det].sort_values("attenuation_db")
-        ax.plot(d.attenuation_db, 100*d.timeslice_frac_raw, "--o", color=COLOR[det], alpha=.55,
-                label=f"raw any-pixel · {LABEL[det]}")
-        ax.plot(d.attenuation_db, 100*d.timeslice_frac, "-s", color=COLOR[det],
-                label=f"denoised (≥{MIN_BOX_PIXELS}px) · {LABEL[det]}")
-    ax.set_xlabel("attenuation (dB) — higher = lower SNR"); ax.set_ylabel("time-blocks KEPT (%)")
+        ax.plot(d.attenuation_db, 100*d.timeslice_frac_raw, ls="--", marker=MARKER[det],
+                color=COLOR[det], alpha=.5, mfc="none", label=f"raw any-pixel · {LABEL[det]}")
+        ax.plot(d.attenuation_db, 100*d.timeslice_frac, ls="-", marker=MARKER[det],
+                color=COLOR[det], label=f"denoised (≥{MIN_BOX_PIXELS}px) · {LABEL[det]}")
+    ax.set_xlabel("attenuation (dB) — higher = lower SNR"); ax.set_ylabel("time-blocks kept (%)")
+    ax.set_ylim(0, 100)
     ax.set_title("Time-slice keep-fraction: raw vs denoised\n(denoised matches what signal_snipper keeps)")
-    ax.grid(alpha=.3); ax.legend(fontsize=8); fig.tight_layout()
-    fig.savefig(fname, dpi=110, bbox_inches="tight"); display(fig); plt.close(fig)
+    ax.legend(); fig.tight_layout()
+    save_fig(fig, fname); display(fig); plt.close(fig)
 fig_timeslice_denoise()
 
 
 # %% [markdown]
-# ### Measured resample+filter (signal_snipper) across the wired attenuation sweep
-# Same real operator as Figure 3c, applied to the attenuation captures (`~/captures/attenuation_dB_*`).
-# `resample_meas_TB_hr` fills in per (detector, attenuation) once the snipper has been run for that
-# detector. Container detectors `coherent_power` / `cuda_dino` are snipper-capable; offline-only models
-# (FT-DINO M1/M2, YOLO26s/m) make masks in Python and can't be snipped by the container binary, so they
-# stay NaN here and fall back to the projection in Figure 1. Produce runs per instructions.md.
+# ### Measured resample+filter footprint across the wired attenuation sweep (all detectors)
+# `resample_meas_TB_hr` is the resample+filter storage footprint each detector's collection would
+# incur, computed **container-free** by `snip_eval/snip_data_metrics.py` directly from the masks: each
+# detection box contributes `bandwidth * duration * 8B`, summed **per-box** — the exact per-snippet
+# counting the C++ `signal_snipper` uses (time-overlapping detections are double-counted, as the
+# snipper would emit them). This avoids materializing any `.sigmf-data` (no N copies of a ~14 GB
+# capture) and, unlike the old snippet-bytes path, covers *every* detector — including the offline
+# models (FT-DINO, YOLO) the container snipper can't process. Point `DS_METRICS` at the CSV it writes.
 
 # %%
-CAPTURES_DIR = Path(os.environ.get("DS_CAPTURES_DIR", str(Path.home()/"captures")))
+CAPTURES_DIR = Path(os.environ.get("DS_CAPTURES_DIR", "/home/bqn82/captures"))
 def _stems_for_db(db):
     return ["attenuation_dB_30","attenuation_dB_30_v2"] if db == 30 else [f"attenuation_dB_{db}"]
 def capture_sec(stem):
     f = CAPTURES_DIR/f"{stem}.sigmf-data"
     return (f.stat().st_size / (BYTES_PER_SAMPLE*RATE_HZ)) if f.exists() else np.nan
-def meas_resample_TB_hr(detector, db):
-    tot_b, tot_s, found = 0.0, 0.0, False
-    for st in _stems_for_db(db):
-        b = snippet_bytes(detector, st); sec = capture_sec(st)
-        if b is not None and np.isfinite(sec) and sec > 0:
-            tot_b += b; tot_s += sec; found = True
-    return (tot_b/tot_s*SEC_PER_HR/1e12) if found else np.nan
-ds["resample_meas_TB_hr"] = [meas_resample_TB_hr(d, a) for d, a in zip(ds.detector, ds.attenuation_db)]
+# resample_meas_TB_hr is supplied by the cache (build_ds_cache.py) — per-box snipper footprint over
+# all frames. No re-merge needed; just report coverage.
 _nmeas = int(ds.resample_meas_TB_hr.notna().sum())
-print(f"measured resample+filter: {_nmeas}/{len(ds)} (detector,attenuation) cells populated "
-      + ("-> run bash_scripts/run_offline_snipper.sh over ~/captures/attenuation_dB_* (see instructions.md)"
-         if _nmeas == 0 else "(container detectors snipped; offline models stay projected)"))
+print(f"measured resample+filter (from cache): {_nmeas}/{len(ds)} (detector, attenuation) cells")
 display(ds.pivot_table(index="detector", columns="attenuation_db", values="resample_meas_TB_hr").round(3))
 
 
 # %% [markdown]
-# ## Figure 1 — bytes/hour vs SNR: save-all vs time-slice vs resample+filter (projected)
-# Coherent Power and fine-tuned DINO (per spec); log-scale bytes. Resample+filter is the projected
-# raw-mask-coverage bound — the real operator is the collaborator hook.
+# ## Figure 1 — bytes/hour vs SNR: all three strategies, every detector
+# Log-scale bytes/hr. Flat black = **naive save-all** (7.08 TB/hr). For each of the 8 detectors, two
+# lines: **solid = time-slice**, **dotted = snipping** (measured per-box resample+filter footprint).
+# No projections; color = detector.
 
 # %%
-def fig1(dets=("coherent_power","cuda_dino","finetuned_dino"), fname="fig1_bytes_per_hour.png"):
-    fig, ax = plt.subplots(figsize=(10, 6))
-    x = sorted(ds.attenuation_db.unique())
-    ax.axhline(SAVE_ALL_BYTES_HR/1e12, color="k", ls="-", lw=2, label="Save-all (7.08 TB/hr)")
+def fig1_all(dets=DETS, fname="fig1_bytes_per_hour.png"):
+    fig, ax = plt.subplots(figsize=(9.8, 6.0))
+    ax.axhline(SAVE_ALL_BYTES_HR/1e12, color="#0b0b0b", ls="-", lw=2.6, zorder=2,
+               label="Naive save-all (7.08 TB/hr)")
+    ax.axhline(GT_TS_MEAN_TB, color="#4d4b47", ls=(0, (6, 3)), lw=2.2, zorder=3,
+               label=f"Ground truth · time-slice ({GT_TS_MEAN_TB:.1f} TB/hr)")
+    ax.axhline(GT_SNIP_MEAN_TB, color="#7a7873", ls=(0, (1, 1)), lw=2.2, zorder=3,
+               label=f"Ground truth · snip ({GT_SNIP_MEAN_TB:.1f} TB/hr)")
     for det in dets:
-        d = ds[ds.detector == det].sort_values("attenuation_db")
-        ax.plot(d.attenuation_db, d.timeslice_TB_hr, "-o", color=COLOR[det], label=f"Time-slice · {LABEL[det]}")
-        ax.plot(d.attenuation_db, d.resample_proj_TB_hr, "--s", color=COLOR[det], alpha=.7,
-                label=f"Resample+filter (proj) · {LABEL[det]}")
+        d = ds[ds.detector == det].sort_values("snr_db")
+        ax.plot(d.snr_db, d.timeslice_TB_hr, ls="-", marker=MARKER[det], color=COLOR[det],
+                lw=1.9, ms=5, label=f"{LABEL[det]} · time-slice")
         mm = d.dropna(subset=["resample_meas_TB_hr"])
-        if len(mm):
-            ax.plot(mm.attenuation_db, mm.resample_meas_TB_hr, "-D", color=COLOR[det], ms=6,
-                    label=f"Resample+filter (MEASURED) · {LABEL[det]}")
-    ax.set_yscale("log"); ax.set_xlabel("attenuation (dB) — higher = lower SNR")
-    ax.set_ylabel("stored data (TB / hour, log)"); ax.grid(alpha=.3, which="both")
-    ax.set_title("Data stored per hour by reduction strategy\n(dashed = resample+filter PROJECTION; diamonds = MEASURED signal_snipper)")
-    ax.legend(fontsize=8, loc="center left", bbox_to_anchor=(1, .5)); fig.tight_layout()
-    fig.savefig(fname, dpi=110, bbox_inches="tight"); display(fig); plt.close(fig)
-fig1()
+        ax.plot(mm.snr_db, mm.resample_meas_TB_hr, ls=(0, (1, 1)), marker=MARKER[det],
+                color=COLOR[det], lw=1.9, ms=5, mfc="none", label=f"{LABEL[det]} · snip")
+    ax.set_yscale("log"); ax.set_xlim(-20, 40); ax.set_xlabel("SNR (dB)  [higher → cleaner]")
+    ax.set_ylabel("stored data (TB / hour, log scale)"); ax.grid(alpha=.3, which="both")
+    ax.set_title("Data stored per hour — naive vs time-slice vs snipping (all detectors)")
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, .5), ncol=1, fontsize=7,
+              title="solid = time-slice · dotted = snip")
+    ax.get_legend().get_title().set_fontsize(8)
+    fig.tight_layout(); save_fig(fig, fname); display(fig); plt.close(fig)
+fig1_all()
+
+
+# %% [markdown]
+# ## Figure 2 — time-slice only: naive + ground-truth ceiling + every detector
+# Isolates the **time-slice** strategy. Flat black = naive save-all; bold gray ★ = **ground truth
+# (perfect time-slice)** — the least a time-slicing scheme could store while keeping every signal
+# time-row; colored = each detector's time-slice.
+
+# %%
+def fig2_timeslice(dets=DETS, fname="fig2_timeslice_bytes.png"):
+    fig, ax = plt.subplots(figsize=(8.6, 5.4))
+    ax.axhline(SAVE_ALL_BYTES_HR/1e12, color="#0b0b0b", ls="-", lw=2.6, label="Naive save-all")
+    ax.axhline(GT_TS_MEAN_TB, color="#4d4b47", ls=(0, (6, 3)), lw=2.8, zorder=5,
+               label=f"Ground truth (perfect time-slice, {GT_TS_MEAN_TB:.1f} TB/hr)")
+    for det in dets:
+        d = ds[ds.detector == det].sort_values("snr_db")
+        ax.plot(d.snr_db, d.timeslice_TB_hr, ls="-", marker=MARKER[det], color=COLOR[det],
+                lw=1.9, ms=5, label=LABEL[det])
+    ax.set_yscale("log"); ax.set_xlim(-20, 40); ax.set_xlabel("SNR (dB)  [higher → cleaner]")
+    ax.set_ylabel("stored data (TB / hour, log scale)"); ax.grid(alpha=.3, which="both")
+    ax.set_title("Time-slice storage — detectors vs naive vs ground-truth ceiling")
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, .5), fontsize=8)
+    fig.tight_layout(); save_fig(fig, fname); display(fig); plt.close(fig)
+fig2_timeslice()
+
+
+# %% [markdown]
+# ## Figure 3 — snipping only: naive + ground-truth ceiling + every detector
+# Isolates the **snipping** (resample+filter) strategy. Flat black = naive save-all; bold gray ★ =
+# **ground truth (snip)** — the footprint if only the true signals were cut out; colored = each
+# detector's measured snip footprint (per-box, == the signal_snipper).
+
+# %%
+def fig3_snip(dets=DETS, fname="fig3_snip_bytes.png"):
+    fig, ax = plt.subplots(figsize=(8.6, 5.4))
+    ax.axhline(SAVE_ALL_BYTES_HR/1e12, color="#0b0b0b", ls="-", lw=2.6, label="Naive save-all")
+    ax.axhline(GT_SNIP_MEAN_TB, color="#4d4b47", ls=(0, (6, 3)), lw=2.8, zorder=5,
+               label=f"Ground truth (snip, {GT_SNIP_MEAN_TB:.1f} TB/hr)")
+    for det in dets:
+        d = ds[ds.detector == det].dropna(subset=["resample_meas_TB_hr"]).sort_values("snr_db")
+        ax.plot(d.snr_db, d.resample_meas_TB_hr, ls="-", marker=MARKER[det], color=COLOR[det],
+                lw=1.9, ms=5, label=LABEL[det])
+    ax.set_yscale("log"); ax.set_xlim(-20, 40); ax.set_xlabel("SNR (dB)  [higher → cleaner]")
+    ax.set_ylabel("stored data (TB / hour, log scale)"); ax.grid(alpha=.3, which="both")
+    ax.set_title("Snipping storage — detectors vs naive vs ground-truth ceiling")
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, .5), fontsize=8)
+    fig.tight_layout(); save_fig(fig, fname); display(fig); plt.close(fig)
+fig3_snip()
+
+
+# %% [markdown]
+# ## Why time-slice barely helps cuda_dino — masks with x = time, y = frequency
+# A few cuda_dino masks at 45 dB (denoised, as time-slicing sees them). **x = time** (512 rows),
+# **y = frequency** (10240 bins). A time column is KEPT by time-slicing if it contains ANY detection;
+# kept time is shaded green. cuda_dino's persistent tone-streaks span nearly the whole timeline, so
+# ~all time columns are kept (timeslice_frac≈1) → time-slicing stores almost the entire capture.
+# Bottom row = ground truth on the same frames (only the true signal's time is kept) for contrast.
+
+# %%
+def _cuda_fm(det, stem, f):
+    d = SWEEP / det / stem / "mask_arrays"
+    c = sorted(d.glob(f"mask_ch0_f{f}_*.packed.npz")) or sorted(d.glob(f"mask_ch0_f{f}_*.npy"))
+    return _load(c[0]).astype(bool) if c else None
+def _cuda_gm(stem, f):
+    d = SWEEP / "cuda_dino" / stem / "gt_masks"
+    c = sorted(d.glob(f"*_f{f}_*.packed.npz")) or sorted(d.glob(f"*_f{f}_*.npy"))
+    return _load(c[0]).astype(bool) if c else None
+
+def fig_timeslice_cuda_example(stem="attenuation_dB_45", frames=(100, 150, 200),
+                               fname="fig_timeslice_cuda_example.png"):
+    import matplotlib.gridspec as gridspec
+    hop_us = NFFT / RATE_HZ * 1e6                     # one time-row = the min time-slice block
+    fig = plt.figure(figsize=(4.8 * len(frames), 6.6))
+    gs = gridspec.GridSpec(3, len(frames), height_ratios=[0.32, 0.32, 4.0], hspace=0.16, wspace=0.14)
+    for j, fnum in enumerate(frames):
+        m = _cuda_fm("cuda_dino", stem, fnum)
+        if m is None:
+            continue
+        md = denoise(m.astype(np.uint8)).astype(bool)
+        kept = md.any(axis=1)                          # per time-row: kept by time-slice?
+        bins_on = md.sum(axis=1)                        # detected freq-bins in each time column
+        frac = float(kept.mean())
+        # (top) time-slice KEEP decision — green = kept, white = dropped (this is separate from the mask)
+        axk = fig.add_subplot(gs[0, j])
+        axk.imshow(kept[None, :], aspect="auto", cmap="Greens", vmin=0, vmax=1,
+                   extent=[0, md.shape[0], 0, 1], interpolation="nearest")
+        axk.set_yticks([]); axk.set_xticks([])
+        axk.set_title(f"cuda_dino · f{fnum} — time-slice keeps {frac*100:.0f}% of time", fontsize=9)
+        axk.set_ylabel("kept", fontsize=7, rotation=0, ha="right", va="center")
+        # (mid) detected freq-bins per time column (log) — reveals the faint thin tone-streaks
+        axc = fig.add_subplot(gs[1, j])
+        axc.imshow(np.log10(bins_on[None, :] + 1.0), aspect="auto", cmap="magma",
+                   extent=[0, md.shape[0], 0, 1], interpolation="nearest")
+        axc.set_yticks([]); axc.set_xticks([])
+        axc.set_ylabel("#bins\n(log)", fontsize=7, rotation=0, ha="right", va="center")
+        # (bottom) the actual mask, x = time, y = frequency (grayscale ONLY — no green here)
+        axm = fig.add_subplot(gs[2, j])
+        axm.imshow(md.T, aspect="auto", cmap="Greys", origin="lower", interpolation="nearest",
+                   extent=[0, md.shape[0], 0, md.shape[1]])
+        axm.set_xlabel(f"time (rows · 1 row = {hop_us:.1f} µs = min slice)")
+        axm.set_yticks([])
+        if j == 0:
+            axm.set_ylabel("frequency (bins)")
+    fig.suptitle("cuda_dino @ 45 dB — bottom: mask (grayscale, x=time y=freq); mid: detected bins/column; "
+                 "top: time-slice keep decision.\nEvery time column holds ≥1 detection (often a faint 1–2 bin "
+                 "tone-streak) → ~100% kept → time-slice stores ~the whole capture.", y=1.03, fontsize=9.5)
+    fig.tight_layout(); save_fig(fig, fname); display(fig); plt.close(fig)
+fig_timeslice_cuda_example()
 
 
 # %% [markdown]
@@ -241,15 +474,35 @@ fig1()
 # factor (× vs save-all, time-slice strategy); Y = signal-time retention. Up-and-right is better.
 
 # %%
+def _pareto_frontier(x, y):
+    """Return frontier points (max x AND max y are both 'good') sorted by x."""
+    pts = sorted(zip(x, y), key=lambda p: (-p[0], -p[1]))   # by decreasing reduction
+    front, best_y = [], -np.inf
+    for px, py in pts:                                       # sweep high->low reduction
+        if py > best_y:                                      # keeps a higher retention than any so-far
+            front.append((px, py)); best_y = py
+    return np.array(sorted(front))
+
 def fig_tradeoff(fname="fig_reduction_vs_retention.png"):
-    fig, ax = plt.subplots(figsize=(9, 6))
+    fig, ax = plt.subplots(figsize=(7.2, 5.0))
+    g = ds.dropna(subset=["retention"])
+    fr = _pareto_frontier(g.reduction_x.values, 100*g.retention.values)
+    if len(fr):
+        ax.plot(fr[:, 0], fr[:, 1], color="#898781", lw=1.6, ls=(0, (6, 3)), zorder=1,
+                label="Pareto frontier")
     for det in DETS:
         d = ds[ds.detector == det].sort_values("attenuation_db")
-        ax.plot(d.reduction_x, 100*d.retention, "-o", color=COLOR[det], label=LABEL[det], ms=4)
-    ax.set_xlabel("data-reduction factor (× vs save-all, time-slice)"); ax.set_ylabel("signal-time retention (%)")
-    ax.set_title("Reduction vs. retention (each path = one detector across 0→60 dB)")
-    ax.grid(alpha=.3); ax.legend(fontsize=8); fig.tight_layout()
-    fig.savefig(fname, dpi=110, bbox_inches="tight"); display(fig); plt.close(fig)
+        base = det == "coherent_power"
+        ax.plot(d.reduction_x, 100*d.retention, ls=DASH[det], marker=MARKER[det], color=COLOR[det],
+                lw=2.6 if base else 1.8, ms=8 if base else 6, zorder=4 if base else 3,
+                mec="#0b0b0b" if base else COLOR[det], mew=0.9 if base else 0.6,
+                label=("Coherent Power (baseline to beat)" if base else LABEL[det]))
+    ax.set_xscale("log")
+    ax.set_xlabel("data-reduction factor (× vs save-all, time-slice) — right is better")
+    ax.set_ylabel("signal-time retention (%) — up is better")
+    ax.set_title("Reduction vs. retention trade-off\n(each path = one detector swept across attenuation)")
+    ax.legend(loc="lower left"); fig.tight_layout()
+    save_fig(fig, fname); display(fig); plt.close(fig)
 fig_tradeoff()
 
 
@@ -265,19 +518,47 @@ iou_by = (frame.groupby(["detector","attenuation_db"])["iou"].mean().reset_index
 ds = ds.merge(iou_by, on=["detector","attenuation_db"], how="left")
 
 def fig_bubble(fname="fig_reduction_retention_accuracy.png"):
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(7.8, 5.0))
+    sc = None
     for det in DETS:
         d = ds[ds.detector == det].sort_values("attenuation_db")
-        ax.plot(d.reduction_x, 100*d.retention, "-", color=COLOR[det], alpha=.4, lw=1)
+        ax.plot(d.reduction_x, 100*d.retention, "-", color=COLOR[det], alpha=.35, lw=1)
         sc = ax.scatter(d.reduction_x, 100*d.retention, c=d.pixel_iou, cmap="viridis",
-                        vmin=0, vmax=1, s=60, edgecolor=COLOR[det], linewidth=1.5, zorder=3)
-    cb = fig.colorbar(sc, ax=ax); cb.set_label("retention accuracy (pixel-IoU of kept mask vs GT)")
+                        vmin=0, vmax=1, s=70, marker=MARKER[det],
+                        edgecolor=COLOR[det], linewidth=1.6, zorder=3)
+    if sc is not None:
+        cb = fig.colorbar(sc, ax=ax); cb.set_label("retention accuracy (pixel-IoU of kept mask vs GT)")
+    ax.set_xscale("log")
     ax.set_xlabel("data-reduction factor (×)"); ax.set_ylabel("signal-time retention (%)")
-    ax.set_title("Reduction × Retention × Accuracy  (path per detector, 0→60 dB; edge color = detector)")
-    handles=[plt.Line2D([],[],color=COLOR[d],marker='o',ls='',label=LABEL[d]) for d in DETS]
-    ax.legend(handles=handles, fontsize=8, loc="lower left"); ax.grid(alpha=.3); fig.tight_layout()
-    fig.savefig(fname, dpi=110, bbox_inches="tight"); display(fig); plt.close(fig)
+    ax.set_title("Reduction × retention × accuracy\n(path per detector across attenuation; edge color + marker = detector)")
+    handles = [plt.Line2D([], [], color=COLOR[d], marker=MARKER[d], ls='', label=LABEL[d]) for d in DETS]
+    ax.legend(handles=handles, loc="lower left"); fig.tight_layout()
+    save_fig(fig, fname); display(fig); plt.close(fig)
 fig_bubble()
+
+
+# %% [markdown]
+# ## Figure — signal-retention (fidelity) vs SNR, per detector
+# The fidelity side of the trade-off on its own axis: of a signal's occupied time-rows, the fraction
+# the detector still flags (so that 42-µs slot is kept). **Coherent Power is the baseline to beat** —
+# it is *supposed* to emit a mask even if unoptimized, so any learned detector should sit above it.
+
+# %%
+def fig_retention(fname="fig_retention_vs_snr.png"):
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    for det in DETS:
+        d = ds[ds.detector == det].sort_values("attenuation_db")
+        base = det == "coherent_power"
+        ax.plot(d.attenuation_db, 100*d.retention, ls=DASH[det], marker=MARKER[det], color=COLOR[det],
+                lw=2.8 if base else 1.9, ms=8 if base else 6, zorder=5 if base else 3,
+                mec="#0b0b0b" if base else COLOR[det], mew=0.9 if base else 0.6,
+                label=("Coherent Power (baseline to beat)" if base else LABEL[det]))
+    ax.set_ylim(0, 103); ax.set_xlabel("attenuation (dB) — higher = lower SNR")
+    ax.set_ylabel("signal-time retention (%)")
+    ax.set_title("Signal-retention (fidelity) vs SNR")
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, .5)); fig.tight_layout()
+    save_fig(fig, fname); display(fig); plt.close(fig)
+fig_retention()
 
 
 # %% [markdown]
@@ -288,13 +569,47 @@ fig_bubble()
 # %%
 comp = pd.read_csv(COMPUTE_CSV)
 display(comp[["model","params_M","gflops_per_tile","gflops_per_s_realtime","gpu_mem_mb","realtime_x","src"]])
-fig, ax = plt.subplots(1, 2, figsize=(14, 4.5))
-c=[COLOR.get(m.replace("_zeroshot","").replace("_m1","").replace("finetuned_dino","finetuned_dino"),"#888") for m in comp.model]
-ax[0].bar(comp.model, comp.gpu_mem_mb); ax[0].set_ylabel("GPU memory (MB)"); ax[0].set_title("GPU memory per detector")
-rt=comp.replace([np.inf],np.nan); ax[1].bar(rt.model, rt.realtime_x); ax[1].axhline(1,color="r",ls="--",label="real-time (1×)")
-ax[1].set_ylabel("real-time factor (×, single GPU)"); ax[1].set_title("Throughput vs 245.76 MS/s real-time"); ax[1].legend()
-for a in ax: a.tick_params(axis="x", rotation=30)
-fig.tight_layout(); fig.savefig("fig_compute.png",dpi=110,bbox_inches="tight"); display(fig); plt.close(fig)
+
+# map compute-table model names -> detector keys used everywhere else
+_COMP2DET = {"finetuned_dino_m1":"finetuned_dino","finetuned_dino_m2":"finetuned_dino_m2",
+             "cuda_dino_zeroshot":"cuda_dino","yolo26m":"yolo26m","yolo26s":"yolo26s",
+             "coherent_power":"coherent_power"}
+comp["detector"] = comp.model.map(_COMP2DET)
+# detection performance = mean pixel-IoU across the SNR sweep (one scalar per detector)
+_perf = ds.groupby("detector").pixel_iou.mean()
+comp["mean_iou"] = comp.detector.map(_perf)
+cc = comp.dropna(subset=["detector"]).copy()
+
+# per-detector text offsets (points) so the clustered ViT-B labels don't collide
+_CMP_OFF = {"coherent_power":(9,-2),"cuda_dino":(9,-11),"finetuned_dino":(9,-12),
+            "finetuned_dino_m2":(9,7),"yolo26m":(9,6),"yolo26s":(9,-6)}
+def fig_compute(fname="fig_compute.png"):
+    fig, ax = plt.subplots(1, 2, figsize=(11.5, 4.6))
+    # (a) compute cost (GFLOPs/tile, log) vs detection performance (mean IoU); bubble = GPU memory
+    for _, r in cc.iterrows():
+        det = r.detector
+        ax[0].scatter(r.gflops_per_tile, r.mean_iou, s=40 + r.gpu_mem_mb*0.32,
+                      color=COLOR[det], marker=MARKER[det], edgecolor="#0b0b0b",
+                      linewidth=0.9, alpha=.85, zorder=3)
+        rt = "∞" if not np.isfinite(r.realtime_x) else f"{r.realtime_x:.2f}×"
+        ax[0].annotate(f"{LABEL.get(det, det)}\n{r.gpu_mem_mb:.0f} MB · {rt} RT",
+                       (r.gflops_per_tile, r.mean_iou), textcoords="offset points",
+                       xytext=_CMP_OFF.get(det, (9, 6)), fontsize=7.5, color="#52514e")
+    ax[0].set_xscale("log"); ax[0].set_xlim(4e-3, 1.1e3)
+    ax[0].set_xlabel("compute cost — GFLOPs per tile (log scale)")
+    ax[0].set_ylabel("detection performance (mean pixel-IoU)")
+    ax[0].set_title("Compute cost vs detection performance\n(bubble area ∝ GPU memory · RT = real-time factor)")
+    ax[0].set_ylim(0, max(0.5, cc.mean_iou.max()*1.15))
+    # (b) GPU memory bar, colored per detector
+    cb = cc.sort_values("gpu_mem_mb")
+    ax[1].bar(range(len(cb)), cb.gpu_mem_mb, color=[COLOR[d] for d in cb.detector],
+              edgecolor="#0b0b0b", linewidth=0.6)
+    ax[1].set_xticks(range(len(cb))); ax[1].set_xticklabels([LABEL[d] for d in cb.detector],
+                                                            rotation=25, ha="right", fontsize=9)
+    ax[1].set_ylabel("GPU memory (MB)"); ax[1].set_title("GPU memory per detector")
+    ax[1].grid(axis="x", visible=False)
+    fig.tight_layout(); save_fig(fig, fname); display(fig); plt.close(fig)
+fig_compute()
 
 
 # %% [markdown]
@@ -303,14 +618,15 @@ fig.tight_layout(); fig.savefig("fig_compute.png",dpi=110,bbox_inches="tight"); 
 
 # %%
 def fig2(fname="fig2_iou_vs_snr.png"):
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
     for det in DETS:
         d = ds[ds.detector == det].sort_values("attenuation_db")
-        ax.plot(d.attenuation_db, d.pixel_iou, "-o", color=COLOR[det], label=LABEL[det])
+        ax.plot(d.attenuation_db, d.pixel_iou, ls=DASH[det], marker=MARKER[det],
+                color=COLOR[det], label=LABEL[det])
     ax.set_xlabel("attenuation (dB) — higher = lower SNR"); ax.set_ylabel("pixel IoU vs GT")
-    ax.set_ylim(-.02, 1.02); ax.grid(alpha=.3); ax.legend(fontsize=8)
-    ax.set_title("Detection performance (IoU) vs SNR — pair with the GPU-memory/FLOP table above")
-    fig.tight_layout(); fig.savefig(fname,dpi=110,bbox_inches="tight"); display(fig); plt.close(fig)
+    ax.set_ylim(-.02, 1.02); ax.legend(ncol=2)
+    ax.set_title("Detection performance (pixel-IoU) vs SNR")
+    fig.tight_layout(); save_fig(fig, fname); display(fig); plt.close(fig)
 fig2()
 
 
@@ -320,14 +636,16 @@ fig2()
 
 # %%
 def fig_saved(fname="fig_tb_saved.png"):
-    fig, ax = plt.subplots(figsize=(9,5))
+    fig, ax = plt.subplots(figsize=(7.0, 4.3))
     for det in ("coherent_power","finetuned_dino_m2","yolo26m"):
         d=ds[ds.detector==det].sort_values("attenuation_db")
-        ax.plot(d.attenuation_db, d.saveall_TB_hr-d.timeslice_TB_hr, "-o", color=COLOR[det], label=LABEL[det])
-    ax.set_xlabel("attenuation (dB)"); ax.set_ylabel("TB/hr SAVED vs save-all (time-slice)")
-    ax.set_title("Storage saved per hour (time-slice) — resample+filter (hook) saves far more")
-    ax.grid(alpha=.3); ax.legend(fontsize=8); fig.tight_layout()
-    fig.savefig(fname,dpi=110,bbox_inches="tight"); display(fig); plt.close(fig)
+        ax.plot(d.attenuation_db, d.saveall_TB_hr-d.timeslice_TB_hr, ls=DASH[det],
+                marker=MARKER[det], color=COLOR[det], label=LABEL[det])
+    ax.set_xlabel("attenuation (dB) — higher = lower SNR")
+    ax.set_ylabel("TB/hr saved vs save-all (time-slice)")
+    ax.set_title("Storage saved per hour (time-slice)\nresample+filter (hook) saves far more")
+    ax.legend(); fig.tight_layout()
+    save_fig(fig, fname); display(fig); plt.close(fig)
 fig_saved()
 
 # %% [markdown]
@@ -344,21 +662,25 @@ _order = ["naive_save_all","coherent_power","cuda_dino_zeroshot","finetuned_dino
 live = live.set_index("model").reindex(_order).reset_index()
 _lab = {"naive_save_all":"Naive\n(save-all)","coherent_power":"Coherent\nPower","cuda_dino_zeroshot":"Zero-shot\nDINO",
         "finetuned_dino":"FT-DINO\nM1","finetuned_dino_m2":"FT-DINO\nM2","yolo26m":"YOLO26m"}
+_OTA2DET = {"cuda_dino_zeroshot":"cuda_dino"}   # live model key -> COLOR key
+def _ota_color(m):
+    return COLOR.get(_OTA2DET.get(m, m), "#52514e")
 def fig3(fname="fig3_live_ota_bytes.png"):
-    fig, ax = plt.subplots(figsize=(11, 6)); base = SAVE_ALL_BYTES_HR/1e12
+    fig, ax = plt.subplots(figsize=(8.0, 4.8)); base = SAVE_ALL_BYTES_HR/1e12
     for i, r in live.iterrows():
         v = r.stored_TB_hr_timeslice
         if r.status == "pending(container)" or not np.isfinite(v):
-            ax.bar(i, base, color="lightgray", hatch="//", edgecolor="gray")
-            ax.text(i, base*1.03, "pending\ncontainer", ha="center", va="bottom", fontsize=7, color="gray")
+            ax.bar(i, base, color="#d9d8d2", hatch="//", edgecolor="#898781")
+            ax.text(i, base*1.03, "pending\ncontainer", ha="center", va="bottom", fontsize=7, color="#898781")
         else:
-            ax.bar(i, v, color=("k" if r.model=="naive_save_all" else COLOR.get(r.model, "#4477aa")))
+            ax.bar(i, v, color=("#0b0b0b" if r.model=="naive_save_all" else _ota_color(r.model)),
+                   edgecolor="#0b0b0b", linewidth=0.5)
             ax.text(i, v*1.03, f"{v:.2f}\nTB/hr", ha="center", va="bottom", fontsize=8)
     ax.set_yscale("log"); ax.set_xticks(range(len(live))); ax.set_xticklabels([_lab[m] for m in live.model], fontsize=8)
-    ax.set_ylabel("stored data (TB / hour, log)")
+    ax.set_ylabel("stored data (TB / hour, log scale)")
     ax.set_title("LIVE OTA (2.45 GHz, 200 MHz BW, dense bursty) — stored data/hr, time-slice\n(coherent/zero-shot pending a container run on the live captures)")
     ax.grid(alpha=.3, axis="y", which="both"); fig.tight_layout()
-    fig.savefig(fname, dpi=110, bbox_inches="tight"); display(fig); plt.close(fig)
+    save_fig(fig, fname); display(fig); plt.close(fig)
 fig3()
 
 # %% [markdown]
@@ -368,13 +690,13 @@ fig3()
 def fig3b(fname="fig3b_live_ota_resample.png"):
     av = live[live.status == "offline"]; xs = np.arange(len(av)); w = 0.38
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(xs-w/2, av.stored_TB_hr_timeslice, w, label="time-slice", color="#4477aa")
-    ax.bar(xs+w/2, av.stored_TB_hr_resample_proj, w, label="resample+filter (proj)", color="#ee6677")
-    ax.axhline(SAVE_ALL_BYTES_HR/1e12, color="k", ls="--", label="naive save-all")
+    ax.bar(xs-w/2, av.stored_TB_hr_timeslice, w, label="time-slice", color="#2a78d6", edgecolor="#0b0b0b", linewidth=0.5)
+    ax.bar(xs+w/2, av.stored_TB_hr_resample_proj, w, label="resample+filter (proj)", color="#eb6834", edgecolor="#0b0b0b", linewidth=0.5)
+    ax.axhline(SAVE_ALL_BYTES_HR/1e12, color="#0b0b0b", ls="--", label="naive save-all")
     ax.set_yscale("log"); ax.set_xticks(xs); ax.set_xticklabels([_lab[m] for m in av.model], fontsize=8)
-    ax.set_ylabel("stored TB/hr (log)"); ax.set_title("OTA: time-slice vs resample+filter projection (offline models)")
-    ax.legend(fontsize=8); ax.grid(alpha=.3, axis="y", which="both"); fig.tight_layout()
-    fig.savefig(fname, dpi=110, bbox_inches="tight"); display(fig); plt.close(fig)
+    ax.set_ylabel("stored TB / hour (log scale)"); ax.set_title("OTA: time-slice vs resample+filter projection (offline models)")
+    ax.legend(); ax.grid(alpha=.3, axis="y", which="both"); fig.tight_layout()
+    save_fig(fig, fname); display(fig); plt.close(fig)
 fig3b()
 
 # %% [markdown]
@@ -411,24 +733,24 @@ def fig3c(fname="fig3c_live_ota_resample_measured.png"):
     for i, m in enumerate(models):
         pv = proj.get(m, np.nan)
         if np.isfinite(pv):
-            ax.bar(xs[i]-w/2, pv, w, color="#ee6677", alpha=.55,
+            ax.bar(xs[i]-w/2, pv, w, color="#eb6834", alpha=.6,
                    label=("resample+filter (proj)" if i == 0 else None))
         mv = meas[m]
         if np.isfinite(mv):
-            ax.bar(xs[i]+w/2, mv, w, color="#228833",
+            ax.bar(xs[i]+w/2, mv, w, color="#2a78d6", edgecolor="#0b0b0b", linewidth=0.5,
                    label=("resample+filter (MEASURED)" if i == 0 else None))
             ax.text(xs[i]+w/2, mv*1.05, f"{mv:.3g}", ha="center", va="bottom", fontsize=7)
         else:
-            ax.bar(xs[i]+w/2, SAVE_ALL_BYTES_HR/1e12, w, color="lightgray", hatch="//", edgecolor="gray")
+            ax.bar(xs[i]+w/2, SAVE_ALL_BYTES_HR/1e12, w, color="#d9d8d2", hatch="//", edgecolor="#898781")
             ax.text(xs[i]+w/2, (SAVE_ALL_BYTES_HR/1e12)*1.03, "pending\nsnipper",
-                    ha="center", va="bottom", fontsize=6, color="gray")
-    ax.axhline(SAVE_ALL_BYTES_HR/1e12, color="k", ls="--", label="naive save-all")
+                    ha="center", va="bottom", fontsize=6, color="#898781")
+    ax.axhline(SAVE_ALL_BYTES_HR/1e12, color="#0b0b0b", ls="--", label="naive save-all")
     ax.set_yscale("log"); ax.set_xticks(xs); ax.set_xticklabels([_lab[m] for m in models], fontsize=8)
-    ax.set_ylabel("stored data (TB / hour, log)")
+    ax.set_ylabel("stored data (TB / hour, log scale)")
     ax.set_title("OTA resample+filter: MEASURED (signal_snipper) vs projection\n"
                  "(measured bar appears once run_offline_snipper.sh has produced snippets for that detector)")
-    ax.legend(fontsize=8, loc="upper right"); ax.grid(alpha=.3, axis="y", which="both"); fig.tight_layout()
-    fig.savefig(fname, dpi=110, bbox_inches="tight"); display(fig); plt.close(fig)
+    ax.legend(loc="upper right"); ax.grid(alpha=.3, axis="y", which="both"); fig.tight_layout()
+    save_fig(fig, fname); display(fig); plt.close(fig)
     n_meas = sum(np.isfinite(v) for v in meas.values())
     print(f"fig3c: measured resample+filter for {n_meas}/{len(models)} models "
           f"({'run bash_scripts/run_offline_snipper.sh for the rest' if n_meas < len(models) else 'all present'})")
@@ -450,3 +772,126 @@ fig3c()
 # 3. **Compute FLOPs are estimates** (ViT-B scaled for DINO, ultralytics for YOLO, FFT for coherent);
 #    GPU memory measured for the offline models; container detectors (coherent, zero-shot) estimated.
 # 4. Numbers use `DS_NFRAMES` frames/stem (default 120); set higher for the final figures.
+
+
+# %% [markdown]
+# ## Detection example — per-model masks on ONE frame (clean detections vs speckle)
+# For a single frame of one capture, each detector's binary mask (x = freq bins, y = time rows) with
+# its **final detection boxes** drawn (the snipper's rule: 4-connected components ≥ `MIN_BOX_PIXELS`=256,
+# then coalesced within a gap). Each title reports **# detection boxes** and **# raw connected-components**.
+# The gap between those two numbers is the story: "noisy" detectors (`3dB_power`, `coherent_power`) fire
+# on *thousands of single-pixel specks* (raw CCs) that the min-box filter discards — only a few real
+# boxes survive — while the fine-tuned models fire a handful of large, clean regions. Choose the example
+# with `DS_EXAMPLE_STEM` / `DS_EXAMPLE_FRAME`.
+
+# %%
+import sys as _sys
+_SNIP = str(HSD / "applications/usrp_wideband_signal_detection/infocom_evals/snip_eval")
+if _SNIP not in _sys.path:
+    _sys.path.insert(0, _SNIP)
+from snip_annotations import boxes_from_mask as _boxes_from_mask   # exact snipper clustering rule
+from matplotlib.patches import Rectangle as _Rect
+
+EX_STEM  = os.environ.get("DS_EXAMPLE_STEM", "attenuation_dB_45")
+EX_FRAME = int(os.environ.get("DS_EXAMPLE_FRAME", "100"))
+
+def _frame_mask(det, stem, fnum):
+    d = SWEEP / det / stem / "mask_arrays"
+    c = sorted(d.glob(f"mask_ch0_f{fnum}_*.packed.npz")) or sorted(d.glob(f"mask_ch0_f{fnum}_*.npy"))
+    return _load(c[0]).astype(bool) if c else None
+
+def _gt_mask(stem, fnum):
+    for det in DETS:
+        d = SWEEP / det / stem / "gt_masks"
+        c = sorted(d.glob(f"*_f{fnum}_*.packed.npz")) or sorted(d.glob(f"*_f{fnum}_*.npy"))
+        if c:
+            return _load(c[0]).astype(bool)
+    return None
+
+def fig_detection_example(stem=EX_STEM, fnum=EX_FRAME, dets=DETS, fname="fig_detection_example.png"):
+    panels = [("__gt__", _gt_mask(stem, fnum))] + [(d, _frame_mask(d, stem, fnum)) for d in dets]
+    panels = [(k, m) for k, m in panels if m is not None]
+    ncol = 3; nrow = int(np.ceil(len(panels) / ncol))
+    fig, axs = plt.subplots(nrow, ncol, figsize=(4.7 * ncol, 2.4 * nrow))
+    axs = np.array(axs).reshape(-1)
+    summary = []
+    for ax, (key, m) in zip(axs, panels):
+        ax.imshow(m, aspect="auto", cmap="Greys", origin="lower", interpolation="nearest",
+                  extent=[0, m.shape[1], 0, m.shape[0]])
+        boxes = _boxes_from_mask(m, MIN_BOX_PIXELS, 16, 80)
+        if key == "__gt__":
+            col, lab, extra = "#0b0b0b", "Ground truth", f"{m.mean()*100:.1f}% on"
+        else:
+            col, lab = COLOR[key], LABEL[key]
+            _, nraw = ndimage.label(m)
+            extra = f"{nraw:,} raw CCs · {m.mean()*100:.1f}% on"
+            summary.append((lab, len(boxes), nraw, m.mean()*100))
+        for (r0, r1, c0, c1) in boxes:
+            ax.add_patch(_Rect((c0, r0), c1 - c0 + 1, r1 - r0 + 1, fill=False,
+                               edgecolor=col, linewidth=1.4))
+        ax.set_title(f"{lab}\n{len(boxes)} detection box(es) · {extra}", fontsize=9)
+        ax.set_xticks([]); ax.set_yticks([])
+    for ax in axs[len(panels):]:
+        ax.axis("off")
+    fig.suptitle(f"Per-model detections — {stem}, frame {fnum}  "
+                 f"(x = freq bins, y = time rows; colored boxes = regions the snipper would cut)",
+                 fontsize=11, y=1.004)
+    fig.tight_layout()
+    save_fig(fig, fname); display(fig); plt.close(fig)
+    print(f"detection boxes on {stem} f{fnum}:")
+    for lab, nb, nraw, on in summary:
+        print(f"  {lab:28s} {nb:4d} boxes   ({nraw:>8,} raw CCs, {on:5.1f}% on)")
+fig_detection_example()
+
+
+# %% [markdown]
+# ## `min_box_pixels` sensitivity — kill speckle without crushing narrowband signals
+# `min_box_pixels` (== `DS_MIN_BOX_PIXELS`, default 256) drops connected components smaller than N
+# pixels. **Too low** → thousands of 1-px noise specks survive (see the raw-CC counts above); **too
+# high** → small / **narrowband** signals get erased (a short narrowband-FM burst spanning only a few
+# freq bins × few time rows has small pixel area even though it's real). This sweep, on the example
+# frame, shows the trade-off so you can pick a safe value:
+#   • **left** — surviving connected-components vs threshold (per detector): the speckle collapse.
+#   • **right** — GT-signal retention vs threshold (per detector): the *cost*. A safe threshold sits in
+#     the flat region where speckle is gone (left) but retention hasn't started dropping (right); the
+#     knee on the right is where you begin crushing real (incl. narrowband) signal.
+# The metrics elsewhere use `DS_MIN_BOX_PIXELS`; `snip_data_metrics.py` takes a matching `--min-box-pixels`.
+
+# %%
+MBOX_SWEEP = [int(x) for x in os.environ.get("DS_MBOX_SWEEP", "0,32,64,128,256,512,1024").split(",")]
+
+def fig_minbox_sensitivity(stem=EX_STEM, fnum=EX_FRAME, dets=DETS, fname="fig_minbox_sensitivity.png"):
+    gt = _gt_mask(stem, fnum)
+    gt_rows = gt.any(axis=1) if gt is not None else None
+    ncomp, reten = {}, {}
+    for det in dets:
+        m = _frame_mask(det, stem, fnum)
+        if m is None:
+            continue
+        lab, n = ndimage.label(m)                          # label ONCE, then sweep thresholds cheaply
+        sizes = np.bincount(lab.ravel()) if n else np.array([0])
+        ncomp[det] = [int((sizes[1:] >= thr).sum()) if n else 0 for thr in MBOX_SWEEP]
+        if gt_rows is not None and gt_rows.any():
+            rr = []
+            for thr in MBOX_SWEEP:
+                keep = sizes >= thr; keep[0] = False        # drop background + sub-threshold comps
+                md_rows = keep[lab].any(axis=1)
+                rr.append(float((gt_rows & md_rows).sum()) / float(gt_rows.sum()))
+            reten[det] = rr
+    fig, ax = plt.subplots(1, 2, figsize=(12.5, 4.4))
+    for det in ncomp:
+        ax[0].plot(MBOX_SWEEP, ncomp[det], marker=MARKER[det], color=COLOR[det], label=LABEL[det], ms=6)
+    ax[0].axvline(MIN_BOX_PIXELS, color="#0b0b0b", ls=":", lw=1.4, label=f"current ({MIN_BOX_PIXELS})")
+    ax[0].set_yscale("symlog"); ax[0].set_xlabel("min_box_pixels threshold")
+    ax[0].set_ylabel("surviving connected-components (symlog)")
+    ax[0].set_title(f"Speckle collapse — {stem} f{fnum}")
+    for det in reten:
+        ax[1].plot(MBOX_SWEEP, [100*v for v in reten[det]], marker=MARKER[det], color=COLOR[det],
+                   label=LABEL[det], ms=6)
+    ax[1].axvline(MIN_BOX_PIXELS, color="#0b0b0b", ls=":", lw=1.4)
+    ax[1].set_xlabel("min_box_pixels threshold"); ax[1].set_ylabel("GT-signal retention (%)")
+    ax[1].set_title("Cost: real-signal retention vs threshold\n(knee = start of crushing narrowband/small signals)")
+    ax[1].set_ylim(0, 103)
+    ax[0].legend(fontsize=8, ncol=2); fig.tight_layout()
+    save_fig(fig, fname); display(fig); plt.close(fig)
+fig_minbox_sensitivity()

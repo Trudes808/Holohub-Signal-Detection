@@ -21,8 +21,8 @@ APP_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 DETECTOR="${DETECTOR:-coherent_power}"
 CONFIG_NAME="${CONFIG_NAME:-config_signal_snipper_single_channel.yaml}"
 SNIP_ROOT="${SNIP_ROOT:-/tmp/usrp_spectrograms/snippets_eval}"
-USER_HOME="$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)"
-CAPTURES_DIR="${CAPTURES_DIR:-${USER_HOME}/captures/live_data/sigmf_out}"
+# captures live under bqn82 regardless of who runs sudo (lab-admin home has no captures/)
+CAPTURES_DIR="${CAPTURES_DIR:-/home/bqn82/captures/live_data/sigmf_out}"
 
 if [[ $# -gt 0 ]]; then
   CAPTURES=("$@")

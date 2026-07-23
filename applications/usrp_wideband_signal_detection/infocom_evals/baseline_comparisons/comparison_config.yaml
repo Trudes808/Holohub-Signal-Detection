@@ -83,6 +83,24 @@ comparison_eval:
       dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
       device: cuda
 
+    # Fine-tuned DINOv3 segmenter, M1_ft (backbone last-4 unfrozen, trained on <=30 dB — low-atten regime).
+    dino_finetuned_m1:
+      kind: dino_finetuned
+      ckpt: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/checkpoints/M1_ft/best.pt
+      eval_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/eval_out/M1_ft/eval_meta.json
+      train_cfg: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/configs/train.yaml
+      dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
+      device: cuda
+
+    # Fine-tuned YOLO26-s (smaller than the yolo=yolo26m entry above).
+    yolo26s:
+      kind: yolo
+      ckpt: /home/bqn82/Holohub-Signal-Detection/yolo_training/runs/detect/yolo26s_signal/weights/best.pt
+      dataset_meta: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset/dataset_meta.json
+      conf: 0.25
+      imgsz: 1024
+      device: cuda
+
   # --------------------------------------------------------- SNR axis knobs -- #
   # build_snr_results.py calibrates SNR from the 0 dB capture; plot_snr_results.py
   # pins the shared x-axis. These defaults match the agreed method.

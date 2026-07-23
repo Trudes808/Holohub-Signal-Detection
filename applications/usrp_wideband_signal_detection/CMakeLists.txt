@@ -162,6 +162,7 @@ target_link_libraries(usrp_wideband_signal_detection
   matx::matx
   holoscan::ops::coherent_power_signal_detector
   holoscan::ops::cuda_dino_detector
+  holoscan::ops::mask_replay_detector
   CUDA::cudart
   holoscan::core
   holoscan::advanced_network
@@ -236,6 +237,7 @@ target_link_libraries(run_offline_cuda_detector_eval
   holoscan::ops::spectrogram
   holoscan::ops::cuda_dino_detector
   holoscan::ops::coherent_power_signal_detector
+  holoscan::ops::mask_replay_detector
 )
 
 if(NOT Torch_FOUND)

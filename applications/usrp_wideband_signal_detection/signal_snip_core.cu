@@ -493,6 +493,18 @@ void append_annotation(std::ostringstream& meta, const MetaAnn& a, bool last) {
   meta << "      \"wfgt:orig_sample_count\": " << a.orig_sample_count << ",\n";
   meta << "      \"wfgt:orig_sample_end\": " << (a.orig_sample_start + a.orig_sample_count) << ",\n";
   meta << "      \"wfgt:center_frequency\": " << a.center_freq_hz << ",\n";
+  // Decimation summary so the meta fully describes the processing without the IQ present:
+  //   core:sample_count      = stored (decimated) sample count
+  //   wfgt:orig_sample_count = full-rate sample count of the same region (above)
+  //   wfgt:decimation_factor = orig / stored (1.0 = no decimation, e.g. time_only or full-band box)
+  const double decim = (a.file_sample_count > 0)
+      ? static_cast<double>(a.orig_sample_count) / static_cast<double>(a.file_sample_count) : 1.0;
+  meta << "      \"wfgt:decimation_factor\": " << decim << ",\n";
+  meta << "      \"wfgt:orig_sample_rate\": " << (a.sample_rate_hz * decim) << ",\n";
+  meta << "      \"wfgt:processing\": \""
+       << (decim > 1.001 ? "mix_to_baseband; lowpass to bandwidth*(1+oversample); decimate"
+                         : "full-rate, no decimation (time_only, or box bandwidth ~= full span)")
+       << "\",\n";
   meta << "      \"wfgt:snippet_sample_rate\": " << a.sample_rate_hz << "\n";
   meta << "    }" << (last ? "\n" : ",\n");
 }

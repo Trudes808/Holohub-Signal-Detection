@@ -14,6 +14,7 @@ DOCKER_FILE=${DOCKER_FILE:-applications/usrp_freq_detection/Dockerfile}
 CONTAINER_NAME=${CONTAINER_NAME:-usrp_x410_signal_detection_demo}
 HUGEPAGES_DIR=${HUGEPAGES_DIR:-/dev/hugepages}
 SPECTROGRAM_HOST_DIR=${SPECTROGRAM_HOST_DIR:-/tmp/usrp_spectrograms}
+CAPTURES_HOST_DIR=${CAPTURES_HOST_DIR:-/home/bqn82/captures}   # raw SigMF captures, mounted read-only (no staging copy)
 DINO_MASK_HOST_DIR=${DINO_MASK_HOST_DIR:-/tmp/usrp_dino_masks}
 COHERENT_SNAPSHOT_HOST_DIR=${COHERENT_SNAPSHOT_HOST_DIR:-/tmp/coherent_power_snapshots}
 COHERENT_MASK_HOST_DIR=${COHERENT_MASK_HOST_DIR:-/tmp/coherent_power_masks}
@@ -192,6 +193,7 @@ DOCKER_RUN_CMD=(
 	-e NVIDIA_DRIVER_CAPABILITIES=graphics,video,compute,utility,display \
 	-v "${REPO_ROOT}:/workspace/holohub" \
 	-v "${SPECTROGRAM_HOST_DIR}:/workspace/spectrograms" \
+	-v "${CAPTURES_HOST_DIR}:/workspace/captures:ro" \
 	-v "${DINO_MASK_HOST_DIR}:/workspace/dino_masks" \
 	-v "${COHERENT_SNAPSHOT_HOST_DIR}:/workspace/coherent_power_snapshots" \
 	-v "${COHERENT_MASK_HOST_DIR}:/workspace/coherent_power_masks" \

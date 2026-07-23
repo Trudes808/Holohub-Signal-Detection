@@ -60,6 +60,7 @@ class SigmfFileSinkOp : public holoscan::Operator {
   holoscan::Parameter<std::string> output_dir_;
   holoscan::Parameter<std::string> filename_prefix_;
   holoscan::Parameter<int> max_queued_batches_;
+  holoscan::Parameter<bool> write_iq_;  // false => write only .sigmf-meta, delete .sigmf-data (footprint-only)
 
   // Producer/consumer handoff to the background writer: HOST-staged batches (device already freed).
   std::thread writer_thread_;
