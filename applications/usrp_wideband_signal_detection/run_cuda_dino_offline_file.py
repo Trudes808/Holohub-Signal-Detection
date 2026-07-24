@@ -254,7 +254,13 @@ def ensure_offline_eval_config(
             config_text, "mask_replay_detector", {"mask_dir": str(mask_container_dir)}
         )
 
-    generated_path.write_text(config_text, encoding="utf-8")
+    try:
+        generated_path.write_text(config_text, encoding="utf-8")
+    except PermissionError:
+        # A previous all-sudo run may have left this generated config root-owned; the directory is
+        # still writable, so replace the file instead of writing into it.
+        generated_path.unlink()
+        generated_path.write_text(config_text, encoding="utf-8")
     return generated_path
 
 
