@@ -80,12 +80,27 @@ class SpectrogramPreviewOp : public Operator {
   Parameter<int> reference_fft_size_;   // FFT size the db_floor/db_ceil were tuned for (gain-normalizes across rates)
   Parameter<bool> timing_summary_enable_;
   Parameter<int> timing_summary_every_n_;
+  // Auto dB-floor: when on, track db_floor to the detected noise floor instead of the fixed value.
+  Parameter<bool> dynamic_db_floor_;              // gate (wired from visualization.renderer.dynamic_color_limits)
+  Parameter<int> dynamic_db_floor_warmup_frames_; // frames to accumulate the dB-floor estimate over
+  Parameter<float> dynamic_db_floor_offset_db_;   // effective db_floor = detected floor + this (dB above floor)
+  Parameter<float> dynamic_db_floor_pct_;         // percentile (0-1) of the dB samples taken as "the floor"
   uint64_t frames_seen_ = 0;
   cudaStream_t reduce_stream_ = nullptr;
   uint8_t* device_output_ = nullptr;
   void* pinned_output_ = nullptr;
   size_t buffer_bytes_ = 0;
   std::vector<PreviewTimingStats> timing_stats_;
+  // Auto dB-floor calibration (active only when dynamic_db_floor_): per-frequency MIN-HOLD of the
+  // reduced dB over the warmup (each column's quietest moment ~= its noise floor, rejecting transient
+  // signals), then freeze db_floor = low-percentile-over-columns + offset (rejects always-on carriers).
+  float* reduced_db_device_ = nullptr;   // dst_rows x dst_cols raw dB (parallel to device_output_)
+  float* reduced_db_pinned_ = nullptr;
+  size_t reduced_db_bytes_ = 0;
+  std::vector<float> db_floor_col_min_;  // per-frequency-column running min of the reduced dB
+  int db_floor_frames_ = 0;
+  bool db_floor_frozen_ = false;
+  float eff_db_floor_ = 0.0f;            // frozen effective floor in RAW dB (gain offset already included)
 
   void ensure_preview_capacity(size_t required_bytes);
 };

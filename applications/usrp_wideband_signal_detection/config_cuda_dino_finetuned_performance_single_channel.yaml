@@ -155,12 +155,20 @@ visualization:
     # show; strong signals saturate). Smaller span = more sensitive; raise it if noise gets speckly.
     dynamic_color_span: 0.30
     dynamic_color_high_pct: 0.995  # only used if dynamic_color_span <= 0
+    # Auto dB-floor: when dynamic_color_limits is true, db_floor auto-tracks the detected noise floor
+    # over the warmup, freezing at (floor + offset). When false, the fixed db_floor below is used.
+    # NOTE: offset is dB RELATIVE to the detected noise floor. It must be NEGATIVE so the display floor
+    # sits BELOW the noise (headroom the dynamic-color stage needs to render noise-dim + signals-bright).
+    # A positive/near-zero offset clips the noise to blue -> whole waterfall goes blue. ~-18 reproduces
+    # the known-good static db_floor of -40 (noise ~-22 dB + (-18) = -40), now auto-tracked per band.
+    dynamic_db_floor_offset_db: -18.0  # display floor = detected noise floor + this (negative = below noise)
+    dynamic_db_floor_pct: 0.05         # noise floor = this percentile across per-column dB min-holds
     overlay_alpha: 0.7
     center_frequency_hz: 2400000000.0
     fft_size: 20480
     dino_chunk_rows: 256
     dino_chunk_cols: 512
-    db_floor: -20.0
+    db_floor: -40.0
     db_ceil: 15.0
     row_average_n: 1
   holoviz:

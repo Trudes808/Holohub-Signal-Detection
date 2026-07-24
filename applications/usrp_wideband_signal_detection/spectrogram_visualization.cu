@@ -1404,7 +1404,8 @@ __global__ void reduce_complex_to_grayscale_kernel(const SpectrogramComplex* inp
                                                    int dst_rows,
                                                    int dst_cols,
                                                    float db_floor,
-                                                   float db_ceil) {
+                                                   float db_ceil,
+                                                   float* reduced_out) {
   const int out_col = blockIdx.x * blockDim.x + threadIdx.x;
   const int out_row = blockIdx.y * blockDim.y + threadIdx.y;
   if (out_col >= dst_cols || out_row >= dst_rows) {
@@ -1433,6 +1434,10 @@ __global__ void reduce_complex_to_grayscale_kernel(const SpectrogramComplex* inp
   }
 
   const float reduced = static_cast<float>(accumulation / static_cast<double>(max(1, count)));
+  if (reduced_out != nullptr) {
+    reduced_out[static_cast<size_t>(out_row) * static_cast<size_t>(dst_cols) + static_cast<size_t>(out_col)] =
+        reduced;  // raw dB (independent of the display window) for the auto dB-floor estimate
+  }
   const float db_range = max(1.0f, db_ceil - db_floor);
   const float normalized = (reduced - db_floor) / db_range;
   output[static_cast<size_t>(out_row) * static_cast<size_t>(dst_cols) + static_cast<size_t>(out_col)] =
@@ -1445,7 +1450,8 @@ void reduce_spectrogram_to_grayscale_row_gpu(const SpectrogramTensor& tensor,
                                              int output_height,
                                              int output_width,
                                              float db_floor,
-                                             float db_ceil) {
+                                             float db_ceil,
+                                             float* reduced_db_output = nullptr) {
   const int src_rows = static_cast<int>(tensor.Size(0));
   const int src_cols = static_cast<int>(tensor.Size(1));
   const bool transpose_input = src_rows > src_cols;
@@ -1463,7 +1469,8 @@ void reduce_spectrogram_to_grayscale_row_gpu(const SpectrogramTensor& tensor,
                                                                  dst_rows,
                                                                  dst_cols,
                                                                  db_floor,
-                                                                 db_ceil);
+                                                                 db_ceil,
+                                                                 reduced_db_output);
 }
 
 }  // namespace
@@ -1550,10 +1557,26 @@ void SpectrogramPreviewOp::setup(OperatorSpec& spec) {
              "Timing Summary Every N",
              "Emit a live preview timing summary every N preview frames per channel.",
              128);
+  spec.param(dynamic_db_floor_, "dynamic_db_floor", "Dynamic dB floor",
+             "If true, auto-track db_floor to the detected noise floor (+ offset) over the first "
+             "warmup frames, then freeze for the run. If false, use the fixed db_floor. Wired from "
+             "visualization.renderer.dynamic_color_limits so it follows the dynamic color toggle.",
+             false);
+  spec.param(dynamic_db_floor_warmup_frames_, "dynamic_db_floor_warmup_frames", "dB-floor warmup",
+             "Preview frames to accumulate the dB-floor estimate over before freezing.", 60);
+  spec.param(dynamic_db_floor_offset_db_, "dynamic_db_floor_offset_db", "dB-floor offset",
+             "Effective db_floor = detected-floor-percentile + this many dB (margin above the noise "
+             "floor). ~7 dB keeps the noise blue and shows signals above it.", 7.0f);
+  spec.param(dynamic_db_floor_pct_, "dynamic_db_floor_pct", "dB-floor percentile",
+             "Percentile (0-1) of the reduced dB samples taken as 'the floor' (0.2 = 20th pct).", 0.20f);
 }
 
 void SpectrogramPreviewOp::initialize() {
   Operator::initialize();
+  db_floor_frozen_ = false;
+  db_floor_frames_ = 0;
+  eff_db_floor_ = 0.0f;
+  db_floor_col_min_.clear();
   auto result = cudaStreamCreateWithFlags(&reduce_stream_, cudaStreamNonBlocking);
   if (result != cudaSuccess) {
     throw std::runtime_error(std::string("Failed to create preview reduction stream: ") + cudaGetErrorString(result));
@@ -1582,6 +1605,19 @@ void SpectrogramPreviewOp::ensure_preview_capacity(size_t required_bytes) {
     throw std::runtime_error(std::string("Failed to allocate preview pinned buffer: ") + cudaGetErrorString(pinned_result));
   }
   buffer_bytes_ = required_bytes;
+  // Parallel raw-dB buffers (one float per grayscale pixel) for the auto dB-floor estimate.
+  const size_t reduced_bytes = required_bytes * sizeof(float);
+  if (reduced_db_device_ != nullptr) { cudaFree(reduced_db_device_); reduced_db_device_ = nullptr; }
+  if (reduced_db_pinned_ != nullptr) { cudaFreeHost(reduced_db_pinned_); reduced_db_pinned_ = nullptr; }
+  auto reduced_dev_result = cudaMalloc(reinterpret_cast<void**>(&reduced_db_device_), reduced_bytes);
+  if (reduced_dev_result != cudaSuccess) {
+    throw std::runtime_error(std::string("Failed to allocate reduced-dB device buffer: ") + cudaGetErrorString(reduced_dev_result));
+  }
+  auto reduced_pin_result = cudaMallocHost(reinterpret_cast<void**>(&reduced_db_pinned_), reduced_bytes);
+  if (reduced_pin_result != cudaSuccess) {
+    throw std::runtime_error(std::string("Failed to allocate reduced-dB pinned buffer: ") + cudaGetErrorString(reduced_pin_result));
+  }
+  reduced_db_bytes_ = reduced_bytes;
 }
 
 void SpectrogramPreviewOp::compute(InputContext& op_input,
@@ -1639,20 +1675,76 @@ void SpectrogramPreviewOp::compute(InputContext& op_input,
                       db_floor_.get(), db_ceil_.get(), actual_fft_bins, ref_fft_bins,
                       db_floor_.get() + gain_offset_db, db_ceil_.get() + gain_offset_db, gain_offset_db);
   }
+  // Effective dB window. Fixed by default; when dynamic_db_floor_ is on and calibrated, the floor is
+  // re-anchored to the detected noise floor (+ offset) while the ceiling stays put (guarded > floor).
+  const float ceil_eff = db_ceil_.get() + gain_offset_db;
+  float floor_eff = db_floor_.get() + gain_offset_db;
+  if (dynamic_db_floor_.get() && db_floor_frozen_) {
+    floor_eff = std::min(eff_db_floor_, ceil_eff - 1.0f);  // eff_db_floor_ is already in raw dB
+  }
+  // Collect the raw reduced dB (parallel buffer) only while calibrating.
+  const bool collecting_db_floor = dynamic_db_floor_.get() && !db_floor_frozen_;
+  float* reduced_out = collecting_db_floor ? reduced_db_device_ : nullptr;
   reduce_spectrogram_to_grayscale_row_gpu(tensor,
                                           reduce_stream_,
                                           device_output_,
                                           preview_height,
                                           preview_width,
-                                          db_floor_.get() + gain_offset_db,
-                                          db_ceil_.get() + gain_offset_db);
+                                          floor_eff,
+                                          ceil_eff,
+                                          reduced_out);
   auto copy_result = cudaMemcpyAsync(pinned_output_, device_output_, bytes, cudaMemcpyDeviceToHost, reduce_stream_);
   if (copy_result != cudaSuccess) {
     throw std::runtime_error(std::string("Preview spectrogram copy failed: ") + cudaGetErrorString(copy_result));
   }
+  const size_t reduced_used_bytes = static_cast<size_t>(preview_width) * static_cast<size_t>(preview_height) * sizeof(float);
+  if (collecting_db_floor && reduced_db_pinned_ != nullptr) {
+    auto reduced_copy = cudaMemcpyAsync(reduced_db_pinned_, reduced_db_device_, reduced_used_bytes,
+                                        cudaMemcpyDeviceToHost, reduce_stream_);
+    if (reduced_copy != cudaSuccess) {
+      throw std::runtime_error(std::string("Reduced-dB copy failed: ") + cudaGetErrorString(reduced_copy));
+    }
+  }
   auto sync_result = cudaStreamSynchronize(reduce_stream_);
   if (sync_result != cudaSuccess) {
     throw std::runtime_error(std::string("Preview spectrogram sync failed: ") + cudaGetErrorString(sync_result));
+  }
+  if (collecting_db_floor && reduced_db_pinned_ != nullptr) {
+    // Per-frequency MIN-HOLD: fold this frame's rows into each column's running minimum. Min-over-time
+    // ~= the column's noise floor (a signal only raises a column, so its quiet moments reveal the floor).
+    const int w = preview_width, h = preview_height;
+    if (static_cast<int>(db_floor_col_min_.size()) != w) {
+      db_floor_col_min_.assign(static_cast<size_t>(w), 1e30f);
+    }
+    for (int r = 0; r < h; ++r) {
+      for (int c = 0; c < w; ++c) {
+        const float v = reduced_db_pinned_[static_cast<size_t>(r) * static_cast<size_t>(w) + static_cast<size_t>(c)];
+        if (std::isfinite(v) && v < db_floor_col_min_[static_cast<size_t>(c)]) {
+          db_floor_col_min_[static_cast<size_t>(c)] = v;
+        }
+      }
+    }
+    ++db_floor_frames_;
+    if (db_floor_frames_ >= std::max(1, dynamic_db_floor_warmup_frames_.get())) {
+      // Low percentile OVER COLUMNS of the per-column minima: noise-only columns cluster at the floor,
+      // always-on carriers sit above and are rejected by the low percentile.
+      std::vector<float> col_mins;
+      col_mins.reserve(db_floor_col_min_.size());
+      for (float m : db_floor_col_min_) if (std::isfinite(m) && m < 1e29f) col_mins.push_back(m);
+      if (!col_mins.empty()) {
+        const float pct = std::max(0.0f, std::min(1.0f, dynamic_db_floor_pct_.get()));
+        std::sort(col_mins.begin(), col_mins.end());
+        int idx = static_cast<int>(pct * static_cast<float>(col_mins.size() - 1) + 0.5f);
+        idx = std::max(0, std::min(static_cast<int>(col_mins.size()) - 1, idx));
+        const float floor_db = col_mins[static_cast<size_t>(idx)];
+        eff_db_floor_ = floor_db + dynamic_db_floor_offset_db_.get();
+        db_floor_frozen_ = true;
+        HOLOSCAN_LOG_INFO("Preview auto dB-floor (ch {}): noise floor {:.1f} dB (p{:.0f} of {} column "
+                          "min-holds) + {:.1f} dB -> db_floor {:.1f} dB (ceil {:.1f}) after {} frames",
+                          configured_channel, floor_db, pct * 100.0f, col_mins.size(),
+                          dynamic_db_floor_offset_db_.get(), eff_db_floor_, ceil_eff, db_floor_frames_);
+      }
+    }
   }
   const uint64_t preview_emit_ns = steady_time_ns();
 
@@ -1750,6 +1842,15 @@ void SpectrogramPreviewOp::stop() {
     cudaFreeHost(pinned_output_);
     pinned_output_ = nullptr;
   }
+  if (reduced_db_device_ != nullptr) {
+    cudaFree(reduced_db_device_);
+    reduced_db_device_ = nullptr;
+  }
+  if (reduced_db_pinned_ != nullptr) {
+    cudaFreeHost(reduced_db_pinned_);
+    reduced_db_pinned_ = nullptr;
+  }
+  reduced_db_bytes_ = 0;
   buffer_bytes_ = 0;
   Operator::stop();
 }

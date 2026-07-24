@@ -133,8 +133,20 @@ visualization:
     timing_summary_every_n: 128
     channel_filter: 0
     tensor_name: "spectrogram"
-    blue_limit: 0.10
+    blue_limit: 0.10               # fallback during warmup / when dynamic_color_limits is false
     red_limit: 0.92
+    # Auto-calibrate the spectrogram color range per run: grayscale histogram over the first N frames,
+    # then freeze blue=low-pct / red=blue+span for the run (recalibrates each launch).
+    dynamic_color_limits: true
+    dynamic_color_warmup_frames: 60
+    dynamic_color_low_pct: 0.10    # noise floor -> blue
+    dynamic_color_span: 0.30       # red = blue + span; smaller = more sensitive to faint signals
+    dynamic_color_high_pct: 0.995  # only used if dynamic_color_span <= 0
+    # Auto dB-floor (gated on dynamic_color_limits): db_floor tracks the detected noise floor over the
+    # warmup. Offset is dB RELATIVE to the noise floor and must be NEGATIVE (floor below noise; a positive
+    # offset clips noise to blue). ~-18 keeps noise dim + signals bright, auto-tracked per band.
+    dynamic_db_floor_offset_db: -18.0
+    dynamic_db_floor_pct: 0.05     # noise floor = this percentile across per-column dB min-holds
     overlay_alpha: 0.7 #0.38
     center_frequency_hz: 0.0
     fft_size: 20480

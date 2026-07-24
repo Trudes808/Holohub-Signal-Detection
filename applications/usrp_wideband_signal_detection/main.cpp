@@ -699,6 +699,16 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           Arg("output_height") = from_config("visualization.renderer.rows_per_frame").as<int>(),
           Arg("db_floor") = from_config("visualization.renderer.db_floor").as<float>(),
           Arg("db_ceil") = from_config("visualization.renderer.db_ceil").as<float>(),
+          // Auto dB-floor follows the dynamic-color toggle; offset/pct/warmup are optional (defaults used
+          // if absent). from_config_or tolerates configs whose renderer block omits these keys.
+          Arg("dynamic_db_floor") =
+              usrp_wideband::from_config_or<bool>(*this, "visualization.renderer.dynamic_color_limits", false),
+          Arg("dynamic_db_floor_warmup_frames") =
+              usrp_wideband::from_config_or<int>(*this, "visualization.renderer.dynamic_color_warmup_frames", 60),
+          Arg("dynamic_db_floor_offset_db") =
+              usrp_wideband::from_config_or<float>(*this, "visualization.renderer.dynamic_db_floor_offset_db", 7.0f),
+          Arg("dynamic_db_floor_pct") =
+              usrp_wideband::from_config_or<float>(*this, "visualization.renderer.dynamic_db_floor_pct", 0.20f),
           Arg("fft_size") = fft_runtime.actual_fft_size,
           Arg("reference_fft_size") = fft_runtime.reference_fft_size));
         visualMaskGateOps.push_back(make_operator<ops::MaskPreviewOp>(
