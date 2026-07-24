@@ -19,7 +19,15 @@ export SNIP_OUT="${SNIP_OUT:-/tmp/usrp_spectrograms/snip_eval}"
 export MODES="${MODES:-frequency time_only}"
 MAX_PASSES="${MAX_PASSES:-30}"
 
-count_done() { find "${SNIP_OUT}" -mindepth 4 -maxdepth 4 -name snippets -type d 2>/dev/null | wc -l; }
+# Count COMPLETED (mode,det,stem) units. Prefer the .snip_complete marker (counts zero-snippet
+# results too, so a legit-empty capture doesn't look perpetually "not done"); fall back to counting
+# snippets dirs for older runs that predate the marker.
+count_done() {
+  local m s
+  m=$(find "${SNIP_OUT}" -mindepth 4 -maxdepth 4 -name .snip_complete 2>/dev/null | wc -l)
+  s=$(find "${SNIP_OUT}" -mindepth 4 -maxdepth 4 -name snippets -type d 2>/dev/null | wc -l)
+  if [ "${m}" -ge "${s}" ]; then echo "${m}"; else echo "${s}"; fi
+}
 
 prev=-1
 for pass in $(seq 1 "${MAX_PASSES}"); do

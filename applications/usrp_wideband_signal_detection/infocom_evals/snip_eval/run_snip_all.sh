@@ -53,9 +53,12 @@ for det in "${DETS[@]}"; do
     "${PYTHON}" "${SCRIPT_DIR}/materialize_npy.py" "${BATCH_ROOT}/${det}/${stem}"      # .packed.npz -> .npy (once)
     for MODE in ${MODES}; do
       out="${SNIP_OUT}/${MODE}/${det}/${stem}"
-      # Resumable: skip if this (mode, detector, capture) already produced snippet metas.
-      if compgen -G "${out}/snippets/*.sigmf-meta" > /dev/null 2>&1; then
-        echo "  skip [${MODE}] ${det}/${stem} (already snipped)"; continue
+      # Resumable: a (mode,detector,capture) is DONE once its eval completes -- INCLUDING a
+      # zero-snippet result (legitimate when a size/SNR threshold leaves nothing to snip). Completion
+      # is recorded with a .snip_complete marker so zero-result captures are not re-run every pass.
+      # Fallback: runs predating the marker are still recognized as done if they have snippet metas.
+      if [ -f "${out}/.snip_complete" ] || compgen -G "${out}/snippets/*.sigmf-meta" > /dev/null 2>&1; then
+        echo "  skip [${MODE}] ${det}/${stem} (already done)"; continue
       fi
       echo "=== snip [${MODE}] ${det}/${stem} ==="
       # --snippets-only => the binary writes ONLY the snippet metas; no mask_arrays/gt_masks/previews
@@ -68,8 +71,10 @@ for det in "${DETS[@]}"; do
           --captures-mounted --no-tensors --snippets-only; then
         echo "  FAILED [${MODE}] ${det}/${stem} — skipping (re-run resumes it)"
         rm -rf "${out}/snippets" 2>/dev/null || true   # drop partial so the resume-check re-attempts it
+        rm -f "${out}/.snip_complete" 2>/dev/null || true
         continue
       fi
+      mkdir -p "${out}" && touch "${out}/.snip_complete"   # mark done (0 or more snippets) -> won't re-run
     done
     # Our Python detections-annotation meta (mode-independent), for cross-check / labelling.
     "${PYTHON}" "${SCRIPT_DIR}/snip_annotations.py" --run-dir "${BATCH_ROOT}/${det}/${stem}" \

@@ -97,9 +97,16 @@ def main():
             det = detdir.name
             for stemdir in sorted(detdir.glob("*/")):
                 stem = stemdir.name
-                if not (stemdir / "snippets").is_dir():
+                # Emit a row even when the eval produced ZERO snippets (legit at aggressive size/SNR
+                # thresholds) so it's recorded as 0 footprint rather than silently dropped. A REAL
+                # capture either produced snippets or has a matching capture file. This excludes the
+                # "<stem>.stale_N" backup dirs the offline binary leaves when it re-runs a capture
+                # (they carry a summary but no matching capture) -- those would create junk NaN rows.
+                has_snips = (stemdir / "snippets").is_dir()
+                cap_exists = (a.captures_dir / f"{stem}.sigmf-data").exists()
+                if not (has_snips or cap_exists):
                     continue
-                s = summarize_run(stemdir)
+                s = summarize_run(stemdir)   # returns zeros if there are no snippet metas
                 sec = capture_sec(a.captures_dir, stem)
                 _ok = sec == sec and sec > 0
                 tbhr = s["stored_bytes"] / sec * SEC_PER_HR / 1e12 if _ok else float("nan")           # decimated (stored)

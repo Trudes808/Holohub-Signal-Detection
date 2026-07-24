@@ -55,6 +55,20 @@ real_snip_metrics.csv   →   plot_data_saving.py  (figures in figs/)
   writes `<stem>_detected.sigmf-meta`; used by the notebook methodology as a cross-check of the real
   measurement. Not part of the live run.
 
+### Low-SNR footprint investigation (see `problem.md`)
+- **`prove_coherent_artifact.py [atten]`** — quantifies the bounding-box fusion over-count
+  (fill %, over-count factor) on the staged coherent_power masks.
+- **`streak_forensics.py`** — attenuation-sweep proof that the persistent 48 MHz line is a
+  receiver clock spur (2048 MHz abs, ~117 Hz CW, family at 2048±k×20.48 MHz), not a transmitted
+  signal → `streak_forensics.csv` + `figs_minsize/streak_*.png`.
+- **`streak_mask_presence.py`** — which detectors' masks contain the spur column, per attenuation
+  → `streak_mask_presence.csv` (energy detectors: yes at 100% occupancy; learned detectors + GT: no).
+- **`quantify_fixes.py`** — offline replication of the snipper clustering that scores candidate
+  fixes (persistent-column split, fill-ratio gate, spur suppression) against the current behavior
+  under all three size-gate configs → `fix_quantification.csv`.
+- **`render_spectrogram_overlay.py` / `visualize_bbox.py` / `render_masks.py`** — per-frame debug
+  visualizations (spectrogram + mask + snipper boxes).
+
 ## Run it (both modes, one command)
 ```
 cd applications/usrp_wideband_signal_detection/infocom_evals/snip_eval
