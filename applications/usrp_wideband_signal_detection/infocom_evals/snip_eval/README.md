@@ -78,6 +78,13 @@ real_snip_metrics.csv   →   plot_data_saving.py  (figures in figs/)
   `figs_minsize/fig{2,3}_*_before_after_{100k5ms,75k1ms}.png`. The 75k BEFORE curve and the GT
   ceilings come from the validated offline replication (`replicate_75k_before.py`,
   `fix_quantification.csv`), labeled as such.
+- **`plot_mixed_storage.py`** — curated single figure in the notebook Figure-1 house style mixing
+  two measurement sources: Coherent Power (the `min_mask_bandwidth_hz`-fixed 75 kHz/1 ms run,
+  `real_snip_metrics_75k_v2.csv`) + DINO FT M2 and the ground-truth ceilings
+  (`real_snip_metrics.csv`), against the naive save-all line. Both strategies per detector
+  (solid = time slice, dashed = time slice + downsample [the resample+filter mode formerly called
+  "snip"]). Detector colors/markers match the baseline/SNR/latency figures outside snip_eval
+  (coherent = blue `o`, DINO FT = brown `P`). → `figs/fig_mixed_storage_vs_snr.png`.
 
 ### End-to-end pipeline (`snip_pipeline.py`)
 One YAML config → mask generation → real snip → soft-label metas → eval, per capture:
