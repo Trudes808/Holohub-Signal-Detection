@@ -84,6 +84,31 @@ namespace snip {
 // Connected components
 // ---------------------------------------------------------------------------------------------
 
+void filter_mask_min_run_cols(std::vector<uint8_t>& mask, int rows, int cols, int min_run_cols) {
+  if (min_run_cols <= 1 || rows <= 0 || cols <= 0 ||
+      mask.size() < static_cast<size_t>(rows) * static_cast<size_t>(cols)) {
+    return;
+  }
+  for (int row = 0; row < rows; ++row) {
+    uint8_t* line = mask.data() + static_cast<size_t>(row) * cols;
+    int col = 0;
+    while (col < cols) {
+      if (!line[col]) {
+        ++col;
+        continue;
+      }
+      int run_end = col;
+      while (run_end < cols && line[run_end]) {
+        ++run_end;
+      }
+      if (run_end - col < min_run_cols) {
+        std::memset(line + col, 0, static_cast<size_t>(run_end - col));
+      }
+      col = run_end;
+    }
+  }
+}
+
 std::vector<BoundingBox> label_components(const std::vector<uint8_t>& mask,
                                           int rows,
                                           int cols,
@@ -185,6 +210,35 @@ std::vector<BoundingBox> merge_boxes(std::vector<BoundingBox> boxes, int gap_row
     boxes = std::move(merged);
   }
   return boxes;
+}
+
+std::vector<BoundingBox> filter_boxes_by_size(std::vector<BoundingBox> boxes,
+                                              const FrameGeometry& geom,
+                                              double min_bandwidth_hz,
+                                              double min_duration_s) {
+  // Post-merge physical-size gate: drop a (merged) box unless it spans at least min_bandwidth_hz
+  // in frequency AND at least min_duration_s in time. Each threshold is independent; <= 0 disables
+  // that axis (so callers can enable min-bandwidth, min-duration, both, or neither -- orthogonal to
+  // the pre-merge min_box_pixels area/speckle filter).
+  if (min_bandwidth_hz <= 0.0 && min_duration_s <= 0.0) {
+    return boxes;
+  }
+  const double rows = std::max(1, geom.mask_rows);
+  const double cols = std::max(1, geom.mask_cols);
+  const double fs = geom.sample_rate_hz;
+  const double frame_samples = static_cast<double>(geom.frame_sample_count);
+  std::vector<BoundingBox> kept;
+  kept.reserve(boxes.size());
+  for (const auto& box : boxes) {
+    const double bandwidth_hz = (static_cast<double>(box.col1 - box.col0 + 1) / cols) * fs;
+    const double duration_s = (fs > 0.0)
+        ? ((static_cast<double>(box.row1 - box.row0 + 1) / rows) * frame_samples) / fs
+        : 0.0;
+    if (min_bandwidth_hz > 0.0 && bandwidth_hz < min_bandwidth_hz) continue;
+    if (min_duration_s > 0.0 && duration_s < min_duration_s) continue;
+    kept.push_back(box);
+  }
+  return kept;
 }
 
 PhysicalRegion map_box_to_physical(const BoundingBox& box, const FrameGeometry& geom) {

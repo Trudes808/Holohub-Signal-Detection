@@ -258,6 +258,17 @@ def ensure_offline_eval_config(
     return generated_path
 
 
+def _run_sudo_free_first(cmd: list[str]) -> None:
+    """Run a `sudo <tool> ...` staging command, trying WITHOUT sudo first so the driver also works
+    for accounts whose passwordless sudo covers only `docker` (host dirs under /tmp are usually
+    world-writable). Falls back to the original sudo form when the plain attempt fails (e.g.
+    root-owned scratch dirs left by earlier all-sudo runs)."""
+    plain = cmd[1:] if cmd and cmd[0] == "sudo" else cmd
+    if subprocess.run(plain, stderr=subprocess.DEVNULL).returncode == 0:
+        return
+    subprocess.run(cmd, check=True)
+
+
 def _copy_into_scratch_if_needed(src: Path, dst: Path) -> None:
     """`sudo cp` src -> dst, but SKIP when dst already exists with the same size. Idempotent staging:
     running many detectors over one capture reuses a single staged copy instead of re-copying ~14 GB
@@ -268,12 +279,12 @@ def _copy_into_scratch_if_needed(src: Path, dst: Path) -> None:
             return
     except OSError:
         pass
-    subprocess.run(["sudo", "cp", "-f", str(src), str(dst)], check=True)
+    _run_sudo_free_first(["sudo", "cp", "-f", str(src), str(dst)])
 
 
 def stage_input_into_scratch(input_file_path: Path, meta_path: Path) -> tuple[Path, Path]:
     staged_dir = HOST_SCRATCH_ROOT / "offline_inputs" / input_file_path.stem
-    subprocess.run(["sudo", "mkdir", "-p", str(staged_dir)], check=True)
+    _run_sudo_free_first(["sudo", "mkdir", "-p", str(staged_dir)])
     staged_input_path = staged_dir / input_file_path.name
     staged_meta_path = staged_dir / meta_path.name
     _copy_into_scratch_if_needed(input_file_path, staged_input_path)
@@ -478,7 +489,7 @@ def main() -> int:
         return 0
 
     # Ensure the output parent exists, then (unless reading in place) stage the input ONCE (idempotent).
-    subprocess.run(["sudo", "mkdir", "-p", str(output_root.parent)], check=True)
+    _run_sudo_free_first(["sudo", "mkdir", "-p", str(output_root.parent)])
     if not use_mount:
         stage_input_into_scratch(input_file_path, sigmf_meta_path)
 

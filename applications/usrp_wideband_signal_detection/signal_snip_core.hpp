@@ -36,6 +36,14 @@ struct CcScratch {
   std::vector<int> queue;  // flat pixel indices, used as a fixed-capacity FIFO (no std::queue churn)
 };
 
+// Mask pre-filter: zero out lit runs narrower than `min_run_cols` along each row (the frequency
+// axis), IN PLACE. Removes persistent narrowband lines (e.g. receiver clock spurs, ~1-3 columns
+// wide) from the mask itself, so 4-connectivity can never fuse them with wide transients into one
+// full-height component whose bounding box would then be stored whole (see
+// infocom_evals/snip_eval/problem.md). Unlike the post-merge box gate this acts on pixel runs, not
+// component bounding boxes, so it is immune to that fusion. `min_run_cols` <= 1 is a no-op.
+void filter_mask_min_run_cols(std::vector<uint8_t>& mask, int rows, int cols, int min_run_cols);
+
 // 4-connected connected-component labeling over a binary (0/non-zero) mask, returning one bounding
 // box per component with at least `min_pixels` pixels. Adapted from the detector's
 // label_mask_connected_components (coherent_power_signal_detector.cu). `scratch` is reused across
@@ -75,6 +83,15 @@ struct PhysicalRegion {
 };
 
 PhysicalRegion map_box_to_physical(const BoundingBox& box, const FrameGeometry& geom);
+
+// Post-merge physical-size gate. Drops a box unless it spans at least `min_bandwidth_hz` (frequency)
+// AND at least `min_duration_s` (time), using `geom` to map mask pixels to Hz/seconds. Each threshold
+// is independent; a value <= 0 disables that axis. Orthogonal to the pre-merge `min_pixels` area
+// filter in label_components, so callers can enable any combination of the three.
+std::vector<BoundingBox> filter_boxes_by_size(std::vector<BoundingBox> boxes,
+                                              const FrameGeometry& geom,
+                                              double min_bandwidth_hz,
+                                              double min_duration_s);
 
 // --- Digital down-conversion ----------------------------------------------------------------
 

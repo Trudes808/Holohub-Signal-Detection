@@ -4,6 +4,7 @@
 #include "signal_snipper.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,7 +38,21 @@ void SignalSnipperOp::setup(holoscan::OperatorSpec& spec) {
   spec.param(bandwidth_margin_hz_, "bandwidth_margin_hz", "Bandwidth margin Hz",
              "Absolute Hz added to the detected bandwidth before low-pass filtering.", 0.0);
   spec.param(min_box_pixels_, "min_box_pixels", "Min box pixels",
-             "Discard connected components smaller than this many mask pixels (speckle filter).", 256);
+             "Discard connected components smaller than this many mask pixels (pre-merge speckle "
+             "filter). 0 = disabled.", 256);
+  spec.param(min_mask_bandwidth_hz_, "min_mask_bandwidth_hz", "Min mask bandwidth Hz",
+             "Pre-labeling mask filter: zero out lit runs narrower than this bandwidth along each "
+             "mask row (auto-scaled to columns from the delivered sample rate). Removes persistent "
+             "narrowband lines (e.g. receiver clock spurs) from the mask itself so they can never "
+             "fuse with wide transients into one full-height component. Acts on pixel runs, not "
+             "component bounding boxes, so it is immune to the fusion artifact that defeats "
+             "min_bandwidth_hz (see infocom_evals/snip_eval/problem.md). 0 = disabled.", 0.0);
+  spec.param(min_bandwidth_hz_, "min_bandwidth_hz", "Min bandwidth Hz",
+             "Discard (merged) boxes narrower than this bandwidth in Hz. 0 = disabled. Applied "
+             "post-merge, independent of min_box_pixels / min_duration_s.", 0.0);
+  spec.param(min_duration_s_, "min_duration_s", "Min duration s",
+             "Discard (merged) boxes shorter than this duration in seconds. 0 = disabled. Applied "
+             "post-merge, independent of min_box_pixels / min_bandwidth_hz.", 0.0);
   spec.param(merge_gap_rows_, "merge_gap_rows", "Merge gap rows",
              "Coalesce component boxes within this many mask rows (time) of each other.", 16);
   spec.param(merge_gap_cols_, "merge_gap_cols", "Merge gap cols",
@@ -268,9 +283,21 @@ void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask, SnippetBatch
     return;
   }
 
+  // Pre-labeling mask filter: drop lit runs narrower than min_mask_bandwidth_hz along each row so
+  // persistent narrowband lines (receiver spurs) can never bridge distinct signals into one
+  // component. Hz -> columns via the delivered rate; a threshold below one column bin is a no-op.
+  const double min_mask_bw = min_mask_bandwidth_hz_.get();
+  if (min_mask_bw > 0.0 && sample_rate > 0.0 && mask.width > 0) {
+    const double hz_per_col = sample_rate / static_cast<double>(mask.width);
+    const int min_run_cols = static_cast<int>(std::ceil(min_mask_bw / hz_per_col));
+    snip::filter_mask_min_run_cols(host_mask_, mask.height, mask.width, min_run_cols);
+  }
+
   auto boxes =
       snip::label_components(host_mask_, mask.height, mask.width, min_box_pixels_.get(), cc_scratch_);
   boxes = snip::merge_boxes(std::move(boxes), merge_gap_rows_.get(), merge_gap_cols_.get());
+  boxes = snip::filter_boxes_by_size(std::move(boxes), geom,
+                                     min_bandwidth_hz_.get(), min_duration_s_.get());
   if (boxes.empty()) {
     return;
   }

@@ -521,15 +521,16 @@ signal_snipper:
   # to a few signal boxes instead of hundreds of slivers.
   min_box_pixels: 256
   # Pre-labeling MASK filter: zero lit runs narrower than this along each mask row (auto-scaled to
-  # columns from the delivered rate). Removes persistent narrowband lines (receiver clock spurs)
-  # from the mask itself so they can never fuse with wide transients into one component (see
-  # snip_eval/problem.md). 0 = disabled (this baseline config keeps current behavior).
-  min_mask_bandwidth_hz: 0.0
+  # columns from the delivered rate: 100 kHz -> 5 cols at 24 kHz/col). Removes persistent narrowband
+  # lines (receiver clock spurs, e.g. the CW spur at 2048 MHz abs) from the mask itself, so they can
+  # never 4-connect with wide transients into one full-height component whose mostly-empty bounding
+  # box would be stored whole (the low-SNR footprint artifact -- see snip_eval/problem.md). 0 = off.
+  min_mask_bandwidth_hz: 100000.0   # match min_bandwidth_hz below
   # Post-merge physical-size gate (independent of min_box_pixels; each 0 = disabled). Drops a merged
   # box unless it is at least min_bandwidth_hz wide AND min_duration_s long. On this grid a mask
   # column = fs/cols = 24 kHz and a row = 41.67 us, so e.g. 100 kHz -> 1e5, 5 ms -> 5e-3.
-  min_bandwidth_hz: 0.0
-  min_duration_s: 0.0
+  min_bandwidth_hz: 100000.0   # 100 kHz  (collaborator spec)
+  min_duration_s: 0.005        # 5 ms     (collaborator spec)
   merge_gap_rows: 16
   merge_gap_cols: 80
   fir_num_taps: 129
