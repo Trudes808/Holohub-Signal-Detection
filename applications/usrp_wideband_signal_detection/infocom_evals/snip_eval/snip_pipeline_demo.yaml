@@ -3,10 +3,12 @@
 # (attenuation 45 -> +9 dB). Run:
 #   ~/miniforge3/envs/dinov3/bin/python snip_pipeline.py snip_pipeline_demo.yaml
 
-# Detector that produces the masks (container binary). detector_config: null uses the driver's
-# per-detector default (coherent_power -> config_coherent_power_perf_perfreq_single_channel.yaml).
+# Detector that produces the masks (container binary). Pin detector_config EXPLICITLY: the
+# driver's per-detector default tracks the app's current live config, which changes over time —
+# masks made under different configs are NOT comparable (see mask_provenance.md). To reproduce
+# the staged July batch instead, use old_configs/config_coherent_power_performance_single_channel.yaml.
 detector: coherent_power
-detector_config: null
+detector_config: /home/bqn82/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection/config_coherent_power_perf_perfreq_single_channel.yaml
 
 # The set of waveform captures. Either an explicit list, a directory (captures_dir +
 # captures_glob), or both.
