@@ -25,6 +25,11 @@ from torch.utils.data import DataLoader
 from dataset import RFSegDataset
 from model import DinoSegmenter, DiceBCELoss
 
+try:
+    from tqdm import tqdm as _tqdm
+except Exception:  # pragma: no cover
+    _tqdm = None
+
 
 def log(msg):
     print(f"[train] {msg}", flush=True)
@@ -35,7 +40,8 @@ def evaluate(model, loader, device, thr, amp):
     model.eval()
     tp = fp = fn = 0
     tot_pos = tot = 0
-    for batch in loader:
+    it = _tqdm(loader, desc="val", unit="batch", leave=False, dynamic_ncols=True) if _tqdm else loader
+    for batch in it:
         img = batch["image"].to(device, non_blocking=True)
         mask = batch["mask"].to(device, non_blocking=True)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
@@ -63,6 +69,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--no-augment", action="store_true",
+                    help="disable train-time augmentation (A/B whether it's slowing convergence).")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
@@ -73,7 +81,7 @@ def main():
     torch.manual_seed(cfg["seed"]); np.random.seed(cfg["seed"])
 
     tr = RFSegDataset(args.dataset, "train", atten_max_db=args.atten_max,
-                      augment=cfg["augment"], seed=cfg["seed"])
+                      augment=cfg["augment"] and not args.no_augment, seed=cfg["seed"])
     va = RFSegDataset(args.dataset, "val", atten_max_db=None, augment=False)
     log(f"{args.name}: train={len(tr)} (atten_max={args.atten_max}) val={len(va)}")
     tl = DataLoader(tr, batch_size=cfg["batch_size"], shuffle=True,
@@ -112,7 +120,9 @@ def main():
     for epoch in range(start_epoch, cfg["epochs"]):
         model.train()
         t0 = time.time(); run = 0.0
-        for it, batch in enumerate(tl):
+        tl_iter = (_tqdm(tl, desc=f"ep{epoch:02d}/{cfg['epochs']}", unit="batch", leave=False,
+                         dynamic_ncols=True) if _tqdm else tl)
+        for it, batch in enumerate(tl_iter):
             for g, blr in zip(opt.param_groups, base_lrs):
                 g["lr"] = blr * lr_at(gstep)
             img = batch["image"].to(device, non_blocking=True)
@@ -126,6 +136,9 @@ def main():
                 [p for p in model.parameters() if p.requires_grad], 1.0)
             opt.step()
             run += loss.item(); gstep += 1
+            if _tqdm is not None:
+                tl_iter.set_postfix(loss=f"{run/(it+1):.3f}", lr=f"{opt.param_groups[0]['lr']:.1e}",
+                                    refresh=False)
         val = evaluate(model, vl, device, cfg["threshold"], cfg["amp"])
         rec = {"epoch": epoch, "train_loss": run / max(1, len(tl)),
                "lr": opt.param_groups[0]["lr"], "time_s": time.time() - t0, **val}

@@ -50,9 +50,15 @@ class FinetunedDinoDetector : public holoscan::Operator {
   struct ChannelBuffers {
     void*    spec_device        = nullptr;   // rows x nfft  complex (cuda::std::complex<float>)
     float*   normalized_device  = nullptr;   // rows x nfft  ([0,1])
+    float*   db_device          = nullptr;   // rows x nfft  dB (fftshifted, gain-corrected) for flatten
+    float*   col_stat_device    = nullptr;   // nfft  per-frequency floor estimate (dB)
+    float*   col_smooth_device  = nullptr;   // nfft  smoothed per-frequency floor (dB)
+    float*   frontend_reference_device = nullptr;  // scalar reference floor level (dB)
     float*   tile_batch_device  = nullptr;   // B x 1 x tile_rows x nfft (model input)
     float*   logits_device      = nullptr;   // B x 1 x tile_rows x nfft (model output)
     uint8_t* tile_mask_device   = nullptr;   // B x tile_rows x nfft (thresholded)
+    float*   window_device      = nullptr;   // fft_size  analysis window (freq axis); leakage suppression
+    size_t   window_len         = 0;         // fft_size the window is currently filled for
     size_t rows = 0;
     size_t nfft = 0;
     size_t tile_rows = 0;
@@ -62,6 +68,7 @@ class FinetunedDinoDetector : public holoscan::Operator {
   };
 
   holoscan::Parameter<std::string> model_script_path_;   // path to <name>.ts (container path)
+  holoscan::Parameter<std::string> fft_window_;          // FFT analysis window: hann|hamming|blackman|none (MUST match training)
   holoscan::Parameter<double>      threshold_;           // sigmoid(logits) >= threshold
   holoscan::Parameter<int>         tile_rows_;           // model input time rows (mult of 16)
   holoscan::Parameter<int>         nfft_;                // model input freq bins (mult of 16)
@@ -77,8 +84,29 @@ class FinetunedDinoDetector : public holoscan::Operator {
   holoscan::Parameter<bool>        real_time_downsample_;
   holoscan::Parameter<int>         downsample_fft_size_;
 
+  // Per-frequency noise-floor flatten (adapted from coherent_power's frontend correction): estimate a
+  // smooth per-frequency floor from the frame and additively lift low-floor bins up to a data-derived
+  // reference so the receiver's filter rolloff/tilt doesn't read as signal to the flat-floor-trained
+  // segmenter. Fully dynamic (per-frame); no calibration file.
+  // Training-power level match: re-level the deployment spectrogram to the absolute dB the finetune
+  // expects. The model uses a FIXED db_vmin/db_vmax, but an unnormalized nfft-pt FFT's noise floor
+  // scales with the RBW (~ sample rate), so a deployment rate != the training rate mis-levels the input
+  // under that fixed clip. A single scalar dB shift (no per-frequency term -> no shape change) anchors
+  // the deployment floor to the training level: 10*log10(rate/reference_sample_rate_hz) + trim.
+  holoscan::Parameter<bool>        match_training_power_level_;
+  holoscan::Parameter<double>      reference_sample_rate_hz_;  // sample rate the checkpoint was trained at
+  holoscan::Parameter<double>      power_level_trim_db_;       // manual scalar nudge (gain/hardware diffs)
+
+  holoscan::Parameter<bool>        flatten_noise_floor_;
+  holoscan::Parameter<double>      flatten_reference_q_;     // quantile (0-100) blending mean->max floor (scale-free)
+  holoscan::Parameter<double>      flatten_smooth_frac_;     // gaussian sigma as a FRACTION of fft_size (bandwidth-invariant)
+  holoscan::Parameter<double>      flatten_max_boost_db_;    // max additive lift per bin (dB; hardware-scale, scale-free)
+  holoscan::Parameter<double>      flatten_signal_cap_db_;   // cap signal influence on the floor estimate (dB; 0=off)
+
   uint64_t compute_count_ = 0;
   bool startup_log_emitted_ = false;
+  bool flatten_log_emitted_ = false;
+  bool level_log_emitted_ = false;
   double inference_ms_ewma_ = 0.0;   // rolling mean of downsample inference time (ms)
   uint64_t inference_samples_ = 0;
   std::vector<uint64_t> frame_count_;

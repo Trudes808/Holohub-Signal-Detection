@@ -10,11 +10,20 @@ detector's imagenet_mean/std) before the backbone.
 """
 from __future__ import annotations
 
+import os
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import dinov3.hub.backbones as B
+# The DINOv3 backbone lives in a source repo (not a pip package). Ensure it's importable even when the
+# environment is stripped (e.g. running under sudo, which drops PYTHONPATH). Override with DINOV3_REPO.
+_DINOV3_REPO = os.environ.get("DINOV3_REPO", "/home/bqn82/dinov3")
+if _DINOV3_REPO and _DINOV3_REPO not in sys.path and os.path.isdir(_DINOV3_REPO):
+    sys.path.insert(0, _DINOV3_REPO)
+
+import dinov3.hub.backbones as B  # noqa: E402
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)

@@ -61,7 +61,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tile-rows", type=int, default=256, help="Model input time rows (mult of 16).")
     p.add_argument("--nfft", type=int, default=1024, help="Model input freq bins (mult of 16).")
     p.add_argument("--sample-rate-hz", type=float, default=DEFAULT_SAMPLE_RATE_HZ,
-                   help="Receive sample rate the checkpoint's physics assumes.")
+                   help="Receive sample rate the checkpoint's physics assumes (single-rate models).")
+    p.add_argument("--rate-range-hz", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                   help="Deployment sample-rate range the model was domain-randomized over. Defaults to "
+                        "[min,max] of the dataset meta's dr_rates_hz if present.")
+    p.add_argument("--fft-window", default=None,
+                   help="FFT analysis window the model was trained with (hann|hamming|blackman|none). "
+                        "Defaults to the dataset meta's fft_window. Recorded so the operator matches.")
     # dB clip + threshold: from --dataset-meta / --eval-meta if given, else these --
     p.add_argument("--db-vmin", type=float, default=None)
     p.add_argument("--db-vmax", type=float, default=None)
@@ -169,6 +175,12 @@ def main() -> int:
         "autocast": args.autocast,
         "bin_hz": float(args.sample_rate_hz) / int(args.nfft),
         "row_seconds": int(args.nfft) / float(args.sample_rate_hz),
+        # Deployment rate range the model is valid over: explicit > dataset dr_rates_hz > null
+        # (single-rate). The operator can warn if the live rate falls outside this.
+        "trained_rate_range_hz": (list(args.rate_range_hz) if args.rate_range_hz else
+                                  ([float(min(ds_meta["dr_rates_hz"])), float(max(ds_meta["dr_rates_hz"]))]
+                                   if ds_meta.get("dr_rates_hz") else None)),
+        "fft_window": args.fft_window or ds_meta.get("fft_window", "hann"),
         "db_vmin": db_vmin,
         "db_vmax": db_vmax,
         "threshold": threshold,

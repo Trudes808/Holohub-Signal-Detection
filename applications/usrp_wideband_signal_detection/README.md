@@ -49,7 +49,7 @@ as the working root; wrappers and helpers live in subfolders and are called with
 | Config | Detector | Use |
 | --- | --- | --- |
 | `config_coherent_power_perf_perfreq_single_channel.yaml` | coherent_power | Live, calibrated per-frequency floor (`per_freq_threshold_mode: calibrated`). |
-| `config_coherent_power_perf_dynamic_single_channel.yaml` | coherent_power | Live, live-learned dynamic floor (`per_freq_threshold_mode: dynamic`; no calibration run needed). |
+| `config_coherent_power_downsample_offline.yaml` | coherent_power | **Default coherent live** config: live-learned dynamic floor (`per_freq_threshold_mode: dynamic`; no calibration run needed) with the dynamic rate/FFT scaling + dynamic color limits, and thresholds tuned to suppress noise speckle. Shares an identical scaffold with the fine-tuned DINO downsample config for apples-to-apples comparison. (Supersedes `old_configs/config_coherent_power_perf_dynamic_single_channel.yaml`.) |
 | `config_cuda_dino_performance_single_channel.yaml` | cuda_dino | Live CUDA DINO detector (zero-shot). |
 | `config_cuda_dino_finetuned_performance_single_channel.yaml` | cuda_dino_finetuned | Live **fine-tuned** DINO segmenter. Geometry-matched dedicated FFT; see [Fine-tuned DINO detector](#fine-tuned-dino-detector-cuda_dino_finetuned). |
 | `config_coherent_power_performance_single_channel_replay.yaml` | coherent_power | Cable-loopback replay of a captured SigMF file. |
@@ -123,8 +123,8 @@ for the cleanest startup. The generic runner rebuilds if needed, syncs the confi
 # Coherent power, calibrated per-frequency floor:
 CONFIG_NAME=config_coherent_power_perf_perfreq_single_channel.yaml sudo ./bash_scripts/run_torchscript_performance_test.sh
 
-# Coherent power, dynamic (self-calibrating) floor:
-CONFIG_NAME=config_coherent_power_perf_dynamic_single_channel.yaml sudo ./bash_scripts/run_torchscript_performance_test.sh
+# Coherent power, dynamic (self-calibrating) floor -- default coherent live config:
+CONFIG_NAME=config_coherent_power_downsample_offline.yaml sudo ./bash_scripts/run_torchscript_performance_test.sh
 
 # CUDA DINO detector, zero-shot (this is the runner's default):
 sudo ./bash_scripts/run_torchscript_performance_test.sh
@@ -223,7 +223,7 @@ threshold is `finetuned_dino_detector.threshold` (M2_ft = 0.85, M1_ft = 0.45).
 
 ### Fine-tuning process
 
-The fine-tuning pipeline lives in `dino_fine_tuning/` (see its `README.md` and
+The fine-tuning pipeline lives in `holohub-dev/dino_fine_tuning/` (see its `README.md` and
 `reports/pipeline.md`). It trains binary signal/noise segmentation on SigMF captures, on a single
 spectrogram grid so training, GT, and inference all share one geometry.
 

@@ -188,6 +188,7 @@ finetuned_dino_detector:
   db_vmin: -46.934                  # global fixed dB->[0,1] clip from the training dataset calibration
   db_vmax: 19.557
   threshold: 0.85                   # M2_ft val-tuned decision threshold (M1_ft = 0.45)
+  fft_window: hann                  # MUST match the model's training window (dataset fft_window / meta.json)
   # ---- model + runtime ----
   model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m2_bf16.ts"
   torch_dtype: "fp32"               # runtime feeds fp32; mixed precision is baked into the .ts (export --autocast bf16)
@@ -197,3 +198,25 @@ finetuned_dino_detector:
   # inference (bounded, rate-independent cost + a 10*log10(fft/nfft) gain correction). false = native.
   real_time_downsample: true
   downsample_fft_size: 0            # 0 = auto-size from the receive rate (=> 10240 @ 245.76 MSps); >0 pins it
+  # Training-power level match. The model uses a FIXED db_vmin/db_vmax, so the deployment spectrogram
+  # must sit at the absolute dB the finetune expects. In a quiet region the model firing on the passband
+  # means the deployment floor maps TOO BRIGHT -> raise vmin to darken it. Use the manual trim:
+  #   power_level_trim_db > 0  -> raises vmin -> darker floor -> FEWER false positives (dial until the
+  #                               quiet-region passband stops firing); < 0 brightens.
+  power_level_trim_db: 0.0
+  # OPT-IN rate/RBW term (10*log10(rate/reference)); only correct if deployment GAIN matches the training
+  # captures -- otherwise it can be the wrong sign, so it's OFF by default (use the trim instead).
+  match_training_power_level: false
+  reference_sample_rate_hz: 245760000.0   # 245.76 MS/s (training captures); only used if match=true
+  # Per-frequency noise-floor flatten: OFF. Training (frames_to_db) does NO flattening -- the model
+  # was trained on raw dB spectrograms that CONTAIN the receiver envelope, so flattening imposes a
+  # shape the model never saw. The correct fix is to MATCH the training envelope + absolute power (see
+  # below), not to flatten. Kept only as an opt-in tool for a future flat-floor-trained model.
+  flatten_noise_floor: false
+  # All knobs below are bandwidth-invariant: reference_q is a percentile, the dB caps are hardware
+  # scale, and the smoothing is a FRACTION of the band -> the same values work at any sample rate with
+  # no per-rate tuning and no no-antenna calibration step (the floor is estimated live each frame).
+  flatten_reference_q: 75.0         # blend mean->max of the per-freq floor for the reference level
+  flatten_smooth_frac: 0.005        # gaussian sigma as a fraction of fft_size (=> ~15 bins @ 3072, ~102 @ 20480)
+  flatten_max_boost_db: 12.0        # max additive lift per bin (dB); hardware rolloff depth, rate-independent
+  flatten_signal_cap_db: 6.0        # cap a bin's influence on its own floor estimate (dB; 0 = off)

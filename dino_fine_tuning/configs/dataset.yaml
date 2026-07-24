@@ -1,37 +1,29 @@
-# Dataset-build configuration for DINOv3 RF signal/noise fine-tuning.
-# Geometry is chosen to match the deployed DINO detector's input aspect
-# (time x freq tile) while staying tractable for these 245.76 MSps captures.
-# See reports/pipeline.md for the rationale and every deviation from the brief.
-
 captures_dir: /home/bqn82/captures
-out_dir: /home/bqn82/Holohub-Signal-Detection/dino_fine_tuning/data/dataset
-
-# --- spectrogram geometry (single grid; no resampling between train & eval) ---
-nfft: 1024                 # frequency bins  -> 245.76e6/1024 = 240 kHz/bin
-frame_rows: 256            # time rows per frame; each row = one nfft-sample FFT block
-# frame spans frame_rows*nfft = 262144 samples = 1.067 ms @ 245.76 MSps
-# DINO input == native grid: 256 (time) x 1024 (freq), patch16 -> 16x64 = 1024 tokens
-
-# --- dB -> uint8 image mapping (GLOBAL & fixed so cross-dB SNR is preserved) ---
-# Filled by the calibration pass (build_dataset.py --calibrate) if left null.
+out_dir: /home/sat3737/holohub-dev/dino_fine_tuning/data/dataset
+nfft: 1024
+frame_rows: 256
 db_vmin: null
 db_vmax: null
-calib_frames_per_file: 40  # random frames per capture used to estimate global dB range
-
-# --- frame selection / balance ---
-min_signal_pixels: 1       # a frame is "signal" if its GT mask has >= this many px
-noise_to_signal_ratio: 0.6 # keep this many noise-only frames per signal frame (per capture)
-max_frames_per_capture: 1500   # cap (signal+noise) per capture for the full run
-frame_stride: 1            # 1 = contiguous non-overlapping frames
-
-# --- temporal split (per capture, so every dB level appears in every split) ---
+calib_frames_per_file: 40
+min_signal_pixels: 1
+noise_to_signal_ratio: 0.6
+max_frames_per_capture: 500
+frame_stride: 1
 split:
-  train: 0.70
+  train: 0.7
   val: 0.15
   test: 0.15
-  guard_frames: 8          # dropped between splits to avoid adjacent-frame leakage
-
-# --- attenuation grouping for the two experiments ---
-low_atten_max_db: 30       # M1 trains on captures with attenuation_db <= this
-
+  guard_frames: 8
+low_atten_max_db: 30
 seed: 7
+domain_randomize: true
+dr_rates_hz:
+- 245.76e6
+- 122.88e6
+- 61.44e6
+- 30.72e6
+- 20.48e6
+dr_centers_per_frame: 2
+dr_center_max_frac: 0.4
+sweep_stats_dir: /home/bqn82/captures/dino_finetune_x411_sweep/stats
+fft_window: hann

@@ -144,8 +144,17 @@ visualization:
     tensor_name: "spectrogram"
     demo_title: "Enabling RF AI for Ultra Wideband Real Time Applications"
     demo_subtitle: "Holoscan enables GPU native real time signal processing and computer vision models to detect and extract regions of interest \n \t\t\t\t\t\t from a 500 MSps stream, reducing RF AI workloads to only the regions that matter."
-    blue_limit: 0.15
+    blue_limit: 0.15               # fallback during warmup / when dynamic_color_limits is false
     red_limit: 0.88
+    # Auto-calibrate the spectrogram color range per run: accumulate a grayscale histogram over the
+    # first N frames, then freeze blue=low-pct / red=high-pct for the run (recalibrates each launch).
+    dynamic_color_limits: true
+    dynamic_color_warmup_frames: 60
+    dynamic_color_low_pct: 0.10    # noise floor -> blue
+    # Span mode: red = blue + span, so anything just above the noise floor maps bright (faint signals
+    # show; strong signals saturate). Smaller span = more sensitive; raise it if noise gets speckly.
+    dynamic_color_span: 0.30
+    dynamic_color_high_pct: 0.995  # only used if dynamic_color_span <= 0
     overlay_alpha: 0.7
     center_frequency_hz: 2400000000.0
     fft_size: 20480
@@ -175,12 +184,14 @@ finetuned_dino_detector:
   # ---- geometry contract: MUST match the checkpoint's exported *.meta.json ----
   tile_rows: 256                    # model input time rows (mult of 16); 512 for the retrained target
   nfft: 1024                        # model input freq bins (mult of 16) -> dedicated FFT size
-  db_vmin: -46.934                  # global fixed dB->[0,1] clip from the training dataset calibration
-  db_vmax: 19.557
-  threshold: 0.85                   # M2_ft val-tuned decision threshold (M1_ft = 0.45)
+  fft_window: "hann"                # analysis window; MUST match the checkpoint meta.json fft_window
+  db_vmin: -47.6526985168457        # global fixed dB->[0,1] clip from the M2_dr (dataset_dr) calibration
+  db_vmax: 20.45633316040039
+  threshold: 0.95                   # M2_dr operating point (real-OTA + labeled threshold sweeps); tune here
   # ---- model + runtime ----
-  model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m2.ts"
-  torch_dtype: "fp32"               # fp32 | fp16
+  # M2_dr = band/rate-invariant domain-randomized segmenter (trained 20.48-245.76 MS/s, Hann window).
+  model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m2_dr_bf16.ts"
+  torch_dtype: "fp32"               # fp32 | fp16 (bf16 compute is baked into the traced .ts)
   emit_stride: 1
   channel_filter: -1
   # Real-time "downsample" mode (experimental): run a wide FFT then bilinear-resize the freq axis to

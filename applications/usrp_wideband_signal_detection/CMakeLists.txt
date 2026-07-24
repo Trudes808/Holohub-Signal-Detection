@@ -318,7 +318,7 @@ endforeach()
 
   set(USRP_WIDEBAND_CONFIG_FILES
     config_coherent_power_perf_perfreq_single_channel.yaml
-    config_coherent_power_perf_dynamic_single_channel.yaml
+    config_coherent_power_downsample_offline.yaml
     config_cuda_dino_performance_single_channel.yaml
     config_cuda_dino_finetuned_performance_single_channel.yaml
     config_coherent_power_performance_single_channel_replay.yaml

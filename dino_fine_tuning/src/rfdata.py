@@ -123,15 +123,41 @@ def load_capture(meta_path: Path) -> Capture:
 # --------------------------------------------------------------------------- #
 # Spectrogram (GPU-batched)
 # --------------------------------------------------------------------------- #
+_WIN_CACHE: dict = {}
+
+
+def get_window(name, nfft: int, device) -> torch.Tensor:
+    """RMS-normalized analysis window (freq axis). RMS-normalization keeps the noise-floor power
+    ~unchanged so db_vmin/db_vmax stay comparable to the no-window scale. 'none' -> ones (no window)."""
+    key = (str(name), int(nfft), str(device))
+    if key not in _WIN_CACHE:
+        if name in (None, "none", False):
+            w = torch.ones(nfft, dtype=torch.float32, device=device)
+        elif name == "hann":
+            w = torch.hann_window(nfft, periodic=True, dtype=torch.float32, device=device)
+        elif name == "hamming":
+            w = torch.hamming_window(nfft, periodic=True, dtype=torch.float32, device=device)
+        elif name == "blackman":
+            w = torch.blackman_window(nfft, periodic=True, dtype=torch.float32, device=device)
+        else:
+            raise ValueError(f"unknown window '{name}'")
+        w = w / w.pow(2).mean().clamp_min(1e-12).sqrt()
+        _WIN_CACHE[key] = w
+    return _WIN_CACHE[key]
+
+
 def frames_to_db(
-    iq_frames: torch.Tensor, nfft: int, frame_rows: int
+    iq_frames: torch.Tensor, nfft: int, frame_rows: int, window: str = "hann"
 ) -> torch.Tensor:
     """(B, frame_rows*nfft) complex -> (B, frame_rows, nfft) dB spectrogram.
 
-    Matches eval_viz.spectrogram_db_from_iq: per-row fftshift(fft) magnitude in dB.
+    Per-row fftshift(fft) magnitude in dB, with an analysis `window` applied along the freq axis to
+    suppress spectral leakage (must match the deployed detector's FFT window). window='none' = legacy.
     """
     B = iq_frames.shape[0]
     block = iq_frames.reshape(B, frame_rows, nfft)
+    if window not in (None, "none", False):
+        block = block * get_window(window, nfft, block.device)
     spec = torch.fft.fftshift(torch.fft.fft(block, dim=-1), dim=-1)
     power = spec.real**2 + spec.imag**2 + 1e-12
     return 10.0 * torch.log10(power)
