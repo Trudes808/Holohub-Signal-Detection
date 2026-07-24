@@ -48,6 +48,20 @@ Save-all baseline at 500 MSps cf32 = **14,400 GB/hr** (40 GB per 10 s capture).
 | 1.0 GHz | snip · 256px | 5,236 | 317 MB | 114 | 126× |
 | 1.0 GHz | snip · 75 kHz + 1 ms | **1,829** | **254 MB** | 91 | **157.5×** |
 
+### Two-channel system totals — 10 s (`ota_system_totals.csv`)
+Both captures together = the two-channel 500 MSps system. Save-all for 10 s = **2 × 40 GB = 80 GB**.
+
+| gate | stored (10 s) | vs 80 GB | recordings | files (data+meta) |
+|---|---:|---:|---:|---:|
+| snip · 256px | **1.21 GB** | **66.1× less** | 21,952 | 43,904 |
+| snip · 75 kHz + 1 ms | **0.90 GB** | **88.5× less** | **4,014** | **8,028** |
+
+So in a 10-second dual-500-MSps window the coherent-power snipper turns **80 GB of raw IQ into
+~0.90 GB across 4,014 SigMF recordings** (8,028 files: one `.sigmf-data` + one `.sigmf-meta` per
+detection) under the 75 kHz/1 ms gate. (These runs use `write_iq: false`, so only the `.sigmf-meta`
+files are actually on disk; the byte totals are the exact sizes the `.sigmf-data` would occupy. Note
+the 1.0 GHz share — 1,829 recordings / 254 MB — is the band-edge spur, see below.)
+
 **Interpretation.** The 256-pixel gate alone leaves many tiny fragments (16.7k / 5.2k snippets).
 Adding the 75 kHz bandwidth + 1 ms duration filters cuts the snippet count by **87 % / 65 %** while
 shedding only **27 % / 20 %** of the bytes — i.e. it removes thousands of tiny, low-content fragments
@@ -83,6 +97,7 @@ to get a meaningful 1.0 GHz number: restrict detection to the ±200 MHz analog p
 - `render_ota_overlay.py` — spectrogram + snipper-box overlays (→ `ota_overlay_cf{2400,1000}MHz.png`).
 - `make_live_eval.py` — builds the combined table + figure from the two source metrics CSVs.
 - `ota_live_eval.csv` — the three-way comparison table (source of the table above).
+- `ota_system_totals.csv` — two-channel system totals (save-all 80 GB vs stored, recording/file counts).
 - `ota_live_eval.png` — stored GB/hr (log) per capture vs the save-all line, snippet counts + reductions.
 - `ota_metrics_snip_256px.csv`, `ota_metrics_snip_75kHz_1ms.csv` — raw `snip_pipeline` per-capture metrics.
 

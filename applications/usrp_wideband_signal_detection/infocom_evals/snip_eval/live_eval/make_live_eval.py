@@ -67,6 +67,30 @@ with open(out_csv, "w", newline="") as fh:
     w.writeheader(); w.writerows(rows)
 print("wrote", out_csv)
 
+# ---- two-channel system totals (both captures = the 2-channel 500 MSps system over 10 s) ----
+N_CH = 2
+saveall_2ch_gb = RATE_HZ * DURATION_S * BYTES_PER_SAMPLE * N_CH / 1e9   # 80.0 GB (both channels, 10 s)
+sys_rows = []
+for stage_label, _ in STAGES:
+    m = metrics[stage_label]
+    tot_samp = sum(int(m[c]["stored_samples"]) for c in captures)
+    tot_snips = sum(int(m[c]["n_snippets"]) for c in captures)
+    gb = tot_samp * BYTES_PER_SAMPLE / 1e9
+    sys_rows.append(dict(config=stage_label,
+                         saveall_two_channel_GB_10s=round(saveall_2ch_gb, 1),
+                         stored_GB_10s=round(gb, 3), stored_MB_10s=round(gb * 1000, 1),
+                         reduction_x=round(saveall_2ch_gb / gb, 1),
+                         n_recordings=tot_snips, n_files_data_plus_meta=tot_snips * 2))
+sys_csv = HERE / "ota_system_totals.csv"
+with open(sys_csv, "w", newline="") as fh:
+    w = csv.DictWriter(fh, fieldnames=list(sys_rows[0].keys()))
+    w.writeheader(); w.writerows(sys_rows)
+print("wrote", sys_csv)
+for r in sys_rows:
+    print(f"  [{r['config']:>10}] 2-ch save-all {r['saveall_two_channel_GB_10s']} GB -> stored "
+          f"{r['stored_GB_10s']} GB ({r['reduction_x']}x less), "
+          f"{r['n_recordings']:,} recordings ({r['n_files_data_plus_meta']:,} files)")
+
 # ---- figure: stored GB/hr (log) per capture, two gate settings, vs the save-all line ----
 cap_labels = [CAP_LABEL.get(c, c) for c in captures]
 x = np.arange(len(captures))
@@ -96,6 +120,12 @@ ax.set_ylabel("Stored Data (GB / hour, log scale)")
 ax.set_title("Live OTA data-saving: coherent-power snip vs save-all")
 ax.grid(alpha=.3, which="both", axis="y")
 ax.legend(loc="upper right", fontsize=8)
+r75 = next(r for r in sys_rows if "75" in r["config"])
+fig.text(0.5, -0.015,
+         f"Two-channel system, 10 s:  save-all {saveall_2ch_gb:.0f} GB  →  coherent-power snip "
+         f"{r75['stored_GB_10s']:.2f} GB ({r75['reduction_x']:g}× less) in "
+         f"{r75['n_recordings']:,} recordings / {r75['n_files_data_plus_meta']:,} files [75 kHz+1 ms]",
+         ha="center", va="top", fontsize=9)
 fig.tight_layout()
 out_png = HERE / "ota_live_eval.png"
 fig.savefig(out_png)
