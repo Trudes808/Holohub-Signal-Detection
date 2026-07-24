@@ -1,0 +1,3 @@
+capture,seconds,n_frames,mask_coverage_pct,n_snippets,n_detections,stored_samples,stored_iq_bytes_on_disk,stored_GB_per_hour,save_all_GB_per_hour,reduction_x,soft_label_meta
+ota_x410_cf2400MHz_500Msps_cf32_10s.sigmf-data,10.0,476,0.739,16716,16716,111624690,0,321.479,14400.0,44.8,/tmp/usrp_spectrograms/ota_snip_pipeline/soft_labels/ota_x410_cf2400MHz_500Msps_cf32_10s.sigmf-meta
+ota_x410_cf1000MHz_500Msps_cf32_10s.sigmf-data,10.0,476,0.23,5236,5236,39651875,0,114.197,14400.0,126.1,/tmp/usrp_spectrograms/ota_snip_pipeline/soft_labels/ota_x410_cf1000MHz_500Msps_cf32_10s.sigmf-meta

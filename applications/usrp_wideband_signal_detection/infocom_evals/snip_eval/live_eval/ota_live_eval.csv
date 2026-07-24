@@ -1,0 +1,7 @@
+capture,stage,n_snippets,stored_MB_10s,stored_GB_per_hr,reduction_x,mask_coverage_pct
+2.4 GHz,original (save-all),,40000.0,14400.0,1.0,
+2.4 GHz,snip · 256px,16716,893.0,321.48,44.8,0.739
+2.4 GHz,snip · 75kHz+1ms,2185,649.8,233.94,61.6,0.739
+1.0 GHz,original (save-all),,40000.0,14400.0,1.0,
+1.0 GHz,snip · 256px,5236,317.2,114.2,126.1,0.23
+1.0 GHz,snip · 75kHz+1ms,1829,253.9,91.41,157.5,0.23

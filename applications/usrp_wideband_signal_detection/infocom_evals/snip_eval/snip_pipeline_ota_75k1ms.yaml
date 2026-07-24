@@ -1,0 +1,23 @@
+# Second pass for the OTA 500 MSps captures: the first pass (256-pixel gate only) produced ~16.7k
+# tiny snippets, so add the 75 kHz bandwidth filter (mask pre-filter + post-merge box gate) and the
+# 1 ms minimum-duration gate, per the plan. Detector/masks are unchanged, so this run reuses the
+# first pass's masks (symlinked; see the setup step) and only re-runs the snip + eval stages.
+
+detector: coherent_power
+detector_config: /home/bqn82/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/config_coherent_power_500msps_1ch.yaml
+
+captures:
+  - /tmp/usrp_spectrograms/ota_x410_cf2400MHz_500Msps_cf32_10s.sigmf-data
+  - /tmp/usrp_spectrograms/ota_x410_cf1000MHz_500Msps_cf32_10s.sigmf-data
+
+snipper:
+  mode: frequency
+  min_mask_bandwidth_hz: 75000.0    # per-row run-length mask pre-filter (spur/fragment-proof)
+  min_bandwidth_hz: 75000.0         # post-merge bounding-box bandwidth gate
+  min_duration_s: 0.001             # 1 ms minimum duration
+  min_box_pixels: 256
+
+write_iq: false
+output_root: /tmp/usrp_spectrograms/ota_snip_pipeline_75k1ms
+container_name: usrp_x410_sig_det_bqn82
+captures_root: /tmp/usrp_spectrograms
