@@ -1,0 +1,4 @@
+capture,seconds,n_frames,mask_coverage_pct,n_snippets,n_detections,stored_samples,stored_iq_bytes_on_disk,stored_GB_per_hour,save_all_GB_per_hour,reduction_x,soft_label_meta
+attenuation_dB_0.sigmf-data,7.09,332,23.221,284,284,587282854,4698262832,2385.898,7077.9,3.0,/tmp/usrp_spectrograms/snip_pipeline_demo/soft_labels/attenuation_dB_0.sigmf-meta
+test_1.sigmf-data,3.0,140,1.221,23,23,2172884,17383072,20.86,7077.9,339.3,/tmp/usrp_spectrograms/snip_pipeline_demo/soft_labels/test_1.sigmf-meta
+attenuation_dB_45.sigmf-data,7.18,336,0.958,358,358,10757877,86063016,43.148,7077.9,164.0,/tmp/usrp_spectrograms/snip_pipeline_demo/soft_labels/attenuation_dB_45.sigmf-meta

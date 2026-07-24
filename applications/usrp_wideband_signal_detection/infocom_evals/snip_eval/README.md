@@ -73,6 +73,26 @@ real_snip_metrics.csv   →   plot_data_saving.py  (figures in figs/)
   SNR; ground-truth/DINO masks untouched). See problem.md "Implemented fix".
 - **`render_spectrogram_overlay.py` / `visualize_bbox.py` / `render_masks.py`** — per-frame debug
   visualizations (spectrogram + mask + snipper boxes).
+- **`plot_maskfilter_figs.py`** — before/after figures in the notebook Figures 1–3 house style
+  (GB/hr log vs SNR), one fig2 (time-slice) + fig3 (snip) pair per gate config →
+  `figs_minsize/fig{2,3}_*_before_after_{100k5ms,75k1ms}.png`. The 75k BEFORE curve and the GT
+  ceilings come from the validated offline replication (`replicate_75k_before.py`,
+  `fix_quantification.csv`), labeled as such.
+
+### End-to-end pipeline (`snip_pipeline.py`)
+One YAML config → mask generation → real snip → soft-label metas → eval, per capture:
+```
+~/miniforge3/envs/dinov3/bin/python snip_pipeline.py snip_pipeline_demo.yaml
+```
+Config selects the detector (+ optional detector config), the captures (list and/or directory),
+the snipper selectivity (`min_mask_bandwidth_hz` mask filter, `min_bandwidth_hz`/`min_duration_s`
+box gates, `min_box_pixels` area), and `write_iq`. Outputs under `output_root`:
+- `masks/<stem>/mask_arrays/*.npy` — the detector's masks (real container run),
+- `snip/<stem>/snippets/*.sigmf-{data,meta}` — one recording per snipped detection,
+- `soft_labels/<stem>.sigmf-meta` — the ORIGINAL capture meta + appended detection annotations
+  (absolute RF edges + `wfgt:*_offset_hz` + provenance; `wfgt:soft_label: true`),
+- `pipeline_metrics.csv` + `pipeline_summary.png` — per-capture footprint / reduction / coverage.
+Stages are resumable per capture. Needs the container + docker access (see problem.md).
 
 ## Run it (both modes, one command)
 ```

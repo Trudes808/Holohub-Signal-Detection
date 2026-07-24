@@ -1,0 +1,38 @@
+# snip_pipeline.py demo config — coherent_power over three captures spanning the interesting
+# regimes: wired max-SNR (attenuation 0 -> +54 dB), live over-the-air, and wired low-SNR
+# (attenuation 45 -> +9 dB). Run:
+#   ~/miniforge3/envs/dinov3/bin/python snip_pipeline.py snip_pipeline_demo.yaml
+
+# Detector that produces the masks (container binary). detector_config: null uses the driver's
+# per-detector default (coherent_power -> config_coherent_power_perf_perfreq_single_channel.yaml).
+detector: coherent_power
+detector_config: null
+
+# The set of waveform captures. Either an explicit list, a directory (captures_dir +
+# captures_glob), or both.
+captures:
+  - /home/bqn82/captures/attenuation_dB_0.sigmf-data
+  - /home/bqn82/captures/live_data/sigmf_out/test_1.sigmf-data
+  - /home/bqn82/captures/attenuation_dB_45.sigmf-data
+# captures_dir: /home/bqn82/captures
+# captures_glob: "attenuation_dB_*.sigmf-data"
+
+# Snipper selectivity. Frequency selectivity appears twice on purpose:
+#   min_mask_bandwidth_hz  — on the MASK (per-row run-length pre-filter; spur/fusion-proof)
+#   min_bandwidth_hz       — on the merged bounding boxes (post-merge gate)
+# Time selectivity is min_duration_s (post-merge; pixel-run time gates would erase speckly real
+# detections). Area selectivity is min_box_pixels (pre-merge connected-component speckle gate).
+snipper:
+  mode: frequency            # "frequency" (snip + resample) or "time_only" (full-band slices)
+  min_mask_bandwidth_hz: 100000.0
+  min_bandwidth_hz: 100000.0
+  min_duration_s: 0.005
+  min_box_pixels: 256
+
+# true: keep the snipped IQ (.sigmf-data + .sigmf-meta per detection).
+# false: footprint-only (metas only; bytes still measured exactly).
+write_iq: true
+
+output_root: /tmp/usrp_spectrograms/snip_pipeline_demo
+container_name: usrp_x410_sig_det_bqn82
+captures_root: /home/bqn82/captures     # the container's /workspace/captures mount
