@@ -66,6 +66,11 @@ real_snip_metrics.csv   →   plot_data_saving.py  (figures in figs/)
 - **`quantify_fixes.py`** — offline replication of the snipper clustering that scores candidate
   fixes (persistent-column split, fill-ratio gate, spur suppression) against the current behavior
   under all three size-gate configs → `fix_quantification.csv`.
+- **`prototype_mask_filter.py`** — prototype + prediction for the fix that was ultimately
+  **implemented**: `signal_snipper.min_mask_bandwidth_hz`, a pre-labeling per-row run-length mask
+  filter (enabled in the two minsize configs). Validated against the real pipeline:
+  `real_snip_metrics_minsize_v2.csv` / `real_snip_metrics_75k_v2.csv` (coherent_power → 0 at low
+  SNR; ground-truth/DINO masks untouched). See problem.md "Implemented fix".
 - **`render_spectrogram_overlay.py` / `visualize_bbox.py` / `render_masks.py`** — per-frame debug
   visualizations (spectrogram + mask + snipper boxes).
 

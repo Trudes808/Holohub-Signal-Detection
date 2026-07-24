@@ -301,6 +301,36 @@ Key observations:
    TB/hr (default gate, frequency): **the detectors are actually comparable** — the entire
    0.92-vs-0.00 gap in the current tables is the spur-fusion artifact.
 
+### Implemented fix (2026-07-24): `min_mask_bandwidth_hz` mask pre-filter — VALIDATED
+
+Per discussion, the fix was implemented as a **mask-level filter in the snipper** rather than a
+box-level or detector-side change: a new `signal_snipper.min_mask_bandwidth_hz` param (default 0 =
+off) zeroes out lit runs narrower than that bandwidth **along each mask row**, before
+connected-component labeling (Hz auto-scaled to columns from the delivered sample rate;
+`filter_mask_min_run_cols` in `signal_snip_core.cu`). Because it acts on pixel runs — not component
+bounding boxes — it removes the ~3-column spur line even though it touches a large component, which
+is exactly the failure mode that defeats the post-merge `min_bandwidth_hz` gate. The min-duration
+requirement stays at the existing bbox gate (a strict pixel-run duration filter would erase speckly
+real detections). Enabled at 100 kHz / 75 kHz in the two minsize eval configs; every other config
+keeps current behavior.
+
+Validation (Python prototype `prototype_mask_filter.py` → real rebuilt pipeline, both matching to
+three decimals; results in `real_snip_metrics_minsize_v2.csv` / `real_snip_metrics_75k_v2.csv`):
+
+| coherent_power | gate | before (freq / time TB/hr) | after (freq / time) |
+|---|---|---|---|
+| −16 dB (atten 70) | 100 kHz/5 ms | 0.92 / 5.35 | **0.000 / 0.000** |
+| −16 dB (atten 70) | 75 kHz/1 ms | 0.92 / 5.72 | **0.000 / 0.000** |
+| +14 dB (atten 40) | 100 kHz/5 ms | 1.08 / 5.36 | 0.005 / 0.245 |
+| +14 dB (atten 40) | 75 kHz/1 ms | 1.09 / 5.97 | 0.014 / 0.386 |
+
+- At low SNR coherent_power now lands on **exactly the same 0 as the fine-tuned DINO** — the
+  0.92-vs-0.00 gap was entirely the spur-fusion artifact.
+- **Harmlessness proven on ground truth**: the run-length filter removes **0.00%** of lit pixels
+  from `ground_truth` and `finetuned_dino_m2` masks at every attenuation (narrowest real signal =
+  324 kHz ≈ 13 columns ≫ the 5-column threshold). What it removes from coherent masks is the spur
+  plus sub-100 kHz speckle.
+
 ### Recommendation
 
 1. **Implement the persistent-column split in the snipper** (`signal_snip_core.cu` /
@@ -339,6 +369,12 @@ the sudo-capable account, either:
 Either grant is root-equivalent (standard docker caveat). Verify with `sudo -n docker ps`.
 
 ## Status
+
+**2026-07-24: fix implemented and validated.** `signal_snipper.min_mask_bandwidth_hz` (pre-labeling
+per-row run-length mask filter) is compiled in and enabled in the two minsize eval configs; the
+re-run real pipeline confirms coherent_power's low-SNR footprint collapses to the honest 0 while
+ground-truth/DINO masks are untouched (section "Implemented fix" above). Refreshed metrics in
+`real_snip_metrics_minsize_v2.csv` and `real_snip_metrics_75k_v2.csv`.
 
 **2026-07-23, second investigation complete (diagnose-only, per user direction):**
 - Pipeline accounting audited end-to-end — correct; the footprint numbers are real, caused by the
