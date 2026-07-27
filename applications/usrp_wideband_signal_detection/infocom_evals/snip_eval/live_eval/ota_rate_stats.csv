@@ -1,0 +1,4 @@
+series,spur,n_detections,total_stored_MB,effective_seconds,mean_Gbps,min_Gbps,max_Gbps,std_Gbps,median_Gbps,p5_Gbps,p95_Gbps,peak_to_mean,mean_MBps,mean_GB_per_hr,mean_det_per_s,max_det_per_s,saveall_Gbps,reduction_vs_saveall_x
+2.4 GHz,False,2185,649.8,9.982,0.5208,0.0,4.9063,0.4497,0.4281,0.0353,1.2467,9.4,65.1,234.3,218.9,619.9,32.0,61.4
+1.0 GHz,True,1829,253.9,9.982,0.2035,0.0,0.494,0.1031,0.2124,0.0279,0.3635,2.4,25.44,91.6,183.2,381.5,32.0,157.3
+2-channel (modeled),False,4014,903.7,9.982,0.7243,0.0,5.2053,0.4713,0.624,0.1813,1.4536,7.2,90.53,325.9,402.1,858.3,64.0,88.4

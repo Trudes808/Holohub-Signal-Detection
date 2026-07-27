@@ -93,7 +93,36 @@ signal — treat the 1.0 GHz row as a hardware-artifact demonstration, not a dat
 to get a meaningful 1.0 GHz number: restrict detection to the ±200 MHz analog passband (or notch the
 +240 MHz spur bin), which the current gate settings do not do. The 2.4 GHz result stands on its own.
 
+## Detection & data-transfer-rate analysis (`analyze_rate.py`, 75 kHz/1 ms pipeline)
+How the stored-data transfer rate and detection rate vary across the ~10 s experiment, binned by the
+detector's native frame (10.49M samples = **20.97 ms**, 476 frames = 9.98 s). Figures:
+`ota_rate_vs_time.png` (rate + detection rate vs time) and `ota_detection_distributions.png`
+(per-detection bandwidth / duration / stored-size histograms).
+
+| series | mean | peak | peak/mean | mean det-rate | vs save-all |
+|---|---:|---:|---:|---:|---:|
+| 2.4 GHz | 0.52 Gbps (65 MB/s) | 4.91 Gbps | **9.4×** (bursty) | 219 det/s (peak 620) | 61× below 32 Gbps |
+| 1.0 GHz *(spur)* | 0.20 Gbps (25 MB/s) | 0.49 Gbps | **2.4×** (steady) | 183 det/s | 157× below 32 Gbps |
+| 2-channel (modeled) | 0.72 Gbps (91 MB/s) | 5.21 Gbps | 7.2× | 402 det/s (peak 858) | **88× below 64 Gbps** |
+
+**Takeaways.**
+- The rate is **bursty** for real traffic — 2.4 GHz averages 0.52 Gbps but peaks at ~4.9 Gbps
+  (9.4× peak-to-mean, e.g. the spike at ~6.2 s), so a real-time link/buffer must be provisioned for
+  the peak, not the mean. The two-channel system peaks at ~5.2 Gbps vs a 0.72 Gbps mean.
+- The **1.0 GHz spur is nearly constant** (2.4× peak-to-mean) — a steady carrier, not bursty traffic —
+  another confirmation it isn't real activity.
+- Per-detection distributions cleanly separate them: 1.0 GHz bandwidth is a single ~8.5 MHz spike
+  (fixed spur), while 2.4 GHz spans 1–70 MHz (median 8.4 MHz). 2.4 GHz stored sizes range 11 KB →
+  12.7 MB per detection (big Wi-Fi bursts); the spur is a tight 13–560 KB.
+
+CSVs: `ota_rate_timeseries.csv` (per-frame ndet / bytes / Gbps / MB/s × {2.4, 1.0, 2-ch}),
+`ota_rate_stats.csv` (min/mean/max/std/median/p5/p95 + totals + det-rate per series),
+`ota_detection_property_stats.csv` (bandwidth/duration/stored-size/decimation stats per capture).
+The two captures were sequential; the "2-channel" series sums them frame-wise as the dual-500-MSps
+config captures simultaneously (exact for totals/means; the combined per-frame peak is a model estimate).
+
 ## Files
+- `analyze_rate.py` — detection-rate + data-transfer-rate analysis (→ `ota_rate_*.{csv,png}`, `ota_detection_*`).
 - `render_ota_overlay.py` — spectrogram + snipper-box overlays (→ `ota_overlay_cf{2400,1000}MHz.png`).
 - `make_live_eval.py` — builds the combined table + figure from the two source metrics CSVs.
 - `ota_live_eval.csv` — the three-way comparison table (source of the table above).
