@@ -11,6 +11,7 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,6 +31,10 @@ void SigmfFileSinkOp::setup(OperatorSpec& spec) {
              std::string("/tmp/usrp_spectrograms/snippets"));
   spec.param(filename_prefix_, "filename_prefix", "Filename prefix", "Prefix for emitted files.",
              std::string("snip"));
+  spec.param(write_iq_, "write_iq", "Write IQ",
+             "If false, write only the .sigmf-meta and immediately delete the .sigmf-data. The snip "
+             "footprint stays exactly measurable (sample_count/rate in the meta) without storing IQ.",
+             true);
   spec.param(max_queued_batches_, "max_queued_batches", "Max queued batches",
              "Bound on batches awaiting the background writer; excess is dropped so the pipeline "
              "never blocks on disk. Each queued batch pins its device IQ until written, so this also "
@@ -142,12 +147,14 @@ void SigmfFileSinkOp::flush_pack() {
   }
 
   if (uniform) {
-    snip::write_sigmf_pack(pack_stem, pending_);
+    const std::string dpath = snip::write_sigmf_pack(pack_stem, pending_);
+    if (!write_iq_.get()) { std::error_code ec; std::filesystem::remove(dpath, ec); }
     ++files_written_;
     HOLOSCAN_LOG_INFO("sigmf_file_sink: flushed pack {} ({} snippet(s), 1 uniform recording).",
                       pack_id, pending_.size());
   } else {
-    snip::write_sigmf_container(pack_stem, pending_);
+    const std::string dpath = snip::write_sigmf_container(pack_stem, pending_);
+    if (!write_iq_.get()) { std::error_code ec; std::filesystem::remove(dpath, ec); }
     ++files_written_;
     HOLOSCAN_LOG_INFO("sigmf_file_sink: flushed pack {} ({} snippet(s), 1 variable-rate container).",
                       pack_id, pending_.size());
@@ -181,7 +188,8 @@ void SigmfFileSinkOp::write_host_batch(const std::vector<snip::HostSnippet>& sni
   uint64_t seq = 0;
   for (const auto& host : snippets) {
     const std::string stem = stem_for(output_dir_.get(), filename_prefix_.get(), host, seq++);
-    snip::write_sigmf_recording(stem, host);
+    const std::string dpath = snip::write_sigmf_recording(stem, host);
+    if (!write_iq_.get()) { std::error_code ec; std::filesystem::remove(dpath, ec); }
     ++files_written_;
   }
   if (!snippets.empty()) {

@@ -19,6 +19,9 @@ APP_DIR = REPO_ROOT / "applications/usrp_wideband_signal_detection"
 DETECTOR_BASE_CONFIGS = {
     "cuda_dino": APP_DIR / "config_cuda_dino_performance_single_channel.yaml",
     "coherent_power": APP_DIR / "config_coherent_power_perf_perfreq_single_channel.yaml",
+    # Replays precomputed masks (via --mask-dir) through the graph so the signal_snipper can snip
+    # ANY detector's masks. Requires the mask_replay_detector operator compiled into the container.
+    "mask_replay": APP_DIR / "config_mask_replay_snip_single_channel.yaml",
 }
 DEFAULT_DETECTOR = "cuda_dino"
 DEFAULT_CONFIG_PATH = DETECTOR_BASE_CONFIGS[DEFAULT_DETECTOR]
@@ -47,6 +50,8 @@ CONTAINER_NAME = (
 HOST_SCRATCH_ROOT = Path("/tmp/usrp_spectrograms")
 CONTAINER_SCRATCH_ROOT = Path("/workspace/spectrograms")
 CONTAINER_REPO_ROOT = Path("/workspace/holohub")
+HOST_CAPTURES_ROOT = Path(os.environ.get("HOST_CAPTURES_ROOT", "/home/bqn82/captures")).expanduser()
+CONTAINER_CAPTURES_ROOT = Path("/workspace/captures")
 GENERATED_CONFIG_ROOT = REPO_ROOT / "applications/usrp_wideband_signal_detection/generated_configs"
 CONTAINER_BINARY_CANDIDATES = (
     CONTAINER_REPO_ROOT / "build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection/run_offline_cuda_detector_eval",
@@ -147,6 +152,9 @@ def map_host_path_to_container(host_path: Path) -> Path:
     if resolved == HOST_SCRATCH_ROOT or HOST_SCRATCH_ROOT in resolved.parents:
         relative = resolved.relative_to(HOST_SCRATCH_ROOT)
         return CONTAINER_SCRATCH_ROOT / relative
+    if resolved == HOST_CAPTURES_ROOT or HOST_CAPTURES_ROOT in resolved.parents:
+        relative = resolved.relative_to(HOST_CAPTURES_ROOT)
+        return CONTAINER_CAPTURES_ROOT / relative
     raise ValueError(
         f"Path is not mounted into the demo container: {resolved}. "
         f"Use a path under {HOST_SCRATCH_ROOT} or under {REPO_ROOT}."
@@ -177,6 +185,8 @@ def ensure_offline_eval_config(
     save_tensors: bool = True,
     save_debug_artifacts: bool = True,
     trace_frames: bool = False,
+    mask_dir: str | None = None,
+    snippets_only: bool = False,
 ) -> Path:
     config_text = config_path.read_text(encoding="utf-8")
 
@@ -200,8 +210,9 @@ def ensure_offline_eval_config(
         "save_detector_debug_artifacts": save_debug_artifacts,
         "save_spectrogram_preview": save_tensors,
         "save_spectrogram_tensor": save_tensors,
-        "save_mask_preview": True,
-        "save_mask_npy": True,
+        "save_mask_preview": not snippets_only,
+        "save_mask_npy": not snippets_only,
+        "save_ground_truth": not snippets_only,
         "trace_frames": trace_frames,
         "progress_every_n_frames": progress_value,
         "drain_frame_count": 32,
@@ -227,17 +238,63 @@ def ensure_offline_eval_config(
         )
         config_text = config_text.rstrip() + "\n" + offline_eval_block
 
-    generated_path.write_text(config_text, encoding="utf-8")
+    # When this config drives the signal_snipper (sigmf_file_sink present), redirect the sink to a
+    # per-capture, host-visible subdir under the run's output_root so snippets from different captures
+    # don't collide and the host can read their SigMF sizes (offline resample+filter data-saving eval).
+    if has_top_level_key(config_text, "sigmf_file_sink"):
+        snippet_container_dir = map_host_path_to_container(Path(output_root).expanduser() / "snippets")
+        config_text = set_block_scalar_values(
+            config_text, "sigmf_file_sink", {"output_dir": str(snippet_container_dir)}
+        )
+
+    # For the mask_replay detector, point it at the source detector's mask_arrays/ (container path).
+    if mask_dir is not None and has_top_level_key(config_text, "mask_replay_detector"):
+        mask_container_dir = map_host_path_to_container(Path(mask_dir).expanduser())
+        config_text = set_block_scalar_values(
+            config_text, "mask_replay_detector", {"mask_dir": str(mask_container_dir)}
+        )
+
+    try:
+        generated_path.write_text(config_text, encoding="utf-8")
+    except PermissionError:
+        # A previous all-sudo run may have left this generated config root-owned; the directory is
+        # still writable, so replace the file instead of writing into it.
+        generated_path.unlink()
+        generated_path.write_text(config_text, encoding="utf-8")
     return generated_path
+
+
+def _run_sudo_free_first(cmd: list[str]) -> None:
+    """Run a `sudo <tool> ...` staging command, trying WITHOUT sudo first so the driver also works
+    for accounts whose passwordless sudo covers only `docker` (host dirs under /tmp are usually
+    world-writable). Falls back to the original sudo form when the plain attempt fails (e.g.
+    root-owned scratch dirs left by earlier all-sudo runs)."""
+    plain = cmd[1:] if cmd and cmd[0] == "sudo" else cmd
+    if subprocess.run(plain, stderr=subprocess.DEVNULL).returncode == 0:
+        return
+    subprocess.run(cmd, check=True)
+
+
+def _copy_into_scratch_if_needed(src: Path, dst: Path) -> None:
+    """`sudo cp` src -> dst, but SKIP when dst already exists with the same size. Idempotent staging:
+    running many detectors over one capture reuses a single staged copy instead of re-copying ~14 GB
+    per detector (and avoids the previous double-copy per invocation)."""
+    try:
+        if dst.exists() and dst.stat().st_size == src.stat().st_size:
+            print(f"Staged (reused existing copy): {dst}")
+            return
+    except OSError:
+        pass
+    _run_sudo_free_first(["sudo", "cp", "-f", str(src), str(dst)])
 
 
 def stage_input_into_scratch(input_file_path: Path, meta_path: Path) -> tuple[Path, Path]:
     staged_dir = HOST_SCRATCH_ROOT / "offline_inputs" / input_file_path.stem
-    subprocess.run(["sudo", "mkdir", "-p", str(staged_dir)], check=True)
+    _run_sudo_free_first(["sudo", "mkdir", "-p", str(staged_dir)])
     staged_input_path = staged_dir / input_file_path.name
     staged_meta_path = staged_dir / meta_path.name
-    subprocess.run(["sudo", "cp", "-f", str(input_file_path), str(staged_input_path)], check=True)
-    subprocess.run(["sudo", "cp", "-f", str(meta_path), str(staged_meta_path)], check=True)
+    _copy_into_scratch_if_needed(input_file_path, staged_input_path)
+    _copy_into_scratch_if_needed(meta_path, staged_meta_path)
     return staged_input_path, staged_meta_path
 
 
@@ -309,6 +366,12 @@ def parse_args() -> argparse.Namespace:
         help="Disable spectrogram tensor/preview and detector debug artifact saves (batch-sweep default).",
     )
     parser.add_argument(
+        "--snippets-only",
+        action="store_true",
+        help="Footprint-only: write ONLY the signal_snipper snippets; skip mask_arrays/gt_masks/previews "
+             "(offline_eval.save_mask_npy/preview/ground_truth=false). Avoids GB/run of unwanted writes.",
+    )
+    parser.add_argument(
         "--trace-frames",
         action="store_true",
         help="Emit one per-frame trace line (source offsets + mask non-zero count) for debugging.",
@@ -322,6 +385,19 @@ def parse_args() -> argparse.Namespace:
         "--binary",
         default=None,
         help="Optional container path to the built run_offline_cuda_detector_eval binary.",
+    )
+    parser.add_argument(
+        "--mask-dir",
+        default=None,
+        help="For --detector mask_replay: host path to the source detector's mask_arrays/ "
+             "(mapped into the container as mask_replay_detector.mask_dir).",
+    )
+    parser.add_argument(
+        "--captures-mounted",
+        action="store_true",
+        help="Read the input capture in place from the container's /workspace/captures mount "
+             "(HOST_CAPTURES_ROOT) instead of staging a copy into scratch. Needs a container built with "
+             "that mount (build_demo_container.sh CAPTURES_HOST_DIR).",
     )
     parser.add_argument(
         "--progress-every",
@@ -380,6 +456,8 @@ def main() -> int:
         save_tensors=not args.no_tensors,
         save_debug_artifacts=not args.no_tensors,
         trace_frames=args.trace_frames,
+        mask_dir=args.mask_dir,
+        snippets_only=args.snippets_only,
     )
 
     staged_dir = HOST_SCRATCH_ROOT / "offline_inputs" / input_file_path.stem
@@ -387,10 +465,15 @@ def main() -> int:
     staged_sigmf_meta_path = staged_dir / sigmf_meta_path.name
 
     binary_path = expected_binary_path(args.binary)
+    # Read the capture in place from the read-only /workspace/captures mount (no 14 GB copy) when
+    # requested and the input lives under HOST_CAPTURES_ROOT; otherwise use the staged scratch copy.
+    use_mount = args.captures_mounted and (
+        input_file_path == HOST_CAPTURES_ROOT or HOST_CAPTURES_ROOT in input_file_path.parents)
+    command_input_path = input_file_path if use_mount else staged_input_file_path
     command = build_command(
         binary_path=binary_path,
         config_path=effective_config_path,
-        input_file_path=staged_input_file_path,
+        input_file_path=command_input_path,
         output_root=output_root,
         progress_every=args.progress_every,
         detector_type=args.detector,
@@ -405,17 +488,16 @@ def main() -> int:
     print("Offline CUDA DINO command:")
     print(" ".join(shlex.quote(part) for part in command))
     print(f"Config used: {effective_config_path}")
-    print(f"SigMF sidecar: {staged_sigmf_meta_path}")
-    print(f"Staged input: {staged_input_file_path}")
+    print(f"Input mode: {'mounted (/workspace/captures, no copy)' if use_mount else 'staged scratch copy'}")
     print(f"Output root: {output_root}")
 
     if args.dry_run:
         return 0
 
-    for prep_command in prep_commands:
-        subprocess.run(prep_command, check=True)
-
-    staged_input_file_path, staged_sigmf_meta_path = stage_input_into_scratch(input_file_path, sigmf_meta_path)
+    # Ensure the output parent exists, then (unless reading in place) stage the input ONCE (idempotent).
+    _run_sudo_free_first(["sudo", "mkdir", "-p", str(output_root.parent)])
+    if not use_mount:
+        stage_input_into_scratch(input_file_path, sigmf_meta_path)
 
     completed = subprocess.run(command, cwd=str(REPO_ROOT), check=False)
     return int(completed.returncode)

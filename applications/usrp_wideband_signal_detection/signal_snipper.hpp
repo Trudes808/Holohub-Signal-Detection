@@ -69,6 +69,9 @@ class SignalSnipperOp : public holoscan::Operator {
   holoscan::Parameter<bool> enable_downsample_;
   holoscan::Parameter<double> bandwidth_margin_hz_;
   holoscan::Parameter<int> min_box_pixels_;
+  holoscan::Parameter<double> min_mask_bandwidth_hz_;  // pre-label mask run-length filter (0 = disabled)
+  holoscan::Parameter<double> min_bandwidth_hz_;   // post-merge min box bandwidth (0 = disabled)
+  holoscan::Parameter<double> min_duration_s_;     // post-merge min box duration  (0 = disabled)
   holoscan::Parameter<int> merge_gap_rows_;
   holoscan::Parameter<int> merge_gap_cols_;
   holoscan::Parameter<int> fir_num_taps_;

@@ -1,0 +1,67 @@
+{
+  "snr0_ref_db": 54.02380742487758,
+  "snr0_mean": 54.86121669565315,
+  "n_class_bw": 60,
+  "per_key": [
+    {
+      "class": "16QAM",
+      "bw_hz": 288000,
+      "snr0_db": 67.82
+    },
+    {
+      "class": "16QAM",
+      "bw_hz": 324000,
+      "snr0_db": 67.52
+    },
+    {
+      "class": "16QAM",
+      "bw_hz": 1152000,
+      "snr0_db": 61.26
+    },
+    {
+      "class": "16QAM",
+      "bw_hz": 1296000,
+      "snr0_db": 61.25
+    },
+    {
+      "class": "16QAM",
+      "bw_hz": 4608000,
+      "snr0_db": 54.64
+    },
+    {
+      "class": "16QAM",
+      "bw_hz": 5184000,
+      "snr0_db": 54.47
+    },
+    {
+      "class": "16QAM",
+      "bw_hz": 18432000,
+      "snr0_db": 49.16
+    },
+    {
+      "class": "16QAM",
+      "bw_hz": 20736000,
+      "snr0_db": 48.98
+    },
+    {
+      "class": "16QAM",
+      "bw_hz": 73728000,
+      "snr0_db": 46.75
+    },
+    {
+      "class": "16QAM",
+      "bw_hz": 82944000,
+      "snr0_db": 46.66
+    },
+    {
+      "class": "5G_Downlink",
+      "bw_hz": 3960000,
+      "snr0_db": 55.02
+    },
+    {
+      "class": "5G_Downlink",
+      "bw_hz": 4500000,
+      "snr0_db": 54.26
+    }
+  ]
+}

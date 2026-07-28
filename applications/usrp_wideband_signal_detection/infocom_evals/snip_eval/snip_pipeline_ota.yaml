@@ -1,0 +1,29 @@
+# snip_pipeline.py config for the over-the-air 500 MSps X410 captures (2.4 GHz + 1 GHz).
+# Run: ~/miniforge3/envs/dinov3/bin/python snip_pipeline.py snip_pipeline_ota.yaml
+#
+# Deliverable: per capture, how many snippets the original splits into (n_snippets) and the total
+# size of that split set (stored_samples * 8 B). write_iq is false, so NO snippet IQ is written --
+# sizes are reconstructed exactly from the decimated sample counts in each snippet meta.
+
+detector: coherent_power
+# 500 MSps single-channel offline coherent config carrying the two-channel config's detector
+# settings (fast-threshold path, no per-freq .npy). See its header for provenance.
+detector_config: /home/bqn82/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/config_coherent_power_500msps_1ch.yaml
+
+captures:
+  - /tmp/usrp_spectrograms/ota_x410_cf2400MHz_500Msps_cf32_10s.sigmf-data
+  - /tmp/usrp_spectrograms/ota_x410_cf1000MHz_500Msps_cf32_10s.sigmf-data
+
+# First pass: 256-pixel connected-component gate only. If this yields lots of tiny masks, add the
+# 75 kHz mask/box bandwidth filter and the 1 ms minimum-duration filter (see the *_75k1ms variant).
+snipper:
+  mode: frequency
+  min_mask_bandwidth_hz: 0.0
+  min_bandwidth_hz: 0.0
+  min_duration_s: 0.0
+  min_box_pixels: 256
+
+write_iq: false
+output_root: /tmp/usrp_spectrograms/ota_snip_pipeline
+container_name: usrp_x410_sig_det_bqn82
+captures_root: /tmp/usrp_spectrograms     # maps to the container's /workspace/spectrograms mount
