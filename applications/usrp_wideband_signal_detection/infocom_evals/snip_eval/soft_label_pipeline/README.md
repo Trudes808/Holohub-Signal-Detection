@@ -73,6 +73,12 @@ the container.
 — `dino_finetuned` = M2, `dino_finetuned_m1` = M1, `yolo` = YOLO26-m, `yolo26s` = YOLO26-s. Point at
 your dinov3 repo with `--dinov3-repo` (default from the config). These are gitignored, GPU-resident.
 
+**Adding a new ML detector:** the pipeline reads the ML detector list *dynamically* from
+`comparison_config.yaml`'s `ml_detectors:` block, so a new model auto-enables here with no edit to
+`soft_label_pipeline.py` — add an entry (a `kind: {yolo|dino_finetuned}` + its `ckpt`/paths, matching
+what `run_ml_detectors_offline.py` expects) and run `--detector <your_new_name>`. Use `--config` to
+point at a different comparison config entirely.
+
 ## 4. Usage examples
 ```bash
 # trained detector, both outputs, one capture:

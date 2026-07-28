@@ -38,12 +38,25 @@ MATERIALIZE = HERE / "materialize_npy.py"
 
 TRAINED = ["coherent_power", "cuda_dino"]
 BASELINES = ["3dB_power", "blob_detection"]
-ML = ["yolo", "dino_finetuned", "dino_finetuned_m1", "yolo26s"]
-ALL_DETECTORS = TRAINED + BASELINES + ML
+ML_FALLBACK = ["yolo", "dino_finetuned", "dino_finetuned_m1", "yolo26s"]
+_ML: list = []          # ML detector names, loaded from --config in main() (new models auto-enable)
+
+
+def ml_detectors(config_path=CMP_CONFIG) -> list:
+    """ML detector names come from comparison_config.yaml's `ml_detectors:` block, so adding a new
+    model there (a `kind` + checkpoint) auto-enables it here with no edit to this script."""
+    try:
+        import yaml
+        block = yaml.safe_load(Path(config_path).read_text())
+        block = block.get("comparison_eval", block)
+        return list((block.get("ml_detectors") or {}).keys()) or ML_FALLBACK
+    except Exception:
+        return ML_FALLBACK
 
 
 def tier(det: str) -> str:
-    return "trained" if det in TRAINED else "baseline" if det in BASELINES else "ml"
+    return ("trained" if det in TRAINED else "baseline" if det in BASELINES
+            else "ml" if det in (_ML or ML_FALLBACK) else "unknown")
 
 
 def run(cmd, env=None, cwd=None) -> int:
@@ -155,7 +168,10 @@ def snip_iq(det, cap, run_dir, iq_root, snip_cfg, args) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--waveform-dir", required=True, help="folder of *.sigmf-data (+ .sigmf-meta) to process")
-    ap.add_argument("--detector", required=True, choices=ALL_DETECTORS, help="detector to soft-label with")
+    ap.add_argument("--detector", required=True,
+                    help="detector to soft-label with. trained: " + ", ".join(TRAINED)
+                         + " | baselines: " + ", ".join(BASELINES)
+                         + " | ml (from --config ml_detectors): " + ", ".join(ml_detectors()))
     ap.add_argument("--outputs", choices=["snipped_meta", "iq", "both"], default="snipped_meta",
                     help="snipped_meta = <stem>_snipped.sigmf-meta only; iq = decimated IQ pairs only; both")
     ap.add_argument("--glob", default="*.sigmf-data", help="capture filter within --waveform-dir")
@@ -181,6 +197,12 @@ def main() -> int:
     ap.add_argument("--dinov3-repo", default=None, help="dinov3 repo path for the fine-tuned DINO models")
     ap.add_argument("--stems-only", action="store_true", help="restrict the ML runner to just these captures")
     args = ap.parse_args()
+
+    global _ML
+    _ML = ml_detectors(args.config)
+    valid = TRAINED + BASELINES + _ML
+    if args.detector not in valid:
+        sys.exit(f"unknown --detector '{args.detector}'. Valid: {', '.join(valid)}")
 
     wdir = Path(args.waveform_dir).expanduser().resolve()
     args.waveform_dir = str(wdir)
