@@ -1,0 +1,10 @@
+# regenerable data — never commit
+
+# local copy of the TX waveform library (~1.8 GB; source: ~/holoscan_generated_waveform)
+generated_waveforms_24576/
+
+# built by ber_precompute.m
+wave_cache.mat
+
+# raw MATLAB run logs (CSVs + figure are the record)
+results/*.log
