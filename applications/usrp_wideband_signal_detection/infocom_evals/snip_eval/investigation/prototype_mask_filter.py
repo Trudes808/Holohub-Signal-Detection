@@ -57,7 +57,7 @@ def main():
     gates = {k: v for k, v in GATES.items() if k != "default"}
     for det in ["coherent_power", "finetuned_dino_m2", "ground_truth"]:
         for att in [40, 50, 60, 65, 70]:
-            fl = sorted(glob.glob(str(SE / f"snip_run/{det}/attenuation_dB_{att}/mask_arrays/*.packed.npz")))
+            fl = sorted(glob.glob(str(SE.parent / f"snip_run/{det}/attenuation_dB_{att}/mask_arrays/*.packed.npz")))
             if not fl:
                 continue
             acc = {(g, s): [0, 0] for g in gates for s in ("current", "maskfilter")}

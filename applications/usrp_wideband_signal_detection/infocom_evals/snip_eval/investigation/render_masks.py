@@ -10,7 +10,7 @@ from pathlib import Path
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
 SE = Path(__file__).resolve().parent
-OUT = SE / "figs_minsize"; OUT.mkdir(exist_ok=True)
+OUT = SE / "figs"; OUT.mkdir(exist_ok=True)
 FS = 245.76e6
 FRAME_MS = 10240 / FS * 512 * 1e3        # ~21.33 ms per frame
 EXT = [-FS/2/1e6, FS/2/1e6, FRAME_MS, 0]
@@ -19,7 +19,7 @@ def load(f):
     z = np.load(f); return np.unpackbits(z["packed"])[:int(z["rows"])*int(z["cols"])].reshape(int(z["rows"]), int(z["cols"]))
 
 def masks(det, atten):
-    return sorted(glob.glob(str(SE / f"snip_run/{det}/attenuation_dB_{atten}/mask_arrays/*.packed.npz")))
+    return sorted(glob.glob(str(SE.parent / f"snip_run/{det}/attenuation_dB_{atten}/mask_arrays/*.packed.npz")))
 
 def frame(det, atten, fr):
     fl = masks(det, atten)

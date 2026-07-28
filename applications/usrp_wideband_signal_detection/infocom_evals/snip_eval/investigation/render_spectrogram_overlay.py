@@ -12,7 +12,7 @@ from matplotlib.patches import Rectangle
 from matplotlib.colors import ListedColormap
 from pathlib import Path
 
-SE = Path(__file__).resolve().parent; OUT = SE / "figs_minsize"
+SE = Path(__file__).resolve().parent; OUT = SE / "figs"
 CAPS = Path("/home/bqn82/captures")
 FS=245.76e6; ROWS=512; COLS=10240; PER_ROW=10240; FRAME=ROWS*PER_ROW   # 5,242,880 samples/frame
 HZ_COL=FS/COLS; S_ROW=PER_ROW/FS
@@ -21,7 +21,7 @@ fmhz=lambda c:(c/COLS-0.5)*FS/1e6
 tms =lambda r:r*S_ROW*1e3
 
 def load_mask(det, atten, fr):
-    c=[x for x in glob.glob(str(SE/f"snip_run/{det}/attenuation_dB_{atten}/mask_arrays/*.packed.npz")) if f"_f{fr}_" in x]
+    c=[x for x in glob.glob(str(SE.parent/f"snip_run/{det}/attenuation_dB_{atten}/mask_arrays/*.packed.npz")) if f"_f{fr}_" in x]
     if not c: return None
     z=np.load(c[0]); return np.unpackbits(z["packed"])[:int(z["rows"])*int(z["cols"])].reshape(int(z["rows"]),int(z["cols"]))
 

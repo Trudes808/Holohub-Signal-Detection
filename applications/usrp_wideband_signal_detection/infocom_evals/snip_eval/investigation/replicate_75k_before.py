@@ -23,7 +23,7 @@ ATTENS = ["0", "5", "10", "15", "20", "25", "30", "30_v2", "35", "40", "45",
 def main():
     rows_out = []
     for att in ATTENS:
-        fl = sorted(glob.glob(str(SE / f"snip_run/coherent_power/attenuation_dB_{att}/mask_arrays/*.packed.npz")))
+        fl = sorted(glob.glob(str(SE.parent / f"snip_run/coherent_power/attenuation_dB_{att}/mask_arrays/*.packed.npz")))
         if not fl:
             continue
         fsamp = tsamp = 0

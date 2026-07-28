@@ -34,7 +34,7 @@ def main():
     rows_out = []
     for det in DETS:
         for att in ATTENS:
-            fl = sorted(glob.glob(str(SE / f"snip_run/{det}/attenuation_dB_{att}/mask_arrays/*.packed.npz")))
+            fl = sorted(glob.glob(str(SE.parent / f"snip_run/{det}/attenuation_dB_{att}/mask_arrays/*.packed.npz")))
             if not fl:
                 continue
             occ_sum = None

@@ -53,7 +53,7 @@ def ser(df, det, mode, floor_gb=1e-2):
 
 
 def gt_ceiling(gate_key, mode_col):
-    q = pd.read_csv(DS / "fix_quantification.csv")
+    q = pd.read_csv(DS / "investigation" / "fix_quantification.csv")   # investigation-generated inputs
     q = q[(q.detector == "ground_truth") & (q.strategy == "current") & (q.gate == gate_key)]
     return gb(q[mode_col].mean())
 
@@ -63,7 +63,7 @@ CFGS = {
                     before=DS / "real_snip_metrics_minsize.csv",
                     after=DS / "real_snip_metrics_minsize_v2.csv", before_replicated=False),
     "75k1ms": dict(gate_key="75k_1ms", label="75 kHz / 1 ms gate",
-                   before=DS / "real_snip_metrics_75k_before_replicated.csv",
+                   before=DS / "investigation" / "real_snip_metrics_75k_before_replicated.csv",
                    after=DS / "real_snip_metrics_75k_v2.csv", before_replicated=True),
 }
 

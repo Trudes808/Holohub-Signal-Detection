@@ -55,29 +55,17 @@ real_snip_metrics.csv   →   plot_data_saving.py  (figures in figs/)
   writes `<stem>_detected.sigmf-meta`; used by the notebook methodology as a cross-check of the real
   measurement. Not part of the live run.
 
-### Low-SNR footprint investigation (see `problem.md`)
-- **`prove_coherent_artifact.py [atten]`** — quantifies the bounding-box fusion over-count
-  (fill %, over-count factor) on the staged coherent_power masks.
-- **`streak_forensics.py`** — attenuation-sweep proof that the persistent 48 MHz line is a
-  receiver clock spur (2048 MHz abs, ~117 Hz CW, family at 2048±k×20.48 MHz), not a transmitted
-  signal → `streak_forensics.csv` + `figs_minsize/streak_*.png`.
-- **`streak_mask_presence.py`** — which detectors' masks contain the spur column, per attenuation
-  → `streak_mask_presence.csv` (energy detectors: yes at 100% occupancy; learned detectors + GT: no).
-- **`quantify_fixes.py`** — offline replication of the snipper clustering that scores candidate
-  fixes (persistent-column split, fill-ratio gate, spur suppression) against the current behavior
-  under all three size-gate configs → `fix_quantification.csv`.
-- **`prototype_mask_filter.py`** — prototype + prediction for the fix that was ultimately
-  **implemented**: `signal_snipper.min_mask_bandwidth_hz`, a pre-labeling per-row run-length mask
-  filter (enabled in the two minsize configs). Validated against the real pipeline:
-  `real_snip_metrics_minsize_v2.csv` / `real_snip_metrics_75k_v2.csv` (coherent_power → 0 at low
-  SNR; ground-truth/DINO masks untouched). See problem.md "Implemented fix".
-- **`render_spectrogram_overlay.py` / `visualize_bbox.py` / `render_masks.py`** — per-frame debug
-  visualizations (spectrogram + mask + snipper boxes).
-- **`plot_maskfilter_figs.py`** — before/after figures in the notebook Figures 1–3 house style
-  (GB/hr log vs SNR), one fig2 (time-slice) + fig3 (snip) pair per gate config →
-  `figs_minsize/fig{2,3}_*_before_after_{100k5ms,75k1ms}.png`. The 75k BEFORE curve and the GT
-  ceilings come from the validated offline replication (`replicate_75k_before.py`,
-  `fix_quantification.csv`), labeled as such.
+### Low-SNR footprint investigation → `investigation/`
+The one-off diagnostic + fix-development scripts that traced coherent_power's inflated low-SNR
+footprint to a **receiver clock spur** (48 MHz / 2048 MHz CW) fused by bbox connectivity into
+full-height boxes, and drove the `signal_snipper.min_mask_bandwidth_hz` fix, live in the
+**`investigation/`** subfolder with their CSVs and figures. See **`investigation/README.md`** for the
+findings and each script (`streak_forensics`, `prove_coherent_artifact`, `quantify_fixes`,
+`prototype_mask_filter`, the `render_*`/`visualize_bbox` debug viz, …).
+- **`plot_maskfilter_figs.py`** — before/after figures for the fix, in the notebook Figures 1–3 house
+  style (GB/hr log vs SNR), one fig2 (time-slice) + fig3 (snip) pair per gate config →
+  `figs_minsize/fig{2,3}_*_before_after_{100k5ms,75k1ms}.png`. Its "before" curve + GT ceilings come
+  from `investigation/{real_snip_metrics_75k_before_replicated,fix_quantification}.csv`.
 - **`plot_mixed_storage.py`** — curated single figure in the notebook Figure-1 house style mixing
   two measurement sources: Coherent Power (the `min_mask_bandwidth_hz`-fixed 75 kHz/1 ms run,
   `real_snip_metrics_75k_v2.csv`) + DINO FT M2 and the ground-truth ceilings
@@ -99,7 +87,7 @@ box gates, `min_box_pixels` area), and `write_iq`. Outputs under `output_root`:
 - `soft_labels/<stem>.sigmf-meta` — the ORIGINAL capture meta + appended detection annotations
   (absolute RF edges + `wfgt:*_offset_hz` + provenance; `wfgt:soft_label: true`),
 - `pipeline_metrics.csv` + `pipeline_summary.png` — per-capture footprint / reduction / coverage.
-Stages are resumable per capture. Needs the container + docker access (see problem.md).
+Stages are resumable per capture. Needs the container + docker access (see `soft_label_pipeline/README.md`).
 
 ## Run it (both modes, one command)
 ```

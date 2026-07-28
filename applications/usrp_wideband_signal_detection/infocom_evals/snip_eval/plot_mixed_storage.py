@@ -17,7 +17,7 @@ Power = blue circles, DINO FT = brown crosses. Y = GB/hour, log (plain-number ti
 Provenance note: GT and DINO FT come from the default-gate sweep; Coherent Power from the 75 kHz/1 ms
 mask-filtered sweep. GT/DINO are gate-robust (real signals, no spur fusion), so this mix is a fair
 apples-to-apples storage comparison; Coherent is shown at the operating point where the fix applies.
-All three mask sets are the same staged July batch family (see mask_provenance.md).
+All three mask sets are the same staged July batch family (see investigation/README.md for provenance).
 
 Run: ~/miniforge3/envs/dinov3/bin/python plot_mixed_storage.py   ->  figs/fig_mixed_storage_vs_snr.png
 """

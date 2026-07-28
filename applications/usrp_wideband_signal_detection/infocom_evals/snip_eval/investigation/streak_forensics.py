@@ -15,7 +15,7 @@ Slope of (streak_db - floor_db) vs attenuation ~ 0   -> receiver artifact
 Slope of (ref_db    - floor_db) vs attenuation ~ -1  -> real signal (until it hits the floor)
 
 Also renders: power-vs-attenuation figure, and a zoomed spectrogram montage of the 48 MHz
-neighborhood across attenuations. Outputs -> figs_minsize/streak_*.png + streak_forensics.csv.
+neighborhood across attenuations. Outputs -> figs/streak_*.png + streak_forensics.csv.
 
 Run: ~/miniforge3/envs/dinov3/bin/python streak_forensics.py
 """
@@ -30,7 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 SE = Path(__file__).resolve().parent
-OUT = SE / "figs_minsize"
+OUT = SE / "figs"
 CAPS = Path("/home/bqn82/captures")
 FS = 245.76e6
 ROWS, COLS = 512, 10240

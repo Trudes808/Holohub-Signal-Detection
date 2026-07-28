@@ -24,7 +24,7 @@ from matplotlib.patches import Rectangle
 from matplotlib.colors import ListedColormap
 from pathlib import Path
 
-SE=Path(__file__).resolve().parent; OUT=SE/"figs_minsize"; CAPS=Path("/home/bqn82/captures")
+SE=Path(__file__).resolve().parent; OUT=SE/"figs"; CAPS=Path("/home/bqn82/captures")
 FS=245.76e6; ROWS=512; COLS=10240; PER=10240; FRAME=ROWS*PER; HZ_COL=FS/COLS; S_ROW=PER/FS
 MIN_PX=256; GAP_R=16; GAP_C=80; MIN_BW=100e3; MIN_DUR=5e-3
 fmhz=lambda c:(c/COLS-0.5)*FS/1e6; tms=lambda r:r*S_ROW*1e3
@@ -61,7 +61,7 @@ def passing(m):
     return res
 
 # ---------- scan ----------
-fl=sorted(glob.glob(str(SE/f"snip_run/coherent_power/attenuation_dB_{ATT}/mask_arrays/*.packed.npz")))
+fl=sorted(glob.glob(str(SE.parent/f"snip_run/coherent_power/attenuation_dB_{ATT}/mask_arrays/*.packed.npz")))
 per_frame={}; boxes=[]
 for f in fl:
     p=passing(load(f))

@@ -12,7 +12,7 @@ from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
 from pathlib import Path
 
-SE = Path(__file__).resolve().parent; OUT = SE / "figs_minsize"
+SE = Path(__file__).resolve().parent; OUT = SE / "figs"
 FS=245.76e6; ROWS=512; COLS=10240; FRAME=5242880
 HZ_COL=FS/COLS; S_ROW=FRAME/ROWS/FS
 MIN_PX=256; GAP_R=16; GAP_C=80; MIN_BW=100e3; MIN_DUR=5e-3
@@ -37,7 +37,7 @@ def merge(bs):
         bs=out
     return bs
 def find(det, atten, fr):
-    c=[x for x in glob.glob(str(SE/f"snip_run/{det}/attenuation_dB_{atten}/mask_arrays/*.packed.npz")) if f"_f{fr}_" in x]
+    c=[x for x in glob.glob(str(SE.parent/f"snip_run/{det}/attenuation_dB_{atten}/mask_arrays/*.packed.npz")) if f"_f{fr}_" in x]
     return c[0] if c else None
 
 def draw(ax, f, title):

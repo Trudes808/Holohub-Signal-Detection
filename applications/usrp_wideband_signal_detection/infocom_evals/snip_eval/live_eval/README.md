@@ -83,7 +83,7 @@ important asymmetry between the two bands:
   beyond the 400 MHz analog passband** (in the rolled-off region near the +250 MHz Nyquist edge).
   That signature (fixed frequency, fixed width, persistent every frame, outside the passband) is a
   **receiver spur / alias**, not a real emitter — the same class of artifact as the 48 MHz RX clock
-  spur documented in `../problem.md`. Meanwhile the genuine broad cellular occupancy at ~758–803 MHz
+  spur documented in `../investigation/README.md`. Meanwhile the genuine broad cellular occupancy at ~758–803 MHz
   (visible at the left of the figure) is *not* boxed: the coherent-power detector normalizes against a
   per-row frequency reference, so smooth wideband occupancy is absorbed into the floor and only
   sharp/narrow features that stand out get flagged.

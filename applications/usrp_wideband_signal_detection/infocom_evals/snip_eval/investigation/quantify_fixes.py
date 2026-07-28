@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quantify candidate fixes for the bounding-box fusion artifact (problem.md), offline on the staged
+"""Quantify candidate fixes for the bounding-box fusion artifact (see README.md), offline on the staged
 masks, replicating the real snipper's clustering + decimation math (signal_snip_core.cu).
 
 Strategies compared per (detector, attenuation, gate):
@@ -172,7 +172,7 @@ def main():
     rows_out = []
     for det in a.dets.split(","):
         for att in [int(x) for x in a.attens.split(",")]:
-            fl = sorted(glob.glob(str(SE / f"snip_run/{det}/attenuation_dB_{att}/mask_arrays/*.packed.npz")))
+            fl = sorted(glob.glob(str(SE.parent / f"snip_run/{det}/attenuation_dB_{att}/mask_arrays/*.packed.npz")))
             if not fl:
                 continue
             acc = {(s, g): dict(fsamp=0, tsamp=0, lit_kept=0, nbox=0)
