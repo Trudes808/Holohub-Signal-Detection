@@ -185,6 +185,52 @@ The entire detector gap is **detection coverage**: coherent's detect rate falls
 detection, rather than decodability. Do NOT attribute coherent's overall-BER gap
 to noise in its wide snippets — the decoded-only column refutes that.
 
+### Why coherent "beats" dino below −10 dB: the miss=1.0 convention, not detection
+The spec scores an undetected signal as **BER 1.0** ("no saved signal → 100%
+BER"). Below ~−10 dB nothing is decodable, so a *saved* signal yields coin-flip
+bits (~0.49) while an *unsaved* one costs 1.0 — i.e. **saving spectrum you cannot
+decode still earns 0.49 instead of 1.0.** Coherent's block-quantized ~19×
+oversized boxes blanket spectrum regardless of content, incidentally covering
+~27% of bits; dino correctly declines to fire and takes 1.0 on 98.5% of bits.
+Re-score misses as a random guess (0.5) and **the ranking inverts**:
+
+| SNR | miss=1.0 COH/DINO | winner | miss=0.5 COH/DINO | winner | decoded-only COH/DINO |
+|---|---|---|---|---|---|
+| −1 | 0.826 / 0.569 | dino | 0.484 / 0.505 | coh | 0.449 / 0.464 |
+| −11 | 0.836 / 0.999 | coh | 0.506 / 0.500 | dino | 0.483 / 0.451 |
+| −16 | 0.847 / 1.000 | coh | 0.513 / 0.500 | dino | 0.487 / 0.475 |
+| −26 | 0.867 / 0.992 | coh | 0.517 / 0.501 | dino | 0.490 / 0.496 |
+
+Under the guess convention they are statistically identical (0.517 vs 0.501).
+**Do not read coherent's deep-noise plateau as better detection** — it is a
+metric that rewards indiscriminate hoarding and penalises correct abstention.
+Both conventions are defensible; the reported curves use miss=1.0 per the spec.
+
+### Detectors sometimes score below genie — selection bias, plus real noise-shaving
+Two distinct causes, both verified:
+1. **At low SNR: survivorship bias** (the dominant one). A detector is graded
+   only on the signals it detected — the *strong* ones. Restricting the genie to
+   the **same signal subset** shows genie is still better:
+
+   | SNR | coherent dec-only | genie on same signals | genie on all |
+   |---|---|---|---|
+   | 9 dB | 0.3654 | **0.3569** | 0.4026 |
+   | −6 dB | 0.4704 | **0.4669** | 0.4792 |
+
+   So **on matched subsets the genie bound is never violated** in aggregate.
+2. **At atten_0 (detect rate 1.00, no selection possible) a few per-class wins
+   are real**, and they split by signal type: **narrowband single-carrier gains**
+   (QPSK 0.0027/0.0026 vs genie 0.0035; 16QAM 0.0138/0.0146 vs 0.0184) while
+   **wideband OFDM-family loses** (OFDM 0.0275/0.0265 vs 0.0238; 5G, 802.11ax
+   similar). Mechanism: the snipper's DDC lowpasses to the box bandwidth and
+   decimates *at the full 245.76 MHz rate*, upstream of the harness's own
+   `isolate_band`. For a narrowband signal in a wide native window that cascaded
+   filtering rejects noise the genie's single-stage path retains; for OFDM the box
+   hugs the occupied band so the extra transition band clips subcarrier edges.
+
+When comparing detectors, prefer **matched-subset** comparisons (or report detect
+rate alongside BER) so coverage and snippet quality stay separable.
+
 ### Caveat: below ~0 dB SNR nothing is genuinely decodable (by anyone)
 `status=="decoded"` only means the decoder ran without throwing, not that it
 recovered the bits. Decoded-only BER at −26 dB is **0.4935 (GT) / 0.4896
