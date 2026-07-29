@@ -6,5 +6,6 @@ generated_waveforms_24576/
 # built by ber_precompute.m
 wave_cache.mat
 
-# raw MATLAB run logs (CSVs + figure are the record)
-results/*.log
+# raw MATLAB / sweep run logs (CSVs + figures are the record).
+# covers results/ and any variant folder, e.g. results_coh_75k_1ms/
+results*/*.log

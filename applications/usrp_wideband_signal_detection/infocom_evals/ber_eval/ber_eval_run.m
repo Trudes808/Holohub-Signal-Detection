@@ -62,7 +62,15 @@ capCF = read_capture_center(capMeta);
 snip = index_snippets(o.SnippetRoot, capCF);
 fprintf("  snippet pieces indexed: %d\n", numel(snip));
 if isempty(snip) && detector ~= "ground_truth"
-    error("No snippets found under %s (run the snip pipeline first).", o.SnippetRoot);
+    % Distinguish "the pipeline was never run" (a mistake -> error) from "the
+    % pipeline ran and the detector legitimately saved NOTHING" (a real result:
+    % every signal is a miss). A selective snipper gate (e.g. 75 kHz + 1 ms) can
+    % suppress every detection at deep noise, and that must be scored, not thrown.
+    if ~isfolder(o.SnippetRoot)
+        error("No snippet folder at %s (run the snip pipeline first).", o.SnippetRoot);
+    end
+    fprintf(2, "  WARNING: snippet folder exists but is EMPTY -- detector saved nothing;\n");
+    fprintf(2, "           scoring every signal as a miss (BER 1.0, detect rate 0).\n");
 end
 slo = [snip.freq_lo]; shi = [snip.freq_hi];      % detection box freq edges (Hz)
 s0 = [snip.orig_start]; s1 = [snip.orig_end];    % original-timeline sample span

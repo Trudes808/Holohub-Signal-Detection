@@ -8,7 +8,11 @@
 # per-level result files (race-free) and then deletes that level's bulky /tmp
 # snippets. ground_truth reads captures directly (no gen). Everything under /tmp.
 #
-# Env knobs: LEVELS, MAXEVAL (default 5), BER_THREADS (default 6), CONTAINER_NAME.
+# Env knobs: LEVELS, MAXEVAL (default 5), BER_THREADS (default 6), CONTAINER_NAME,
+#   SNIP_EXTRA  extra soft_label_pipeline flags, e.g. the 75 kHz + 1 ms snipper gate:
+#               SNIP_EXTRA="--min-mask-bandwidth-hz 75000 --min-bandwidth-hz 75000 --min-duration-s 0.001"
+#   RESULTS_DIR results folder for a variant sweep (default results/)
+#   TAG         suffix for the /tmp snippet root so a variant never collides
 set -uo pipefail
 
 DET="${1:?usage: run_ber_sweep.sh <ground_truth|coherent_power|finetuned_dino_m2>}"
@@ -20,13 +24,17 @@ LEVELS="${LEVELS:-5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80}"
 MAXEVAL="${MAXEVAL:-5}"
 export BER_THREADS="${BER_THREADS:-6}"
 export CONTAINER_NAME="${CONTAINER_NAME:-usrp_x410_sig_det_bqn82}"
+SNIP_EXTRA="${SNIP_EXTRA:-}"
+RESULTS_DIR="${RESULTS_DIR:-$BER/results}"
+TAG="${TAG:-}"
 
 case "$DET" in
-    coherent_power)    OUTROOT="/tmp/usrp_spectrograms/ber_eval/coherent_power" ;;
-    finetuned_dino_m2) OUTROOT="/tmp/usrp_spectrograms/ber_eval/finetuned_dino_m2" ;;
+    coherent_power)    OUTROOT="/tmp/usrp_spectrograms/ber_eval/coherent_power${TAG}" ;;
+    finetuned_dino_m2) OUTROOT="/tmp/usrp_spectrograms/ber_eval/finetuned_dino_m2${TAG}" ;;
     ground_truth)      OUTROOT="" ;;
     *) echo "bad detector '$DET'"; exit 2 ;;
 esac
+mkdir -p "$RESULTS_DIR"
 
 source ~/miniforge3/etc/profile.d/conda.sh
 conda activate dinov3
@@ -36,8 +44,10 @@ running_evals() { jobs -rp | wc -l; }
 
 eval_one() {   # $1=stem  (run backgrounded)
     local stem="$1"
-    ( cd "$BER" && matlab -batch "ber_sweep_one('${stem}','${DET}')" ) \
-        >> "$BER/results/eval_${DET}_${stem}.log" 2>&1
+    local sroot=""
+    [ -n "$OUTROOT" ] && sroot="${OUTROOT}/iq/${stem}/snippets"
+    ( cd "$BER" && matlab -batch "ber_sweep_one('${stem}','${DET}','${RESULTS_DIR}','${sroot}')" ) \
+        >> "$RESULTS_DIR/eval_${DET}_${stem}.log" 2>&1
     if [ -n "$OUTROOT" ]; then
         rm -rf "${OUTROOT}/iq/${stem}" \
                "${OUTROOT}/masks/coherent_power/${stem}" \
@@ -52,7 +62,7 @@ gen_coherent() {  # $1=stem -> returns rc
     [ -d "${ALLDET}/coherent_power/${stem}/mask_arrays" ] && maskarg=(--mask-root "$ALLDET")
     ( cd "$PIPE" && python soft_label_pipeline.py --waveform-dir "$CAPS" --glob "${stem}.sigmf-data" \
         --detector coherent_power --outputs iq --mode frequency --min-box-pixels 256 "${maskarg[@]}" \
-        --output-root "$OUTROOT" )
+        $SNIP_EXTRA --output-root "$OUTROOT" )
 }
 
 gen_dino() {  # $1=stem -> returns rc
@@ -63,10 +73,13 @@ gen_dino() {  # $1=stem -> returns rc
     fi
     ( cd "$PIPE" && python soft_label_pipeline.py --waveform-dir "$CAPS" --glob "${stem}.sigmf-data" \
         --detector dino_finetuned --outputs iq --mode frequency --min-box-pixels 256 \
-        --output-root "$OUTROOT" )
+        $SNIP_EXTRA --output-root "$OUTROOT" )
 }
 
 echo "=== sweep ${DET} start $(date -u +%FT%TZ)  levels: ${LEVELS}  MAXEVAL=${MAXEVAL} threads=${BER_THREADS} ==="
+echo "    results -> ${RESULTS_DIR}"
+[ -n "$SNIP_EXTRA" ] && echo "    snipper gate: ${SNIP_EXTRA}"
+[ -n "$OUTROOT" ] && echo "    snippets -> ${OUTROOT}"
 for L in $LEVELS; do
     stem="attenuation_dB_${L}"
     [ -f "${CAPS}/${stem}.sigmf-data" ] || { echo "!! missing capture ${stem} -> skip"; continue; }
@@ -93,6 +106,15 @@ for L in $LEVELS; do
     if [ -n "$OUTROOT" ]; then
         n=$(ls "${OUTROOT}/iq/${stem}/snippets/"*.sigmf-meta 2>/dev/null | wc -l)
         echo "[$(date -u +%TZ)] ${stem}: ${n} snippets generated"
+        # A selective snipper gate can legitimately emit NOTHING (e.g. the 75 kHz +
+        # 1 ms gate at deep noise, where every detection was a clock-spur artifact).
+        # The snipper then never creates snippets/, which the harness would read as
+        # "pipeline never ran" and throw. Gen succeeded here, so materialize the empty
+        # dir to assert "ran, saved nothing" -> scored as all-miss instead of skipped.
+        if [ "$n" -eq 0 ]; then
+            mkdir -p "${OUTROOT}/iq/${stem}/snippets"
+            echo "         (zero detections -> empty snippets/ created; scores as all-miss)"
+        fi
     fi
 
     while [ "$(running_evals)" -ge "$MAXEVAL" ]; do sleep 5; done

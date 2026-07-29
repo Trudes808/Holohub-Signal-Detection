@@ -23,17 +23,25 @@ Detector colors/markers follow the repo-wide convention in
 signal_detection_experiments/plot_eval_results.py (DETECTOR_STYLE) so these
 figures match every other eval; ground truth is the neutral grey baseline.
 
-Usage:  python plot_ber_figs.py
+Usage:  python plot_ber_figs.py [results_dir] [--title-suffix "..."]
+        (default results_dir = ./results; a variant sweep such as the 75 kHz + 1 ms
+         coherent snipper gate lives in its own folder and plots into it)
 """
 from pathlib import Path
-import csv, collections
+import csv, collections, sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
 HERE = Path(__file__).resolve().parent
-RES = HERE / "results"
+_args = [a for a in sys.argv[1:] if not a.startswith("--")]
+RES = Path(_args[0]).expanduser().resolve() if _args else HERE / "results"
+SUFFIX = ""
+if "--title-suffix" in sys.argv:
+    SUFFIX = sys.argv[sys.argv.index("--title-suffix") + 1]
+if not RES.is_dir():
+    sys.exit(f"no such results dir: {RES}")
 LEVELS = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80]
 SNR0 = 54.0                                   # SNR ~= 54 - attenuation (snr_calibration.json)
 CLASSES = ["BPSK", "QPSK", "16QAM", "OFDM", "5G_Downlink", "802_11ax", "Bluetooth"]
@@ -143,6 +151,16 @@ for L in have:
         CLAIM[det]["det"].append(db); CLAIM[det]["gt"].append(gb); CLAIM[det]["n"].append(n)
 
 
+def save(fig, out):
+    """Save, stamping the variant label (if any) so a 75k/1ms figure is never
+    mistaken for the baseline one."""
+    if SUFFIX:
+        fig.text(0.995, 0.002, SUFFIX, ha="right", va="bottom", fontsize=9, color=INK2)
+    fig.savefig(out)
+    plt.close(fig)
+    print("wrote", out)
+
+
 def pctfmt(decimals=0):
     return FuncFormatter(lambda v, _: f"{v:.{decimals}f}%")
 
@@ -204,8 +222,7 @@ fig.suptitle("Snipping is minimally destructive compared to the channel\n"
              "same signals, decoded from the detector's saved snippet vs from the full capture",
              y=1.06, fontsize=13.5, color=INK)
 out = RES / "fig_snip_vs_channel.png"
-fig.savefig(out); plt.close(fig)
-print("wrote", out)
+save(fig, out)
 
 # ============================== A2. excess BER from snipping ========================= #
 fig, ax = plt.subplots(figsize=(8.6, 5.0))
@@ -225,8 +242,7 @@ ax.set_title("Cost of snipping, isolated\n(BER after snipping − BER of the sam
              pad=10)
 ax.legend(loc="best", fontsize=10)
 out = RES / "fig_snip_excess.png"
-fig.savefig(out); plt.close(fig)
-print("wrote", out)
+save(fig, out)
 
 # ============================== A3. the claim, per class ============================= #
 BYCLS = {d: {c: dict(snr=[], det=[], gt=[]) for c in CLASSES} for d in DETS}
@@ -280,8 +296,7 @@ fig.suptitle("Snipping is minimally destructive, per modulation class\n"
              "same signals, decoded from the saved snippet vs from the full capture",
              y=1.02, fontsize=13.5, color=INK)
 out = RES / "fig_snip_vs_channel_byclass.png"
-fig.savefig(out); plt.close(fig)
-print("wrote", out)
+save(fig, out)
 
 # ============================== B1. overall sweep (restyled) ======================== #
 fig, ax = plt.subplots(figsize=(9.0, 5.4))
@@ -301,8 +316,7 @@ ax.set_title("Overall BER vs SNR\n(all signals; a signal the detector never save
 # sits on top of the curves
 ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=10.5)
 out = RES / "ber_sweep_overall.png"
-fig.savefig(out); plt.close(fig)
-print("wrote", out)
+save(fig, out)
 
 # ============================== B2. per-class sweep (restyled) ===================== #
 CLS_OVER = {d: {c: dict(snr=[], ber=[]) for c in CLASSES} for d in [GT] + DETS}
@@ -341,8 +355,7 @@ for ax in axes[1]:
     ax.set_xlabel("SNR (dB)")
 fig.suptitle("Per-class overall BER vs SNR", y=1.02, fontsize=13.5, color=INK)
 out = RES / "ber_sweep_byclass.png"
-fig.savefig(out); plt.close(fig)
-print("wrote", out)
+save(fig, out)
 
 # ============================== C. the cost of MISSED detections ==================== #
 # Additive error budget on a common denominator (every scored bit at that level):
@@ -415,8 +428,7 @@ ax.set_ylim(-3, 108)
 ax.set_title("Detection coverage: what fraction of decodable signals each detector saved", pad=10)
 ax.legend(loc="lower left", fontsize=10.5)
 out = RES / "fig_miss_coverage.png"
-fig.savefig(out); plt.close(fig)
-print("wrote", out)
+save(fig, out)
 
 # ---- C2. error budget: channel vs snipping vs missed detections ---------------------- #
 fig, axes = plt.subplots(1, 2, figsize=(13.0, 5.4), sharey=True)
@@ -449,8 +461,7 @@ fig.suptitle("Where the bit errors come from: the channel, snipping, or never sa
              "a missed signal is charged only the excess over what the channel would have cost it anyway",
              y=1.06, fontsize=13.5, color=INK)
 out = RES / "fig_error_budget.png"
-fig.savefig(out); plt.close(fig)
-print("wrote", out)
+save(fig, out)
 
 # ---- C3. per-class detection coverage ----------------------------------------------- #
 COV = {d: {c: dict(snr=[], cov=[]) for c in CLASSES} for d in DETS}
@@ -492,8 +503,7 @@ for ax in axes[1]:
     ax.set_xlabel("SNR (dB)")
 fig.suptitle("Detection coverage per modulation class", y=1.02, fontsize=13.5, color=INK)
 out = RES / "fig_miss_coverage_byclass.png"
-fig.savefig(out); plt.close(fig)
-print("wrote", out)
+save(fig, out)
 
 print("\nerror budget (BER %, share of every scored bit):")
 for det in DETS:
