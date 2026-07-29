@@ -1,0 +1,2 @@
+detector,atten_dB,snr_dB,overallBER,nSignals,nDecoded,nMiss,nInsuff
+finetuned_dino_m2,55,-1,0.568793898490246,1668,1009,66,562

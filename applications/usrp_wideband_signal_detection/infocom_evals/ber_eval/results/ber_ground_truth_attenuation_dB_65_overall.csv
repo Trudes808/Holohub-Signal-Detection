@@ -1,0 +1,2 @@
+detector,atten_dB,snr_dB,overallBER,nSignals,nDecoded,nMiss,nInsuff
+ground_truth,65,-11,0.542993780886719,1668,1054,0,556

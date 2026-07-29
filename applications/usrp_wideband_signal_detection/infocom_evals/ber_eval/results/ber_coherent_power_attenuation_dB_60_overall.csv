@@ -1,0 +1,2 @@
+detector,atten_dB,snr_dB,overallBER,nSignals,nDecoded,nMiss,nInsuff
+coherent_power,60,-6,0.851944007728268,1668,484,618,556

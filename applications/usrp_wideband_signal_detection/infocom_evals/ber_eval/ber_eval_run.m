@@ -55,7 +55,11 @@ mfMap = containers.Map(manifest.waveformName, 1:height(manifest));
 cache = load_wave_cache(o.CachePath);
 
 % ---- 3. index detector snippets ----
-snip = index_snippets(o.SnippetRoot);
+% Capture center this recording declares (0 for some, 2 GHz for others). Snippet
+% box freq edges are labeled in ABSOLUTE RF (capture center + baseband offset);
+% GT is always baseband, so subtract the capture center to align them.
+capCF = read_capture_center(capMeta);
+snip = index_snippets(o.SnippetRoot, capCF);
 fprintf("  snippet pieces indexed: %d\n", numel(snip));
 if isempty(snip) && detector ~= "ground_truth"
     error("No snippets found under %s (run the snip pipeline first).", o.SnippetRoot);
@@ -121,8 +125,10 @@ for i = 1:n
         % Fallback: if a detector's stitched multi-frame snippet decoded poorly,
         % the stitch seam may be corrupting a phase-continuous signal (GFSK/BT).
         % Try each frame-piece alone (each already holds >=1 tiled waveform) and
-        % keep the best -- only fires on failures, so clean signals aren't slowed.
-        if ~isGT && isfield(r,"BER") && r.BER > 0.05 && numel(pieces) > 1
+        % keep the best -- only fires on RECOVERABLE failures (BER in (0.05,0.40]),
+        % so clean signals aren't slowed and deep-noise signals (BER~0.5, nothing
+        % to rescue) don't each spawn per-piece re-decodes + refines.
+        if ~isGT && isfield(r,"BER") && r.BER > 0.05 && r.BER <= 0.40 && numel(pieces) > 1
             for pp = 1:numel(pieces)
                 try
                     rp = decode_native(stitch_and_recenter(pieces(pp), gtCenter, gStart, gEnd, w.native, o.CompensateCenter), w, o);
@@ -193,7 +199,35 @@ end
 end
 
 % ======================================================================= %
-function snip = index_snippets(root)
+function cf = read_capture_center(capMeta)
+% Absolute RF center this capture declares (SigMF captures[0].core:frequency);
+% snippet box freqs are labeled relative to it. Some captures report 0, others 2 GHz.
+cf = 0;
+try
+    m = jsondecode(fileread(capMeta));
+    if isfield(m,'captures') && ~isempty(m.captures)
+        c = m.captures; if iscell(c), c = c{1}; else, c = c(1); end
+        if isfield(c,'core_frequency') && ~isempty(c.core_frequency)
+            cf = double(c.core_frequency);
+        end
+    end
+catch
+end
+end
+
+% ======================================================================= %
+function snip = index_snippets(root, capCF)
+% Snippet box freq edges + center are labeled in ABSOLUTE RF: snip_annotations
+% computes them as (capture core:frequency) + baseband_offset, and the IQ-snippet
+% metas do NOT carry core:frequency in their own global. GT annotations are always
+% baseband (center 0), and some captures declare core:frequency=0 while others
+% report 2 GHz -- so for the 2 GHz captures the absolute boxes never overlap the
+% baseband GT and every signal falsely "misses". Subtract the CAPTURE center (read
+% from the capture meta, passed in as capCF) to bring boxes back to baseband
+% (no-op when capCF==0). The snippet IQ itself is already baseband (the DDC mixes
+% by the baseband bin), so only the labels need correcting -- this also makes the
+% decode's (trueCenter - s.center) offset correct.
+if nargin < 2, capCF = 0; end
 snip = struct("meta",{},"data",{},"rate",{},"center",{}, ...
               "freq_lo",{},"freq_hi",{},"orig_start",{},"orig_end",{}, ...
               "off",{},"count",{});
@@ -210,9 +244,9 @@ for i = 1:numel(d)
         rate = getdef(a,"wfgt_snippet_sample_rate", getdef(m.global,"core_sample_rate",NaN));
         ctr  = getdef(a,"wfgt_center_frequency", 0);
         snip(end+1) = struct( ...  %#ok<AGROW>
-            "meta",mp, "data",dp, "rate",double(rate), "center",double(ctr), ...
-            "freq_lo",double(getdef(a,"core_freq_lower_edge",-inf)), ...
-            "freq_hi",double(getdef(a,"core_freq_upper_edge", inf)), ...
+            "meta",mp, "data",dp, "rate",double(rate), "center",double(ctr)-capCF, ...
+            "freq_lo",double(getdef(a,"core_freq_lower_edge",-inf))-capCF, ...
+            "freq_hi",double(getdef(a,"core_freq_upper_edge", inf))-capCF, ...
             "orig_start",double(getdef(a,"wfgt_orig_sample_start",0)), ...
             "orig_end",  double(getdef(a,"wfgt_orig_sample_end",0)), ...
             "off",  double(getdef(a,"core_sample_start",0)), ...
@@ -378,17 +412,44 @@ end
 
 % ======================================================================= %
 function rBest = cfo_refine_decode(rx, w, md)
-% Small BER-minimizing carrier-offset search around the current estimate; used
-% to rescue signals the correlation-based CFO estimate mislocked (e.g. GFSK/BLE).
+% Adaptive coarse-to-fine BER-minimizing carrier-offset search, used to rescue
+% signals whose data-aided CFO estimate mislocked (e.g. broad GFSK/BLE peaks).
+%
+% Replaces the old fixed 33-point (+-8 kHz @ 500 Hz) full-grid search. That ran
+% 33 full standards decodes on EVERY failing signal, which dominates runtime at
+% low SNR where essentially every signal fails but NONE is recoverable (all 33
+% offsets just return ~0.5). The coarse pass (9 pts) locates a promising offset;
+% the fine local pass (@500 Hz, same resolution as before) runs ONLY when the
+% coarse best is recoverable, so deep-noise signals stop after 9 decodes instead
+% of 33. Early-exits on a clean lock. For recoverable signals this converges to
+% the same 500 Hz-resolution optimum as the old grid (validated faithful).
 rBest = struct("BER", inf, "bitErrors", NaN, "numComparedBits", 0);
 n = (0:numel(rx)-1).';
-for off = -8e3:500:8e3   % wide absolute search: the data-aided CFO can mislock on broad GFSK peaks
-    rxo = rx .* exp(-1j*2*pi*off/w.native*n);
-    try
-        r = decode_waveforms_24576(rxo, "Fs", w.native, "Metadata", md, "TxBits", w.txBits, "Channel", "none");
-        if isfield(r,"BER") && r.BER < rBest.BER, rBest = r; end
-    catch
+bestOff = 0;
+for off = -8e3:2e3:8e3                         % coarse: 9 points across +-8 kHz
+    r = refine_try(rx, off, w, md, n);
+    if r.BER < rBest.BER, rBest = r; bestOff = off; end
+    if rBest.BER < 0.02, return; end           % clean lock -> done
+end
+if rBest.BER <= 0.35                            % promising (signal present) -> fine local search
+    for off = (bestOff-1500):500:(bestOff+1500)
+        if off == bestOff, continue; end
+        r = refine_try(rx, off, w, md, n);
+        if r.BER < rBest.BER, rBest = r; end
+        if rBest.BER < 0.02, return; end
     end
+end
+end
+
+% ======================================================================= %
+function r = refine_try(rx, off, w, md, n)
+% One trial decode at carrier offset `off` (Hz); returns inf-BER struct on throw.
+r = struct("BER", inf, "bitErrors", NaN, "numComparedBits", 0);
+try
+    rr = decode_waveforms_24576(rx .* exp(-1j*2*pi*off/w.native*n), "Fs", w.native, ...
+        "Metadata", md, "TxBits", w.txBits, "Channel", "none");
+    if isfield(rr,"BER"), r = rr; end
+catch
 end
 end
 
