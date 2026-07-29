@@ -318,6 +318,38 @@ ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=10.5)
 out = RES / "ber_sweep_overall.png"
 save(fig, out)
 
+# ============================== B1b. overall sweep, v2 (paper style) =============== #
+# Presentation variant: SNR ascending left->right over a fixed -20..40 dB window,
+# linear BER% axis capped at 100 with 0 at the bottom, full box outline, legend inside
+# the (empty) lower-left corner, bare title. Deliberately NOT the log/inverted view.
+fig, ax = plt.subplots(figsize=(9.0, 5.6))
+for det in [GT] + DETS:
+    o = OVER[det]
+    if not o["snr"]:
+        continue
+    s = STYLE[det]
+    pts = sorted(zip(o["snr"], o["ber"]))            # ascending SNR for a left->right line
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    ax.plot(xs, ys, color=s["color"], ls=s["ls"], lw=2.2, marker=s["marker"],
+            ms=8, mew=1.6, zorder=4 if det != GT else 3, label=s["label"],
+            clip_on=True)
+ax.set_xlim(-20, 40)                                  # ascending: low SNR left, high SNR right
+ax.set_ylim(0, 100)
+ax.set_yticks(range(0, 101, 20))
+ax.yaxis.set_major_formatter(pctfmt())
+ax.grid(True, color=GRID, lw=0.7, alpha=0.9)
+ax.set_axisbelow(True)
+for sp in ax.spines.values():                         # full outline: top + right included
+    sp.set_visible(True)
+    sp.set_linewidth(0.9)
+    sp.set_color("#9a9a95")
+ax.set_xlabel("SNR (dB)")
+ax.set_ylabel("BER %")
+ax.set_title("Bit Error Rate (BER) vs. SNR", pad=10)  # no subtitle
+ax.legend(loc="lower left", fontsize=10.5, framealpha=0.0)
+out = RES / "ber_sweep_overall_v2.png"
+save(fig, out)
+
 # ============================== B2. per-class sweep (restyled) ===================== #
 CLS_OVER = {d: {c: dict(snr=[], ber=[]) for c in CLASSES} for d in [GT] + DETS}
 for L in have:
