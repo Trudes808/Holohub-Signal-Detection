@@ -1,0 +1,8 @@
+class,nSignals,nDecoded,nMiss,nInsuff,detectRate,BER,BER_detectedOnly
+16QAM,360,0,240,120,0,1,0
+5G_Downlink,264,0,176,88,0,1,0
+802_11ax,96,0,64,32,0,1,0
+BPSK,360,0,240,120,0,1,0
+Bluetooth,84,0,52,31,0,1,0
+OFDM,144,0,96,48,0,1,0
+QPSK,360,0,240,120,0,1,0

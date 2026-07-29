@@ -9,7 +9,9 @@ costs in BER. This separates the two effects the same way the main figures do:
   snip-fidelity BER (matched)   -> whether what it KEPT decodes any better
   overall BER                   -> the net, with unsaved signals charged 100%
 
-Usage:  python compare_variants.py [baseline_dir] [variant_dir] [--label "..."]
+Usage:  python compare_variants.py BASE_DIR VARIANT_DIR [VARIANT_DIR ...] \
+            [--labels "label1,label2,..."]
+        First dir is the baseline; the rest are variants plotted against it.
 """
 from pathlib import Path
 import csv, sys, re
@@ -19,14 +21,38 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
 HERE = Path(__file__).resolve().parent
-pos = [a for a in sys.argv[1:] if not a.startswith("--")]
-BASE = Path(pos[0]).resolve() if len(pos) > 0 else HERE / "results"
-VAR = Path(pos[1]).resolve() if len(pos) > 1 else HERE / "results_coh_75k_1ms"
-LABEL = sys.argv[sys.argv.index("--label") + 1] if "--label" in sys.argv else "75 kHz + 1 ms gate"
+pos = []
+i = 1
+while i < len(sys.argv):
+    a = sys.argv[i]
+    if a.startswith("--"):
+        i += 2                                   # skip the flag and its value
+        continue
+    pos.append(a); i += 1
+if len(pos) < 2:
+    sys.exit(__doc__)
+BASE = Path(pos[0]).resolve()
+VARS = [Path(p).resolve() for p in pos[1:]]
+if "--labels" in sys.argv:
+    LABELS = [s.strip() for s in sys.argv[sys.argv.index("--labels") + 1].split(",")]
+elif "--label" in sys.argv:                      # back-compat with the single-variant form
+    LABELS = [sys.argv[sys.argv.index("--label") + 1]]
+else:
+    LABELS = [v.name for v in VARS]
+if len(LABELS) < len(VARS):
+    LABELS += [v.name for v in VARS[len(LABELS):]]
+elif len(LABELS) > len(VARS):
+    # more labels than variants: almost always a comma INSIDE a label (--labels is
+    # comma-separated), which would otherwise misalign every series. Fail loudly.
+    sys.exit(f"--labels gave {len(LABELS)} labels for {len(VARS)} variant dirs "
+             f"({LABELS}). Commas separate labels, so avoid commas within a label.")
 DET = "coherent_power"
 LEVELS = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80]
 SNR0 = 54.0
-C_BASE, C_VAR, C_GT = "#1f77b4", "#4a3aa7", "#4d4b47"
+C_BASE, C_GT = "#1f77b4", "#4d4b47"
+# distinct hues for variants (kept clear of the baseline blue and the grey reference)
+C_VARS = ["#4a3aa7", "#1baf7a", "#eb6834", "#9467bd"]
+MK_VARS = ["s", "D", "v", "^"]
 INK, INK2, GRID = "#1a1a1a", "#4a4a4a", "#d8d8d4"
 plt.rcParams.update({
     "figure.dpi": 130, "savefig.dpi": 150, "savefig.bbox": "tight", "font.size": 11,
@@ -96,28 +122,57 @@ def snippet_counts(d):
     return out
 
 
-SB, SV = snippet_counts(BASE), snippet_counts(VAR)
-data = []
+SB = snippet_counts(BASE)
+SVS = [snippet_counts(v) for v in VARS]
+data = []                                        # (L, base_stats, [variant_stats...])
 for L in LEVELS:
-    a, c = stats(BASE, L), stats(VAR, L)
-    if a and c:
-        data.append((L, a, c))
+    a = stats(BASE, L)
+    if not a:
+        continue
+    cs = [stats(v, L) for v in VARS]
+    data.append((L, a, cs))
 if not data:
-    sys.exit(f"no overlapping coherent levels between {BASE} and {VAR}")
+    sys.exit(f"no coherent levels found under {BASE}")
 
-print(f"coherent_power: baseline ({BASE.name}) vs {LABEL} ({VAR.name})")
-print(f"  {'SNR':>5} | {'snips base':>10} {'snips var':>9} {'kept':>6} | "
-      f"{'cov base':>8} {'cov var':>7} | {'BER base':>8} {'BER var':>7} | "
-      f"{'snipΔ base':>10} {'snipΔ var':>10}")
-for L, a, c in data:
-    sb, sv = SB.get(L), SV.get(L)
-    # NB: 0 is a real value here (a gate can legitimately save nothing) -- test for
-    # None explicitly rather than truthiness, or zero renders as "missing".
-    keep = f"{100*sv/sb:5.1f}%" if (sb not in (None, 0) and sv is not None) else "    -"
-    print(f"  {SNR0-L:5.0f} | {sb if sb is not None else '-':>10} "
-          f"{sv if sv is not None else '-':>9} {keep:>6} | "
-          f"{a['cov']:7.1f}% {c['cov']:6.1f}% | {a['overall']:7.2f}% {c['overall']:6.2f}% | "
-          f"{a['matched']-a['genie']:+9.2f} {c['matched']-c['genie']:+9.2f}")
+names = ["baseline"] + LABELS
+print(f"coherent_power snip-gate comparison")
+for nm, d in zip(names, [BASE] + VARS):
+    print(f"    {nm:<26} {d.name}")
+HDR = "  " + f"{'SNR':>5} |" + "".join(f" {nm[:12]:>12}" for nm in names)
+
+
+def block(title, cell):
+    """print one table: a row per level, a column per variant. `cell(stats)` -> str."""
+    print(f"\n  {title}")
+    print(HDR)
+    for L, a, cs in data:
+        row = f"  {SNR0 - L:5.0f} |"
+        for st in [a] + cs:
+            row += f" {(cell(st) if st else '-'):>12}"
+        print(row)
+
+
+def snips_block():
+    # COUNT only -- deliberately not called a volume proxy. The 75 kHz per-row mask
+    # pre-filter de-fuses components (it strips the spur rows that 4-connected separate
+    # signals into one giant box), so a gated variant can emit MORE but much SMALLER
+    # boxes than the baseline. Comparing counts across variants says nothing about
+    # stored bytes; use snip_eval's GB/hr metrics for that.
+    print("\n  snippet COUNT per level (not a volume proxy -- box sizes differ per variant)")
+    print(HDR)
+    for L, _, _ in data:
+        row = f"  {SNR0 - L:5.0f} |"
+        for s in [SB] + SVS:
+            v = s.get(L)                          # 0 is a real value -- test None, not truthiness
+            row += f" {(str(v) if v is not None else '-'):>12}"
+        print(row)
+
+
+snips_block()
+block("coverage (% of decodable signals saved)", lambda s: f"{s['cov']:.1f}%")
+block("overall BER % (unsaved signals count as 100%)", lambda s: f"{s['overall']:.2f}%")
+block("snip excess, points above genie on the SAME signals (fidelity of what was kept)",
+      lambda s: f"{s['matched'] - s['genie']:+.2f}")
 
 snr = [SNR0 - L for L, _, _ in data]
 
@@ -135,37 +190,51 @@ def tidy(ax, ylabel):
 pct = FuncFormatter(lambda v, _: f"{v:.0f}%")
 fig, axes = plt.subplots(1, 3, figsize=(17.0, 5.0))
 
+def series(key, idx):
+    """values of `key` for variant idx (-1 = baseline), None-safe -> (xs, ys)"""
+    xs, ys = [], []
+    for L, a, cs in data:
+        st = a if idx < 0 else cs[idx]
+        if st is None:
+            continue
+        xs.append(SNR0 - L)
+        ys.append(st[key] if key != "excess" else st["matched"] - st["genie"])
+    return xs, ys
+
+
+def draw(ax, key, ylabel, title):
+    x, y = series(key, -1)
+    ax.plot(x, y, "-o", color=C_BASE, lw=2.0, ms=8, label="baseline snip", zorder=4)
+    for j, lab in enumerate(LABELS):
+        x, y = series(key, j)
+        ax.plot(x, y, ls="-", marker=MK_VARS[j % len(MK_VARS)], color=C_VARS[j % len(C_VARS)],
+                lw=2.0, ms=7.5, label=lab, zorder=4)
+    tidy(ax, ylabel)
+    ax.set_title(title, pad=8)
+
+
 # 1. coverage -- what the gate threw away
 ax = axes[0]
-ax.axhline(100, color=C_GT, ls=(0, (6, 3)), lw=2.0, label="perfect detection")
-ax.plot(snr, [a["cov"] for _, a, _ in data], "-o", color=C_BASE, lw=2.0, ms=8, label="baseline snip")
-ax.plot(snr, [c["cov"] for _, _, c in data], "-s", color=C_VAR, lw=2.0, ms=7.5, label=LABEL)
-tidy(ax, "signals saved (% of decodable)")
+ax.axhline(100, color=C_GT, ls=(0, (6, 3)), lw=2.0, label="perfect detection", zorder=3)
+draw(ax, "cov", "signals saved (% of decodable)", "What the gate discards")
 ax.yaxis.set_major_formatter(pct); ax.set_ylim(-3, 108)
-ax.set_title("What the gate discards", pad=8); ax.legend(loc="lower left", fontsize=10)
+ax.legend(loc="lower left", fontsize=9.5)
 
-# 2. snip fidelity -- does what it KEPT decode better?
+# 2. snip fidelity -- does what it KEPT decode any better?
 ax = axes[1]
-ax.axhline(0, color=C_GT, ls=(0, (6, 3)), lw=2.0, label="channel only (reference)")
-ax.plot(snr, [a["matched"] - a["genie"] for _, a, _ in data], "-o", color=C_BASE, lw=2.0, ms=8,
-        label="baseline snip")
-ax.plot(snr, [c["matched"] - c["genie"] for _, _, c in data], "-s", color=C_VAR, lw=2.0, ms=7.5,
-        label=LABEL)
-tidy(ax, "excess BER from snipping (points)")
-ax.set_title("Fidelity of what it kept", pad=8); ax.legend(loc="best", fontsize=10)
+ax.axhline(0, color=C_GT, ls=(0, (6, 3)), lw=2.0, label="channel only (reference)", zorder=3)
+draw(ax, "excess", "excess BER from snipping (points)", "Fidelity of what it kept")
+ax.legend(loc="best", fontsize=9.5)
 
 # 3. net overall BER
 ax = axes[2]
-ax.plot(snr, [100 * 0 + a["genie"] for _, a, _ in data], ls=(0, (6, 3)), color=C_GT, lw=2.0,
-        label="channel only")
-ax.plot(snr, [a["overall"] for _, a, _ in data], "-o", color=C_BASE, lw=2.0, ms=8, label="baseline snip")
-ax.plot(snr, [c["overall"] for _, _, c in data], "-s", color=C_VAR, lw=2.0, ms=7.5, label=LABEL)
-tidy(ax, "overall BER %")
+gx, gy = series("genie", -1)
+ax.plot(gx, gy, ls=(0, (6, 3)), color=C_GT, lw=2.0, label="channel only", zorder=3)
+draw(ax, "overall", "overall BER %", "Net effect (unsaved = 100%)")
 ax.yaxis.set_major_formatter(pct); ax.set_ylim(0, 105)
-ax.set_title("Net effect (unsaved = 100%)", pad=8); ax.legend(loc="lower right", fontsize=10)
+ax.legend(loc="lower right", fontsize=9.5)
 
-fig.suptitle(f"Coherent Power snip gate trade-off — baseline vs {LABEL}", y=1.04,
-             fontsize=13.5, color=INK)
-out = Path(VAR) / "fig_gate_tradeoff.png"
+fig.suptitle("Coherent Power snip-gate trade-off", y=1.04, fontsize=13.5, color=INK)
+out = VARS[-1] / "fig_gate_tradeoff.png"
 fig.savefig(out); plt.close(fig)
 print("\nwrote", out)
