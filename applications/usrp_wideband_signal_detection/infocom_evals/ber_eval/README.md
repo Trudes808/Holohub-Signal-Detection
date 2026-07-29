@@ -115,6 +115,33 @@ power envelope). So a full slot is always decodable. Annotations **< 1 ms** (the
 sync/decode → marked **`insufficient`** and **excluded** (data lost, undecodable by
 any detector — not a decode failure). This is the expected slot-truncation loss.
 
+## Figures
+`python plot_ber_figs.py` (env `dinov3`) regenerates every figure from the result
+CSVs. BER is plotted in **percent** ("BER %"), and detector colors/markers follow
+the repo-wide `DETECTOR_STYLE` (coherent `#1f77b4` ○, dino_ft `#8c564b` ✚) with
+ground truth as the neutral grey baseline, so these match the other evals.
+
+**The headline claim — "snipping is minimally destructive vs what the channel
+already did":**
+- `fig_snip_vs_channel.png` — per detector, channel-only vs after-snipping on the
+  **same signals**. The curves nearly coincide. Channel: **1.9% → 49% (+47 pts)**;
+  snipping adds **at most +3.1 pts (coherent, median +0.7)** and **+2.1 pts
+  (dino, median +0.3)**.
+- `fig_snip_excess.png` — that cost isolated: excess BER in percentage points,
+  hugging zero across the whole sweep.
+- `fig_snip_vs_channel_byclass.png` — the same claim per modulation class.
+
+These use a **matched subset**: each detector is compared against the genie
+evaluated on *exactly the signals that detector saved*. That is what isolates
+"what the snip did" from "what the detector missed" — without it, survivorship
+bias flatters whichever detector missed the weak signals (see the selection-bias
+section). Note each per-class panel therefore carries **one grey reference per
+detector**; the two separate only where the detectors saved different sets.
+
+**Full-sweep reference:** `ber_sweep_overall.png`, `ber_sweep_byclass.png` — the
+overall metric, where an unsaved signal counts as 100%. Use these for the
+detector comparison (coverage included), and the claim figures for snip fidelity.
+
 ## Results: BER vs SNR (the sweep)
 Overall bit-weighted BER (`results/ber_sweep_overall.csv`, figure
 `ber_sweep_overall.png`; SNR ≈ 54 − attenuation, per `snip_eval/snr_calibration.json`):
@@ -319,8 +346,10 @@ pieces (union) moves −16 dB from 3 → 4 matches, i.e. ≤0.1%.
 - **`run_ber_sweep.sh`** — sweep one detector across levels (gen → eval → cleanup;
   serial gen, pooled evals, idempotent resume).
 - **`ber_sweep_one.m`** — one (level, detector) eval + its own per-level summary row.
-- **`ber_sweep_combine.m`** — aggregate all levels → `ber_sweep_overall.{csv,png}`
-  + `ber_sweep_byclass.{csv,png}`.
+- **`ber_sweep_combine.m`** — aggregate all levels → `ber_sweep_overall.csv`
+  + `ber_sweep_byclass.csv` (the tables; figures come from `plot_ber_figs.py`).
+- **`plot_ber_figs.py`** — all figures (claim + full-sweep), repo-standard styling,
+  BER in %. Run this after a sweep; it reads only the result CSVs.
 - **`ber_status.sh`** — live progress dashboard (detector × level grid with BERs).
 - `dev_*.m` — one-off diagnostics used to root-cause the fixes above.
 - `results/` — per-signal + per-class CSVs per level, sweep tables + figures, logs.
