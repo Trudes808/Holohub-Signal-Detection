@@ -138,6 +138,41 @@ bias flatters whichever detector missed the weak signals (see the selection-bias
 section). Note each per-class panel therefore carries **one grey reference per
 detector**; the two separate only where the detectors saved different sets.
 
+**The other half — what MISSED detections cost:**
+- `fig_miss_coverage.png` — fraction of decodable signals each detector saved.
+  Dino holds **100% from 54 dB down to +4 dB** then falls off a cliff (94% → 71%
+  → 0.7% over −1…−11 dB); coherent decays steadily from the start (96% at 44 dB,
+  82% at 24 dB, 57% at +4 dB, ~43% at −26 dB).
+- `fig_error_budget.png` — **the decomposition figure.** Overall BER split into an
+  additive budget on a common denominator (every scored bit):
+
+  `overall = channel floor + snip excess + decode-fail excess + miss excess`
+
+  A missed signal is charged only the **excess over what the channel would have
+  cost it anyway** (at deep noise the genie itself is ~49%, so a miss costs ~51
+  points, not 100) — otherwise the 1.0 convention swamps everything and the three
+  effects aren't comparable.
+- `fig_miss_coverage_byclass.png` — coverage per modulation class (shows dino
+  failing wideband-first: 802.11ax and 5G go before BPSK/Bluetooth).
+
+The budget makes the split stark — snipping is a rounding error, misses are the
+whole story (BER %, share of every scored bit):
+
+| SNR | detector | channel | snipping | decode-fail | **MISSES** | overall |
+|---|---|---|---|---|---|---|
+| 39 | coherent | 2.66 | +0.09 | +0.00 | **+3.51** | 6.26 |
+| 19 | coherent | 29.56 | **−0.09** | +2.27 | **+33.02** | 64.76 |
+| 9 | coherent | 40.42 | +0.17 | +0.12 | **+36.26** | 76.97 |
+| 19 | dino | 28.94 | −0.03 | +0.00 | **+0.00** | 28.91 |
+| −6 | dino | 51.35 | −0.96 | +3.79 | **+24.68** | 78.85 |
+| −11 | dino | 52.03 | −0.01 | +0.00 | **+47.92** | 99.94 |
+
+At 19 dB, coherent's **missed detections cost more than the channel itself**
+(+33.0 vs 29.6 points) while snipping contributes **−0.09** — i.e. slightly
+*better* than genie. Dino carries a **zero** miss term across the entire 54 → +4 dB
+range. Note the snip term is frequently negative: that's the snip DDC's
+band-limiting shaving out-of-band noise (see the noise-shaving section).
+
 **Full-sweep reference:** `ber_sweep_overall.png`, `ber_sweep_byclass.png` — the
 overall metric, where an unsaved signal counts as 100%. Use these for the
 detector comparison (coverage included), and the claim figures for snip fidelity.

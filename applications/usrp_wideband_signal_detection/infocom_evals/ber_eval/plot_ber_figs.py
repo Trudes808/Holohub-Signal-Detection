@@ -344,6 +344,166 @@ out = RES / "ber_sweep_byclass.png"
 fig.savefig(out); plt.close(fig)
 print("wrote", out)
 
+# ============================== C. the cost of MISSED detections ==================== #
+# Additive error budget on a common denominator (every scored bit at that level):
+#
+#   detector overall BER  =  channel floor            (what perfect detection would give)
+#                         +  snip excess              (saved signals decoded worse than genie)
+#                         +  decode-fail excess       (saved, but the decoder threw)
+#                         +  miss excess              (never saved: 1.0 minus what genie got)
+#
+# A missed signal is charged only the EXCESS over what the channel would have done to
+# it anyway -- at deep noise the genie itself is at ~0.49, so a miss costs ~0.51, not 1.0.
+# That keeps the three effects comparable instead of letting the 1.0 convention dominate.
+def budget(det_rows, gt_rows):
+    tot = ch = snip = miss = dfail = 0.0
+    nsig = nmiss = 0
+    for k, v in det_rows.items():
+        nb, be = _num(v, "numBits"), _num(v, "bitErrors")
+        if nb is None or be is None:
+            continue                                  # 'insufficient' -> excluded for everyone
+        g = gt_rows.get(k)
+        gref = _num(g, "bitErrors") if g else None     # what the channel alone cost this signal
+        if gref is None:
+            gref = 0.0
+        tot += nb; ch += gref; nsig += 1
+        st = v["status"].split(":")[0]
+        if st == "decoded":
+            snip += be - gref
+        elif st == "miss":
+            miss += be - gref; nmiss += 1
+        else:
+            dfail += be - gref
+    if not tot:
+        return None
+    f = 100.0 / tot
+    return dict(ch=ch * f, snip=snip * f, dfail=dfail * f, miss=miss * f,
+                overall=(ch + snip + dfail + miss) * f, nsig=nsig, nmiss=nmiss)
+
+
+BUD = {d: dict(snr=[], ch=[], snip=[], dfail=[], miss=[], overall=[], cov=[]) for d in DETS}
+for L in have:
+    g = DATA.get((GT, L))
+    if not g:
+        continue
+    for det in DETS:
+        r = DATA.get((det, L))
+        if not r:
+            continue
+        b = budget(r, g)
+        if not b:
+            continue
+        for key in ("ch", "snip", "dfail", "miss", "overall"):
+            BUD[det][key].append(b[key])
+        BUD[det]["snr"].append(SNR0 - L)
+        BUD[det]["cov"].append(100.0 * (1 - b["nmiss"] / max(1, b["nsig"])))
+
+# ---- C1. detection coverage vs SNR --------------------------------------------------- #
+fig, ax = plt.subplots(figsize=(8.8, 5.0))
+for det in DETS:
+    b = BUD[det]
+    if not b["snr"]:
+        continue
+    s = STYLE[det]
+    ax.plot(b["snr"], b["cov"], color=s["color"], ls=s["ls"], lw=2.0, marker=s["marker"],
+            ms=8, mew=1.6, zorder=4, label=s["label"])
+ax.axhline(100, color=STYLE[GT]["color"], ls=STYLE[GT]["ls"], lw=2.0, zorder=3,
+           label="perfect detection (ground truth)")
+tidy(ax, ylabel="signals saved (% of decodable signals)")
+ax.yaxis.set_major_formatter(pctfmt())
+ax.set_ylim(-3, 108)
+ax.set_title("Detection coverage: what fraction of decodable signals each detector saved", pad=10)
+ax.legend(loc="lower left", fontsize=10.5)
+out = RES / "fig_miss_coverage.png"
+fig.savefig(out); plt.close(fig)
+print("wrote", out)
+
+# ---- C2. error budget: channel vs snipping vs missed detections ---------------------- #
+fig, axes = plt.subplots(1, 2, figsize=(13.0, 5.4), sharey=True)
+for ax, det in zip(axes, DETS):
+    b = BUD[det]
+    if not b["snr"]:
+        continue
+    s = STYLE[det]
+    x = b["snr"]
+    y0 = b["ch"]
+    y1 = [a + c for a, c in zip(y0, b["snip"])]
+    y2 = [a + c for a, c in zip(y1, b["dfail"])]
+    y3 = [a + c for a, c in zip(y2, b["miss"])]
+    ax.fill_between(x, 0, y0, color=STYLE[GT]["color"], alpha=0.30, lw=0.8,
+                    ec="white", zorder=2, label="channel (what perfect detection gives)")
+    ax.fill_between(x, y0, y1, color=s["color"], alpha=0.85, lw=0.8, ec="white",
+                    zorder=3, label="snipping")
+    ax.fill_between(x, y1, y2, color="#b0aca4", alpha=0.9, lw=0.8, ec="white",
+                    zorder=3, hatch="///", label="decoder failed on saved snippet")
+    ax.fill_between(x, y2, y3, color=s["color"], alpha=0.30, lw=0.8, ec="white",
+                    zorder=3, hatch="...", label="MISSED detections")
+    ax.plot(x, y3, color=s["color"], lw=2.0, marker=s["marker"], ms=7, mew=1.5,
+            zorder=5, label="overall BER")
+    ax.set_title(s["label"], pad=8)
+    tidy(ax, ylabel="BER %" if det == DETS[0] else None)
+    ax.yaxis.set_major_formatter(pctfmt())
+    ax.set_ylim(0, 100)
+    ax.legend(loc="upper left", fontsize=9.5)
+fig.suptitle("Where the bit errors come from: the channel, snipping, or never saving the signal\n"
+             "a missed signal is charged only the excess over what the channel would have cost it anyway",
+             y=1.06, fontsize=13.5, color=INK)
+out = RES / "fig_error_budget.png"
+fig.savefig(out); plt.close(fig)
+print("wrote", out)
+
+# ---- C3. per-class detection coverage ----------------------------------------------- #
+COV = {d: {c: dict(snr=[], cov=[]) for c in CLASSES} for d in DETS}
+for L in have:
+    for det in DETS:
+        f = RES / f"ber_{det}_attenuation_dB_{L}_byclass.csv"
+        if not f.exists():
+            continue
+        with open(f) as fh:
+            for x in csv.DictReader(fh):
+                c = x["class"].strip('"')
+                if c in COV[det]:
+                    COV[det][c]["snr"].append(SNR0 - L)
+                    COV[det][c]["cov"].append(100.0 * float(x["detectRate"]))
+
+fig, axes = plt.subplots(2, 4, figsize=(17.0, 8.2), sharex=True, sharey=True)
+for i, c in enumerate(CLASSES):
+    ax = axes.flat[i]
+    ax.axhline(100, color=STYLE[GT]["color"], ls=STYLE[GT]["ls"], lw=1.6, zorder=3)
+    for det in DETS:
+        d = COV[det][c]
+        if not d["snr"]:
+            continue
+        s = STYLE[det]
+        ax.plot(d["snr"], d["cov"], color=s["color"], ls=s["ls"], lw=1.9,
+                marker=s["marker"], ms=6.5, mew=1.4, zorder=4)
+    ax.set_title(CLASS_LABEL.get(c, c), pad=6)
+    tidy(ax, xlabel=None, ylabel="signals saved %" if i % 4 == 0 else None)
+    ax.yaxis.set_major_formatter(pctfmt())
+    ax.set_ylim(-4, 108)
+for ax in axes.flat[len(CLASSES):]:
+    ax.axis("off")
+    h = [plt.Line2D([], [], color=STYLE[GT]["color"], ls=STYLE[GT]["ls"], lw=2.0,
+                    label="perfect detection")]
+    h += [plt.Line2D([], [], color=STYLE[d]["color"], ls="-", lw=2.0, marker=STYLE[d]["marker"],
+                     ms=8, mew=1.6, label=STYLE[d]["label"]) for d in DETS]
+    ax.legend(handles=h, loc="center", fontsize=11)
+for ax in axes[1]:
+    ax.set_xlabel("SNR (dB)")
+fig.suptitle("Detection coverage per modulation class", y=1.02, fontsize=13.5, color=INK)
+out = RES / "fig_miss_coverage_byclass.png"
+fig.savefig(out); plt.close(fig)
+print("wrote", out)
+
+print("\nerror budget (BER %, share of every scored bit):")
+for det in DETS:
+    b = BUD[det]
+    print(f"  -- {STYLE[det]['label']}")
+    print(f"    {'SNR':>5} {'saved':>7} | {'channel':>8} {'snip':>7} {'decfail':>8} {'MISSES':>8} | {'overall':>8}")
+    for i, snr in enumerate(b["snr"]):
+        print(f"    {snr:5.0f} {b['cov'][i]:6.1f}% | {b['ch'][i]:7.2f}% {b['snip'][i]:+6.2f}% "
+              f"{b['dfail'][i]:+7.2f}% {b['miss'][i]:+7.2f}% | {b['overall'][i]:7.2f}%")
+
 # ---------------------------------------------------------------- summary ----------- #
 print("\nheadline numbers for the claim (matched signals, BER %):")
 print(f"  {'SNR':>5} | {'channel':>8} {'coh snip':>9} {'Δ':>6} | {'channel':>8} {'dino snip':>9} {'Δ':>6}")
