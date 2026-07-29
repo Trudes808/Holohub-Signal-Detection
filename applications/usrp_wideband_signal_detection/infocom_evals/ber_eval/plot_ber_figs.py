@@ -52,7 +52,7 @@ GT = "ground_truth"
 STYLE = {
     GT:                  dict(color="#4d4b47", marker=None, ls=(0, (6, 3)), label="channel only (ground truth)"),
     "coherent_power":    dict(color="#1f77b4", marker="o",  ls="-", label="Coherent Power"),
-    "finetuned_dino_m2": dict(color="#8c564b", marker="P",  ls="-", label="DINO FT (M2)"),
+    "finetuned_dino_m2": dict(color="#8c564b", marker="P",  ls="-", label="DINO FT"),
 }
 DETS = ["coherent_power", "finetuned_dino_m2"]
 INK, INK2, GRID = "#1a1a1a", "#4a4a4a", "#d8d8d4"
