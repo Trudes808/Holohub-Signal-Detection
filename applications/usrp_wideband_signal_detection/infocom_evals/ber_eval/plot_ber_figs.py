@@ -151,10 +151,11 @@ for L in have:
         CLAIM[det]["det"].append(db); CLAIM[det]["gt"].append(gb); CLAIM[det]["n"].append(n)
 
 
-def save(fig, out):
-    """Save, stamping the variant label (if any) so a 75k/1ms figure is never
-    mistaken for the baseline one."""
-    if SUFFIX:
+def save(fig, out, stamp=True):
+    """Save, stamping the variant label (if any) so a variant figure is never mistaken
+    for the baseline one. stamp=False for figures specified to carry no sub-label
+    (the v2 presentation figure), where the caption belongs in the surrounding doc."""
+    if SUFFIX and stamp:
         fig.text(0.995, 0.002, SUFFIX, ha="right", va="bottom", fontsize=9, color=INK2)
     fig.savefig(out)
     plt.close(fig)
@@ -348,7 +349,7 @@ ax.set_ylabel("BER %")
 ax.set_title("Bit Error Rate (BER) vs. SNR", pad=10)  # no subtitle
 ax.legend(loc="lower left", fontsize=10.5, framealpha=0.0)
 out = RES / "ber_sweep_overall_v2.png"
-save(fig, out)
+save(fig, out, stamp=False)          # spec: bare title, no sub-label of any kind
 
 # ============================== B2. per-class sweep (restyled) ===================== #
 CLS_OVER = {d: {c: dict(snr=[], ber=[]) for c in CLASSES} for d in [GT] + DETS}
