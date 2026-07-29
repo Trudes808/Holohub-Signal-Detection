@@ -145,25 +145,55 @@ Overall bit-weighted BER (`results/ber_sweep_overall.csv`, figure
    essentially nothing in decodability.
 2. **Same span: coherent is 2–3× worse than genie** and the gap opens as SNR
    falls (0.0626 vs 0.0214 at 39 dB; 0.6476 vs 0.2866 at 19 dB). Per class the
-   cost is brutal — at 39 dB **BPSK is 0.194 (coherent) vs 0.0010 (genie/dino),
-   ~190×** — driven by its **detect rate falling** (0.82 at 39 dB, 0.23 for
-   802.11ax at 9 dB) while dino holds 1.00.
+   overall-BER cost is large — at 39 dB **BPSK is 0.194 (coherent) vs 0.0010
+   (genie/dino)** — but note **this is a miss-rate effect, not snippet quality**:
+   its detect rate falls 1.00 → 0.23 while dino holds 1.00, and missed bits score
+   1.0. On the signals it *does* save, coherent decodes ≈ genie (see below).
 3. **Below −1 dB dino inverts and collapses** (0.999+ at −11 dB and below);
-   coherent plateaus ~0.85. See below — this is real, not a harness artifact.
+   coherent plateaus ~0.85. Real, not a harness artifact — but read the
+   "nothing is genuinely decodable below ~0 dB" caveat before interpreting it.
 
 GT itself saturates at **~0.546** (not 0.5) from −11 dB on: the floor once
 nothing is decodable. Per-class detail for every level: `ber_sweep_byclass.csv`,
 figure `ber_sweep_byclass.png`.
 
-### Why coherent loses so much (and dino doesn't)
-Detection *precision* is the mechanism, and it matches the independent mask-eval:
-**dino IoU 0.95 vs coherent 0.48**; coherent's boxes are ~19× wider than the
-occupied bandwidth. A too-wide box buries the signal in captured noise, so its
-snippet decodes worse *and* stores ~19× more spectrum per detection. As SNR
-drops, coherent additionally starts **missing** signals outright (detect rate
-0.82 → 0.23), which the harness scores as BER 1.0 for those bits — exactly the
-"did the detector save enough to decode?" question this eval exists to answer.
-None of this is visible at atten_0 alone, where all three look equivalent.
+### Why coherent loses so much — it's MISSES, not snippet quality
+Decompose overall BER into bits from **missed** signals (scored 1.0 by
+definition) vs bits from **decoded** signals, and the mechanism is unambiguous:
+
+| SNR | coherent overall | from misses | from decoded | miss share of bits |
+|---|---|---|---|---|
+| 39 dB | 0.0626 | 0.0357 | 0.0269 | 3.6% |
+| 24 dB | 0.4201 | 0.2674 | 0.1527 | 26.7% |
+| 9 dB | 0.7694 | **0.6366** | 0.1328 | **63.7%** |
+| −26 dB | 0.8616 | 0.7289 | 0.1327 | 72.9% |
+
+**BER on decoded signals only** (i.e. quality of the IQ each detector actually
+saved) is ≈ genie at every SNR — coherent is sometimes *better*:
+
+| SNR | GT | coherent | dino |
+|---|---|---|---|
+| 39 dB | 0.0214 | 0.0279 | 0.0242 |
+| 24 dB | 0.2007 | 0.2084 | 0.2078 |
+| 9 dB | 0.4026 | **0.3654** | 0.4042 |
+
+So **what gets saved decodes as well as perfect extraction, for both detectors**
+(the snip DDC band-limits each snippet, which can even shave out-of-band noise).
+The entire detector gap is **detection coverage**: coherent's detect rate falls
+1.00 → 0.23 while dino holds 1.00 down to +4 dB. Coherent's ~19×-too-wide boxes
+(IoU 0.48 vs dino 0.95) therefore cost **storage**, ~19× more spectrum per
+detection, rather than decodability. Do NOT attribute coherent's overall-BER gap
+to noise in its wide snippets — the decoded-only column refutes that.
+
+### Caveat: below ~0 dB SNR nothing is genuinely decodable (by anyone)
+`status=="decoded"` only means the decoder ran without throwing, not that it
+recovered the bits. Decoded-only BER at −26 dB is **0.4935 (GT) / 0.4896
+(coherent) / 0.4961 (dino)** — a coin flip. GT's own overall saturates ~0.55.
+So the deep-noise end of every curve measures **how much spectrum a detector
+happened to save**, not decodability; only the ≳ +9 dB region carries real
+decodability information. (A third status, `decode_err` — a genuine decoder
+exception, scored 1.0 — also grows at depth: 6.3% of GT bits at −6 dB, 10.7% at
+−26 dB, which is why GT's overall exceeds its decoded-only.)
 
 ### dino's deep-noise collapse (verified real, ≤ −11 dB)
 At −16 dB dino emits ~1012 boxes but decodes **3 / 1112** signals. Verified by
