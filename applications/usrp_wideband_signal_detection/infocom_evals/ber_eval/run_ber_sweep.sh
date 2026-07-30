@@ -13,6 +13,12 @@
 #               SNIP_EXTRA="--min-mask-bandwidth-hz 75000 --min-bandwidth-hz 75000 --min-duration-s 0.001"
 #   RESULTS_DIR results folder for a variant sweep (default results/)
 #   TAG         suffix for the /tmp snippet root so a variant never collides
+#   REGION_DET  1 = results_v2 detection rule. Builds a region-detection table from the
+#               detector's RAW MASK (>= REGION_THRESH of each GT emission's area covered,
+#               same rule as the other evals) and passes it to the harness, which then
+#               ignores the legacy center-in-band + time-overlap test entirely.
+#   REGION_THRESH  coverage threshold (default 0.1)
+#   KEEP_MASKS  1 = do not delete mask_arrays during cleanup (needed by REGION_DET)
 set -uo pipefail
 
 DET="${1:?usage: run_ber_sweep.sh <ground_truth|coherent_power|finetuned_dino_m2>}"
@@ -27,6 +33,10 @@ export CONTAINER_NAME="${CONTAINER_NAME:-usrp_x410_sig_det_bqn82}"
 SNIP_EXTRA="${SNIP_EXTRA:-}"
 RESULTS_DIR="${RESULTS_DIR:-$BER/results}"
 TAG="${TAG:-}"
+REGION_DET="${REGION_DET:-0}"
+REGION_THRESH="${REGION_THRESH:-0.1}"
+KEEP_MASKS="${KEEP_MASKS:-0}"
+[ "$REGION_DET" = "1" ] && KEEP_MASKS=1        # the table is built from the masks
 
 case "$DET" in
     coherent_power)    OUTROOT="/tmp/usrp_spectrograms/ber_eval/coherent_power${TAG}" ;;
@@ -42,17 +52,47 @@ mkdir -p "$BER/results"
 
 running_evals() { jobs -rp | wc -l; }
 
+mask_run_dir() {   # $1=stem -> the dir holding mask_arrays/gt_annotations/frame_manifest
+    local stem="$1"
+    case "$DET" in
+        coherent_power)
+            if [ -f "${ALLDET}/coherent_power/${stem}/frame_manifest.csv" ]; then
+                echo "${ALLDET}/coherent_power/${stem}"
+            else
+                echo "${OUTROOT}/masks/coherent_power/${stem}"
+            fi ;;
+        finetuned_dino_m2) echo "${OUTROOT}/masks/dino_finetuned/${stem}" ;;
+        *) echo "" ;;
+    esac
+}
+
 eval_one() {   # $1=stem  (run backgrounded)
     local stem="$1"
-    local sroot=""
+    local sroot="" dtab=""
     [ -n "$OUTROOT" ] && sroot="${OUTROOT}/iq/${stem}/snippets"
-    ( cd "$BER" && matlab -batch "ber_sweep_one('${stem}','${DET}','${RESULTS_DIR}','${sroot}')" ) \
+    if [ "$REGION_DET" = "1" ]; then
+        local mdir; mdir="$(mask_run_dir "$stem")"
+        dtab="${RESULTS_DIR}/regdet_${DET}_${stem}.csv"
+        ( cd "$BER" && python region_detect.py --run-dir "$mdir" --out "$dtab" \
+              --threshold "$REGION_THRESH" ) >> "$RESULTS_DIR/eval_${DET}_${stem}.log" 2>&1
+        if [ ! -s "$dtab" ]; then
+            echo "!! region_detect FAILED for ${DET} ${stem} (masks at ${mdir}) -> skip eval"
+            return 1
+        fi
+    fi
+    ( cd "$BER" && matlab -batch "ber_sweep_one('${stem}','${DET}','${RESULTS_DIR}','${sroot}','${dtab}')" ) \
         >> "$RESULTS_DIR/eval_${DET}_${stem}.log" 2>&1
     if [ -n "$OUTROOT" ]; then
-        rm -rf "${OUTROOT}/iq/${stem}" \
-               "${OUTROOT}/masks/coherent_power/${stem}" \
-               "${OUTROOT}/masks/cuda_dino/${stem}" \
-               "${OUTROOT}/masks/dino_finetuned/${stem}"
+        rm -rf "${OUTROOT}/iq/${stem}"
+        if [ "$KEEP_MASKS" != "1" ]; then
+            rm -rf "${OUTROOT}/masks/coherent_power/${stem}" \
+                   "${OUTROOT}/masks/cuda_dino/${stem}" \
+                   "${OUTROOT}/masks/dino_finetuned/${stem}"
+        else
+            # the region table is already extracted; drop only the bulky cuda_dino
+            # foundation, keep the detector's own masks for reproducibility
+            rm -rf "${OUTROOT}/masks/cuda_dino/${stem}"
+        fi
     fi
     echo "[$(date -u +%TZ)] EVAL DONE ${DET} ${stem}  (/tmp free $(df -h --output=avail /tmp | tail -1 | tr -d ' '))"
 }

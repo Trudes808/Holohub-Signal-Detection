@@ -24,6 +24,11 @@ p.addParameter("CachePath", fullfile(HERE, "wave_cache.mat"));   % shared precom
 p.addParameter("SnippetRoot", "");   % default derived below
 p.addParameter("OutDir", fullfile(HERE, "results"));
 p.addParameter("TimeOverlapMin", 0.10);
+% results_v2 detection rule: path to a region_detect.py table. When set, a signal is
+% "detected" iff >= 0.1 of its AREA on the FFT grid is covered by the detector's raw
+% mask -- the same region-level rule the other evaluations use -- and the legacy
+% center-in-band + per-piece time-overlap test is NOT applied at all.
+p.addParameter("DetectionTable", "");
 p.addParameter("CompensateCenter", true);
 p.addParameter("CorrectCFO", true);   % data-aided CFO vs known TX waveform (all classes)
 p.addParameter("EqualizeSC", true);   % data-aided MMSE equalizer on the single-carrier path (ISI)
@@ -75,6 +80,21 @@ end
 slo = [snip.freq_lo]; shi = [snip.freq_hi];      % detection box freq edges (Hz)
 s0 = [snip.orig_start]; s1 = [snip.orig_end];    % original-timeline sample span
 
+% ---- 3b. region-level detection table (results_v2 rule), if supplied ----
+detMap = containers.Map('KeyType','char','ValueType','double');
+useRegion = strlength(string(o.DetectionTable)) > 0;
+if useRegion
+    if ~isfile(o.DetectionTable)
+        error("DetectionTable not found: %s (run region_detect.py first)", o.DetectionTable);
+    end
+    Td = readtable(o.DetectionTable, TextType="string");
+    for r = 1:height(Td)
+        detMap(region_key(Td.sample_start(r), Td.freq_lower_hz(r), Td.freq_upper_hz(r))) = ...
+            double(Td.detected(r));
+    end
+    fprintf("  region-detection table: %d emissions (threshold applied upstream)\n", height(Td));
+end
+
 % ---- 4. per-signal decode ----
 % "ground_truth" = genie reference: extract each signal straight from the
 % capture at its known center/time (perfect detection + full bandwidth).
@@ -114,6 +134,28 @@ for i = 1:n
     try
         if isGT
             rx = extract_from_capture(capFid, gStart, gEnd, gtCenter, w.native, w.numOut, capLen);
+        elseif useRegion
+            % results_v2: detection is decided ONLY by region-level mask coverage
+            % (>= 0.1 of the emission's area), exactly as in the other evaluations.
+            key = region_key(gStart, g.freq_lo, g.freq_hi);
+            isDet = isKey(detMap, key) && detMap(key) > 0;
+            if ~isDet
+                rows{i} = mkrow(g, 1.0, w.nbits, w.nbits, "miss");   % not detected -> 100% BER
+                continue;
+            end
+            % Detected. Decode whatever the snipper actually saved for it: any snippet
+            % overlapping this emission in BOTH time and frequency (no center test --
+            % the region rule replaced it).
+            ovT = min(s1, gEnd) - max(s0, gStart);
+            ovF = min(shi, g.freq_hi) - max(slo, g.freq_lo);
+            match = find(ovT > 0 & ovF > 0);
+            if isempty(match)
+                % Detected by the mask but the snipper saved no IQ for it -> there is
+                % nothing to decode. Charged as a full miss (per the eval's convention),
+                % but tagged separately so the data-saving loss stays countable.
+                rows{i} = mkrow(g, 1.0, w.nbits, w.nbits, "miss_nosave");
+                continue;
+            end
         else
             inBand = slo <= gtCenter & gtCenter <= shi;   % detection band contains signal center
             ov = max(0, min(s1, gEnd) - max(s0, gStart));  % time overlap in samples
@@ -123,6 +165,10 @@ for i = 1:n
                 rows{i} = mkrow(g, 1.0, w.nbits, w.nbits, "miss");   % failed to detect -> 100% BER
                 continue;
             end
+        end
+        if ~isGT
+            % shared by both detection rules: stitch the matched pieces, recenter on the
+            % known signal center, resample to native.
             pieces = dedup_by_frame(snip(match), gtCenter);
             rx = stitch_and_recenter(pieces, gtCenter, gStart, gEnd, w.native, o.CompensateCenter);
         end
@@ -172,7 +218,9 @@ totErr = sum(T.bitErrors(~isnan(T.bitErrors)));
 totBit = sum(T.numBits(~isnan(T.numBits)));
 out = struct("detector",string(detector), "stem",string(stem), ...
     "nSignals",height(T), "nDecoded",height(decoded), ...
-    "nMiss",sum(T.status=="miss"), "nInsuff",sum(T.status=="insufficient"), ...
+    "nMiss",sum(T.status=="miss" | T.status=="miss_nosave"), ...
+    "nMissNoSave",sum(T.status=="miss_nosave"), ...
+    "nInsuff",sum(T.status=="insufficient"), ...
     "overallBER", totErr/max(1,totBit), ...
     "byClass",byClass, "table",T, "resultsCsv",string(resPath), "byClassCsv",string(clsPath));
 
@@ -204,6 +252,15 @@ for k = 1:numel(A)
         "freq_hi", double(a.core_freq_upper_edge), ...
         "block_center", bc, "class", cls, "variation", v);
 end
+end
+
+% ======================================================================= %
+function k = region_key(sampleStart, freqLo, freqHi)
+% Join key shared with region_detect.py: an emission is identified by its global
+% sample_start plus its frequency edges (several emissions can share a slot at
+% different frequencies, so sample_start alone is not unique). Both sides are integer
+% Hz / samples, so round before formatting to avoid float-formatting drift.
+k = sprintf('%.0f_%.0f_%.0f', round(sampleStart), round(freqLo), round(freqHi));
 end
 
 % ======================================================================= %
@@ -529,7 +586,10 @@ rows = cell(numel(cls),1);
 for i = 1:numel(cls)
     sub = T(T.class==cls(i),:);
     dec = sub(sub.status=="decoded",:);
-    nMiss = sum(sub.status=="miss");
+    % "miss_nosave" = detected by the region rule but the snipper saved no IQ. It is a
+    % miss for every purpose here (scored BER 1.0); kept as its own status only so the
+    % data-saving loss stays countable in the per-signal CSV.
+    nMiss = sum(sub.status=="miss" | sub.status=="miss_nosave");
     nInsuff = sum(sub.status=="insufficient");   % signal truncated/clipped in capture -> data lost
     nDecodable = max(1, height(dec) + nMiss);    % signals that COULD be decoded if the detector saved them
     err = sum(sub.bitErrors(~isnan(sub.bitErrors)));

@@ -1,4 +1,4 @@
-function ber_sweep_one(stem, detector, outDir, snippetRoot)
+function ber_sweep_one(stem, detector, outDir, snippetRoot, detectionTable)
 %BER_SWEEP_ONE Run ber_eval_run for one (stem, detector) and write a per-level
 % overall-summary row to results/ber_<detector>_<stem>_overall.csv.
 %
@@ -22,6 +22,10 @@ end
 extra = {};
 if nargin >= 4 && strlength(string(snippetRoot)) > 0
     extra = {"SnippetRoot", string(snippetRoot)};
+end
+% results_v2: region-level mask-coverage detection table (replaces the legacy match rule)
+if nargin >= 5 && strlength(string(detectionTable)) > 0
+    extra = [extra, {"DetectionTable", string(detectionTable)}];
 end
 if ~exist(outDir, "dir"), mkdir(outDir); end
 r = ber_eval_run(stem, detector, "OutDir", outDir, extra{:});
