@@ -14,7 +14,9 @@ function ber_precompute(varargin)
 %   ber_precompute("Force",true)         % rebuild even if present
 HERE = fileparts(mfilename('fullpath')); addpath(HERE);
 p = inputParser;
-p.addParameter("GenRoot", "/home/bqn82/holoscan_generated_waveform/generated_waveforms_24576");
+% External waveform library (not in the repo); override with BER_GEN_ROOT per machine.
+p.addParameter("GenRoot", env_or("BER_GEN_ROOT", ...
+    "/home/bqn82/holoscan_generated_waveform/generated_waveforms_24576"));
 p.addParameter("CachePath", fullfile(HERE, "wave_cache.mat"));
 p.addParameter("Force", false);
 p.parse(varargin{:}); o = p.Results;
@@ -50,4 +52,10 @@ end
 
 function v = getdef(s, f, d)
 if isfield(s,f) && ~isempty(s.(f)), v = s.(f); else, v = d; end
+end
+
+function v = env_or(name, dflt)
+% Environment override for a machine-specific data path, else the default.
+v = string(getenv(name));
+if strlength(v) == 0, v = string(dflt); end
 end

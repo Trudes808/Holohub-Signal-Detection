@@ -18,8 +18,11 @@ function out = ber_eval_run(stem, detector, varargin)
 
 HERE = fileparts(mfilename('fullpath'));
 p = inputParser;
-p.addParameter("CapturesDir", "/home/bqn82/captures");
-p.addParameter("GenRoot", "/home/bqn82/holoscan_generated_waveform/generated_waveforms_24576");
+% Data locations. These are EXTERNAL artifacts (not in the repo) -- override per machine
+% with the env vars, or pass the parameters explicitly. See the README "Requirements".
+p.addParameter("CapturesDir", env_or("BER_CAPTURES_DIR", "/home/bqn82/captures"));
+p.addParameter("GenRoot", env_or("BER_GEN_ROOT", ...
+    "/home/bqn82/holoscan_generated_waveform/generated_waveforms_24576"));
 p.addParameter("CachePath", fullfile(HERE, "wave_cache.mat"));   % shared precomputed decode cache
 p.addParameter("SnippetRoot", "");   % default derived below
 p.addParameter("OutDir", fullfile(HERE, "results"));
@@ -252,6 +255,13 @@ for k = 1:numel(A)
         "freq_hi", double(a.core_freq_upper_edge), ...
         "block_center", bc, "class", cls, "variation", v);
 end
+end
+
+% ======================================================================= %
+function v = env_or(name, dflt)
+% Environment override for a machine-specific data path, else the default.
+v = string(getenv(name));
+if strlength(v) == 0, v = string(dflt); end
 end
 
 % ======================================================================= %

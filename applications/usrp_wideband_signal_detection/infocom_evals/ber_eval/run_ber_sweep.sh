@@ -22,9 +22,11 @@
 set -uo pipefail
 
 DET="${1:?usage: run_ber_sweep.sh <ground_truth|coherent_power|finetuned_dino_m2>}"
-BER="/home/bqn82/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection/infocom_evals/ber_eval"
-PIPE="/home/bqn82/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/soft_label_pipeline"
-CAPS="/home/bqn82/captures"
+# Repo-relative so this works from any checkout; CAPS is external data (override with
+# BER_CAPTURES_DIR). See README "Requirements".
+BER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+PIPE="$(cd "$BER/../snip_eval/soft_label_pipeline" && pwd -P)"
+CAPS="${BER_CAPTURES_DIR:-/home/bqn82/captures}"
 ALLDET="/tmp/usrp_spectrograms/all_detectors"
 LEVELS="${LEVELS:-5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80}"
 MAXEVAL="${MAXEVAL:-5}"

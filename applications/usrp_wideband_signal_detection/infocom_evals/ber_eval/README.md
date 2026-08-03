@@ -5,15 +5,94 @@ detector actually saved* and comparing to the known transmitted bits. The point:
 show whether lossy **detect → snip** (data saving) preserves **decodability**, per
 modulation class, for **ground_truth / coherent_power / finetuned_dino_m2**.
 
-Branch: `BER_eval`. Uses MATLAB R2025b (Comms/Signal/DSP/5G/LTE/WLAN/Bluetooth +
-the `helperOFDM*` example). Run headless: `matlab -batch "..."`.
+> **Status: COMPLETE.** 17 attenuation levels (0–80 dB, skipping the `*_v2`
+> recaptures) × 3 detectors, in **four** result folders (see *Result folders* below).
+> Headline: **dino_ft decodes essentially as well as perfect genie extraction across
+> ~50 dB of SNR, while coherent_power runs 2–3× worse than genie over the same span**
+> — and that gap is *missed detections*, not snippet damage.
 
-> **Status (2026-07-29): SNR SWEEP COMPLETE** — 17 attenuation levels (0–80 dB,
-> skipping the `*_v2` recaptures) × 3 detectors = **51/51 detector-levels**.
-> Headline: **dino_ft decodes essentially as well as perfect genie extraction
-> across ~50 dB of SNR (54 → +4 dB), while coherent_power runs 2–3× worse than
-> genie over the same span.** Below −1 dB dino collapses (real, verified — see
-> "dino's deep-noise collapse"). Full curves: `results/ber_sweep_*.{csv,png}`.
+---
+
+# Requirements
+
+## 1. MATLAB (required for all decoding)
+Developed on **R2025b**, headless via `matlab -batch "..."`. Toolboxes, by what the
+decoder actually calls:
+
+| Toolbox | Needed for | Example calls |
+|---|---|---|
+| **Communications** | single-carrier PSK/QAM, RRC filtering, the OFDM helpers | `pskmod/pskdemod`, `qammod/qamdemod`, `comm.RaisedCosineReceiveFilter` |
+| **Signal Processing** | resampling / band isolation | `resample`, `lowpass` |
+| **5G** | 5G downlink (PDSCH) | `nrPDSCHDecode`, `nrDLSCHDecoder`, `nrOFDMDemodulate`, … |
+| **WLAN** | 802.11ax | `wlanHEDemodulate`, `wlanHEDataBitRecover`, `wlanPacketDetect`, … |
+| **Bluetooth** | BR/EDR + LE | `bluetoothIdealReceiver`, `bluetoothPhyConfig` |
+
+**LTE Toolbox is _not_ required** — there are no `lte*` calls (an earlier version of this
+README wrongly listed it). DSP System Toolbox is not called directly either, though
+Communications Toolbox pulls it in as an install dependency.
+
+**One-time setup — the OFDM example helpers.** The generic-OFDM path reuses MathWorks'
+`helperOFDM*` files, which ship as *example* files and are not on the path by default. Run
+once, interactively (it cannot run under `-batch`):
+```matlab
+openExample('comm/OFDMEndToEndExample')
+```
+That copies them to `~/Documents/MATLAB/Examples/<release>/comm/OFDMEndToEndExample/`.
+`decode_waveforms_24576.m` then finds and `addpath`s them automatically (it also checks
+`matlabroot/examples/comm/OFDMEndToEndExample`) and raises a message telling you to run the
+above if they are missing. Nothing else needs configuring.
+
+## 2. External data (NOT in the repo)
+Three artifacts live outside git because of size. Override the locations per machine with
+env vars — no code edits needed:
+
+| What | Default location | Override | Notes |
+|---|---|---|---|
+| **TX waveform library** | `~/holoscan_generated_waveform/generated_waveforms_24576` | `BER_GEN_ROOT` | 287 `.mat` in per-class subdirs + `waveform_manifest.csv`. Holds `f_sig`, `metadata`, `txBits` — the known-transmitted truth. |
+| **Captures** | `~/captures` | `BER_CAPTURES_DIR` | `attenuation_dB_*.sigmf-{data,meta}`, ~14 GB each. Only ground-truth reads these. |
+| **`wave_cache.mat`** | this folder | `CachePath` param | Built by `ber_precompute`; gitignored (~64 MB). |
+
+```bash
+export BER_GEN_ROOT=/path/to/generated_waveforms_24576
+export BER_CAPTURES_DIR=/path/to/captures
+```
+
+## 3. Just want to decode a waveform? (no detectors, no captures)
+`decode_waveforms_24576.m` is standalone — it needs **only MATLAB + the toolboxes above +
+the waveform library**. No container, no Python, no captures:
+```matlab
+% one waveform, clean -> BER ~0
+r = decode_waveforms_24576("<GEN_ROOT>/QPSK/<name>.mat")
+
+% add an impairment channel
+r = decode_waveforms_24576(path, "Channel","wireless", "SNRdB",30, "FrequencyOffsetHz",1e3)
+
+% decode arbitrary IQ you already have, using known metadata + bits
+r = decode_waveforms_24576(rx, "Fs",245.76e6, "Metadata",md, "TxBits",bits)
+
+% batch a whole directory/manifest -> results table
+t = decode_waveforms_24576("<GEN_ROOT>")
+```
+Returns BER for the digital classes, recovered audio + quality for the two FM classes.
+This is the piece most people will want to reuse.
+
+## 4. Only for (re)generating detector snippets
+Needed **only** if you must rebuild the coherent/dino snippets (they live in volatile
+`/tmp`). Ground-truth and any already-generated results need none of this.
+- the demo container running (see the app README / `bash_scripts/`)
+- conda env `dinov3` (python + numpy/pandas/matplotlib) for `soft_label_pipeline.py`,
+  `region_detect.py`, `plot_ber_figs.py`, `compare_variants.py`
+- a GPU for the `dino_finetuned` masks
+
+## 5. Reproduce from a clean machine
+```bash
+export BER_GEN_ROOT=... BER_CAPTURES_DIR=...
+matlab -batch "ber_precompute"                      # build wave_cache.mat (~10 min, once)
+matlab -batch "ber_eval_run('attenuation_dB_0','ground_truth')"   # genie: no snippets needed
+```
+Then, for the detector rows, regenerate snippets (§4) and run a sweep — see *Quickstart*.
+
+---
 
 ## Quickstart
 ```matlab
@@ -47,6 +126,21 @@ python soft_label_pipeline.py --waveform-dir /home/bqn82/captures \
 # dino: --detector dino_finetuned, drop --mask-root (regenerates masks on GPU),
 #       --output-root .../ber_eval/finetuned_dino_m2
 ```
+
+## Result folders — which one to use
+Four complete sweeps. They differ in **one variable each**; `ground_truth` is identical in
+all of them (the genie reads the capture directly, so no detector setting can change it).
+
+| folder | what differs | use it for |
+|---|---|---|
+| **`results/`** | baseline: snip with `min_box_pixels 256` only; detection = signal-center-in-box **and** ≥10% time overlap | the **snip-fidelity claim** ("snipping is minimally destructive") — that claim is matched-subset and so rule-independent |
+| **`results_v2/`** | **detection = region-level mask coverage ≥ 0.1**, the same rule as the other evals (`mask_eval_metrics.py`) | ✅ **detector comparison** — consistent with the rest of the eval suite, and free of the artifact that let coherent appear to win at deep noise |
+| **`results_coh_75k_1ms/`** | coherent snip gated to 75 kHz **and** 1 ms | the data-saving gate variation from `snip_eval` |
+| **`results_coh_75k_notime/`** | coherent snip gated to 75 kHz, **no** time minimum | isolating which half of that gate costs BER (answer: the bandwidth half) |
+
+Each folder has its own `README.md` with its exact parameters and numbers, plus the same
+figure set. **Start with `results_v2/` for detector comparison and `results/` for the
+snip-fidelity story.**
 
 ## Method
 Per ground-truth *data* waveform (`wfgt:kind=="waveform"`, digital classes only):
@@ -386,6 +480,10 @@ pieces (union) moves −16 dB from 3 → 4 matches, i.e. ≤0.1%.
 - **`plot_ber_figs.py`** — all figures (claim + full-sweep), repo-standard styling,
   BER in %. Run this after a sweep; it reads only the result CSVs.
 - **`ber_status.sh`** — live progress dashboard (detector × level grid with BERs).
-- `dev_*.m` — one-off diagnostics used to root-cause the fixes above.
+- **`region_detect.py`** — builds the region-level detection table (imports
+  `mask_eval_metrics.py` so the ≥0.1 coverage rule is bit-for-bit the other evals').
+- **`compare_variants.py`** — compare coherent across result folders → `fig_gate_tradeoff.png`.
+- `dev/` — one-off diagnostics kept as breadcrumbs for the fixes above (see `dev/README.md`);
+  not part of the pipeline.
 - `results/` — per-signal + per-class CSVs per level, sweep tables + figures, logs.
 - `wave_cache.mat` — generated by `ber_precompute.m` (do not commit; rebuild anywhere).

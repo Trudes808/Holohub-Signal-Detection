@@ -39,6 +39,7 @@ as the working root; wrappers and helpers live in subfolders and are called with
 | `run_cuda_dino_offline_file.py` | Offline-eval driver (documented below). `export_dinov3_torchscript.py` is the one-time DINO TorchScript export used during container setup. |
 | `main.cpp`, `spectrogram_visualization.cu`, `run_offline_cuda_detector_eval.cpp`, `*.hpp`, … | App and offline-eval build sources. The detectors themselves live in `operators/{coherent_power_signal_detector,cuda_dino_detector}`. |
 | `infocom_evals/signal_detection_experiments/` | Offline evaluation notebook + harness and experiment records. |
+| [`infocom_evals/ber_eval/`](infocom_evals/ber_eval/README.md) | **BER evaluation**: decodes the IQ each detector actually saved and compares it to the known transmitted bits (BER vs SNR, per modulation class). Also contains the standalone **MATLAB decoder** `decode_waveforms_24576.m` (5G / 802.11ax / Bluetooth / OFDM / single-carrier / FM) — usable on its own; see that README's *Requirements*. |
 
 ### Current configs
 

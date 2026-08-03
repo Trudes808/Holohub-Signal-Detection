@@ -1,6 +1,11 @@
 # regenerable data — never commit
 
-# local copy of the TX waveform library (~1.8 GB; source: ~/holoscan_generated_waveform)
+# Local copy of the TX waveform library (~1.8 GB). The canonical source is
+# $BER_GEN_ROOT (default ~/holoscan_generated_waveform/generated_waveforms_24576), which
+# the harness reads -- this copy is redundant for the eval and safe to delete to reclaim
+# space. NOTE before deleting: it is a SUPERSET, holding 18 extra LTE/*.mat waveforms that
+# the canonical dir does not have. Nothing here decodes LTE (no lte* calls), but they exist
+# nowhere else on this machine.
 generated_waveforms_24576/
 
 # built by ber_precompute.m
