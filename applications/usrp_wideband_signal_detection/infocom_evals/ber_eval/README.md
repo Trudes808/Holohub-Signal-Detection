@@ -76,6 +76,24 @@ t = decode_waveforms_24576("<GEN_ROOT>")
 Returns BER for the digital classes, recovered audio + quality for the two FM classes.
 This is the piece most people will want to reuse.
 
+**Verified**: on clean library waveforms all six digital standards decode at **BER = 0** —
+5G NR downlink, Bluetooth BR/EDR, Bluetooth LE, Generic OFDM, Generic single-carrier,
+IEEE 802.11ax HE-SU. If any of those errors instead, the cause is a missing toolbox or the
+`helperOFDM*` step above, not the waveform.
+
+> **Known limitation — the two FM classes need an audio file you probably don't have.**
+> FM decode scores recovered *audio* against the original source, whose path is baked into
+> each waveform's metadata as `metadata.audioFm.AudioSourceFile`. In this library that
+> points at the **waveform-generation machine** (a macOS path,
+> `/Users/.../Disco_Snail_easter_egg.mp3`), so `audioread` fails anywhere else with
+> *"The filename specified was not found in the MATLAB path."* To decode FM, either place
+> that MP3 at the recorded path or override the field before calling:
+> ```matlab
+> md = load(fmMat).metadata;  md.audioFm.AudioSourceFile = '/your/copy.mp3';
+> r = decode_waveforms_24576(rx, "Fs",245.76e6, "Metadata",md);
+> ```
+> This never affected the BER results — the eval scopes to digital classes only.
+
 ## 4. Only for (re)generating detector snippets
 Needed **only** if you must rebuild the coherent/dino snippets (they live in volatile
 `/tmp`). Ground-truth and any already-generated results need none of this.
