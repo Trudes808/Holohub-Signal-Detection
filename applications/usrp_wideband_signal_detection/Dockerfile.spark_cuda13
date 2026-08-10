@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# CUDA-13 container image for running usrp_wideband_signal_detection on the DGX Spark
+# (GB10 = Blackwell sm_121 / compute 12.1). The stock applications/usrp_freq_detection/Dockerfile
+# hardcodes a CUDA 12.6 base whose nvcc tops out at compute_90 and cannot target GB10. This
+# variant bases on the Holoscan v3.7.0-cuda13 image, which already provides:
+#   - aarch64 / Ubuntu 24.04, nvcc 13.0 (knows compute_121)
+#   - Holoscan 3.7 C++ SDK
+#   - libcu{blas,fft,solver,rand,sparse}-dev-13-0 (MatX deps), cmake 3.31, ninja, pkgconf
+#   - the DOCA 3.0 apt repo preconfigured for ubuntu24.04/arm64-sbsa
+# so we only add the DOCA/DPDK dev packages (advanced_network GPUNetIO backend) and MatX.
+# See applications/usrp_wideband_signal_detection/notes/dgx_spark_port.md.
+
+FROM nvcr.io/nvidia/clara-holoscan/holoscan:v3.7.0-cuda13 AS base
+SHELL ["/bin/bash", "-eou", "pipefail", "-c"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# DOCA/DPDK dev packages for the advanced_network (GPUNetIO/DPDK) backend.
+# The base image ships DOCA 3.1.0105 *runtime* but only configures the DOCA 3.0.0 apt repo (whose
+# -dev packages are 3.0.0058) -> unmet-dependency conflict. Realign the repo to 3.1.0 so the -dev
+# packages match the preinstalled runtime (3.1.0105-1 / mlnx-dpdk 22.11...2507).
+# - mlnx-dpdk-dev: dpdk + gpunetio backends
+# - libdoca-sdk-{dma,gpunetio,eth,flow}-dev: doca gpunetio backend modules
+# - mlnx-ofed-kernel-utils: ibdev2netdev etc. (used by tune_system.py)
+# - ibverbs-utils, python3-pyelftools: utilities used by the mlnx/dpdk tooling
+# - python3-dev: for building python bindings
+RUN sed -i 's#/public/repo/doca/3.0.0/#/public/repo/doca/3.1.0/#' /etc/apt/sources.list.d/doca.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        ninja-build \
+        pkgconf \
+        mlnx-dpdk-dev \
+        libdoca-sdk-dma-dev \
+        libdoca-sdk-gpunetio-dev \
+        libdoca-sdk-eth-dev \
+        libdoca-sdk-flow-dev \
+        libdoca-sdk-verbs-dev \
+        libdoca-sdk-rdma-dev \
+        mlnx-ofed-kernel-utils \
+        ibverbs-utils \
+        python3-pyelftools \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Test/mock deps used by the advanced_network tooling. Ubuntu 24.04's pip is externally managed
+# (PEP 668), so allow installing into the system environment.
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        pytest \
+        pyyaml \
+        scapy
+
+# ==============================
+# matx: Install MatX from source (pinned to the version the app is built against)
+# ==============================
+ARG MATX_VERSION=0.9.2
+
+RUN mkdir /tmp/matx && \
+    cd /tmp/matx && \
+    curl -OL "https://github.com/NVIDIA/MatX/archive/refs/tags/v${MATX_VERSION}.tar.gz" && \
+    tar -xzf "v${MATX_VERSION}.tar.gz" && \
+    cd "./MatX-${MATX_VERSION}" && \
+    mkdir -p build && \
+    cd build && \
+    cmake .. && \
+    make && \
+    make install && \
+    cd /tmp && \
+    rm -rf /tmp/matx

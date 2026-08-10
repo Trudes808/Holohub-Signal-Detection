@@ -51,6 +51,10 @@ if(TORCH_SEARCH_HINTS)
   list(PREPEND CMAKE_PREFIX_PATH ${TORCH_SEARCH_HINTS})
 endif()
 
+# GB10 (sm_121 / capability 12.1): Torch's Caffe2 CUDA autodetect misparses 12.1 and injects a
+# bogus `-gencode arch=compute_20,code=sm_121` into the global CUDA flags (nvcc fatal: Unsupported
+# gpu architecture 'compute_20'). Pin TORCH_CUDA_ARCH_LIST so Torch emits valid gencode instead.
+set(TORCH_CUDA_ARCH_LIST "9.0;12.1")
 find_package(Torch QUIET PATHS ${TORCH_SEARCH_HINTS})
 if(NOT Torch_FOUND)
   find_package(Torch QUIET)
@@ -68,6 +72,8 @@ find_library(NVML_LIBRARY
   PATHS
     /usr/lib/x86_64-linux-gnu
     /lib/x86_64-linux-gnu
+    /usr/lib/aarch64-linux-gnu
+    /lib/aarch64-linux-gnu
     /usr/local/cuda/lib64
 )
 
@@ -76,6 +82,8 @@ find_library(APP_VULKAN_LINK_ITEM
   PATHS
     /usr/lib/x86_64-linux-gnu
     /lib/x86_64-linux-gnu
+    /usr/lib/aarch64-linux-gnu
+    /lib/aarch64-linux-gnu
     /usr/local/lib
     /usr/local/lib64
 )
@@ -83,6 +91,8 @@ find_library(APP_VULKAN_LINK_ITEM
 set(APP_SYSTEM_LINK_DIRS
   /usr/lib/x86_64-linux-gnu
   /lib/x86_64-linux-gnu
+  /usr/lib/aarch64-linux-gnu
+  /lib/aarch64-linux-gnu
   /usr/local/lib
   /usr/local/lib64
 )
@@ -91,12 +101,17 @@ if(NOT APP_VULKAN_LINK_ITEM)
   message(WARNING "usrp_wideband_signal_detection: Vulkan loader library not found; visualization binaries may fail to link")
 endif()
 
-set(CMAKE_CUDA_ARCHITECTURES "70;80;90")
+# GB10 (DGX Spark) = sm_121. CUDA 13 dropped sm_70, so the old "70;80;90" is invalid here.
+# 90 (Hopper) kept for portability of the offline-eval binaries.
+set(CMAKE_CUDA_ARCHITECTURES "90;121")
 enable_language(CUDA)
 
 set(CUDA_LINK_DIRS
   "/usr/local/cuda/targets/x86_64-linux/lib"
+  "/usr/local/cuda/targets/sbsa-linux/lib"
   "/usr/local/cuda/lib64"
+  "/usr/local/cuda-13.0/targets/sbsa-linux/lib"
+  "/usr/local/cuda-13.0/lib64"
   "/usr/local/cuda-12.6/targets/x86_64-linux/lib"
   "/usr/local/cuda-12.6/lib64"
 )
@@ -108,7 +123,7 @@ execute_process(
   ERROR_QUIET
 )
 
-if(PY_NVJITLINK_DIR AND EXISTS "${PY_NVJITLINK_DIR}/libnvJitLink.so.12")
+if(PY_NVJITLINK_DIR AND (EXISTS "${PY_NVJITLINK_DIR}/libnvJitLink.so.13" OR EXISTS "${PY_NVJITLINK_DIR}/libnvJitLink.so.12"))
   list(APPEND CUDA_LINK_DIRS ${PY_NVJITLINK_DIR})
 endif()
 
@@ -118,7 +133,7 @@ if(TARGET CUDA::nvJitLink)
 else()
   unset(APP_NVJITLINK_LINK_ITEM CACHE)
   find_library(APP_NVJITLINK_LINK_ITEM
-    NAMES libnvJitLink.so.12 nvJitLink
+    NAMES libnvJitLink.so.13 libnvJitLink.so.12 nvJitLink
     PATHS ${CUDA_LINK_DIRS}
     NO_DEFAULT_PATH
   )

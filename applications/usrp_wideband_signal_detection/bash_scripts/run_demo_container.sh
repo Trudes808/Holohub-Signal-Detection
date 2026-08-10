@@ -82,40 +82,29 @@ container_has_mount_source() {
 
 require_current_display_forwarding() {
   local requested_display=${DISPLAY:-}
-  local requested_xauthority=${XAUTHORITY:-}
   local x11_socket_dir=/tmp/.X11-unix
 
   if [[ -z "${requested_display}" ]]; then
     return
   fi
 
-  if ! container_has_env_value DISPLAY "${requested_display}"; then
-    echo "Container ${CONTAINER_NAME} was not created with DISPLAY=${requested_display}." >&2
-    echo "docker start cannot add display forwarding to an existing container." >&2
-    echo "Recreate it from this desktop session with:" >&2
-    echo "  SKIP_IMAGE_BUILD=1 sudo -E ./build_demo_container.sh" >&2
-    exit 1
-  fi
-
+  # The X11 socket directory is bind-mounted as a whole (see build_demo_container.sh), so it always
+  # exposes the CURRENT session's socket regardless of the display number. That mount -- not the
+  # container's baked DISPLAY env -- is the real requirement for visualization.
   if [[ -d "${x11_socket_dir}" ]] && ! container_has_mount_destination "${x11_socket_dir}"; then
-    echo "Container ${CONTAINER_NAME} is missing the ${x11_socket_dir} mount required by the current session." >&2
-    echo "Recreate it from this desktop session with:" >&2
+    echo "Container ${CONTAINER_NAME} is missing the ${x11_socket_dir} mount needed for visualization." >&2
+    echo "Recreate it from a desktop session with:" >&2
     echo "  SKIP_IMAGE_BUILD=1 sudo -E ./build_demo_container.sh" >&2
     exit 1
   fi
 
-  if [[ -n "${requested_xauthority}" ]]; then
-    if [[ ! -f "${requested_xauthority}" ]]; then
-      echo "Warning: XAUTHORITY is set to ${requested_xauthority}, but that file does not exist on the host." >&2
-      return
-    fi
-
-    if ! container_has_env_value XAUTHORITY "${requested_xauthority}" || ! container_has_mount_source "${requested_xauthority}"; then
-      echo "Container ${CONTAINER_NAME} was not created with the current XAUTHORITY file." >&2
-      echo "Recreate it from this desktop session with:" >&2
-      echo "  SKIP_IMAGE_BUILD=1 sudo -E ./build_demo_container.sh" >&2
-      exit 1
-    fi
+  # A baked DISPLAY (or XAUTHORITY) that differs from the current session is NOT a problem: the run
+  # wrappers pass `-e DISPLAY=$DISPLAY` / `-e XAUTHORITY` at `docker exec` time, so the app always
+  # targets the current display. This lets the container survive a reboot that changes the X display
+  # number without a recreate (host-side `xhost +local:root` in after_reboot.sh grants access).
+  if ! container_has_env_value DISPLAY "${requested_display}"; then
+    echo "Note: ${CONTAINER_NAME} was created with a different DISPLAY than the current ${requested_display};" >&2
+    echo "      the run wrappers override DISPLAY at exec time, so no recreate is needed for visualization." >&2
   fi
 }
 

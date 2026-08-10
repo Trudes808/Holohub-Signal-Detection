@@ -38,7 +38,7 @@ advanced_network:
         num_bufs: 131072
         buf_size: 64
       - name: "CH1_Data_RX_GPU"
-        kind: "device"
+        kind: "huge"   # GB10 is integrated/coherent: NIC DMAs into host hugepages, GPU reads them zero-copy (ATS). device-mem GPUDirect is unsupported here. See notes/gb10_unified_memory_ingest.md
         affinity: 0
         access:
           - local
@@ -47,9 +47,9 @@ advanced_network:
 
     interfaces:
       - name: sdr_data
-        address: 0000:a2:00.0
+        address: 0000:01:00.0
         rx:
-          flow_isolation: true
+          flow_isolation: true   # two-QSFP topology: this is the DEDICATED DPDK data port (01:00.0); UHD control is on the separate kernel link enp1s0f1np1 (01:00.1).
           queues:
             - name: "Channel 1 data"
               id: 0
@@ -74,7 +74,7 @@ chdr_converter:
   interface_name: sdr_data
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 512
+  num_ffts_per_batch: 128   # latency vs stability: 512=>~321ms(stable), 32=>~60ms but converter backlogs+panic_resets (needs ~750 batch/s, tops out ~264). 128 => ~188 batch/s (headroom). Must match fft.num_bursts.
   num_simul_batches: 4
   num_channels: 1
   log_packets: false
@@ -88,7 +88,7 @@ chdr_converter:
 
 fft:
   burst_size: 20480
-  num_bursts: 512
+  num_bursts: 128   # must match chdr_converter.num_ffts_per_batch
   num_channels: 1
   spectrum_type: 1
   averaging_type: 1

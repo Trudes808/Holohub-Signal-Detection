@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(dinov3_signal_detector CXX)
 
-set(CMAKE_CUDA_ARCHITECTURES "70;80;90")
+set(CMAKE_CUDA_ARCHITECTURES "90;121")
 enable_language(CUDA)
 
 find_package(holoscan 2.5.0 REQUIRED CONFIG

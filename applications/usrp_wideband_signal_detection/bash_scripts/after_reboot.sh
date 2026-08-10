@@ -13,7 +13,7 @@ HUGEPAGES_DIR=${HUGEPAGES_DIR:-/dev/hugepages}
 HUGEPAGE_PAGE_SIZE=${HUGEPAGE_PAGE_SIZE:-1G}
 HUGEPAGE_DIR_MODE=${HUGEPAGE_DIR_MODE:-1777}
 HUGEPAGES_COUNT=${HUGEPAGES_COUNT:-}
-DEFAULT_HUGEPAGES_COUNT=${DEFAULT_HUGEPAGES_COUNT:-3}
+DEFAULT_HUGEPAGES_COUNT=${DEFAULT_HUGEPAGES_COUNT:-8}   # 1G pages on this box (see GRUB default_hugepagesz=1G)
 PERSIST_BOOT_CONFIG=${PERSIST_BOOT_CONFIG:-0}
 RESET_MLX_PORTS=${RESET_MLX_PORTS:-1}
 RECREATE_CONTAINER=${RECREATE_CONTAINER:-0}
@@ -21,10 +21,19 @@ START_CONTAINER=${START_CONTAINER:-1}
 CLEAN_DPDK_STATE=${CLEAN_DPDK_STATE:-1}
 XHOST_LOCAL_ROOT=${XHOST_LOCAL_ROOT:-1}
 SKIP_IMAGE_BUILD=${SKIP_IMAGE_BUILD:-1}
-MLX_PORTS=${MLX_PORTS:-"ens4f0np0 ens4f1np1"}
-MLX_DEVICES=${MLX_DEVICES:-"pci/0000:a2:00.0 pci/0000:a2:00.1"}
-MLX_PCI_FUNCTIONS=${MLX_PCI_FUNCTIONS:-"0000:a2:00.0 0000:a2:00.1"}
-BRING_MLX_PORTS_UP=${BRING_MLX_PORTS_UP:-0}
+# DGX Spark (this box): one ConnectX-7 port is dedicated to the X410 uplink.
+# Both RF channels arrive on this single port as separate UDP flows (see the
+# two-channel config's flow_isolation). Override MLX_* to use a different port.
+MLX_PORTS=${MLX_PORTS:-"enp1s0f0np0"}
+MLX_DEVICES=${MLX_DEVICES:-"pci/0000:01:00.0"}
+MLX_PCI_FUNCTIONS=${MLX_PCI_FUNCTIONS:-"0000:01:00.0"}
+BRING_MLX_PORTS_UP=${BRING_MLX_PORTS_UP:-1}
+# DGX Spark: the DPDK data port must be UP with an IP on the X410 sfp0 subnet (mlx5 is
+# bifurcated — the kernel netdev stays up while DPDK flow-steers the CHDR stream). The host
+# netplan (91-houdini_100gb.yaml) carries stale FrontHaul addressing for this port, so the
+# recovery script enforces the correct address deterministically. Set DATA_PORT_IP="" to skip.
+DATA_PORT=${DATA_PORT:-enp1s0f0np0}
+DATA_PORT_IP=${DATA_PORT_IP:-192.168.10.1/24}
 BUILD_APP_DIR=${BUILD_APP_DIR:-/workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection}
 DEFAULT_CONFIG_PATH=${DEFAULT_CONFIG_PATH:-/workspace/holohub/applications/usrp_wideband_signal_detection/config_cuda_dino_performance_single_channel.yaml}
 
@@ -163,7 +172,9 @@ ensure_nvidia_peermem_loaded() {
   fi
 
   if ! nvidia_peermem_loaded; then
-    die "Failed to load nvidia-peermem. Run 'sudo modprobe nvidia-peermem' manually and inspect its error output."
+    warn "nvidia-peermem is not available on this host: the inbox RDMA stack lacks the legacy peer-memory API it needs."
+    warn "This is expected on Grace / DGX Spark; DPDK GPUDirect uses the dmabuf path instead. Continuing without peermem."
+    return
   fi
 
   log "nvidia-peermem is now loaded"
@@ -283,6 +294,23 @@ reset_mlx_ports_if_requested() {
   else
     log "Leaving dedicated Mellanox ports administratively down for DPDK ownership"
   fi
+}
+
+ensure_data_port_addressing() {
+  if [[ -z "${DATA_PORT_IP}" ]]; then
+    log "Skipping data-port IP enforcement because DATA_PORT_IP is empty"
+    return
+  fi
+
+  if [[ ! -d "/sys/class/net/${DATA_PORT}" ]]; then
+    warn "Data port ${DATA_PORT} does not exist; skipping IP enforcement"
+    return
+  fi
+
+  log "Enforcing ${DATA_PORT_IP} on data port ${DATA_PORT} (X410 sfp0 subnet)"
+  sudo ip addr flush dev "${DATA_PORT}" 2>/dev/null || true
+  sudo ip addr replace "${DATA_PORT_IP}" dev "${DATA_PORT}"
+  sudo ip link set "${DATA_PORT}" up
 }
 
 grant_local_root_display_access() {
@@ -430,6 +458,7 @@ main() {
   stop_container_if_running
   detach_mlx_ports_from_network_manager
   reset_mlx_ports_if_requested
+  ensure_data_port_addressing
   grant_local_root_display_access
   recreate_container_if_requested
   start_container_if_requested

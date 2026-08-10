@@ -21,6 +21,11 @@ Visualization is enabled by default on all of the current live configs.
 > repository-root [README](../../README.md) first; this document covers everything specific to
 > the signal-detection pipeline.
 
+> **Running on DGX Spark (AArch64 / GB10)?** This README describes the original x86 bench.
+> For the AArch64 port — CUDA-13 container, unified-memory ingest (`kind: "huge"`), two-QSFP
+> X410 topology, dual-channel tuning — follow
+> [`notes/RUNNING_ON_DGX_SPARK.md`](notes/RUNNING_ON_DGX_SPARK.md) instead.
+
 ---
 
 ## Repository layout

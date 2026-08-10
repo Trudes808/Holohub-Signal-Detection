@@ -10,7 +10,7 @@ pipeline:
   log_from_spectrogram: false
 
 scheduler:
-  worker_thread_number: 4
+  worker_thread_number: 8   # dual-channel graph (2x converter/fft/spectrogram/detector + viz) starves at 4 workers
   stop_on_deadlock: true
   stop_on_deadlock_timeout: 500
 
@@ -39,7 +39,7 @@ advanced_network:
         num_bufs: 262144
         buf_size: 64
       - name: "CH1_Data_RX_GPU"
-        kind: "device"
+        kind: "huge"   # GB10 integrated GPU: NIC DMAs into host hugepages, GPU reads coherently (see notes/gb10_unified_memory_ingest.md)
         affinity: 0
         access:
           - local
@@ -53,7 +53,7 @@ advanced_network:
         num_bufs: 262144
         buf_size: 64
       - name: "CH2_Data_RX_GPU"
-        kind: "device"
+        kind: "huge"   # GB10 integrated GPU: NIC DMAs into host hugepages, GPU reads coherently (see notes/gb10_unified_memory_ingest.md)
         affinity: 0
         access:
           - local
@@ -62,7 +62,7 @@ advanced_network:
 
     interfaces:
       - name: sdr_data
-        address: 0000:a2:00.1
+        address: 0000:01:00.0
         rx:
           flow_isolation: true
           queues:
@@ -106,7 +106,7 @@ chdr_converter:
   channel_center_frequencies_hz: "2400e6,1000e6"
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 512
+  num_ffts_per_batch: 256   # see tuning notes: with 8 scheduler workers, 256 sustains both channels
   num_simul_batches: 4
   num_channels: 2
   log_packets: false
@@ -120,12 +120,15 @@ chdr_converter:
 
 fft:
   burst_size: 20480
-  num_bursts: 512
+  num_bursts: 256   # must match chdr_converter.num_ffts_per_batch
   num_channels: 2
   spectrum_type: 1
   averaging_type: 1
   window_time: 0
   window_type: 0
+  reference_span_hz: 500000000
+  reference_fft_size: 20480
+  override_fft_bin_size: 0
   # FFT length in bins. For this path it should stay aligned with burst_size.
   transform_points: 20480
   # Window size in bins. Keep this equal to transform_points unless you intentionally window a smaller FFT.
@@ -157,7 +160,7 @@ visualization:
     rows_per_frame: 2
     mask_frame_offset: 0
     allow_backpressure_valve: true
-    render_every_n_frames: 1
+    render_every_n_frames: 3   # display decimation: ~94 frames/s/ch at batch=256 -> ~31 rendered fps/ch; detection still runs every frame (emit_stride 1)
     timing_summary_enable: true
     timing_summary_every_n: 128
     channel_filter: -1

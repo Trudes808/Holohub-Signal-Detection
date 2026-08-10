@@ -38,7 +38,7 @@ advanced_network:
         num_bufs: 131072
         buf_size: 64
       - name: "CH1_Data_RX_GPU"
-        kind: "device"
+        kind: "huge"   # GB10 integrated GPU: NIC->host hugepages, GPU reads coherently (no GPUDirect). See notes/gb10_unified_memory_ingest.md. (batch left at 512: cuda_dino is DINO-inference-bound, not converter-bound.)
         affinity: 0
         access:
           - local
@@ -47,7 +47,7 @@ advanced_network:
 
     interfaces:
       - name: sdr_data
-        address: 0000:a2:00.0
+        address: 0000:01:00.0
         rx:
           flow_isolation: true
           queues:

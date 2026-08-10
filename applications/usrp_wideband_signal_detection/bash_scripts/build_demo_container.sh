@@ -24,7 +24,7 @@ CONTAINER_DINOV3_ROOT=${CONTAINER_DINOV3_ROOT:-/workspace/models/dinov3}
 CONTAINER_WEIGHT_PATH=${CONTAINER_WEIGHT_PATH:-${CONTAINER_DINOV3_ROOT}/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth}
 CONTAINER_TORCHSCRIPT_PATH=${CONTAINER_TORCHSCRIPT_PATH:-${CONTAINER_DINOV3_ROOT}/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.ts}
 CONTAINER_EXPORT_SCRIPT=${CONTAINER_EXPORT_SCRIPT:-/workspace/holohub/applications/usrp_wideband_signal_detection/export_dinov3_torchscript.py}
-PYTORCH_INDEX_URL=${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu126}
+PYTORCH_INDEX_URL=${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}   # DGX Spark: CUDA 13 aarch64 wheels
 PYTORCH_VERSION=${PYTORCH_VERSION:-2.10.0}
 TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.25.0}
 MATX_VERSION=${MATX_VERSION:-0.9.2}
@@ -144,11 +144,15 @@ ensure_nvjitlink_symlink() {
 	run_in_container 'set -euo pipefail
 for libdir in \
 	/usr/local/cuda/targets/x86_64-linux/lib \
+	/usr/local/cuda/targets/sbsa-linux/lib \
 	/usr/local/cuda/lib64 \
+	/usr/local/cuda-13.0/targets/sbsa-linux/lib \
+	/usr/local/cuda-13.0/lib64 \
 	/usr/local/cuda-12.6/targets/x86_64-linux/lib \
 	/usr/local/cuda-12.6/lib64; do
-	if [[ -f "$libdir/libnvJitLink.so.12" && ! -e "$libdir/libnvJitLink.so" ]]; then
-		ln -s libnvJitLink.so.12 "$libdir/libnvJitLink.so"
+	sofile=$(ls "$libdir"/libnvJitLink.so.* 2>/dev/null | head -1 || true)
+	if [[ -n "${sofile:-}" && ! -e "$libdir/libnvJitLink.so" ]]; then
+		ln -s "$(basename "$sofile")" "$libdir/libnvJitLink.so"
 	fi
 done'
 }
@@ -271,7 +275,7 @@ print(f"torch={torch.__version__}")
 print(f"torch_cuda={torch.version.cuda}")
 print(f"cuda_available={torch.cuda.is_available()}")
 
-if not str(torch.version.cuda).startswith("12.6"):
+if not str(torch.version.cuda).startswith("13"):
 		sys.exit(1)
 
 if not torch.cuda.is_available():
@@ -335,7 +339,10 @@ run_in_container "ls -lah ${CONTAINER_DINOV3_ROOT}/weights"
 
 if [[ "${BUILD_APP_IN_CONTAINER}" == "1" ]]; then
 	clear_incompatible_app_build_tree
-	run_in_container "cd ${CONTAINER_WORKSPACE_DIR} && export HOLOHUB_BUILD_LOCAL=1 && ./holohub build ${APP_NAME} --local --configure-args=-Dmatx_DIR=/usr/local/lib/cmake/matx"
+	# GB10/CUDA-13: export TORCH_CUDA_ARCH_LIST so Torch-using operators emit valid gencode (not the
+	# bogus compute_20/compute_50 from its autodetect). ANO_MGR=dpdk skips the gpunetio manager,
+	# whose code targets the DOCA 2.x API and does not compile against this base's DOCA 3.1.
+	run_in_container "cd ${CONTAINER_WORKSPACE_DIR} && export HOLOHUB_BUILD_LOCAL=1 && export TORCH_CUDA_ARCH_LIST='9.0;12.1' && ./holohub build ${APP_NAME} --local --configure-args=-Dmatx_DIR=/usr/local/lib/cmake/matx --configure-args=-DANO_MGR=dpdk"
 	run_in_container "ls -lah ${CONTAINER_APP_BUILD_DIR}/applications/${APP_NAME}"
 fi
 

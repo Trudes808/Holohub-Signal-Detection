@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(cuda_dino_detector LANGUAGES CXX CUDA)
 
-set(CMAKE_CUDA_ARCHITECTURES "70;80;90")
+set(CMAKE_CUDA_ARCHITECTURES "90;121")
 
 find_package(holoscan 2.5.0 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
