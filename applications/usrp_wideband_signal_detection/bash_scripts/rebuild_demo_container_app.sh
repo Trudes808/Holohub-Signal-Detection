@@ -244,10 +244,14 @@ fi
 clear_incompatible_build_tree_cache
 
 if needs_rebuild; then
+  # GB10/CUDA-13: TORCH_CUDA_ARCH_LIST guards against Torch's bogus compute_20 autodetect (also
+  # pinned in the Torch-using operators' CMakeLists); ANO_MGR=dpdk skips the gpunetio manager,
+  # which does not compile against DOCA 3.1. Keep in sync with build_demo_container.sh.
   run_in_container "set -euo pipefail && \
     cd ${WORKSPACE_DIR} && \
     export HOLOHUB_BUILD_LOCAL=1 && \
-    ./holohub build ${APP_NAME} --local --configure-args=-Dmatx_DIR=${MATX_DIR}"
+    export TORCH_CUDA_ARCH_LIST='9.0;12.1' && \
+    ./holohub build ${APP_NAME} --local --configure-args=-Dmatx_DIR=${MATX_DIR} --configure-args=-DANO_MGR=dpdk"
 fi
 
 build_compare_targets

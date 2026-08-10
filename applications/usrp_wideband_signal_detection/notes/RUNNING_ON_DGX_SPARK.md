@@ -148,3 +148,4 @@ decimates only the display (detection runs every emitted frame at `emit_stride: 
 | App runs but `packets=0` | X410 not streaming, or sender used the wrong `--adapter`/dest (data must exit **sfp0** to `192.168.10.1` / MAC `...:45:13`) |
 | `Failed to initialize glfw` | X access: `xhost +local:root` (after_reboot does this), or recreate the container from a desktop session |
 | `modprobe nvidia-peermem ... Invalid argument` | Expected on GB10 — ignore (unified memory path is used instead) |
+| `nvcc fatal : Unsupported gpu architecture 'compute_20'` during a rebuild | Torch's CUDA autodetect misparses GB10 capability 12.1. Fixed by `set(TORCH_CUDA_ARCH_LIST "9.0;12.1")` before every `find_package(Torch)` (app + cuda_dino_detector + dinov3_signal_detector CMakeLists) and exported by both build wrappers — if it reappears, a new `find_package(Torch)` call site is missing the pin |

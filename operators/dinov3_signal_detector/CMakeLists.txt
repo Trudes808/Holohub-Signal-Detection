@@ -75,6 +75,11 @@ else()
   message(STATUS "dinov3_torch_runtime: No Python Torch CMake hints detected from ${Python3_EXECUTABLE}")
 endif()
 
+# GB10 (sm_121 / capability 12.1): Torch's Caffe2 CUDA autodetect misparses 12.1 and injects a
+# bogus `-gencode arch=compute_20,code=sm_121` (nvcc fatal: Unsupported gpu architecture). Pin
+# TORCH_CUDA_ARCH_LIST before find_package(Torch) so the flags are valid without relying on the
+# TORCH_CUDA_ARCH_LIST environment variable being exported by the build wrapper.
+set(TORCH_CUDA_ARCH_LIST "9.0;12.1")
 find_package(Torch QUIET PATHS ${TORCH_SEARCH_HINTS})
 
 if(NOT Torch_FOUND)
