@@ -18,6 +18,11 @@ fi
 
 CONFIG_NAME=${1:-${CONFIG_NAME:-config_cuda_dino_performance_single_channel.yaml}}
 
+if [[ $# -eq 0 ]]; then
+	echo "NOTE: no config argument provided — using: ${CONFIG_NAME}" >&2
+	echo "      (a CONFIG_NAME=... prefix does NOT survive sudo; pass the config as the first argument instead)" >&2
+fi
+
 echo "Running usrp_wideband_signal_detection with config: ${CONFIG_NAME}"
 
 "${REBUILD_DEMO_CONTAINER_APP}"

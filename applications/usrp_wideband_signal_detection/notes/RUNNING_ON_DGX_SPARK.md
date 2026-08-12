@@ -78,15 +78,18 @@ expected — GB10 does not use peermem.
 
 **Terminal A — the app** (from the app dir; visualization opens on your desktop):
 
-```bash
-# single channel, coherent detector (dynamic floor, ~115 ms chdr→fft):
-CONFIG_NAME=config_coherent_power_perf_dynamic_single_channel.yaml sudo ./bash_scripts/run_torchscript_performance_test.sh
+Pass the config as the **first argument** — a `CONFIG_NAME=...` env prefix does NOT survive
+`sudo` (the wrapper then silently falls back to the cuda_dino default):
 
-# DUAL channel, coherent detector (dual-panel viz, ~350 ms):
-CONFIG_NAME=config_coherent_power_performance_emit_stride1_two_channel.yaml sudo ./bash_scripts/run_torchscript_performance_test.sh
+```bash
+# single channel, coherent detector (dynamic floor):
+sudo ./bash_scripts/run_torchscript_performance_test.sh config_coherent_power_perf_dynamic_single_channel.yaml
+
+# DUAL channel, coherent detector (dual-panel viz):
+sudo ./bash_scripts/run_torchscript_performance_test.sh config_coherent_power_performance_emit_stride1_two_channel.yaml
 
 # single channel, DINOv3 detector (inference-bound; processes a subset of the stream):
-sudo ./bash_scripts/run_torchscript_performance_test.sh
+sudo ./bash_scripts/run_torchscript_performance_test.sh config_cuda_dino_performance_single_channel.yaml
 ```
 
 **Terminal B — the radio (over-the-air collection).** This step is NOT a synthetic/demo signal
