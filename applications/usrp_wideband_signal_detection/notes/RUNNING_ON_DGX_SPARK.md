@@ -74,7 +74,20 @@ This mounts/permissions the 1 GB hugepages, resets the data NIC for DPDK, **enfo
 grants X access, starts the container, and clears stale DPDK state. The `nvidia-peermem` warning is
 expected — GB10 does not use peermem.
 
-## 4. Live runs (two terminals)
+## 4. Live runs
+
+**One command (recommended):** starts the app, waits for DPDK to arm, starts the
+over-the-air radio stream, mirrors the app log, and stops everything on Ctrl-C. It also hands
+the app the true 491.52 Msps rate up front, so the frequency axis is exact.
+
+```bash
+sudo ./bash_scripts/run_live_demo.sh            # dual channel (2400 + 1000 MHz)
+sudo ./bash_scripts/run_live_demo.sh single     # single channel @ 2400 MHz
+sudo env FREQS="915e6 1800e6" GAIN=40 ./bash_scripts/run_live_demo.sh   # custom radio knobs
+```
+
+Or run the two halves in separate terminals (useful for retuning the radio without
+restarting the app):
 
 **Terminal A — the app** (from the app dir; visualization opens on your desktop):
 
