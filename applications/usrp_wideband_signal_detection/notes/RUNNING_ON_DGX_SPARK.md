@@ -106,6 +106,11 @@ python3 rx_to_remote_udp.py --args "addr=192.168.21.2" \
 ```
 
 Notes:
+- **The HoloViz window opens as soon as the app starts but stays blank/frozen until the radio
+  stream starts** — the renderer only draws when frames arrive, so with no data GNOME may report
+  the window "not responding" and it can appear transparent (showing the desktop behind it). This
+  is the expected idle state, not a failure: start the sender (Terminal B) and the window comes
+  alive within a couple of seconds.
 - `--dest-mac-addr` is `enp1s0f0np0`'s MAC. This X410 negotiates **491.52 Msps** when 500e6 is
   requested — expected; the receiver derives FFT geometry from the actual rate.
 - Control rides `addr=192.168.21.2` (sfp1/kernel); data exits `--adapter sfp0`. Don't swap these.
@@ -146,6 +151,7 @@ decimates only the display (detection runs every emitted frame at `emit_stride: 
 | `Cannot create lock ... Is another primary process running?` | Previous app instance still shutting down — wait for it to exit, clear `/dev/hugepages/nwlrbbmqbh*` |
 | Sender: `No devices found for addr: 192.168.21.2` | The app's DPDK grabbed the **control** port — the config must bind `0000:01:00.0` (data), never `01:00.1` |
 | App runs but `packets=0` | X410 not streaming, or sender used the wrong `--adapter`/dest (data must exit **sfp0** to `192.168.10.1` / MAC `...:45:13`) |
+| Window frozen / GNOME "not responding" / window looks transparent (mirrors the desktop) | No data flowing yet — the renderer only draws when frames arrive. Start the sender; if it's already running, check the app log's `RX worker summary` lines for `packets=0` and fix the stream (see the row above) |
 | `Failed to initialize glfw` | X access: `xhost +local:root` (after_reboot does this), or recreate the container from a desktop session |
 | `modprobe nvidia-peermem ... Invalid argument` | Expected on GB10 — ignore (unified memory path is used instead) |
 | `nvcc fatal : Unsupported gpu architecture 'compute_20'` during a rebuild | Torch's CUDA autodetect misparses GB10 capability 12.1. Fixed by `set(TORCH_CUDA_ARCH_LIST "9.0;12.1")` before every `find_package(Torch)` (app + cuda_dino_detector + dinov3_signal_detector CMakeLists) and exported by both build wrappers — if it reappears, a new `find_package(Torch)` call site is missing the pin |
