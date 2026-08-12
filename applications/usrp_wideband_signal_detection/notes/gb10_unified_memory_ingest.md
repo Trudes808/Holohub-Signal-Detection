@@ -281,6 +281,16 @@ detections on both channels. Empirical findings:
 - New wrapper `bash_scripts/start_radio_stream.sh` = the OTA radio-control step with bench
   defaults (it IS real over-the-air collection, not a synthetic source).
 
+**Zero-out root cause (2026-08-12).** User-visible "spectrogram zeroes out then restarts" during
+live runs = the CHDR converter's `dpdk-rx-queue-warning-threshold` soft resync (`chdr_rx.cu:886`):
+`degraded_shutdown_on_rx_queue_warning_threshold: 3` triggered a FULL channel flush after every 3rd
+NIC `rx_q_errors` micro-drop warning — losing far more data than the micro-drop and blanking the
+display (~1 resync/s at full rate). Fixed in the dynamic single + two-channel configs:
+threshold → 0 (partial-flush self-heal retained) and single-channel `num_bufs` 131072 → 262144.
+Verified: `panic_resets=0` over a full-rate run (was ~1/s), continuous display. Single-channel
+landing point: batch 256 (128 needs 187.5 batch/s > ~140 capacity → sheds ~25%; 256 needs 93.75
+→ ~82% coverage limited by NIC micro-drop bursts, latency ~200 ms).
+
 **Viz decimation (clarification):** `num_ffts_per_batch` is COMPUTE batching, NOT display decimation.
 Display rate = `render_every_n_frames` (frame stride) + the spectrogram source→display row
 downsample (shown in-UI as "Processing Ratio"/"Vis Ratio"). Detection runs `emit_stride: 1` (every

@@ -28,21 +28,21 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144   # headroom against rx_q_errors micro-drops at full rate (matches the dual-channel pools)
         buf_size: 42
       - name: "CH1_CHDR_Headers_RX_CPU"
         kind: "huge"
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144   # headroom against rx_q_errors micro-drops at full rate (matches the dual-channel pools)
         buf_size: 64
       - name: "CH1_Data_RX_GPU"
         kind: "huge"   # GB10 is integrated/coherent: NIC DMAs into host hugepages, GPU reads them zero-copy (ATS). device-mem GPUDirect is unsupported here. See notes/gb10_unified_memory_ingest.md
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144   # headroom against rx_q_errors micro-drops at full rate (matches the dual-channel pools)
         buf_size: 4096
 
     interfaces:
@@ -74,21 +74,21 @@ chdr_converter:
   interface_name: sdr_data
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 128   # latency vs stability: 512=>~321ms(stable), 32=>~60ms but converter backlogs+panic_resets (needs ~750 batch/s, tops out ~264). 128 => ~188 batch/s (headroom). Must match fft.num_bursts.
+  num_ffts_per_batch: 256   # single-channel full rate needs 93.75 batch/s; converter capacity ~140/s -> TRUE full coverage. (128 needs 187.5/s > capacity -> sheds ~25% via panic resets.) Must equal fft.num_bursts.
   num_simul_batches: 4
   num_channels: 1
   log_packets: false
   log_data: false
   partial_batch_drop_timeout_ms: 250
   degraded_reset_on_rx_queue_warning: false
-  degraded_shutdown_on_rx_queue_warning_threshold: 3
+  degraded_shutdown_on_rx_queue_warning_threshold: 0   # 3 caused a full channel resync (visible spectrogram zero-out + data loss) every 3rd NIC micro-drop warning; 0 disables it. The partial-flush self-heal still covers real stalls.
   degraded_shutdown_force_exit_timeout_ms: 2000
   degraded_reset_partial_flush_threshold: 3
   degraded_reset_cooldown_ms: 1000
 
 fft:
   burst_size: 20480
-  num_bursts: 128   # must match chdr_converter.num_ffts_per_batch
+  num_bursts: 256   # must match chdr_converter.num_ffts_per_batch
   num_channels: 1
   spectrum_type: 1
   averaging_type: 1

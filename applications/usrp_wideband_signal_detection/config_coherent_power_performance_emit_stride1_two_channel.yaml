@@ -113,7 +113,7 @@ chdr_converter:
   log_data: false
   partial_batch_drop_timeout_ms: 250
   degraded_reset_on_rx_queue_warning: false
-  degraded_shutdown_on_rx_queue_warning_threshold: 3
+  degraded_shutdown_on_rx_queue_warning_threshold: 0   # 3 caused a full channel resync (visible spectrogram zero-out + data loss) every 3rd NIC micro-drop warning; 0 disables it. The partial-flush self-heal still covers real stalls.
   degraded_shutdown_force_exit_timeout_ms: 2000
   degraded_reset_partial_flush_threshold: 3
   degraded_reset_cooldown_ms: 1000

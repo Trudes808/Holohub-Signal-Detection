@@ -139,7 +139,7 @@ Reference capture used to validate this port:
 
 | Scenario | Ingest | chdr→fft latency | Frame coverage |
 | --- | --- | --- | --- |
-| 1 channel, coherent | 491.52 Msps, 0 NIC drops | ~115 ms (batch 128) | full |
+| 1 channel, coherent | 491.52 Msps ingest | ~200 ms (batch 256) | ~80–85% (NIC micro-drop bursts + converter; continuous display, no blanking) |
 | 2 channels, coherent | 2× 491.52 Msps ingest | ~575 ms (batch 512, 8 workers) | ~50–60%/ch (pipeline ceiling ≈ 24k FFT/s aggregate — see shedding note) |
 | 1 channel, cuda_dino | full wire rate; DINO throttles processing via backpressure valve | DINO-bound (~fft→preview 320 ms+) | subset (ViT inference cost) |
 
@@ -172,6 +172,7 @@ size and run-to-run scheduling:
 | App runs but `packets=0` | X410 not streaming, or sender used the wrong `--adapter`/dest (data must exit **sfp0** to `192.168.10.1` / MAC `...:45:13`) |
 | Window frozen / GNOME "not responding" / window looks transparent (mirrors the desktop) | No data flowing yet — the renderer only draws when frames arrive. Start the radio stream; if it's already running, check the app log's `RX worker summary` lines for `packets=0` and fix the stream (see the row above) |
 | Dual-channel: `Fell behind in processing on GPU!` spam + `Dropped N packets since last poll` + `might get dropped` warnings | Expected at dual full rate — the GB10 ceiling shedding (see the shedding note in §6). Ensure `num_ffts_per_batch: 512` (smaller batches make it much worse). Not a malfunction: the viz stays live and detection runs on all processed frames |
+| Spectrogram periodically **zeroes out and restarts** mid-stream (looks like the USRP restarting) | It isn't the radio — `degraded_shutdown_on_rx_queue_warning_threshold: 3` made the CHDR converter fully resync the channel after every 3rd NIC micro-drop warning, flushing all state. Set it to `0` (the current configs' default); the partial-flush self-heal still covers real stream stalls |
 | `Failed to initialize glfw` | X access: `xhost +local:root` (after_reboot does this), or recreate the container from a desktop session |
 | `modprobe nvidia-peermem ... Invalid argument` | Expected on GB10 — ignore (unified memory path is used instead) |
 | `nvcc fatal : Unsupported gpu architecture 'compute_20'` during a rebuild | Torch's CUDA autodetect misparses GB10 capability 12.1. Fixed by `set(TORCH_CUDA_ARCH_LIST "9.0;12.1")` before every `find_package(Torch)` (app + cuda_dino_detector + dinov3_signal_detector CMakeLists) and exported by both build wrappers — if it reappears, a new `find_package(Torch)` call site is missing the pin |
