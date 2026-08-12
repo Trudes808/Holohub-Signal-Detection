@@ -160,7 +160,7 @@ visualization:
     rows_per_frame: 8   # waterfall scroll cadence (display-only, no pipeline cost) — match the single-channel feel; was 2, which made dual look ~4x slower than it is
     mask_frame_offset: 0
     allow_backpressure_valve: true
-    render_every_n_frames: 3   # display decimation (~10 rendered fps/ch at batch 512); detection cadence is governed separately by emit_stride
+    render_every_n_frames: 1   # no display decimation: at the current operating point (batch 512, emit_stride 2) rendering every frame costs nothing measurable — coverage/latency identical to render=3
     timing_summary_enable: true
     timing_summary_every_n: 128
     channel_filter: -1

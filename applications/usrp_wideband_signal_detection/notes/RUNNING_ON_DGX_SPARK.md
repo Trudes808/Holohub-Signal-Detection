@@ -170,7 +170,7 @@ out-queue sits pegged at its max (downstream won't consume); and the same detect
 costs ~3.7 ms/frame single-channel costs ~14.5 ms/frame dual (spectrogram preview adds ~11 ms) —
 per-kernel wall time inflates ~4× when both channels' converter+FFT+preview+detector kernels
 contend for the integrated GPU. Config levers already applied: `emit_stride: 2` (detect every 2nd
-frame, +30% throughput, −25% latency), `render_every_n_frames: 3`, 8 scheduler workers, RX on the
+frame, +30% throughput, −25% latency), `rows_per_frame: 8` (fast waterfall scroll), 8 scheduler workers, RX on the
 isolated cores. Going to ~100% dual coverage would need code-level work (batch both channels into
 single kernel launches, CUDA graphs to cut launch overhead, fuse/trim the preview path) — or a
 discrete GPU.
