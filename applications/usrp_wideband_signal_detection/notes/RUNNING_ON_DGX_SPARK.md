@@ -143,7 +143,7 @@ Reference capture used to validate this port:
 | Scenario | Ingest | chdr→fft latency | Frame coverage |
 | --- | --- | --- | --- |
 | 1 channel, coherent | 491.52 Msps ingest | ~200 ms (batch 256) | ~80–85% (NIC micro-drop bursts + converter; continuous display, no blanking) |
-| 2 channels, coherent | 2× 491.52 Msps ingest | ~575 ms (batch 512, 8 workers) | ~50–60%/ch (pipeline ceiling ≈ 24k FFT/s aggregate — see shedding note) |
+| 2 channels, coherent | 2× 491.52 Msps ingest | ~435 ms (batch 512, 8 workers, emit_stride 2) | ~75%/ch, symmetric (GPU-contention ceiling — see shedding note) |
 | 1 channel, cuda_dino | full wire rate; DINO throttles processing via backpressure valve | DINO-bound (~fft→preview 320 ms+) | subset (ViT inference cost) |
 
 Knobs: `chdr_converter.num_ffts_per_batch` (= `fft.num_bursts`) trades latency vs converter load;
@@ -163,6 +163,22 @@ size and run-to-run scheduling:
 - There is **no half-rate escape hatch on this X410**: the CG_400 FPGA image is fixed at
   491.52 Msps (requests for lower rates are refused). Single-channel runs are within the ceiling
   and clean.
+
+**What the dual-channel bottleneck actually is (profiled 2026-08-12):** GPU contention, not
+networking. Evidence: RX cores moved to the isolated CPUs (5,7) changed nothing; the converter's
+out-queue sits pegged at its max (downstream won't consume); and the same detector kernel that
+costs ~3.7 ms/frame single-channel costs ~14.5 ms/frame dual (spectrogram preview adds ~11 ms) —
+per-kernel wall time inflates ~4× when both channels' converter+FFT+preview+detector kernels
+contend for the integrated GPU. Config levers already applied: `emit_stride: 2` (detect every 2nd
+frame, +30% throughput, −25% latency), `render_every_n_frames: 3`, 8 scheduler workers, RX on the
+isolated cores. Going to ~100% dual coverage would need code-level work (batch both channels into
+single kernel launches, CUDA graphs to cut launch overhead, fuse/trim the preview path) — or a
+discrete GPU.
+
+**DPDK core-pinning trap:** the EAL takes the *lowest* core in its `-l` list as the main lcore,
+and RX workers cannot run there. `master_core` must therefore be numerically LOWER than every
+queue `cpu_core` (the config uses master 3, workers on isolated cores 5,7) — otherwise one RX
+worker silently fails to start and that queue receives nothing.
 
 ## 7. Troubleshooting quick table
 

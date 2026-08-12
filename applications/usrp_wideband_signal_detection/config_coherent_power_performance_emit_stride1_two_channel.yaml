@@ -18,7 +18,7 @@ advanced_network:
   cfg:
     version: 1
     manager: "dpdk"
-    master_core: 9
+    master_core: 3   # must be LOWER than the worker cores: DPDK takes the lowest core in -l as its main lcore, and workers cannot launch on the main lcore (workers ride the isolated cores 5,7)
     debug: false
     log_level: "info"
     rx_meta_buffers: 8192
@@ -68,7 +68,7 @@ advanced_network:
           queues:
             - name: "Channel 1 data"
               id: 0
-              cpu_core: 10
+              cpu_core: 5   # isolated core (isolcpus=5,7) — kernel keeps it free, so DPDK RX polling runs unpreempted
               batch_size: 10240
               memory_regions:
                 - "Headers_RX_CPU"
@@ -76,7 +76,7 @@ advanced_network:
                 - "CH1_Data_RX_GPU"
             - name: "Channel 2 data"
               id: 1
-              cpu_core: 11
+              cpu_core: 7   # isolated core (isolcpus=5,7)
               batch_size: 10240
               memory_regions:
                 - "Headers_RX_CPU"
@@ -107,7 +107,7 @@ chdr_converter:
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
   num_ffts_per_batch: 512   # dual-channel full rate exceeds the GB10 pipeline ceiling (~24k FFT/s aggregate); 512 sheds the excess QUIETLY at assembly (out_q stays small, RX pools healthy). 256 sheds via out_q backpressure -> RX mempool exhaustion -> NIC drops + error spam. For lossless dual, stream at --rate 250e6. Must equal fft.num_bursts.
-  num_simul_batches: 4
+  num_simul_batches: 4   # hard max: chdr_rx supports 4 in-flight batch slots (app aborts on more)
   num_channels: 2
   log_packets: false
   log_data: false
@@ -160,7 +160,7 @@ visualization:
     rows_per_frame: 2
     mask_frame_offset: 0
     allow_backpressure_valve: true
-    render_every_n_frames: 3   # display decimation: ~94 frames/s/ch at batch=256 -> ~31 rendered fps/ch; detection still runs every frame (emit_stride 1)
+    render_every_n_frames: 3   # display decimation (~10 rendered fps/ch at batch 512); detection cadence is governed separately by emit_stride
     timing_summary_enable: true
     timing_summary_every_n: 128
     channel_filter: -1
@@ -206,7 +206,7 @@ coherent_power_signal_detector:
   live_emit_mask_cols: 20480
   live_emit_freq_persistence_window: 45
   live_emit_freq_persistence_min_hits: 11
-  emit_stride: 1
+  emit_stride: 2   # GPU-contention relief: detect every 2nd frame (~14 detections/s/ch); frees ~400ms/s of GPU for the rest of the dual pipeline
   log_detections: false
   save_performance_path_artifacts: false
   enable_mask_save: false
