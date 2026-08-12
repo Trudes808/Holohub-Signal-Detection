@@ -63,6 +63,19 @@ if [[ -f "${STREAM_PARAMS_SIDECAR}" ]]; then
 	sudo rm -f "${STREAM_PARAMS_SIDECAR}" 2>/dev/null || rm -f "${STREAM_PARAMS_SIDECAR}" 2>/dev/null || true
 fi
 
+# The sidecar center is a single (channel-0) value. Multi-channel configs carry their own
+# per-channel centers (chdr_converter.channel_center_frequencies_hz), and a global override
+# would mislabel every channel with channel 0's frequency — so only apply it to
+# single-channel configs. The rate override stays (all channels share one rate).
+HOST_CONFIG_PATH="${SCRIPT_DIR}/../${CONFIG_NAME}"
+if [[ -n "${USRP_CENTER_FREQ_HZ:-}" && -f "${HOST_CONFIG_PATH}" ]]; then
+	CONFIG_NUM_CHANNELS=$(awk '/^chdr_converter:/{f=1;next} f&&/^[^[:space:]]/{exit} f&&$1=="num_channels:"{print $2; exit}' "${HOST_CONFIG_PATH}")
+	if [[ "${CONFIG_NUM_CHANNELS:-1}" =~ ^[0-9]+$ && "${CONFIG_NUM_CHANNELS:-1}" -gt 1 ]]; then
+		echo "Multi-channel config (num_channels=${CONFIG_NUM_CHANNELS}): ignoring single-value USRP_CENTER_FREQ_HZ=${USRP_CENTER_FREQ_HZ}; per-channel centers come from the config."
+		USRP_CENTER_FREQ_HZ=""
+	fi
+fi
+
 exec sudo docker exec -it \
 	-e DISPLAY="${DISPLAY_VALUE}" \
 	-e XAUTHORITY="${XAUTHORITY_VALUE}" \
