@@ -106,7 +106,7 @@ chdr_converter:
   channel_center_frequencies_hz: "2400e6,1000e6"
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 256   # see tuning notes: with 8 scheduler workers, 256 sustains both channels
+  num_ffts_per_batch: 512   # dual-channel full rate exceeds the GB10 pipeline ceiling (~24k FFT/s aggregate); 512 sheds the excess QUIETLY at assembly (out_q stays small, RX pools healthy). 256 sheds via out_q backpressure -> RX mempool exhaustion -> NIC drops + error spam. For lossless dual, stream at --rate 250e6. Must equal fft.num_bursts.
   num_simul_batches: 4
   num_channels: 2
   log_packets: false
@@ -120,7 +120,7 @@ chdr_converter:
 
 fft:
   burst_size: 20480
-  num_bursts: 256   # must match chdr_converter.num_ffts_per_batch
+  num_bursts: 512   # must match chdr_converter.num_ffts_per_batch
   num_channels: 2
   spectrum_type: 1
   averaging_type: 1

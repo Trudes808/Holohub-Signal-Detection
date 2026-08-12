@@ -269,6 +269,18 @@ detections on both channels. Empirical findings:
   (`EAL: Cannot create lock ... Is another primary process running?` otherwise), then clear
   `/dev/hugepages/nwlrbbmqbh*` and `/var/run/dpdk/nwlrbbmqbh`.
 
+**Shed-mode addendum (2026-08-12).** Batch size decides WHERE the over-ceiling excess is shed:
+- **512**: shed at batch assembly — out_q stays ≤5, RX mempools healthy (~250k/262k free), calm
+  logs. Coverage varies run-to-run (~29/47 per ch, sometimes one channel reaches full 47/47 while
+  the other drops to ~25 with NIC rx_missed bursts — scheduling-dependent). **Committed default.**
+- **256**: shed via out_q backpressure — out_q pegs ~48 batches × 10240 pkts, which pins the ENTIRE
+  262144-buffer RX mempool (`seg2 avail=0`) → NIC starves → rx_missed ~200k/s + continuous
+  `Fell behind in processing on GPU!` error spam. Reverted; do not use for dual full rate.
+- **No half-rate option**: the CG_400 FPGA image refuses lower rates (`Requesting invalid sampling
+  rate ... Actual rate is: 491.52 MHz`) — dual lossless would need a different FPGA image.
+- New wrapper `bash_scripts/start_radio_stream.sh` = the OTA radio-control step with bench
+  defaults (it IS real over-the-air collection, not a synthetic source).
+
 **Viz decimation (clarification):** `num_ffts_per_batch` is COMPUTE batching, NOT display decimation.
 Display rate = `render_every_n_frames` (frame stride) + the spectrogram source→display row
 downsample (shown in-UI as "Processing Ratio"/"Vis Ratio"). Detection runs `emit_stride: 1` (every

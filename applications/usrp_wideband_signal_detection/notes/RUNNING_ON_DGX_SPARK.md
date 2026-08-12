@@ -89,21 +89,26 @@ CONFIG_NAME=config_coherent_power_performance_emit_stride1_two_channel.yaml sudo
 sudo ./bash_scripts/run_torchscript_performance_test.sh
 ```
 
-**Terminal B — the radio** (from `applications/usrp_freq_detection/`; start after the app is up):
+**Terminal B — the radio (over-the-air collection).** This step is NOT a synthetic/demo signal
+source: it commands the X410 to tune its RF frontends, **receive over the air through the
+antennas**, and stream the received IQ into the app. It is a separate process by design — the
+Holoscan app is a pure DPDK consumer and cannot own the UHD/RFNoC control session (control rides
+the kernel QSFP). The bench defaults are baked into a wrapper:
 
 ```bash
-# single channel @ 2.4 GHz:
-python3 rx_to_remote_udp.py --args "addr=192.168.21.2" \
-  --freq 2400e6 --rate 500e6 --gain 30 --channels 0 \
-  --adapter sfp0 --dest-addr 192.168.10.1 --dest-port 1234 \
-  --dest-mac-addr 4c:bb:47:2c:45:13 --spp 1024
+# dual channel (RF ports 0+1 @ 2400/1000 MHz), streams until Ctrl-C:
+./bash_scripts/start_radio_stream.sh
 
-# dual channel (RF ports 0 and 1; per-channel center freqs; two dest ports):
-python3 rx_to_remote_udp.py --args "addr=192.168.21.2" \
-  --freq 2400e6 1000e6 --rate 500e6 --gain 30 --channels 0 1 \
-  --adapter sfp0 --dest-addr 192.168.10.1 --dest-port 1234 1235 \
-  --dest-mac-addr 4c:bb:47:2c:45:13 --spp 1024
+# single channel:
+CHANNELS="0" FREQS="2400e6" DEST_PORTS="1234" ./bash_scripts/start_radio_stream.sh
+
+# other centers / gain / timed run:
+FREQS="915e6 1800e6" GAIN=40 DURATION=60 ./bash_scripts/start_radio_stream.sh
 ```
+
+(Equivalent raw command: `applications/usrp_freq_detection/rx_to_remote_udp.py --args
+"addr=192.168.21.2" --freq <f0> [f1] --rate 500e6 --gain 30 --channels 0 [1] --adapter sfp0
+--dest-addr 192.168.10.1 --dest-port 1234 [1235] --dest-mac-addr 4c:bb:47:2c:45:13 --spp 1024`.)
 
 Notes:
 - **The HoloViz window opens as soon as the app starts but stays blank/frozen until the radio
@@ -135,12 +140,26 @@ Reference capture used to validate this port:
 | Scenario | Ingest | chdr→fft latency | Frame coverage |
 | --- | --- | --- | --- |
 | 1 channel, coherent | 491.52 Msps, 0 NIC drops | ~115 ms (batch 128) | full |
-| 2 channels, coherent | 2× 491.52 Msps, 0 NIC drops | ~350 ms (batch 256, 8 workers) | ~60%/ch (pipeline ceiling ≈ 24k FFT/s aggregate; excess frames shed gracefully) |
+| 2 channels, coherent | 2× 491.52 Msps ingest | ~575 ms (batch 512, 8 workers) | ~50–60%/ch (pipeline ceiling ≈ 24k FFT/s aggregate — see shedding note) |
 | 1 channel, cuda_dino | full wire rate; DINO throttles processing via backpressure valve | DINO-bound (~fft→preview 320 ms+) | subset (ViT inference cost) |
 
 Knobs: `chdr_converter.num_ffts_per_batch` (= `fft.num_bursts`) trades latency vs converter load;
 `scheduler.worker_thread_number: 8` needed for dual-channel symmetry; `render_every_n_frames`
 decimates only the display (detection runs every emitted frame at `emit_stride: 1`).
+
+**Dual-channel shedding (expected, not a malfunction).** Dual full rate (2× 491.52 Msps = 48k
+FFT/s) is ~2× the GB10 pipeline ceiling, so roughly half the frames are shed; the waterfalls stay
+live and detection runs on every processed frame. *Where* the excess is shed varies with batch
+size and run-to-run scheduling:
+- `num_ffts_per_batch: 512` (the committed default) sheds **quietly at batch assembly** — RX pools
+  stay healthy, logs mostly calm (occasional `panic reset` self-heals, sporadic NIC-drop
+  messages).
+- Smaller batches (e.g. 256) shed via **output-queue backpressure**: queued batches pin the entire
+  RX mempool, the NIC starves, and the log fills with `Fell behind in processing on GPU!` +
+  `Dropped N packets since last poll` + `might get dropped` spam. Avoid for dual-channel.
+- There is **no half-rate escape hatch on this X410**: the CG_400 FPGA image is fixed at
+  491.52 Msps (requests for lower rates are refused). Single-channel runs are within the ceiling
+  and clean.
 
 ## 7. Troubleshooting quick table
 
@@ -151,7 +170,8 @@ decimates only the display (detection runs every emitted frame at `emit_stride: 
 | `Cannot create lock ... Is another primary process running?` | Previous app instance still shutting down — wait for it to exit, clear `/dev/hugepages/nwlrbbmqbh*` |
 | Sender: `No devices found for addr: 192.168.21.2` | The app's DPDK grabbed the **control** port — the config must bind `0000:01:00.0` (data), never `01:00.1` |
 | App runs but `packets=0` | X410 not streaming, or sender used the wrong `--adapter`/dest (data must exit **sfp0** to `192.168.10.1` / MAC `...:45:13`) |
-| Window frozen / GNOME "not responding" / window looks transparent (mirrors the desktop) | No data flowing yet — the renderer only draws when frames arrive. Start the sender; if it's already running, check the app log's `RX worker summary` lines for `packets=0` and fix the stream (see the row above) |
+| Window frozen / GNOME "not responding" / window looks transparent (mirrors the desktop) | No data flowing yet — the renderer only draws when frames arrive. Start the radio stream; if it's already running, check the app log's `RX worker summary` lines for `packets=0` and fix the stream (see the row above) |
+| Dual-channel: `Fell behind in processing on GPU!` spam + `Dropped N packets since last poll` + `might get dropped` warnings | Expected at dual full rate — the GB10 ceiling shedding (see the shedding note in §6). Ensure `num_ffts_per_batch: 512` (smaller batches make it much worse). Not a malfunction: the viz stays live and detection runs on all processed frames |
 | `Failed to initialize glfw` | X access: `xhost +local:root` (after_reboot does this), or recreate the container from a desktop session |
 | `modprobe nvidia-peermem ... Invalid argument` | Expected on GB10 — ignore (unified memory path is used instead) |
 | `nvcc fatal : Unsupported gpu architecture 'compute_20'` during a rebuild | Torch's CUDA autodetect misparses GB10 capability 12.1. Fixed by `set(TORCH_CUDA_ARCH_LIST "9.0;12.1")` before every `find_package(Torch)` (app + cuda_dino_detector + dinov3_signal_detector CMakeLists) and exported by both build wrappers — if it reappears, a new `find_package(Torch)` call site is missing the pin |
