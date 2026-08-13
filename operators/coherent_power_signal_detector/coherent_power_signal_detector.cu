@@ -1119,77 +1119,6 @@ inline void launch_transpose_u8(const uint8_t* input,
   transpose_u8_tiled_kernel<<<grid, block, 0, stream>>>(input, input_rows, input_cols, output);
 }
 
-// Fused rectangular binary morphology: one pass computing OR (dilate) or AND (erode) over an
-// edge-clamped (2*row_radius+1) x (2*col_radius+1) window from a shared-memory tile. This is
-// bit-identical to the freq-pass-then-cols-pass separable pair it replaces (clamping a window
-// at the border is the same as padding with the operation's neutral element), while the
-// intermediate full-mask global round-trip disappears.
-template <bool kDilate>
-__global__ void coherent_power_binary_morph_rect_kernel(const uint8_t* input,
-                                                        int rows,
-                                                        int cols,
-                                                        int row_radius,
-                                                        int col_radius,
-                                                        uint8_t* output) {
-  extern __shared__ uint8_t morph_tile[];
-  const int tile_w = blockDim.x + 2 * col_radius;
-  const int tile_h = blockDim.y + 2 * row_radius;
-  const int base_row = blockIdx.y * blockDim.y - row_radius;
-  const int base_col = blockIdx.x * blockDim.x - col_radius;
-  const int tile_elements = tile_w * tile_h;
-  for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < tile_elements; i += blockDim.x * blockDim.y) {
-    const int tile_row = i / tile_w;
-    const int tile_col = i % tile_w;
-    const int global_row = base_row + tile_row;
-    const int global_col = base_col + tile_col;
-    uint8_t value = kDilate ? 0 : 1;  // out-of-range = neutral element
-    if (global_row >= 0 && global_row < rows && global_col >= 0 && global_col < cols) {
-      value = input[static_cast<size_t>(global_row) * static_cast<size_t>(cols) + global_col] ? 1 : 0;
-    }
-    morph_tile[i] = value;
-  }
-  __syncthreads();
-  const int out_row = blockIdx.y * blockDim.y + threadIdx.y;
-  const int out_col = blockIdx.x * blockDim.x + threadIdx.x;
-  if (out_row >= rows || out_col >= cols) {
-    return;
-  }
-  uint8_t value = kDilate ? 0 : 1;
-  for (int dr = 0; dr <= 2 * row_radius; ++dr) {
-    const int tile_base = (static_cast<int>(threadIdx.y) + dr) * tile_w + threadIdx.x;
-    for (int dc = 0; dc <= 2 * col_radius; ++dc) {
-      const uint8_t sample = morph_tile[tile_base + dc];
-      if (kDilate) {
-        if (sample) { value = 1; dr = 2 * row_radius; break; }
-      } else {
-        if (!sample) { value = 0; dr = 2 * row_radius; break; }
-      }
-    }
-  }
-  output[static_cast<size_t>(out_row) * static_cast<size_t>(cols) + out_col] = value;
-}
-
-void launch_binary_morph_rect(bool dilate,
-                              const uint8_t* input,
-                              int rows,
-                              int cols,
-                              int row_radius,
-                              int col_radius,
-                              uint8_t* output,
-                              cudaStream_t stream) {
-  const dim3 block(32, 8);
-  const dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
-  const size_t shared_bytes =
-      static_cast<size_t>(block.x + 2 * col_radius) * static_cast<size_t>(block.y + 2 * row_radius);
-  if (dilate) {
-    coherent_power_binary_morph_rect_kernel<true><<<grid, block, shared_bytes, stream>>>(
-        input, rows, cols, row_radius, col_radius, output);
-  } else {
-    coherent_power_binary_morph_rect_kernel<false><<<grid, block, shared_bytes, stream>>>(
-        input, rows, cols, row_radius, col_radius, output);
-  }
-}
-
 void apply_emit_mask_morphology(uint8_t* mask_device,
                                 int rows,
                                 int cols,
@@ -1212,31 +1141,95 @@ void apply_emit_mask_morphology(uint8_t* mask_device,
   const int close_row_radius = std::max(0, (kEmitMorphCloseRows - 1) / 2);
   const int close_col_radius = std::max(0, (kEmitMorphCloseCols - 1) / 2);
 
-  // Open (erode then dilate), each as one fused rectangle pass instead of a freq+cols pair.
-  launch_binary_morph_rect(false, mask_device, rows, cols, open_row_radius, open_col_radius, scratch0_device, stream);
+  // NOTE (2026-08-13): a fused rectangle (shared-memory tile) version of these open/close
+  // pairs was tried and REVERTED — it was ~50% slower on real mask distributions. The masks
+  // (~10 MB u8) largely sit in GB10's 24 MB L2, so the separable intermediate pass is nearly
+  // free, while the rectangle scan costs O(w*h) reads per pixel vs O(w+h) with early exit.
+  coherent_power_binary_erode_freq_kernel<<<blocks, threads, 0, stream>>>(mask_device,
+                                                                           rows,
+                                                                           cols,
+                                                                           open_row_radius,
+                                                                           scratch0_device);
   auto kernel_result = cudaGetLastError();
   if (kernel_result != cudaSuccess) {
-    throw std::runtime_error(std::string("emit mask open erode kernel launch failed: ") +
-                             cudaGetErrorString(kernel_result));
-  }
-  launch_binary_morph_rect(true, scratch0_device, rows, cols, open_row_radius, open_col_radius, mask_device, stream);
-  kernel_result = cudaGetLastError();
-  if (kernel_result != cudaSuccess) {
-    throw std::runtime_error(std::string("emit mask open dilate kernel launch failed: ") +
+    throw std::runtime_error(std::string("emit mask open-axis0 erode kernel launch failed: ") +
                              cudaGetErrorString(kernel_result));
   }
 
-  // Close (dilate then erode).
-  launch_binary_morph_rect(true, mask_device, rows, cols, close_row_radius, close_col_radius, scratch0_device, stream);
+  coherent_power_binary_erode_cols_kernel<<<blocks, threads, 0, stream>>>(scratch0_device,
+                                                                           rows,
+                                                                           cols,
+                                                                           open_col_radius,
+                                                                           scratch1_device);
   kernel_result = cudaGetLastError();
   if (kernel_result != cudaSuccess) {
-    throw std::runtime_error(std::string("emit mask close dilate kernel launch failed: ") +
+    throw std::runtime_error(std::string("emit mask open-axis1 erode kernel launch failed: ") +
                              cudaGetErrorString(kernel_result));
   }
-  launch_binary_morph_rect(false, scratch0_device, rows, cols, close_row_radius, close_col_radius, mask_device, stream);
+
+  coherent_power_binary_dilate_freq_kernel<<<blocks, threads, 0, stream>>>(scratch1_device,
+                                                                            rows,
+                                                                            cols,
+                                                                            open_row_radius,
+                                                                            scratch0_device);
   kernel_result = cudaGetLastError();
   if (kernel_result != cudaSuccess) {
-    throw std::runtime_error(std::string("emit mask close erode kernel launch failed: ") +
+    throw std::runtime_error(std::string("emit mask open-axis0 dilate kernel launch failed: ") +
+                             cudaGetErrorString(kernel_result));
+  }
+
+  coherent_power_binary_dilate_cols_kernel<<<blocks, threads, 0, stream>>>(scratch0_device,
+                                                                            rows,
+                                                                            cols,
+                                                                            open_col_radius,
+                                                                            mask_device);
+  kernel_result = cudaGetLastError();
+  if (kernel_result != cudaSuccess) {
+    throw std::runtime_error(std::string("emit mask open-axis1 dilate kernel launch failed: ") +
+                             cudaGetErrorString(kernel_result));
+  }
+
+  coherent_power_binary_dilate_freq_kernel<<<blocks, threads, 0, stream>>>(mask_device,
+                                                                            rows,
+                                                                            cols,
+                                                                            close_row_radius,
+                                                                            scratch0_device);
+  kernel_result = cudaGetLastError();
+  if (kernel_result != cudaSuccess) {
+    throw std::runtime_error(std::string("emit mask close-axis0 dilate kernel launch failed: ") +
+                             cudaGetErrorString(kernel_result));
+  }
+
+  coherent_power_binary_dilate_cols_kernel<<<blocks, threads, 0, stream>>>(scratch0_device,
+                                                                            rows,
+                                                                            cols,
+                                                                            close_col_radius,
+                                                                            scratch1_device);
+  kernel_result = cudaGetLastError();
+  if (kernel_result != cudaSuccess) {
+    throw std::runtime_error(std::string("emit mask close-axis1 dilate kernel launch failed: ") +
+                             cudaGetErrorString(kernel_result));
+  }
+
+  coherent_power_binary_erode_freq_kernel<<<blocks, threads, 0, stream>>>(scratch1_device,
+                                                                           rows,
+                                                                           cols,
+                                                                           close_row_radius,
+                                                                           scratch0_device);
+  kernel_result = cudaGetLastError();
+  if (kernel_result != cudaSuccess) {
+    throw std::runtime_error(std::string("emit mask close-axis0 erode kernel launch failed: ") +
+                             cudaGetErrorString(kernel_result));
+  }
+
+  coherent_power_binary_erode_cols_kernel<<<blocks, threads, 0, stream>>>(scratch0_device,
+                                                                           rows,
+                                                                           cols,
+                                                                           close_col_radius,
+                                                                           mask_device);
+  kernel_result = cudaGetLastError();
+  if (kernel_result != cudaSuccess) {
+    throw std::runtime_error(std::string("emit mask close-axis1 erode kernel launch failed: ") +
                              cudaGetErrorString(kernel_result));
   }
 
