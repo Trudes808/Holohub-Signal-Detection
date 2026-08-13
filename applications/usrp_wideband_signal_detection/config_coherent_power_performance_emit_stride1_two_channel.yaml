@@ -206,7 +206,7 @@ coherent_power_signal_detector:
   live_emit_mask_cols: 20480
   live_emit_freq_persistence_window: 45
   live_emit_freq_persistence_min_hits: 11
-  emit_stride: 2   # GPU-contention relief: detect every 2nd frame (~14 detections/s/ch); frees ~400ms/s of GPU for the rest of the dual pipeline
+  emit_stride: 2   # detect every 2nd frame. Post-Tier-A this operating point ingests at 100% (zero NIC drops, 60s measured); stride 1 still sheds ~15% (needs Tier B fusion — see notes/gpu_optimization_plan.md)
   log_detections: false
   save_performance_path_artifacts: false
   enable_mask_save: false

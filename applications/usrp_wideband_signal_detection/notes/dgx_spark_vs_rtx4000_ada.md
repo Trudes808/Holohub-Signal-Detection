@@ -81,24 +81,33 @@ Dual 491.52 Msps = 48,000 FFTs/s of 20,480 points. Rough sustained DRAM traffic:
 
 ## 5. What it means / what would close the gap
 
-Current operating points on GB10 (committed configs):
+Current operating points on GB10 (committed configs; dual re-measured 2026-08-13 after the
+Tier A code-level GPU work, commit `ab8e7f78` — see `gpu_optimization_plan.md`):
 
 | | Ingest | Coverage | Latency | Visualization |
 | --- | --- | --- | --- | --- |
 | Single-channel | 491.52 Msps | **97.8% measured** | ~200 ms | full rate |
-| Dual-channel | 2× 491.52 Msps | **79.1% measured** into the pipeline; detection every 2nd frame | ~435 ms | ~36 fps/ch |
+| Dual-channel | 2× 491.52 Msps | **100% measured** (zero NIC drops); detection every 2nd frame | ~320 ms | ~36 fps/ch |
 
-Config-level tuning is exhausted (batch size, workers, core isolation, render decimation,
-emit stride — all measured above). Closing the remaining dual-channel gap would take:
+**2026-08-13 revision to this note's conclusion.** The original diagnosis above attributed the
+dual-channel gap entirely to the memory system. The Tier A optimization pass showed that a large
+share of it was **host-side serialization inside the operators** (per-stage timing syncs,
+blocking counter readbacks, per-frame cudaMalloc/cudaFree — stalls the baseline profiling was
+itself subject to): removing them took dual stride-2 coverage from 79.1% to 100% with no config
+change. The contention argument in §§1–4 still holds, but as a smaller effect: at
+`emit_stride: 1` (2× detector work) the pipeline still sheds ~15%, and the detector's pipeline
+stage inflates 7.4 → 9.8 ms/frame under the doubled kernel load — that residual is the true
+memory-system ceiling on this SoC.
 
-1. **Code-level GPU work** (highest value): batch both channels into single kernel launches,
-   CUDA graphs to remove per-launch overhead, fuse the power/dB/detector passes to cut DRAM
-   round-trips (this attacks the bandwidth wall directly), trim the preview pipeline.
+What closing the remaining (stride-1) gap takes:
+
+1. **Kernel fusion** (Tier B, in progress): fuse the power/dB/frontend/score chain and the
+   separable morphology pairs, fold the fftshift pass into consumers, share the power surface
+   with the preview — cuts full-surface DRAM round-trips directly.
 2. **Cheaper detection footprint**: the dual config's full-width (20,480-column) masks exist for
    snipper/artifact capture; a demo-only detector profile could halve detector traffic.
 3. **Different hardware class**: any discrete GPU with dedicated GDDR restores the isolation the
-   x86 bench had; the workload needs bandwidth, not cores.
+   x86 bench had.
 
-The Spark's trade is deliberate: a ~1 kW bench collapsed into a ~140 W box that still ingests
-dual 500-class Msps with live detection and visualization — at ~75% frame coverage instead of
-100%.
+The Spark's trade after Tier A: a ~1 kW bench collapsed into a ~140 W box that ingests dual
+500-class Msps at **100% coverage** with live detection (every 2nd frame) and visualization.

@@ -156,55 +156,55 @@ Reference capture used to validate this port:
 | Scenario | Ingest | chdr→fft latency | Frame coverage |
 | --- | --- | --- | --- |
 | 1 channel, coherent | 491.52 Msps ingest | ~200 ms (batch 256) | **97.8% measured** (2.2% NIC micro-drops); detection on every processed frame |
-| 2 channels, coherent | 2× 491.52 Msps ingest | ~435 ms (batch 512, 8 workers, emit_stride 2) | **79.1% measured** into the pipeline; detection on every 2nd processed frame (~40% of RF time) |
+| 2 channels, coherent | 2× 491.52 Msps ingest | ~320 ms (batch 512, 8 workers, emit_stride 2) | **100% measured** (zero NIC drops) since the Tier A GPU work (commit `ab8e7f78`); detection on every 2nd processed frame (~50% of RF time) |
+| 1 channel, cuda_dino | full wire rate; DINO throttles processing via backpressure valve | DINO-bound (~fft→preview 320 ms+) | subset (ViT inference cost) |
 
-**Measured loss budget (60 s validation runs, 2026-08-13).** The X410 delivers exactly full rate
-on the wire (dual run: 57,600,000 packets = 480k pps × 2 ch × 60 s, to the packet). Where losses
-occur:
+**Measured loss budget (60 s validation runs; dual re-measured 2026-08-13 after the Tier A
+GPU optimizations — see `gpu_optimization_plan.md` and
+`../infocom_evals/signal_detection_experiments/gpu_opt_tier_a_results.md`).** The X410 delivers
+exactly full rate on the wire (480k pps × channels × seconds, to the packet). Where losses occur:
 
-| Stage | Single channel | Dual channel |
+| Stage | Single channel | Dual channel (post-Tier-A) |
 | --- | --- | --- |
 | Wire → NIC | 0 (exact) | 0 (exact) |
-| NIC → app (RX out-of-buffers) | −2.2% (622,410 pkts) | **−20.9%** (12,031,807 pkts; budget closes to the packet: 45,568,193 received + 12,031,807 dropped = 57,600,000) |
-| Inside the pipeline (converter/FFT/display) | **0** — 0 partial drops, 0 panic resets | **0** — everything received is processed and displayed |
+| NIC → app (RX out-of-buffers) | −2.2% (622,410 pkts) | **0** (was −20.9% before commit `ab8e7f78`) |
+| Inside the pipeline (converter/FFT/display) | **0** — 0 partial drops, 0 panic resets | **0** — 0 partial drops, 0 panic resets, out-queue depth ~1 |
 | Detection cadence | every frame | every 2nd frame (`emit_stride: 2`) |
 
-Interpretation: the dual-channel loss is *at the NIC buffer level*, but its root cause is still
-the GPU ceiling — downstream consumes batches too slowly, RX buffers recycle late, and the NIC
-starves during bursts. Latency (~435 ms) is a separate phenomenon (batching + queueing) and does
-not indicate loss. A signal must persist ≳50 ms to be virtually guaranteed to intersect a
-dual-channel detection frame; the waterfall itself shows ~79% of RF time.
-| 1 channel, cuda_dino | full wire rate; DINO throttles processing via backpressure valve | DINO-bound (~fft→preview 320 ms+) | subset (ViT inference cost) |
+Interpretation: the pre-Tier-A 20.9% dual loss turned out to be mostly **host-side
+serialization** (per-stage timing syncs, blocking counter readbacks, per-frame
+cudaMalloc/cudaFree) masquerading as a GPU-bandwidth ceiling; removing it freed the pipeline to
+consume at full dual rate with no config change. Per-frame detection (`emit_stride: 1`) still
+sheds ~15% and is the target of the Tier B fusion work. The standing ~320 ms chdr→fft latency is
+a startup-fill queue backlog that never drains at matched rates — a separate latency (not loss)
+phenomenon.
 
 Knobs: `chdr_converter.num_ffts_per_batch` (= `fft.num_bursts`) trades latency vs converter load;
 `scheduler.worker_thread_number: 8` needed for dual-channel symmetry; `render_every_n_frames`
 decimates only the display (detection runs every emitted frame at `emit_stride: 1`).
 
-**Dual-channel shedding (expected, not a malfunction).** Dual full rate (2× 491.52 Msps = 48k
-FFT/s) is ~2× the GB10 pipeline ceiling, so roughly half the frames are shed; the waterfalls stay
-live and detection runs on every processed frame. *Where* the excess is shed varies with batch
-size and run-to-run scheduling:
-- `num_ffts_per_batch: 512` (the committed default) sheds **quietly at batch assembly** — RX pools
-  stay healthy, logs mostly calm (occasional `panic reset` self-heals, sporadic NIC-drop
-  messages).
+**Dual-channel shedding (historical — resolved at the committed operating point).** Before
+commit `ab8e7f78`, dual full rate (2× 491.52 Msps = 48k FFT/s) exceeded what the pipeline
+consumed and ~21% of packets were shed; since the Tier A GPU de-serialization the committed
+config (`num_ffts_per_batch: 512`, `emit_stride: 2`) ingests at **100% with zero drops**. The
+shedding mechanics below still apply whenever the pipeline is pushed over its ceiling (e.g.
+`emit_stride: 1` today, which sheds ~15%):
+- Batch 512 sheds **quietly at batch assembly** — RX pools stay healthy, logs mostly calm.
 - Smaller batches (e.g. 256) shed via **output-queue backpressure**: queued batches pin the entire
   RX mempool, the NIC starves, and the log fills with `Fell behind in processing on GPU!` +
   `Dropped N packets since last poll` + `might get dropped` spam. Avoid for dual-channel.
 - There is **no half-rate escape hatch on this X410**: the CG_400 FPGA image is fixed at
-  491.52 Msps (requests for lower rates are refused). Single-channel runs are within the ceiling
-  and clean.
+  491.52 Msps (requests for lower rates are refused).
 
-**What the dual-channel bottleneck actually is (profiled 2026-08-12):** GPU contention, not
-networking. Full hardware comparison against the original x86 bench GPU:
-[`dgx_spark_vs_rtx4000_ada.md`](dgx_spark_vs_rtx4000_ada.md). Evidence: RX cores moved to the isolated CPUs (5,7) changed nothing; the converter's
-out-queue sits pegged at its max (downstream won't consume); and the same detector kernel that
-costs ~3.7 ms/frame single-channel costs ~14.5 ms/frame dual (spectrogram preview adds ~11 ms) —
-per-kernel wall time inflates ~4× when both channels' converter+FFT+preview+detector kernels
-contend for the integrated GPU. Config levers already applied: `emit_stride: 2` (detect every 2nd
-frame, +30% throughput, −25% latency), `rows_per_frame: 8` (fast waterfall scroll), 8 scheduler workers, RX on the
-isolated cores. Going to ~100% dual coverage would need code-level work (batch both channels into
-single kernel launches, CUDA graphs to cut launch overhead, fuse/trim the preview path) — or a
-discrete GPU.
+**What the dual-channel bottleneck actually was (profiled 2026-08-12, revised 2026-08-13):**
+originally diagnosed as pure GPU memory-system contention (hardware comparison:
+[`dgx_spark_vs_rtx4000_ada.md`](dgx_spark_vs_rtx4000_ada.md)); the Tier A work
+([`gpu_optimization_plan.md`](gpu_optimization_plan.md)) showed a large share was **host-side
+serialization** — per-stage timing syncs, blocking counter readbacks, and per-frame
+cudaMalloc/cudaFree stalls — which the baseline profiling itself was subject to. With those
+removed, dual stride-2 runs clean; the remaining true GPU ceiling shows up only at
+`emit_stride: 1` (detector ~14.7 ms/frame/ch, ~15% over budget), which the Tier B kernel-fusion
+work targets.
 
 **DPDK core-pinning trap:** the EAL takes the *lowest* core in its `-l` list as the main lcore,
 and RX workers cannot run there. `master_core` must therefore be numerically LOWER than every

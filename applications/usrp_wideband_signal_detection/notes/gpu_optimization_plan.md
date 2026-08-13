@@ -101,8 +101,22 @@ exactly what Tiers A/B attack:
 
 (updated as work lands)
 
-- [ ] A.1 detector de-serialization (event-based stage timing, deferred counters, emit-path pools)
-- [ ] A.2 FFT output tensor pooling
+- [x] A.1 detector de-serialization (event-based stage timing, pinned-staged counters,
+      emit-path buffer pooling) — commit ab8e7f78, bit-exact PASS both variants
+- [x] A.2 FFT output tensor async allocation — same commit, same gate
 - [ ] A.3 event-carrying `DetectorMaskMessage` (drop the last per-frame sync) + preview event pool
+- [ ] A.4 (new) one-shot startup-backlog drain in the converter→FFT queue (~300 ms standing
+      latency at matched rates; see results doc)
+- [x] re-measure + emit_stride 1 attempt — see
+      `infocom_evals/signal_detection_experiments/gpu_opt_tier_a_results.md`.
+      **Headline: dual-channel NIC loss 20.9% → 0% at stride 2 (100% ingest), no config change.**
+      stride 1 still sheds ~15% (detector ~14.7 ms/frame/ch × 48 frames/s) → Tier B next.
 - [ ] B fusion passes
-- [ ] re-measure; emit_stride 1 attempt
+
+## Post-measurement correction to the bottleneck story
+
+The baseline "GPU memory-system contention" ceiling was **partly an artifact of host-side
+serialization**: with the syncs/allocs removed, the same GPU sustains dual full rate with the
+stride-2 detector cadence and empty queues. The bandwidth wall is still real — stride 1's
+pipeline stage inflates 7.4 → 9.8 ms under the doubled kernel load — but it sits ~15% over
+budget, not ~70%, and Tier B fusion attacks exactly that.
