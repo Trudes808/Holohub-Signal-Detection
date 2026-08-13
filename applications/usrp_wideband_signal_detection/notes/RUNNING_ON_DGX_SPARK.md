@@ -178,7 +178,8 @@ size and run-to-run scheduling:
   and clean.
 
 **What the dual-channel bottleneck actually is (profiled 2026-08-12):** GPU contention, not
-networking. Evidence: RX cores moved to the isolated CPUs (5,7) changed nothing; the converter's
+networking. Full hardware comparison against the original x86 bench GPU:
+[`dgx_spark_vs_rtx4000_ada.md`](dgx_spark_vs_rtx4000_ada.md). Evidence: RX cores moved to the isolated CPUs (5,7) changed nothing; the converter's
 out-queue sits pegged at its max (downstream won't consume); and the same detector kernel that
 costs ~3.7 ms/frame single-channel costs ~14.5 ms/frame dual (spectrogram preview adds ~11 ms) —
 per-kernel wall time inflates ~4× when both channels' converter+FFT+preview+detector kernels
