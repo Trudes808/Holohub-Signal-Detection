@@ -161,6 +161,11 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<bool> timing_summary_enable_;
   holoscan::Parameter<int> timing_summary_every_n_;
   holoscan::Parameter<int> timing_summary_window_;
+  // Diagnostic-only nonzero counts of the intermediate masks (raw / post-smooth / post-close /
+  // post-persistence). Four extra full-mask read passes per emitted frame; disable on
+  // GPU-saturated live configs. The emitted-mask count (used by the timing summary and
+  // metadata) always runs.
+  holoscan::Parameter<bool> emit_mask_diagnostic_counts_;
 
   std::vector<uint64_t> frame_count_;
   std::vector<int> masks_saved_;
