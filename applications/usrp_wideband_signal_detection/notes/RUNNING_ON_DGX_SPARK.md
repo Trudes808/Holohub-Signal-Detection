@@ -155,8 +155,25 @@ Reference capture used to validate this port:
 
 | Scenario | Ingest | chdr→fft latency | Frame coverage |
 | --- | --- | --- | --- |
-| 1 channel, coherent | 491.52 Msps ingest | ~200 ms (batch 256) | ~80–85% (NIC micro-drop bursts + converter; continuous display, no blanking) |
-| 2 channels, coherent | 2× 491.52 Msps ingest | ~435 ms (batch 512, 8 workers, emit_stride 2) | ~75%/ch, symmetric (GPU-contention ceiling — see shedding note) |
+| 1 channel, coherent | 491.52 Msps ingest | ~200 ms (batch 256) | **97.8% measured** (2.2% NIC micro-drops); detection on every processed frame |
+| 2 channels, coherent | 2× 491.52 Msps ingest | ~435 ms (batch 512, 8 workers, emit_stride 2) | **79.1% measured** into the pipeline; detection on every 2nd processed frame (~40% of RF time) |
+
+**Measured loss budget (60 s validation runs, 2026-08-13).** The X410 delivers exactly full rate
+on the wire (dual run: 57,600,000 packets = 480k pps × 2 ch × 60 s, to the packet). Where losses
+occur:
+
+| Stage | Single channel | Dual channel |
+| --- | --- | --- |
+| Wire → NIC | 0 (exact) | 0 (exact) |
+| NIC → app (RX out-of-buffers) | −2.2% (622,410 pkts) | **−20.9%** (12,031,807 pkts; budget closes to the packet: 45,568,193 received + 12,031,807 dropped = 57,600,000) |
+| Inside the pipeline (converter/FFT/display) | **0** — 0 partial drops, 0 panic resets | **0** — everything received is processed and displayed |
+| Detection cadence | every frame | every 2nd frame (`emit_stride: 2`) |
+
+Interpretation: the dual-channel loss is *at the NIC buffer level*, but its root cause is still
+the GPU ceiling — downstream consumes batches too slowly, RX buffers recycle late, and the NIC
+starves during bursts. Latency (~435 ms) is a separate phenomenon (batching + queueing) and does
+not indicate loss. A signal must persist ≳50 ms to be virtually guaranteed to intersect a
+dual-channel detection frame; the waterfall itself shows ~79% of RF time.
 | 1 channel, cuda_dino | full wire rate; DINO throttles processing via backpressure valve | DINO-bound (~fft→preview 320 ms+) | subset (ViT inference cost) |
 
 Knobs: `chdr_converter.num_ffts_per_batch` (= `fft.num_bursts`) trades latency vs converter load;

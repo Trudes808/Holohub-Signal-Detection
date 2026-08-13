@@ -85,8 +85,8 @@ Current operating points on GB10 (committed configs):
 
 | | Ingest | Coverage | Latency | Visualization |
 | --- | --- | --- | --- | --- |
-| Single-channel | 491.52 Msps, no drops | ~82–100% | ~200 ms | full rate |
-| Dual-channel | 2× 491.52 Msps, no NIC drops | ~75%/ch, detection every 2nd frame | ~435 ms | ~36 fps/ch |
+| Single-channel | 491.52 Msps | **97.8% measured** | ~200 ms | full rate |
+| Dual-channel | 2× 491.52 Msps | **79.1% measured** into the pipeline; detection every 2nd frame | ~435 ms | ~36 fps/ch |
 
 Config-level tuning is exhausted (batch size, workers, core isolation, render decimation,
 emit stride — all measured above). Closing the remaining dual-channel gap would take:
