@@ -189,10 +189,14 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
         stats.window_max_chdr_to_fft_ms = std::max(stats.window_max_chdr_to_fft_ms, chdr_to_fft_ms);
     }
     meta->set("fft_enter_ts_ns", fft_enter_ns);
-    tensor_t<complex, 2> out;
-    make_tensor(out, {num_bursts.get(), burst_size.get()}, MATX_DEVICE_MEMORY);
-
     auto stream = std::get<1>(input);
+    // Stream-ordered allocation: a fresh MATX_DEVICE_MEMORY tensor here costs a synchronous
+    // cudaMalloc per frame plus a device-syncing cudaFree when the last consumer drops it.
+    // The async pool recycles the same blocks per stream with no device-wide stalls; every
+    // consumer runs on (or synchronizes with) this same per-channel stream before release,
+    // which keeps the stream-ordered free safe.
+    tensor_t<complex, 2> out;
+    make_tensor(out, {num_bursts.get(), burst_size.get()}, MATX_ASYNC_DEVICE_MEMORY, stream);
     throw_if_cufft_error(cufftSetStream(fft_plan_, stream), "cufftSetStream");
     throw_if_cufft_error(
         cufftExecC2C(fft_plan_,

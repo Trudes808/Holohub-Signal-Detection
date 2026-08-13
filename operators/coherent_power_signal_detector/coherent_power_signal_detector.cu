@@ -168,6 +168,27 @@ std::shared_ptr<unsigned int> acquire_pooled_u32_buffer() {
                                        [](unsigned int* ptr) { recycle_mask_output_buffer(ptr, kBytes); });
 }
 
+// Pool-backed replacement for the per-frame cudaMalloc/cudaFree emit buffers (cudaFree
+// device-syncs, so a fresh owned buffer per frame stalls the whole GPU on release).
+// Recycling contract: the holder must not drop the shared_ptr until all GPU work touching
+// the buffer has completed on some synchronized stream — the emit path holds its buffers
+// past the per-frame emit sync, and downstream mask consumers sync their own streams before
+// releasing DetectorMaskMessage::device_pixels.
+std::shared_ptr<uint8_t> acquire_pooled_u8_buffer(size_t bytes) {
+  return std::shared_ptr<uint8_t>(static_cast<uint8_t*>(acquire_mask_output_buffer(bytes)),
+                                  [bytes](uint8_t* ptr) { recycle_mask_output_buffer(ptr, bytes); });
+}
+
+// Slot layout of ChannelBuffers::emit_counters_pinned.
+enum PinnedEmitCounterSlot : size_t {
+  kCtrEmittedNonzero = 0,
+  kCtrRawNonzero,
+  kCtrPostCloseNonzero,
+  kCtrPostPersistenceNonzero,
+  kCtrPostSmoothNonzero,
+  kPinnedEmitCounterCount,
+};
+
 std::shared_ptr<uint8_t> allocate_owned_u8_buffer(size_t bytes) {
   void* ptr = nullptr;
   auto result = cudaMalloc(&ptr, bytes);
@@ -1391,8 +1412,20 @@ CoherentPowerSignalDetector::~CoherentPowerSignalDetector() {
     cudaFree(buffers.dynamic_floor_ring_device);
     cudaFreeHost(buffers.power_db_host);
     cudaFreeHost(buffers.mask_host);
+    cudaFreeHost(buffers.emit_counters_pinned);
 
     buffers = ChannelBuffers {};
+  }
+  for (auto& events : stage_timing_events_) {
+    if (!events.created) {
+      continue;
+    }
+    for (auto& slot : events.boundaries) {
+      for (auto& event : slot) {
+        cudaEventDestroy(event);
+      }
+    }
+    events = StageTimingEvents {};
   }
   cudaFree(per_freq_threshold_device_);
   per_freq_threshold_device_ = nullptr;
@@ -1532,6 +1565,7 @@ void CoherentPowerSignalDetector::initialize() {
   path_artifacts_saved_.assign(num_channels_.get(), 0);
   timing_stats_.assign(num_channels_.get(), ChannelTimingStats {});
   channel_buffers_.assign(num_channels_.get(), ChannelBuffers {});
+  stage_timing_events_.assign(num_channels_.get(), StageTimingEvents {});
   reset_detector_state_on_next_full_batch_.assign(num_channels_.get(), 0);
   last_seen_chdr_soft_resync_epoch_.assign(num_channels_.get(), 0);
   last_seen_center_frequency_.assign(num_channels_.get(), 0);
@@ -1838,23 +1872,77 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   std::array<double, kTimingStageCount> stage_ms {};
   const bool timing_enabled = timing_summary_enable_.get();
 
+  // GPU stage timing without per-stage stream syncs. The three GPU-queued stages (input,
+  // power_db, pipeline) are bracketed by boundary events on the channel stream; results are
+  // harvested one timed frame later from the double-buffered slot about to be reused, whose
+  // work is long complete, so the launch queue is never drained just to read a stopwatch.
+  // stage_ms therefore carries the previous timed frame's GPU durations into the current
+  // frame's rolling summary — same steady-state distribution, none of the serialization.
+  auto& stage_events = stage_timing_events_[channel_number];
+  size_t timing_slot = 0;
+  if (timing_enabled) {
+    if (!stage_events.created) {
+      for (auto& slot : stage_events.boundaries) {
+        for (auto& event : slot) {
+          const auto event_result = cudaEventCreate(&event);
+          if (event_result != cudaSuccess) {
+            throw std::runtime_error(std::string("failed to create stage timing event: ") +
+                                     cudaGetErrorString(event_result));
+          }
+        }
+      }
+      stage_events.created = true;
+    }
+    timing_slot = static_cast<size_t>(stage_events.timed_frames & 1ULL);
+    stage_events.timed_frames++;
+    if (stage_events.recorded[timing_slot]) {
+      const auto& prev = stage_events.boundaries[timing_slot];
+      const auto ready = cudaEventSynchronize(prev[StageTimingEvents::kBoundaryCount - 1]);
+      if (ready == cudaSuccess) {
+        constexpr std::array<size_t, 3> kGpuStageOrder = {kInputStage, kPowerDbStage, kPipelineStage};
+        for (size_t boundary = 0; boundary + 1 < StageTimingEvents::kBoundaryCount; ++boundary) {
+          float elapsed = 0.0f;
+          if (cudaEventElapsedTime(&elapsed, prev[boundary], prev[boundary + 1]) == cudaSuccess) {
+            stage_ms[kGpuStageOrder[boundary]] = static_cast<double>(elapsed);
+          }
+        }
+      }
+      stage_events.recorded[timing_slot] = false;
+    }
+  }
+
+  auto gpu_stage_boundary = [](size_t stage_index) -> int {
+    switch (stage_index) {
+      case kInputStage: return 0;
+      case kPowerDbStage: return 1;
+      case kPipelineStage: return 2;
+      default: return -1;
+    }
+  };
+
   auto time_step_ms = [&](size_t stage_index, auto&& fn) {
     if (!timing_enabled) {
       fn();
       return;
     }
-
-    const auto stage_start = std::chrono::steady_clock::now();
-    fn();
-    auto sync_result = cudaStreamSynchronize(stream);
-    if (sync_result != cudaSuccess) {
-      HOLOSCAN_LOG_ERROR("Coherent power detector timing sync failed at {}: {}",
-                         kTimingStageNames[stage_index],
-                         cudaGetErrorString(sync_result));
+    const int boundary = gpu_stage_boundary(stage_index);
+    if (boundary < 0) {
+      // Host-side stage (debug artifact saves) with internal syncs: CPU wall time is accurate.
+      const auto stage_start = std::chrono::steady_clock::now();
+      fn();
+      stage_ms[stage_index] =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
       return;
     }
-    stage_ms[stage_index] =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stage_start).count();
+    auto& slot = stage_events.boundaries[timing_slot];
+    if (boundary == 0) {
+      cudaEventRecord(slot[0], stream);
+    }
+    fn();
+    cudaEventRecord(slot[static_cast<size_t>(boundary) + 1], stream);
+    if (boundary + 2 == static_cast<int>(StageTimingEvents::kBoundaryCount)) {
+      stage_events.recorded[timing_slot] = true;
+    }
   };
 
   int ignore_bins_per_side = 0;
@@ -1881,6 +1969,16 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
   const size_t power_db_bytes = static_cast<size_t>(total_bins) * sizeof(float);
   const size_t mask_bytes = static_cast<size_t>(total_bins) * sizeof(uint8_t);
   auto& buffers = channel_buffers_[channel_number];
+
+  if (buffers.emit_counters_pinned == nullptr) {
+    const auto pinned_result = cudaMallocHost(reinterpret_cast<void**>(&buffers.emit_counters_pinned),
+                                              kPinnedEmitCounterCount * sizeof(unsigned int));
+    if (pinned_result != cudaSuccess) {
+      throw std::runtime_error(std::string("failed to allocate pinned emit counter staging: ") +
+                               cudaGetErrorString(pinned_result));
+    }
+    std::fill_n(buffers.emit_counters_pinned, kPinnedEmitCounterCount, 0U);
+  }
 
   if (reset_detector_state_on_next_full_batch_[channel_number] != 0) {
     reset_channel_state(channel_number, static_cast<size_t>(src_rows), static_cast<size_t>(total_bins), stream);
@@ -2425,6 +2523,13 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     if (kernel_result != cudaSuccess) {
       throw std::runtime_error(std::string("fast raw mask count kernel launch failed: ") + cudaGetErrorString(kernel_result));
     }
+    if (cudaMemcpyAsync(&buffers.emit_counters_pinned[kCtrRawNonzero],
+                        fast_raw_mask_nonzero_device.get(),
+                        sizeof(unsigned int),
+                        cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess) {
+      throw std::runtime_error("failed to queue fast raw mask nonzero count copy");
+    }
 
     for (int iter = 0; iter < std::max(0, fast_mask_smooth_iterations_.get()); ++iter) {
       coherent_power_majority_smooth_kernel<<<blocks, threads, 0, stream>>>(buffers.mask_device,
@@ -2449,6 +2554,13 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
     kernel_result = cudaGetLastError();
     if (kernel_result != cudaSuccess) {
       throw std::runtime_error(std::string("fast post-smooth mask count kernel launch failed: ") + cudaGetErrorString(kernel_result));
+    }
+    if (cudaMemcpyAsync(&buffers.emit_counters_pinned[kCtrPostSmoothNonzero],
+                        fast_post_smooth_mask_nonzero_device.get(),
+                        sizeof(unsigned int),
+                        cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess) {
+      throw std::runtime_error("failed to queue fast post-smooth mask nonzero count copy");
     }
 
     fast_summary.ignore_bins_per_side = ignore_bins_per_side;
@@ -3092,8 +3204,16 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       const int dst_rows = emitted_mask_rows;
       const int dst_cols = emitted_mask_cols;
         const size_t emitted_mask_bytes = static_cast<size_t>(dst_rows) * static_cast<size_t>(dst_cols) * sizeof(uint8_t);
-      auto mask_buffer = allocate_owned_u8_buffer(emitted_mask_bytes);
-      auto emitted_nonzero_device = allocate_owned_u32_buffer();
+      auto mask_buffer = acquire_pooled_u8_buffer(emitted_mask_bytes);
+      auto emitted_nonzero_device = acquire_pooled_u32_buffer();
+      // Pooled emit scratch, declared at this scope (not inside the filter/rescue blocks that
+      // use it) so every buffer outlives the emit sync below — recycling must never race the
+      // in-flight kernels still reading or writing these on the channel stream.
+      std::shared_ptr<uint8_t> emit_scratch0_device;
+      std::shared_ptr<uint8_t> emit_scratch1_device;
+      std::shared_ptr<uint8_t> strong_emit_buffer;
+      std::shared_ptr<unsigned int> fast_post_emit_persistence_mask_nonzero_device;
+      unsigned int* counters_pinned = buffers.emit_counters_pinned;
       if (cudaMemsetAsync(emitted_nonzero_device.get(), 0, sizeof(unsigned int), stream) != cudaSuccess) {
         throw std::runtime_error("failed to reset emitted mask nonzero counter");
       }
@@ -3121,10 +3241,10 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       }
 
       if (filter_detection_mask_.get()) {
-        auto emit_scratch0_device = allocate_owned_u8_buffer(emitted_mask_bytes);
-        auto emit_scratch1_device = allocate_owned_u8_buffer(emitted_mask_bytes);
-        fast_post_emit_close_mask_nonzero_device = allocate_owned_u32_buffer();
-        auto fast_post_emit_persistence_mask_nonzero_device = allocate_owned_u32_buffer();
+        emit_scratch0_device = acquire_pooled_u8_buffer(emitted_mask_bytes);
+        emit_scratch1_device = acquire_pooled_u8_buffer(emitted_mask_bytes);
+        fast_post_emit_close_mask_nonzero_device = acquire_pooled_u32_buffer();
+        fast_post_emit_persistence_mask_nonzero_device = acquire_pooled_u32_buffer();
         apply_emit_mask_morphology(mask_buffer.get(),
                                    dst_rows,
                                    dst_cols,
@@ -3135,14 +3255,18 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
                                    fast_post_emit_close_mask_nonzero_device.get(),
                                    fast_post_emit_persistence_mask_nonzero_device.get(),
                                    stream);
-        unsigned int post_persistence_nonzero_count = 0;
-        if (cudaMemcpy(&post_persistence_nonzero_count,
-                       fast_post_emit_persistence_mask_nonzero_device.get(),
-                       sizeof(unsigned int),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          throw std::runtime_error("failed to copy fast post-persistence mask nonzero count");
+        if (cudaMemcpyAsync(&counters_pinned[kCtrPostCloseNonzero],
+                            fast_post_emit_close_mask_nonzero_device.get(),
+                            sizeof(unsigned int),
+                            cudaMemcpyDeviceToHost,
+                            stream) != cudaSuccess ||
+            cudaMemcpyAsync(&counters_pinned[kCtrPostPersistenceNonzero],
+                            fast_post_emit_persistence_mask_nonzero_device.get(),
+                            sizeof(unsigned int),
+                            cudaMemcpyDeviceToHost,
+                            stream) != cudaSuccess) {
+          throw std::runtime_error("failed to queue post-emit mask nonzero count copies");
         }
-        fast_summary.post_emit_persistence_mask_nonzero_pixels = post_persistence_nonzero_count;
       }
 
       const int compact_total = dst_rows * dst_cols;
@@ -3153,7 +3277,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       // morphology + frequency-persistence pass, transposed into the emit orientation to match.
       // This is what lets a strong but frequency-narrow signal survive the width filters.
       if (fast_strong_rescue_enable_.get()) {
-        auto strong_emit_buffer = allocate_owned_u8_buffer(emitted_mask_bytes);
+        strong_emit_buffer = acquire_pooled_u8_buffer(emitted_mask_bytes);
         if (canonical_view.transposed) {
           transpose_u8_kernel<<<count_blocks, count_threads, 0, stream>>>(buffers.strong_mask_device,
                                                                            src_rows,
@@ -3189,46 +3313,31 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
       if (kernel_result != cudaSuccess) {
         throw std::runtime_error(std::string("live mask count kernel launch failed: ") + cudaGetErrorString(kernel_result));
       }
-      unsigned int emitted_nonzero_count = 0;
-      if (cudaMemcpyAsync(&emitted_nonzero_count,
+      if (cudaMemcpyAsync(&counters_pinned[kCtrEmittedNonzero],
                           emitted_nonzero_device.get(),
                           sizeof(unsigned int),
                           cudaMemcpyDeviceToHost,
                           stream) != cudaSuccess) {
         throw std::runtime_error("failed to copy emitted mask nonzero count");
       }
+      // The one emit-path sync: downstream consumers of DetectorMaskMessage assume the mask
+      // is complete on receipt, and it also retires every queued pinned-counter copy above so
+      // the diagnostics below are same-frame values with no per-counter blocking reads.
       if (cudaStreamSynchronize(stream) != cudaSuccess) {
         throw std::runtime_error("failed to synchronize live mask emission stream");
       }
+      const unsigned int emitted_nonzero_count = counters_pinned[kCtrEmittedNonzero];
       if (fast_raw_mask_nonzero_device) {
-        unsigned int raw_nonzero_count = 0;
-        if (cudaMemcpy(&raw_nonzero_count,
-                       fast_raw_mask_nonzero_device.get(),
-                       sizeof(unsigned int),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          throw std::runtime_error("failed to copy fast raw mask nonzero count");
-        }
-        fast_summary.raw_mask_nonzero_pixels = raw_nonzero_count;
+        fast_summary.raw_mask_nonzero_pixels = counters_pinned[kCtrRawNonzero];
       }
       if (fast_post_emit_close_mask_nonzero_device) {
-        unsigned int post_close_nonzero_count = 0;
-        if (cudaMemcpy(&post_close_nonzero_count,
-                       fast_post_emit_close_mask_nonzero_device.get(),
-                       sizeof(unsigned int),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          throw std::runtime_error("failed to copy fast post-close mask nonzero count");
-        }
-        fast_summary.post_emit_close_mask_nonzero_pixels = post_close_nonzero_count;
+        fast_summary.post_emit_close_mask_nonzero_pixels = counters_pinned[kCtrPostCloseNonzero];
+      }
+      if (fast_post_emit_persistence_mask_nonzero_device) {
+        fast_summary.post_emit_persistence_mask_nonzero_pixels = counters_pinned[kCtrPostPersistenceNonzero];
       }
       if (fast_post_smooth_mask_nonzero_device) {
-        unsigned int post_smooth_nonzero_count = 0;
-        if (cudaMemcpy(&post_smooth_nonzero_count,
-                       fast_post_smooth_mask_nonzero_device.get(),
-                       sizeof(unsigned int),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          throw std::runtime_error("failed to copy fast post-smooth mask nonzero count");
-        }
-        fast_summary.post_smooth_mask_nonzero_pixels = post_smooth_nonzero_count;
+        fast_summary.post_smooth_mask_nonzero_pixels = counters_pinned[kCtrPostSmoothNonzero];
       }
       if (fast_always_on_stripe_count_device) {
         unsigned int always_on_stripe_count = 0;

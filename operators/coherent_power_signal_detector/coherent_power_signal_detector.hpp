@@ -62,9 +62,26 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
     // window_slots * slot_frames frames without storing every frame.
     float* dynamic_floor_ring_device = nullptr;
     uint8_t* mask_host = nullptr;
+    // Pinned staging for the per-frame emit diagnostics counters. The device counters are
+    // cudaMemcpyAsync'd into these slots on the channel stream and read back on the CPU only
+    // after the single emit-path stream sync, so no counter ever costs its own blocking
+    // round trip.
+    unsigned int* emit_counters_pinned = nullptr;
     size_t frame_elements = 0;
     size_t row_elements = 0;
     size_t mask_elements = 0;
+  };
+
+  // Boundary events bracketing the GPU-queued timing stages (start / post-input /
+  // post-power_db / post-pipeline), double-buffered per channel. A frame records into one
+  // slot and harvests the other slot's results (from the previous timed frame, long since
+  // complete), so stage timing no longer drains the launch queue with per-stage syncs.
+  struct StageTimingEvents {
+    static constexpr size_t kBoundaryCount = 4;
+    std::array<std::array<cudaEvent_t, kBoundaryCount>, 2> boundaries {};
+    std::array<bool, 2> recorded {false, false};
+    uint64_t timed_frames = 0;
+    bool created = false;
   };
 
   struct ChannelTimingStats {
@@ -151,6 +168,7 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   std::vector<int> path_artifacts_saved_;
   std::vector<ChannelTimingStats> timing_stats_;
   std::vector<ChannelBuffers> channel_buffers_;
+  std::vector<StageTimingEvents> stage_timing_events_;
   std::vector<uint8_t> reset_detector_state_on_next_full_batch_;
   std::vector<uint64_t> last_seen_chdr_soft_resync_epoch_;
   // Dynamic per-frequency floor bookkeeping: last-seen tuning center frequency (a change re-seeds
