@@ -38,3 +38,23 @@ accumulates in the converter→FFT queue during Vulkan/app startup **never drain
 ~322 ms standing CHDR→FFT latency. A one-shot stale-batch drain at stream start (or a brief
 faster-than-realtime catch-up) would cut visualization latency by ~300 ms without touching
 throughput. Candidate Tier A.4.
+
+## Addendum — Tier B rounds 1–2 (2026-08-13, later the same day)
+
+- **Round 1** (`10a0807d`, bit-exact PASS both variants): fused input+power kernel, tiled u8
+  transpose (nsys: 182 → 37 µs, was the #1 GPU kernel at 16.8%), `emit_mask_diagnostic_counts`
+  gate (dual live config now skips 4 audit-only full-mask count passes per frame).
+  Live stride-1 with only the fused kernel: ingest 85% → 87.5% (0.405 → 0.42 Mpps/ch) and the
+  detector *stage* times redistributed (input 2.5 → 0.05 ms; pipeline absorbed the rest) —
+  clean demonstration that the regime is bandwidth-saturated: wall time follows total DRAM
+  traffic, not kernel count.
+- **Round 2** fused rectangle morphology: **reverted after measurement** (+50% kernel time,
+  242 vs 161 ms aggregate). The u8 masks are L2-resident on GB10; only float/complex surfaces
+  pay DRAM. This redirects all remaining fusion work.
+- The live effect of the tiled transpose + count gating is **unmeasured**: the X410's control
+  link (sfp1) dropped mid-session (host port shows NO-CARRIER; UHD "No devices found") and
+  needs a physical power-cycle. Offline validation is unaffected and PASS.
+
+Measurement scripts: `measure_dual_60s.sh` methodology (app detached → wait for DPDK arm →
+settle 8 s → 60 s OTA stream → settle → graceful stop; loss from cumulative
+`rx_out_of_buffer` deltas + CHDR per-window summaries).

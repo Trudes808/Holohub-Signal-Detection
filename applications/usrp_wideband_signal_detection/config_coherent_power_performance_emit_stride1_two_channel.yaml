@@ -206,7 +206,7 @@ coherent_power_signal_detector:
   live_emit_mask_cols: 20480
   live_emit_freq_persistence_window: 45
   live_emit_freq_persistence_min_hits: 11
-  emit_stride: 1   # measurement in progress
+  emit_stride: 2   # detect every 2nd frame. Post-Tier-A this ingests at 100% (zero NIC drops, 60 s measured). stride 1 last measured ~87% ingest (Tier B in progress — see notes/gpu_optimization_plan.md)
   emit_mask_diagnostic_counts: false   # skip the 4 diagnostic full-mask count passes per frame (audit-log only); the emitted-mask count still runs
   log_detections: false
   save_performance_path_artifacts: false

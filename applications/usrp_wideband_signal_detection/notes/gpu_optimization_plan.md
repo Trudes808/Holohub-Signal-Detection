@@ -111,7 +111,32 @@ exactly what Tiers A/B attack:
       `infocom_evals/signal_detection_experiments/gpu_opt_tier_a_results.md`.
       **Headline: dual-channel NIC loss 20.9% → 0% at stride 2 (100% ingest), no config change.**
       stride 1 still sheds ~15% (detector ~14.7 ms/frame/ch × 48 frames/s) → Tier B next.
-- [ ] B fusion passes
+- [x] B round 1 (commit 10a0807d, bit-exact PASS): fused input+power kernel (power dB straight
+      from the FFT tensor; complex analysis scratch now snapshot-only), shared-memory tiled u8
+      transpose (was the profile's #1 kernel at 16.8% — 182 → 37 µs, 5×), new
+      `emit_mask_diagnostic_counts` param (audit-only counters; dual live config disables — 4
+      full-mask count passes per frame gone). Live stride-1 with the fused kernel alone: ingest
+      85 → 87.5%; the tiled transpose + gated counts landed after the X410 control link dropped,
+      so their live effect is **pending a radio power-cycle**.
+- [x] B round 2 fused rectangle morphology — **tried, measured 50% slower, reverted**
+      (d2df3ca4 / 9a4a3e7a). Lesson: the ~10 MB u8 masks are L2-resident on GB10 (24 MB L2), so
+      collapsing separable pairs saves no real DRAM traffic and pays O(w×h) vs O(w+h) scans.
+      **Fusion effort must target the non-L2-resident float (42 MB) and complex (84 MB)
+      surfaces only.**
+- [ ] B round 3 candidates, in profile order (post-round-1 nsys, dynamic variant):
+      fftshift fold into consumers (8.4%, complex 84 MB round-trip; needs an fft-op flag +
+      remaps in detector/preview/cuda_dino), score-family fusion (score 5.1% + per_freq_fill
+      1.5% + strong_rescue 2.6% all re-read corrected_db), dynamic_floor_update +
+      row_sampled_mean merge (4.4% + 3.2%, both full-surface row reductions), box-mean pair
+      (7.4% combined).
+
+## Saturation math (why per-kernel µs matter 3×)
+
+Under dual stride-1 load, kernels run ~3× their uncontended time (offline detector ~4.4 ms/frame
+equivalent → 14.7 ms measured live). So ~1 µs of uncontended kernel time saved returns ~3 µs of
+live GPU headroom: round 1's ~390 µs/frame/ch ≈ 60 ms/s contended ≈ ~6 points of ingest.
+The stride-1 gap is ~125 ms/s — round 3's targets (~300–400 µs/frame uncontended) are plausibly
+enough, but each must be re-measured live before trusting the estimate.
 
 ## Post-measurement correction to the bottleneck story
 
