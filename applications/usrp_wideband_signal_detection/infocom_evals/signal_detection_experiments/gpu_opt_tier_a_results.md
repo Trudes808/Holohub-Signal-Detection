@@ -58,3 +58,39 @@ throughput. Candidate Tier A.4.
 Measurement scripts: `measure_dual_60s.sh` methodology (app detached → wait for DPDK arm →
 settle 8 s → 60 s OTA stream → settle → graceful stop; loss from cumulative
 `rx_out_of_buffer` deltas + CHDR per-window summaries).
+
+## Addendum 2 — no-hardware benchmark stood up (2026-08-13, radio + QSFP unavailable)
+
+With the X410 gone and no loopback cable, the optimization loop now runs entirely offline:
+
+1. **Bit-exact gate** (unchanged): offline replay vs `gpu_opt_golden_masks/`.
+2. **Kernel ranking**: nsys per-kernel sums over the benchmark config (primary signal).
+3. **End-to-end sanity**: `bash_scripts/bench_gpu_contention.sh` — N concurrent offline
+   replays in the binary's new loop-preload mode (zero per-frame host I/O) at live dual frame
+   geometry (512×20480, per-frame detection, dual detector profile, static floor mode).
+   Config: `gpu_bench/config_bench491_gpu_contention.yaml`; input: hardlink of the frozen
+   capture relabeled to 491.52 Msps (same bytes, live FFT geometry).
+
+**Baseline (commit ad83ddcc)**: 1 instance 36.3 f/s; 2 concurrent 27.8+27.7 = **55.5 aggregate**
+(bar: 46.9 f/s per live channel; ~94 aggregate ≈ dual stride-1). Run-to-run noise ~±1 f/s.
+Caveats: two processes time-slice CUDA contexts (live overlaps streams in one process), and the
+offline graph carries ~20 ms/frame of serial host overhead the live app does not (kernel sums:
+~7.1 ms/frame GPU vs 27.6 ms wall) — so absolute f/s undershoots live; use for *ranking*.
+
+**Dual-profile kernel ranking at live geometry** (nsys, per frame, uncontended — this supersedes
+the earlier dynamic-variant ranking for stride-1 work):
+
+| Kernel | ms/frame | share | note |
+| --- | --- | --- | --- |
+| cuFFT (3 passes: 64·64·5 for 20480 pts) | 2.24 | 32% | untouchable |
+| power_db_from_input (fused, scatter-write) | 0.76 | 11% | write side could tile like transpose_u8 |
+| fftshift_rows | 0.70 | 10% | **pure overhead — fold into consumers** |
+| emit morphology (8 separable passes) | 1.09 | 15% | L2-resident at small geometry, NOT at live 10.5 MB masks — revisit tiling *at this geometry* |
+| score | 0.56 | 8% | fusable with strong_rescue reads |
+| box_mean cols+rows | 0.78 | 11% | |
+| frontend_correction + row_mean | 0.49 | 7% | |
+| majority_smooth / transpose / persistence / count | 0.48 | 7% | |
+
+Next round (3a): fftshift fold — detector side is one index remap in the fused kernel; preview
+and cuda_dino need an `apply_fftshift` fft-op param (default true) so untouched paths keep the
+shift.

@@ -123,7 +123,7 @@ exactly what Tiers A/B attack:
       collapsing separable pairs saves no real DRAM traffic and pays O(w×h) vs O(w+h) scans.
       **Fusion effort must target the non-L2-resident float (42 MB) and complex (84 MB)
       surfaces only.**
-- [ ] B round 3 candidates, in profile order (post-round-1 nsys, dynamic variant):
+- [ ] B round 3 candidates — RE-RANKED at live dual geometry (see results Addendum 2): fftshift fold (10%), power_db scatter-write tiling (11%), morphology tiling AT LIVE GEOMETRY (15%, masks no longer L2-resident at 10.5 MB), score-family fusion (8%). Previous dynamic-variant list:
       fftshift fold into consumers (8.4%, complex 84 MB round-trip; needs an fft-op flag +
       remaps in detector/preview/cuda_dino), score-family fusion (score 5.1% + per_freq_fill
       1.5% + strong_rescue 2.6% all re-read corrected_db), dynamic_floor_update +
