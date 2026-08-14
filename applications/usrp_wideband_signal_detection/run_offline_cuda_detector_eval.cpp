@@ -575,6 +575,11 @@ struct EvalOverrides {
   bool run_offline_on_file = true;
   std::string detector_type = "cuda_dino";
   int source_ring_size = 8;
+  // Benchmark loop mode (offline_eval.loop_preloaded_frames / loop_total_frames): serve K
+  // preloaded device frames round-robin for N scheduled frames — GPU-pipeline throughput
+  // measurement with zero per-frame host I/O. 0 = normal file streaming.
+  int loop_preloaded_frames = 0;
+  int64_t loop_total_frames = 0;
   bool trace_frames = false;
   bool require_full_mask_coverage = false;
   bool save_detector_debug_artifacts = false;
@@ -1562,6 +1567,14 @@ class OfflineSc16FileSourceOp : public holoscan::Operator {
                "Number of marked non-data frames emitted to flush downstream operators.",
                static_cast<int64_t>(0));
     spec.param(ring_size_, "ring_size", "Ring Size", "Reusable device-buffer ring size.", 4);
+    spec.param(loop_preloaded_frames_,
+               "loop_preloaded_frames",
+               "Loop Preloaded Frames",
+               "BENCHMARK MODE: preload this many frames to the device once and emit them "
+               "round-robin with zero per-frame host work, so throughput measures the GPU "
+               "pipeline instead of file I/O. 0 (default) = normal file streaming. Masks "
+               "repeat with this period — never use for accuracy/golden validation.",
+               0);
   }
 
   void initialize() override {
@@ -1602,11 +1615,73 @@ class OfflineSc16FileSourceOp : public holoscan::Operator {
     if (cudaStreamCreateWithFlags(&upload_stream_, cudaStreamNonBlocking) != cudaSuccess) {
       throw std::runtime_error("failed to create offline source CUDA stream");
     }
+
+    // Benchmark loop mode: read + upload the first K frames once, then compute() serves them
+    // round-robin with no per-frame file read / conversion / H2D copy. Downstream only ever
+    // READS the FFT-input tensor, so sharing one device tensor across in-flight frames is safe
+    // (unlike the historical ring bug above, the data in a slot never changes).
+    const int loop_frames = std::max(0, loop_preloaded_frames_.get());
+    if (loop_frames > 0) {
+      preloaded_.reserve(static_cast<size_t>(loop_frames));
+      for (int frame = 0; frame < loop_frames; ++frame) {
+        input_.read(reinterpret_cast<char*>(host_input_bytes_.data()),
+                    static_cast<std::streamsize>(samples_per_frame_ * input_format_.bytes_per_complex));
+        if (static_cast<uint64_t>(input_.gcount()) !=
+            samples_per_frame_ * input_format_.bytes_per_complex) {
+          throw std::runtime_error("offline source: input file too short to preload " +
+                                   std::to_string(loop_frames) + " benchmark frames");
+        }
+        if (fast_copy_cf32_) {
+          std::memcpy(host_complex_.data(), host_input_bytes_.data(), samples_per_frame_ * sizeof(Complex));
+        } else {
+          for (size_t index = 0; index < samples_per_frame_; ++index) {
+            const auto* raw_sample = host_input_bytes_.data() + (index * input_format_.bytes_per_complex);
+            host_complex_[index] = decode_complex_sample(raw_sample, input_format_);
+          }
+        }
+        matx::tensor_t<Complex, 2> device_tensor;
+        make_tensor(device_tensor,
+                    {static_cast<matx::index_t>(num_bursts_.get()),
+                     static_cast<matx::index_t>(burst_size_.get())},
+                    MATX_DEVICE_MEMORY);
+        if (cudaMemcpy(device_tensor.Data(),
+                       host_complex_.data(),
+                       host_complex_.size() * sizeof(Complex),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+          throw std::runtime_error("offline source failed to preload benchmark frame to device");
+        }
+        preloaded_.push_back(device_tensor);
+      }
+      HOLOSCAN_LOG_INFO(
+          "Offline source BENCHMARK loop mode: {} preloaded device frames served round-robin "
+          "({} real frames scheduled); throughput below reflects the GPU pipeline, masks repeat.",
+          loop_frames,
+          real_frame_count_limit_);
+    }
   }
 
   void compute(holoscan::InputContext&, holoscan::OutputContext& op_output, holoscan::ExecutionContext&) override {
     const uint64_t frame_number = emitted_frames_ + 1;
     const bool drain_frame = emitted_frames_ >= real_frame_count_limit_;
+
+    // Benchmark loop mode: serve a preloaded device frame with zero host-side work.
+    if (!drain_frame && !preloaded_.empty()) {
+      auto device_tensor = preloaded_[emitted_frames_ % preloaded_.size()];
+      auto meta = metadata();
+      if (meta) {
+        meta->set("channel_number", static_cast<uint16_t>(std::max(0, channel_number_.get())));
+        meta->set("sample_rate_hz", span_hz_.get());
+        meta->set("offline_source_frame_number", frame_number);
+        meta->set("offline_source_drain_frame", false);
+        meta->set("offline_source_real_frame_count", real_frame_count_limit_);
+        meta->set("offline_source_complex_samples_read", static_cast<uint64_t>(samples_per_frame_));
+        meta->set("offline_source_complex_samples_padded", static_cast<uint64_t>(0));
+        meta->set("offline_source_partial_frame", false);
+      }
+      op_output.emit(FftInputMessage {device_tensor, upload_stream_}, "out");
+      emitted_frames_++;
+      return;
+    }
 
     size_t complex_samples_read = 0;
     if (drain_frame) {
@@ -1733,6 +1808,8 @@ class OfflineSc16FileSourceOp : public holoscan::Operator {
   holoscan::Parameter<int> ring_size_;  // DEPRECATED/ignored: kept only so the existing
                                         // Arg("ring_size") stays valid. Frames now use a fresh
                                         // per-frame device tensor (no reusable ring).
+  holoscan::Parameter<int> loop_preloaded_frames_;
+  std::vector<matx::tensor_t<Complex, 2>> preloaded_;
 
   std::ifstream input_;
   cudaStream_t upload_stream_ = nullptr;
@@ -2185,7 +2262,8 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
         Arg("total_complex_samples") = static_cast<int64_t>(overrides_.total_complex_samples),
         Arg("real_frame_count") = static_cast<int64_t>(overrides_.total_frames),
         Arg("drain_frame_count") = static_cast<int64_t>(overrides_.drain_frame_count),
-        Arg("ring_size") = std::max(2, overrides_.source_ring_size));
+        Arg("ring_size") = std::max(2, overrides_.source_ring_size),
+        Arg("loop_preloaded_frames") = overrides_.loop_preloaded_frames);
 
     auto fft = make_operator<holoscan::ops::FFT>(
         "fftOpCh0",
@@ -2288,6 +2366,10 @@ EvalOverrides load_overrides(holoscan::Application& app,
           : cli_options.detector_type;
   overrides.source_ring_size =
       std::max(2, usrp_wideband::from_config_or<int>(app, "offline_eval.source_ring_size", 8));
+  overrides.loop_preloaded_frames =
+      std::max(0, usrp_wideband::from_config_or<int>(app, "offline_eval.loop_preloaded_frames", 0));
+  overrides.loop_total_frames = static_cast<int64_t>(
+      std::max(0, usrp_wideband::from_config_or<int>(app, "offline_eval.loop_total_frames", 0)));
   overrides.trace_frames =
       usrp_wideband::from_config_or<bool>(app, "offline_eval.trace_frames", false);
   overrides.require_full_mask_coverage =
@@ -2378,6 +2460,17 @@ EvalOverrides load_overrides(holoscan::Application& app,
     throw std::runtime_error("offline input file contains " + std::to_string(overrides.input_total_complex_samples) +
                              " complex samples, which is less than one complete frame of " +
                              std::to_string(overrides.samples_per_frame) + " samples");
+  }
+  // Benchmark loop mode: schedule loop_total_frames rounds over the preloaded frames instead of
+  // one pass over the file (throughput measurement only — masks repeat with the preload period).
+  if (overrides.loop_preloaded_frames > 0) {
+    if (static_cast<uint64_t>(overrides.loop_preloaded_frames) > overrides.total_frames) {
+      throw std::runtime_error("offline_eval.loop_preloaded_frames exceeds the frames available in the input file");
+    }
+    if (overrides.loop_total_frames > 0) {
+      overrides.total_frames = static_cast<uint64_t>(overrides.loop_total_frames);
+      overrides.total_complex_samples = overrides.total_frames * overrides.samples_per_frame;
+    }
   }
   if (overrides.progress_every_n_frames <= 0) {
     overrides.progress_every_n_frames =
