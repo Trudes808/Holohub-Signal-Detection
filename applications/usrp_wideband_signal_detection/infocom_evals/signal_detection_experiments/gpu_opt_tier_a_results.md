@@ -127,3 +127,30 @@ channels is examined by the detector, with zero loss anywhere in the chain.**
   127 SigMF snippet files written. The profile oscillates (falls ~1 s behind under snip+write
   bursts, catches up at ~0.67 Mpps through the RX pools) — loss-free, but running near its
   ceiling; benign "Fell behind" log lines during the catch-ups.
+
+## Addendum 5 — latency attempt #1 (freshness guard) FALSIFIED the backlog model (2026-08-15, grcon)
+
+Attempted "Tier A.4" as designed: an FFT-side freshness guard (`max_ingress_age_ms`) dropping
+input batches older than a threshold, on the theory that the standing chdr→fft latency
+(~160 ms single / ~320 ms dual) was a drainable startup-fill queue backlog. **The live test
+disproved the theory**: with a 150 ms threshold the guard dropped essentially every frame for
+the full 60 s (blank display) while measured ages stayed pinned at 154–162 ms — dropping at
+consumer speed did not drain anything. The change was fully reverted (code + configs) and the
+post-revert sanity run is clean (0 NIC drops, 128/128 emitted, 160.6 ms transit).
+
+What the experiment established:
+- The latency equals **exactly ~15 batch-periods in both profiles** (15 × 10.67 ms = 160
+  single; 15 × 21.3 ms = 320 dual) and is **rate-invariant and non-drainable** — a
+  scheduling/backpressure equilibrium, not a FIFO fill.
+- It cannot be 15 queued batches at the FFT input: the converter's ring has only
+  `num_simul_batches: 4` slots and `refcounted_bursts` runs at ~1, so ≤4 batches exist
+  downstream at once. The "15" must come from somewhere else (queue policies /
+  scheduling-condition interaction across the converter→FFT→spectrogram→detector chain —
+  note the FFT ports declare `IOSize{16}`).
+- `chdr_emit_ts_ns` is stamped inside the converter's emit call (chdr_rx.cu:738), so the
+  measured age is genuinely post-emit transit.
+
+Next step if latency reduction is pursued: a focused instrumented session to find what sets
+the 15-period equilibrium (per-hop timestamps through spectrogram/preview, queue-depth
+telemetry, an IOSize A/B on a throwaway build) BEFORE designing the next fix. Until then the
+shipped configs keep the verified 100%-coverage behavior with ~160/~320 ms display latency.

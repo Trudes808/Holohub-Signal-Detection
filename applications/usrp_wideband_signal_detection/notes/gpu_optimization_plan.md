@@ -111,8 +111,11 @@ exactly what Tiers A/B attack:
       emit-path buffer pooling) — commit ab8e7f78, bit-exact PASS both variants
 - [x] A.2 FFT output tensor async allocation — same commit, same gate
 - [ ] A.3 event-carrying `DetectorMaskMessage` (drop the last per-frame sync) + preview event pool
-- [ ] A.4 (new) one-shot startup-backlog drain in the converter→FFT queue (~300 ms standing
-      latency at matched rates; see results doc)
+- [~] A.4 latency: attempt #1 (FFT-side freshness guard) tried and REVERTED on grcon — it
+      falsified the drainable-backlog model: the ~160/~320 ms standing latency is exactly ~15
+      batch-periods in both profiles, rate-invariant and non-drainable (a scheduling/backpressure
+      equilibrium; the converter ring holds only 4 slots, so it is not 15 queued batches).
+      Requires an instrumented investigation before the next design — results doc Addendum 5.
 - [x] re-measure + emit_stride 1 attempt — see
       `infocom_evals/signal_detection_experiments/gpu_opt_tier_a_results.md`.
       **Headline: dual-channel NIC loss 20.9% → 0% at stride 2 (100% ingest), no config change.**
