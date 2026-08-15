@@ -131,3 +131,29 @@ Composites are now >=1 ms only (framed [20,5,1] ms with 1024-bit FSK frames so
 every tier decodes; ordered [20,10,5,1] ms re-verified 32/32 at BER 0).
 
 ![LIVE DECODE dashboard v2](img/hud_dashboard_v2.png)
+
+## Addendum 5 — low-SNR staircase: BER intentionally degrading (2026-08-15)
+
+`pycodec.snr_staircase` builds a capture where QPSK/2FSK/16QAM repeat through
+descending in-band SNR steps (30 -> 6 dB AWGN). Through the real
+detect -> snip -> decode chain:
+
+| SNR | 16QAM | QPSK | 2FSK |
+| --- | --- | --- | --- |
+| 20 dB | BER 1.3e-3, CRC 33% | clean | clean |
+| 15 dB | 6.5e-3, CRC 0% | 7.7e-4 | clean |
+| 12 dB | 5.2e-2 | 1.3e-3 | clean |
+| 9 dB  | 6.5e-2 | 2.7e-3 | **BER 0** |
+| 6 dB  | no sync | no sync | (step not detected) |
+
+Exactly the textbook ordering: 16QAM (least margin) degrades first, QPSK
+follows gracefully, the narrowband noncoherent 2FSK never drops a bit down to
+9 dB. On the dashboard everything that was green goes orange: headline BER
+1.68e-02, CRC 43.3%, orange sparkline bars, and an orange (CRC-fail) 16QAM
+marker on the detection panel:
+
+![LIVE DECODE dashboard under low SNR](img/hud_dashboard_low_snr.png)
+
+(Notes: detector warmup consumes the first 30 dB step for the linear signals
+— the dynamic floor is still learning; with real noise the detector produces
+per-signal decimated snips, exercising the decimation path end-to-end.)
