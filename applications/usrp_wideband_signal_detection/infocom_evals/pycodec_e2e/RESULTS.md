@@ -51,3 +51,24 @@ python3 infocom_evals/pycodec_e2e/decode_snippets.py \
   the driver already handles decimated snips via wfgt:snippet_sample_rate.
 - Live integration target: the same decode logic consuming sigmf_file_sink
   output (or an in-process mask+IQ tap) with a PN9-BER readout in the demo.
+
+## Addendum — REAL-TIME framed decode with live BER metrics (2026-08-15)
+
+`rt_decode_daemon.py` ran concurrently with the detection pipeline processing
+the framed composite (`comprehensive_framed_py`): it consumed signal_snipper
+packs as they appeared and decoded every snippet **with zero ground truth** —
+sub-band channelization (merged detection boxes), blind symbol-rate estimation,
+residual-CFO correction, self-describing frame headers, per-frame CRC, live
+PN9 BER:
+
+```
+[16:45:48] === LIVE: frames 816 (crc_ok 812) by_mod {'BPSK': 277, 'QPSK': 539}
+           PN9 BER 1.08e-04 (361/3342336) ===
+```
+
+99.5% of frames CRC-verified with BER 0; the handful of failures are frames
+clipped at snippet time-boundaries (the CRC flags them — which is its job).
+Metrics also stream to `rt_metrics.json` for a future HoloViz overlay.
+Remaining polish for the demo: snip-boundary edge guard, decode-throughput
+optimization (pure-numpy prototype runs ~100 ms per short snip), and a native
+in-graph operator (or holoviz overlay feed) instead of the file-tail sidecar.
