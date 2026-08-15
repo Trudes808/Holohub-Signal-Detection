@@ -34,8 +34,31 @@ sys.path.insert(0, PYCODEC_ROOT)
 
 from pycodec.frame import (channelize, decode_frames,  # noqa: E402
                            estimate_symbol_rate, find_subbands)
+from pycodec.fsk import (decode_frames_fsk, envelope_cv,  # noqa: E402
+                         estimate_symbol_rate_fsk)
+from pycodec.ofdm import decode_frames_ofdm, snap_profile_rate  # noqa: E402
 
 PROFILE = dict(sps=8, pulse_shape="rrc", rolloff=0.35, span_symbols=10)
+FSK_PROFILE = dict(sps=8, h=0.5, bt=0.5)
+
+
+def decode_band(ch, chfs, bw):
+    """Family cascade for one channelized sub-band: constant envelope -> FSK;
+    otherwise linear framed; if that finds nothing, OFDM at the snapped
+    profile rate (OFDM has high PAPR, so it lands in the 'else' branch)."""
+    if envelope_cv(ch) < 0.15:
+        rs = estimate_symbol_rate_fsk(ch, chfs, lo_hz=max(0.2e6, 0.1 * bw),
+                                      hi_hz=max(1e6, min(bw, 0.45 * chfs)))
+        return decode_frames_fsk(ch, chfs, rs, **FSK_PROFILE), f"fsk/rs{rs/1e6:.2f}"
+    rs = estimate_symbol_rate(ch, chfs, lo_hz=max(1e6, 0.3 * bw / 1.35),
+                              hi_hz=max(2e6, min(1.2 * bw, 0.45 * chfs)))
+    frames = decode_frames(ch, chfs, rs, **PROFILE)
+    if frames:
+        return frames, f"lin/rs{rs/1e6:.2f}"
+    frames = decode_frames_ofdm(ch, chfs, snap_profile_rate(bw))
+    for f in frames:  # distinguish the transport family in the metrics
+        f.payload_mod = f"OFDM-{f.payload_mod}"
+    return frames, f"ofdm/fs{snap_profile_rate(bw)/1e6:.2f}"
 
 
 class Metrics:
@@ -79,11 +102,9 @@ def process_annotation(a, data, metrics: Metrics) -> str:
     try:
         for center, bw in find_subbands(iq, snip_fs):
             ch, chfs = channelize(iq, snip_fs, center, bw)
-            rs = estimate_symbol_rate(ch, chfs, lo_hz=max(1e6, 0.3 * bw / 1.35),
-                                      hi_hz=max(2e6, min(1.2 * bw, 0.45 * chfs)))
-            got = decode_frames(ch, chfs, rs, **PROFILE)
+            got, how = decode_band(ch, chfs, bw)
             frames.extend(got)
-            band_info.append(f"{center/1e6:+.1f}MHz/rs{rs/1e6:.2f}:{len(got)}")
+            band_info.append(f"{center/1e6:+.1f}MHz/{how}:{len(got)}")
     except Exception as e:
         return f"decode error: {e}"
     dt_ms = (time.time() - t0) * 1e3

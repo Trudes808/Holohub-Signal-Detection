@@ -72,3 +72,24 @@ Metrics also stream to `rt_metrics.json` for a future HoloViz overlay.
 Remaining polish for the demo: snip-boundary edge guard, decode-throughput
 optimization (pure-numpy prototype runs ~100 ms per short snip), and a native
 in-graph operator (or holoviz overlay feed) instead of the file-tail sidecar.
+
+## Addendum 2 — six modulation families through the live chain (2026-08-15)
+
+pycodec grew 16QAM, 8PSK, framed GFSK (2FSK/4FSK, noncoherent), and generic
+framed OFDM (64-FFT, pilots, LTF channel est). The daemon now runs a family
+cascade per channelized sub-band: constant envelope -> FSK discriminator;
+else linear framed; else OFDM at the profile-snapped rate.
+
+Concurrent detect+snip+decode over `comprehensive_framed_py` (36 placements,
+6 classes x 3 durations):
+
+```
+frames_decoded 3249   crc_ok 3130 (96.3%)   PN9 BER 4.3e-04
+by_mod: BPSK 274, QPSK 539, 8PSK 786, 16QAM 1018, 2FSK 20, 4FSK 39,
+        OFDM-QPSK/OFDM-16QAM 573
+```
+
+Every family decodes blind in real time; CRC failures remain concentrated at
+snippet time-boundary clips (plus marginal 4FSK, whose I&D filter is not
+Gaussian-matched yet). This is the classifier-ready substrate: six visually
+and statistically distinct classes, each with self-describing ground truth.
