@@ -17,12 +17,21 @@ namespace holoscan::ops {
 void RenderBufferScreenshotOp::setup(OperatorSpec& spec) {
   spec.input<gxf::Entity>("input");
   spec.param(output_path_, "output_path", "Output Path", "PNG path for the captured render buffer.");
+  spec.param(skip_frames_, "skip_frames", "Skip Frames",
+             "Frames to discard before saving, so the dashboard is populated.", 0);
 }
 
 void RenderBufferScreenshotOp::compute(InputContext& op_input,
                                        OutputContext&,
                                        ExecutionContext&) {
   if (saved_) {
+    // keep draining the port so the connection never backs up
+    (void)op_input.receive<gxf::Entity>("input");
+    return;
+  }
+  if (seen_frames_ < skip_frames_.get()) {
+    ++seen_frames_;
+    (void)op_input.receive<gxf::Entity>("input");
     return;
   }
 

@@ -625,6 +625,7 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     std::shared_ptr<holoscan::Operator> spectrogramVisualizerOp;
     std::shared_ptr<holoscan::Operator> holovizOp;
+    std::shared_ptr<holoscan::Operator> screenshotOp;
     std::vector<std::shared_ptr<holoscan::Operator>> visualSpectrogramGateOps;
     std::vector<std::shared_ptr<holoscan::Operator>> visualMaskGateOps;
     std::vector<std::shared_ptr<holoscan::Operator>> visualSpectrogramStoreOps;
@@ -692,10 +693,17 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
               from_config("visualization.renderer.allow_backpressure_valve").as<bool>()));
       }
         
+      // Dashboard screenshot: when visualization.screenshot_path is set, tap the
+      // HoloViz render buffer (dashboard-only capture — no desktop involvement)
+      // and save one PNG after screenshot_after_frames frames.
+      const std::string screenshot_path =
+          usrp_wideband::from_config_or<std::string>(*this, "visualization.screenshot_path",
+                                                     std::string(""));
       holovizOp = make_operator<LoggingHolovizOp>(
         "holovizOp",
         Arg("window_close_scheduling_term") = visualization_shutdown_term,
-        Arg("enable_render_buffer_output") = false,
+        Arg("enable_render_buffer_output") = !screenshot_path.empty(),
+        Arg("allocator") = make_resource<holoscan::UnboundedAllocator>("holoviz_allocator"),
         from_config("visualization.holoviz"),
         Arg("layer_callback",
           ops::HolovizOp::LayerCallbackFunction(
@@ -703,6 +711,13 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
                   this,
                   std::placeholders::_1))),
         holoscan::Arg("tensors") = ops::make_spectrogram_input_specs(tensor_name));
+      if (!screenshot_path.empty()) {
+        screenshotOp = make_operator<ops::RenderBufferScreenshotOp>(
+            "renderBufferScreenshotOp",
+            Arg("output_path") = screenshot_path,
+            Arg("skip_frames") =
+                usrp_wideband::from_config_or<int>(*this, "visualization.screenshot_after_frames", 120));
+      }
     }
     std::vector<std::shared_ptr<holoscan::Operator>> logOps;
     if (enable_logger_branch) {
@@ -847,6 +862,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 
     if (enable_visualization) {
       add_flow(spectrogramVisualizerOp, holovizOp, {{"outputs", "receivers"}});
+      if (screenshotOp) {
+        add_flow(holovizOp, screenshotOp, {{"render_buffer_output", "input"}});
+      }
     }
     if (enable_visualization && enable_detector) {
       for (int ch = 0; ch < pipeline_channels; ++ch) {

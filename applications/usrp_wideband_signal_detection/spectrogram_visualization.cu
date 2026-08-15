@@ -2100,6 +2100,134 @@ bool visualization_full_ui_enabled() {
   return global_full_ui_enabled().load(std::memory_order_relaxed);
 }
 
+// ---- Live decode metrics (rt_metrics.json from the pycodec decode stage) ----
+// The real-time decode daemon writes flat JSON metrics next to the snipper
+// output; the visualizer polls it (throttled, mtime-gated) and renders a
+// LIVE DECODE panel in the sidebar. Instantaneous BER per poll interval is
+// derived from the deltas of the cumulative bit/error counters.
+struct DecodeMetricsSnapshot {
+  bool valid = false;
+  uint64_t frames = 0;
+  uint64_t crc_ok = 0;
+  uint64_t bits = 0;
+  uint64_t errors = 0;
+  double ber = -1.0;
+  double uptime_s = 0.0;
+  std::vector<std::pair<std::string, uint64_t>> by_mod;
+  std::deque<float> inst_ber_history;   // last N poll-interval BERs
+};
+
+std::mutex& decode_metrics_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+DecodeMetricsSnapshot& decode_metrics_storage() {
+  static DecodeMetricsSnapshot s;
+  return s;
+}
+
+std::string& decode_metrics_path_storage() {
+  static std::string p;
+  return p;
+}
+
+void set_visualization_decode_metrics_path(const std::string& path) {
+  std::lock_guard<std::mutex> lock(decode_metrics_mutex());
+  decode_metrics_path_storage() = path;
+}
+
+bool json_find_u64(const std::string& text, const std::string& key, uint64_t& out) {
+  const auto pos = text.find("\"" + key + "\"");
+  if (pos == std::string::npos) return false;
+  const auto colon = text.find(':', pos);
+  if (colon == std::string::npos) return false;
+  try {
+    out = std::stoull(text.substr(colon + 1));
+  } catch (...) { return false; }
+  return true;
+}
+
+bool json_find_double(const std::string& text, const std::string& key, double& out) {
+  const auto pos = text.find("\"" + key + "\"");
+  if (pos == std::string::npos) return false;
+  const auto colon = text.find(':', pos);
+  if (colon == std::string::npos) return false;
+  const auto value = text.substr(colon + 1, 32);
+  if (value.find("null") != std::string::npos) return false;
+  try {
+    out = std::stod(value);
+  } catch (...) { return false; }
+  return true;
+}
+
+void poll_decode_metrics() {
+  static std::chrono::steady_clock::time_point last_poll;
+  static std::filesystem::file_time_type last_mtime;
+  static uint64_t prev_bits = 0, prev_errors = 0;
+
+  std::lock_guard<std::mutex> lock(decode_metrics_mutex());
+  const std::string path = decode_metrics_path_storage();
+  if (path.empty()) return;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_poll < std::chrono::milliseconds(500)) return;
+  last_poll = now;
+
+  std::error_code ec;
+  const auto mtime = std::filesystem::last_write_time(path, ec);
+  if (ec || mtime == last_mtime) return;
+  last_mtime = mtime;
+
+  std::ifstream in(path);
+  if (!in.is_open()) return;
+  std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  auto& s = decode_metrics_storage();
+  DecodeMetricsSnapshot next;
+  next.inst_ber_history = s.inst_ber_history;
+  json_find_u64(text, "frames_decoded", next.frames);
+  json_find_u64(text, "frames_crc_ok", next.crc_ok);
+  json_find_u64(text, "pn9_bits_compared", next.bits);
+  json_find_u64(text, "pn9_bit_errors", next.errors);
+  json_find_double(text, "pn9_ber", next.ber);
+  json_find_double(text, "uptime_s", next.uptime_s);
+  const auto mod_pos = text.find("\"frames_by_modulation\"");
+  if (mod_pos != std::string::npos) {
+    const auto open = text.find('{', mod_pos);
+    const auto close = text.find('}', open);
+    if (open != std::string::npos && close != std::string::npos) {
+      std::string body = text.substr(open + 1, close - open - 1);
+      size_t cursor = 0;
+      while (true) {
+        const auto q1 = body.find('"', cursor);
+        if (q1 == std::string::npos) break;
+        const auto q2 = body.find('"', q1 + 1);
+        const auto colon = body.find(':', q2);
+        if (q2 == std::string::npos || colon == std::string::npos) break;
+        uint64_t count = 0;
+        try { count = std::stoull(body.substr(colon + 1)); } catch (...) {}
+        next.by_mod.emplace_back(body.substr(q1 + 1, q2 - q1 - 1), count);
+        cursor = colon + 1;
+      }
+    }
+  }
+  if (next.bits > prev_bits) {
+    const double inst = static_cast<double>(next.errors - std::min(next.errors, prev_errors)) /
+                        static_cast<double>(next.bits - prev_bits);
+    next.inst_ber_history.push_back(static_cast<float>(inst));
+    while (next.inst_ber_history.size() > 64) next.inst_ber_history.pop_front();
+  }
+  prev_bits = next.bits;
+  prev_errors = next.errors;
+  next.valid = next.frames > 0 || next.bits > 0;
+  s = std::move(next);
+}
+
+DecodeMetricsSnapshot decode_metrics_snapshot() {
+  poll_decode_metrics();
+  std::lock_guard<std::mutex> lock(decode_metrics_mutex());
+  return decode_metrics_storage();
+}
+
 void update_visualization_ui_state(const VisualizationUiState& state) {
   std::lock_guard<std::mutex> lock(visualization_ui_state_mutex());
   visualization_ui_state_storage() = state;
@@ -2232,6 +2360,94 @@ void render_visualization_ui_overlay() {
                        IM_COL32(17, 29, 42, 255),
                        1.0f);
     sidebar_text_y += 12.0f;
+  }
+
+  // ---- LIVE DECODE panel (pycodec real-time decode metrics) ----
+  {
+    const auto dm = decode_metrics_snapshot();
+    if (dm.valid) {
+      const float x0 = sidebar_min.x + 16.0f;
+      const float x1 = rect_max(state.sidebar_rect).x - 16.0f;
+      draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.25f,
+                         ImVec2(x0, sidebar_text_y), accent_blue, "LIVE DECODE");
+      sidebar_text_y += 24.0f;
+
+      const double crc_pct = dm.frames ? 100.0 * dm.crc_ok / dm.frames : 0.0;
+      char line[96];
+      std::snprintf(line, sizeof(line), "Frames %llu   CRC %.1f%%",
+                    static_cast<unsigned long long>(dm.frames), crc_pct);
+      draw_list->AddText(ImVec2(x0, sidebar_text_y),
+                         crc_pct >= 99.0 ? accent_green : (crc_pct >= 90.0 ? IM_COL32(255, 212, 89, 255)
+                                                                            : accent_orange),
+                         line);
+      sidebar_text_y += 18.0f;
+
+      // Aggregate PN9 BER: the demo's headline number, color-coded.
+      ImU32 ber_color = accent_green;
+      char ber_line[64];
+      if (dm.ber < 0.0 || dm.bits == 0) {
+        std::snprintf(ber_line, sizeof(ber_line), "PN9 BER  --");
+        ber_color = panel_muted;
+      } else if (dm.errors == 0) {
+        std::snprintf(ber_line, sizeof(ber_line), "PN9 BER  0.0");
+      } else {
+        std::snprintf(ber_line, sizeof(ber_line), "PN9 BER  %.2e", dm.ber);
+        ber_color = dm.ber < 1e-3 ? IM_COL32(255, 212, 89, 255) : accent_orange;
+      }
+      draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.6f,
+                         ImVec2(x0, sidebar_text_y), ber_color, ber_line);
+      sidebar_text_y += 28.0f;
+
+      const double mbit = dm.bits / 1e6;
+      const double thr = dm.uptime_s > 0.0 ? dm.bits / dm.uptime_s / 1e6 : 0.0;
+      std::snprintf(line, sizeof(line), "%.1f Mbit checked   %.1f Mb/s", mbit, thr);
+      draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_muted, line);
+      sidebar_text_y += 20.0f;
+
+      // Instantaneous-BER sparkline (per poll interval, log-scaled bars).
+      if (!dm.inst_ber_history.empty()) {
+        const float spark_h = 30.0f;
+        const float spark_w = x1 - x0;
+        const float base_y = sidebar_text_y + spark_h;
+        draw_list->AddRectFilled(ImVec2(x0, sidebar_text_y), ImVec2(x1, base_y),
+                                 IM_COL32(17, 24, 34, 255), 3.0f);
+        const int n = static_cast<int>(dm.inst_ber_history.size());
+        const float bar_w = spark_w / 64.0f;
+        for (int i = 0; i < n; ++i) {
+          const float v = dm.inst_ber_history[i];
+          // log map: BER 1e-6 -> ~0, BER 1e-1 -> full height; 0 stays flat green
+          float hgt = 0.0f;
+          ImU32 c = accent_green;
+          if (v > 0.0f) {
+            hgt = std::min(1.0f, std::max(0.0f, (std::log10(v) + 6.0f) / 5.0f)) * (spark_h - 4.0f);
+            c = v < 1e-3f ? IM_COL32(255, 212, 89, 255) : accent_orange;
+          } else {
+            hgt = 2.0f;
+          }
+          const float bx = x0 + spark_w - (n - i) * bar_w;
+          draw_list->AddRectFilled(ImVec2(bx, base_y - hgt - 2.0f),
+                                   ImVec2(bx + bar_w - 1.0f, base_y - 2.0f), c);
+        }
+        draw_list->AddText(ImVec2(x0 + 4.0f, sidebar_text_y + 2.0f), panel_muted, "inst BER");
+        sidebar_text_y = base_y + 8.0f;
+      }
+
+      // Per-modulation frame counts as mini bars.
+      uint64_t max_count = 1;
+      for (const auto& [name, count] : dm.by_mod) max_count = std::max(max_count, count);
+      for (const auto& [name, count] : dm.by_mod) {
+        const float frac = static_cast<float>(count) / static_cast<float>(max_count);
+        draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_text, name.c_str());
+        const float bar_x = x0 + 92.0f;
+        const float bar_max = x1 - bar_x - 52.0f;
+        draw_list->AddRectFilled(ImVec2(bar_x, sidebar_text_y + 3.0f),
+                                 ImVec2(bar_x + std::max(2.0f, frac * bar_max), sidebar_text_y + 12.0f),
+                                 accent_blue);
+        std::snprintf(line, sizeof(line), "%llu", static_cast<unsigned long long>(count));
+        draw_list->AddText(ImVec2(x1 - 46.0f, sidebar_text_y), panel_muted, line);
+        sidebar_text_y += 17.0f;
+      }
+    }
   }
 
   for (const auto& channel : state.channels) {
@@ -2419,6 +2635,13 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
              "Demo Subtitle",
              "Subtitle rendered below the main visualization header title.",
              std::string("REAL TIME SIGNAL DETECTION"));
+  spec.param(decode_metrics_json_,
+             "decode_metrics_json",
+             "Decode Metrics JSON",
+             "Path to the rt_metrics.json written by the real-time decode stage; when set, a "
+             "LIVE DECODE panel (frames, CRC, PN9 BER, per-modulation counts, BER sparkline) "
+             "renders in the sidebar. Empty disables the panel.",
+             std::string(""));
   spec.param(center_frequency_hz_, "center_frequency_hz", "Center Frequency", "Center frequency for display in Hz.", 0.0);
   spec.param(span_hz_, "span_hz", "Span Hz", "Frequency span shown on calibrated plot axes in Hz.", 0.0);
   spec.param(fft_size_, "fft_size", "FFT Size", "FFT size shown in analyzer readouts.", 20480);
@@ -2473,6 +2696,10 @@ void SpectrogramToHolovizOp::initialize() {
     shutdown_term->enable_tick();
   }
   initialize_visualization_overlay_state(overlay_enable_.get());
+  if (!decode_metrics_json_.get().empty()) {
+    set_visualization_decode_metrics_path(decode_metrics_json_.get());
+    HOLOSCAN_LOG_INFO("LIVE DECODE panel enabled: watching {}", decode_metrics_json_.get());
+  }
   render_stop_ = false;
   render_work_pending_ = false;
   pending_composed_ready_ = false;

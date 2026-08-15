@@ -172,6 +172,7 @@ class SpectrogramToHolovizOp : public Operator {
   Parameter<bool> overlay_enable_;
   Parameter<std::string> detector_label_;
   Parameter<std::string> demo_title_;
+  Parameter<std::string> decode_metrics_json_;
   Parameter<std::string> demo_subtitle_;
   Parameter<double> center_frequency_hz_;
   Parameter<double> span_hz_;
@@ -320,6 +321,9 @@ class OfflinePgmReplayOp : public Operator {
 
 };
 
+// One-shot HoloViz render-buffer capture (dashboard-only: never touches the
+// desktop, so no risk of catching unrelated windows). Waits skip_frames frames
+// so the waterfall/metrics are populated before saving.
 class RenderBufferScreenshotOp : public Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(RenderBufferScreenshotOp)
@@ -331,6 +335,8 @@ class RenderBufferScreenshotOp : public Operator {
 
  private:
   Parameter<std::string> output_path_;
+  Parameter<int> skip_frames_;
+  int seen_frames_ = 0;
   bool saved_ = false;
 };
 

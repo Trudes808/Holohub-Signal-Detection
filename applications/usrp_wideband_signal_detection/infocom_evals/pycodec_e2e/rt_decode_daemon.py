@@ -137,7 +137,11 @@ def main():
     ap.add_argument("--once", action="store_true", help="process what exists, then exit")
     ap.add_argument("--idle-exit", type=float, default=None,
                     help="exit after this many seconds without new snippets")
+    ap.add_argument("--metrics-out", default=None,
+                    help="where to write rt_metrics.json (default: inside --snips); "
+                         "the HoloViz LIVE DECODE panel watches this path")
     args = ap.parse_args()
+    metrics_path = args.metrics_out or os.path.join(args.snips, "rt_metrics.json")
 
     metrics = Metrics()
     seen: dict[str, int] = {}   # pack meta path -> annotations processed
@@ -164,6 +168,14 @@ def main():
                 line = process_annotation(a, data, metrics)
                 if line:
                     print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
+                # stream metrics per snippet so the HoloViz panel updates live
+                try:
+                    tmp = metrics_path + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump(metrics.as_dict(), f, indent=1)
+                    os.replace(tmp, metrics_path)
+                except OSError:
+                    pass
             seen[mp] = len(anns)
             new_work = True
         if new_work:
@@ -175,8 +187,10 @@ def main():
                   f"PN9 BER {ber if ber is None else f'{ber:.2e}'} "
                   f"({m['pn9_bit_errors']}/{m['pn9_bits_compared']}) ===", flush=True)
             try:
-                with open(os.path.join(args.snips, "rt_metrics.json"), "w") as f:
+                tmp = metrics_path + ".tmp"
+                with open(tmp, "w") as f:
                     json.dump(m, f, indent=1)
+                os.replace(tmp, metrics_path)  # atomic: the HoloViz panel polls this file
             except OSError:
                 pass
         if args.once and not new_work:

@@ -163,6 +163,7 @@ visualization:
     render_every_n_frames: 1   # no display decimation: at the current operating point (batch 512, emit_stride 2) rendering every frame costs nothing measurable — coverage/latency identical to render=3
     timing_summary_enable: true
     timing_summary_every_n: 128
+    decode_metrics_json: "/workspace/spectrograms/rt_metrics.json"   # LIVE DECODE sidebar panel (written by rt_decode_daemon.py --metrics-out)
     channel_filter: -1
     tensor_name: "spectrogram"
     demo_title: "Enabling RF AI for Ultra Wideband Real Time Applications"

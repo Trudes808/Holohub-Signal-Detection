@@ -93,3 +93,23 @@ Every family decodes blind in real time; CRC failures remain concentrated at
 snippet time-boundary clips (plus marginal 4FSK, whose I&D filter is not
 Gaussian-matched yet). This is the classifier-ready substrate: six visually
 and statistically distinct classes, each with self-describing ground truth.
+
+## Addendum 3 — LIVE DECODE dashboard panel (2026-08-15)
+
+The HoloViz sidebar now renders a **LIVE DECODE** panel fed by the decode
+daemon's `rt_metrics.json` (config: `visualization.renderer.decode_metrics_json`):
+frames + CRC pass rate (color-coded), the aggregate PN9 BER as the headline
+number, Mbit checked + decode throughput, an instantaneous-BER sparkline
+(log-scaled, per poll interval), and per-modulation frame-count bars.
+
+Captured live (single-channel 2.4 GHz ambient RF on the waterfall, decode
+metrics from a concurrent framed-composite sweep), via the new dashboard-only
+render-buffer screenshot path (`visualization.screenshot_path` +
+`screenshot_after_frames`, headless-friendly — never touches the desktop):
+
+![LIVE DECODE dashboard v1](img/hud_dashboard_v1.png)
+
+Iteration knobs on the table: panel placement/size, a wider BER history strip
+under the waterfalls, per-band decode markers drawn onto the detection panel,
+frames/s + pipeline-latency readouts (from the existing timing summaries), and
+a "last decoded payload" text ticker for arbitrary-payload demos.
