@@ -276,7 +276,7 @@ struct RgbColor {
 };
 
 constexpr int kHeaderHeight = 138;
-constexpr int kFooterHeight = 40;
+constexpr int kFooterHeight = 64;  // BER strip + payload ticker band
 constexpr int kSidebarWidth = 260;
 constexpr int kPsdHeight = 142;
 constexpr int kPanelPadding = 28;
@@ -2105,6 +2105,13 @@ bool visualization_full_ui_enabled() {
 // output; the visualizer polls it (throttled, mtime-gated) and renders a
 // LIVE DECODE panel in the sidebar. Instantaneous BER per poll interval is
 // derived from the deltas of the cumulative bit/error counters.
+struct DecodeMarker {
+  double f_hz = 0.0;      // absolute Hz, OR baseband offset when |f| < 1 GHz
+  std::string mod;
+  bool crc_ok = true;
+  double age_s = 0.0;
+};
+
 struct DecodeMetricsSnapshot {
   bool valid = false;
   uint64_t frames = 0;
@@ -2115,6 +2122,8 @@ struct DecodeMetricsSnapshot {
   double uptime_s = 0.0;
   std::vector<std::pair<std::string, uint64_t>> by_mod;
   std::deque<float> inst_ber_history;   // last N poll-interval BERs
+  std::vector<DecodeMarker> recent;     // decode markers for the detection panel
+  std::string last_payload_text;        // footer ticker
 };
 
 std::mutex& decode_metrics_mutex() {
@@ -2208,6 +2217,46 @@ void poll_decode_metrics() {
         next.by_mod.emplace_back(body.substr(q1 + 1, q2 - q1 - 1), count);
         cursor = colon + 1;
       }
+    }
+  }
+  // recent_decodes: [{"f_hz": ..., "mod": "...", "crc_ok": ..., "age_s": ...}, ...]
+  const auto rec_pos = text.find("\"recent_decodes\"");
+  if (rec_pos != std::string::npos) {
+    const auto open = text.find('[', rec_pos);
+    const auto close = text.find(']', open);
+    if (open != std::string::npos && close != std::string::npos) {
+      std::string body = text.substr(open, close - open + 1);
+      size_t cursor = 0;
+      while (true) {
+        const auto obj = body.find('{', cursor);
+        if (obj == std::string::npos) break;
+        const auto obj_end = body.find('}', obj);
+        if (obj_end == std::string::npos) break;
+        const std::string item = body.substr(obj, obj_end - obj + 1);
+        DecodeMarker m;
+        double f = 0.0, age = 0.0;
+        if (json_find_double(item, "f_hz", f)) m.f_hz = f;
+        if (json_find_double(item, "age_s", age)) m.age_s = age;
+        m.crc_ok = item.find("\"crc_ok\": true") != std::string::npos;
+        const auto mq = item.find("\"mod\"");
+        if (mq != std::string::npos) {
+          const auto q1 = item.find('"', item.find(':', mq));
+          const auto q2 = item.find('"', q1 + 1);
+          if (q1 != std::string::npos && q2 != std::string::npos) {
+            m.mod = item.substr(q1 + 1, q2 - q1 - 1);
+          }
+        }
+        next.recent.push_back(std::move(m));
+        cursor = obj_end + 1;
+      }
+    }
+  }
+  const auto pay_pos = text.find("\"last_payload_text\"");
+  if (pay_pos != std::string::npos) {
+    const auto q1 = text.find('"', text.find(':', pay_pos));
+    const auto q2 = text.find('"', q1 + 1);
+    if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1) {
+      next.last_payload_text = text.substr(q1 + 1, q2 - q1 - 1);
     }
   }
   if (next.bits > prev_bits) {
@@ -2548,6 +2597,98 @@ void render_visualization_ui_overlay() {
     draw_list->AddText(ImVec2(display_size.x - 140.0f, display_size.y - 28.0f),
                        live_ratio < 0.9f ? accent_orange : accent_green,
                        footer_text.str().c_str());
+  }
+
+  // ---- v2: full-width footer BER strip + payload ticker + decode markers ----
+  {
+    const auto dm = decode_metrics_snapshot();
+    const float canvas_h = static_cast<float>(std::max(1, state.canvas_height));
+    const float footer_h = display_size.y * (static_cast<float>(kFooterHeight) / canvas_h);
+    const float fy0 = display_size.y - footer_h + 4.0f;
+    const float fy1 = display_size.y - 6.0f;
+    // Leave the bottom-center zone (~0.44..0.56) free: the display-controls
+    // popup renders there and must not collide with the metric panels.
+    const float split_x = display_size.x * 0.565f;
+
+    if (dm.valid) {
+      // BER strip (left): log-scaled instantaneous-BER bars over the recent window.
+      const float bx0 = 16.0f, bx1 = display_size.x * 0.435f;
+      draw_list->AddRectFilled(ImVec2(bx0, fy0), ImVec2(bx1, fy1), IM_COL32(13, 18, 27, 235), 6.0f);
+      draw_list->AddRect(ImVec2(bx0, fy0), ImVec2(bx1, fy1), panel_border, 6.0f, 0, 1.0f);
+      char hdr[96];
+      if (dm.bits > 0 && dm.errors == 0) {
+        std::snprintf(hdr, sizeof(hdr), "PN9 BER 0.0   (%llu frames, CRC %.1f%%)",
+                      static_cast<unsigned long long>(dm.frames),
+                      dm.frames ? 100.0 * dm.crc_ok / dm.frames : 0.0);
+      } else {
+        std::snprintf(hdr, sizeof(hdr), "PN9 BER %.2e   (%llu frames, CRC %.1f%%)",
+                      dm.ber < 0 ? 0.0 : dm.ber,
+                      static_cast<unsigned long long>(dm.frames),
+                      dm.frames ? 100.0 * dm.crc_ok / dm.frames : 0.0);
+      }
+      const ImU32 hdr_color = (dm.errors == 0) ? accent_green
+                              : (dm.ber < 1e-3 ? IM_COL32(255, 212, 89, 255) : accent_orange);
+      draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.3f,
+                         ImVec2(bx0 + 12.0f, fy0 + 4.0f), hdr_color, hdr);
+      const float chart_x0 = bx0 + 12.0f, chart_x1 = bx1 - 64.0f;
+      const float chart_y1 = fy1 - 4.0f;
+      const float chart_h = chart_y1 - (fy0 + 26.0f);
+      if (!dm.inst_ber_history.empty() && chart_h > 6.0f) {
+        const int n = static_cast<int>(dm.inst_ber_history.size());
+        const float bar_w = (chart_x1 - chart_x0) / 64.0f;
+        for (int i = 0; i < n; ++i) {
+          const float v = dm.inst_ber_history[i];
+          float hgt = 2.0f;
+          ImU32 c = accent_green;
+          if (v > 0.0f) {
+            hgt = std::min(1.0f, std::max(0.05f, (std::log10(v) + 6.0f) / 5.0f)) * chart_h;
+            c = v < 1e-3f ? IM_COL32(255, 212, 89, 255) : accent_orange;
+          }
+          const float x = chart_x1 - (n - i) * bar_w;
+          draw_list->AddRectFilled(ImVec2(x, chart_y1 - hgt), ImVec2(x + bar_w - 1.0f, chart_y1), c);
+        }
+        draw_list->AddText(ImVec2(chart_x1 + 8.0f, chart_y1 - 14.0f), panel_muted, "inst BER");
+      }
+
+      // Payload ticker (right): last CRC-verified arbitrary payload.
+      const float tx0 = split_x, tx1 = display_size.x - 16.0f;
+      draw_list->AddRectFilled(ImVec2(tx0, fy0), ImVec2(tx1, fy1), IM_COL32(13, 18, 27, 235), 6.0f);
+      draw_list->AddRect(ImVec2(tx0, fy0), ImVec2(tx1, fy1), panel_border, 6.0f, 0, 1.0f);
+      draw_list->AddText(ImVec2(tx0 + 12.0f, fy0 + 4.0f), accent_blue, "LAST DECODED PAYLOAD");
+      const std::string ticker = dm.last_payload_text.empty()
+                                     ? std::string("(no text payloads decoded yet)")
+                                     : ("\"" + dm.last_payload_text + "\"");
+      draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                         ImVec2(tx0 + 12.0f, fy0 + 26.0f),
+                         dm.last_payload_text.empty() ? panel_muted : panel_text,
+                         ticker.c_str(), nullptr, tx1 - tx0 - 24.0f);
+
+      // Decode markers on each detection panel: flag at the decoded band's
+      // frequency, green = CRC ok, orange = CRC fail. Marker f_hz below 1 GHz
+      // is treated as a baseband offset from the channel center (snippets of
+      // offline/composite captures carry baseband centers; live snips carry
+      // absolute RF).
+      for (const auto& channel : state.channels) {
+        if (!channel.active) continue;
+        const double span = resolved_span_hz(channel);
+        if (!(span > 0.0)) continue;
+        const ImVec2 mmin = rect_min(channel.mask_rect);
+        const ImVec2 mmax = rect_max(channel.mask_rect);
+        for (const auto& mk : dm.recent) {
+          const double f_abs = std::abs(mk.f_hz) < 1e9 ? channel.center_frequency_hz + mk.f_hz
+                                                        : mk.f_hz;
+          const double lo = channel.center_frequency_hz - span / 2.0;
+          if (f_abs < lo || f_abs > lo + span) continue;
+          const float x = mmin.x + static_cast<float>((f_abs - lo) / span) * (mmax.x - mmin.x);
+          const ImU32 c = mk.crc_ok ? accent_green : accent_orange;
+          draw_list->AddTriangleFilled(ImVec2(x - 7.0f, mmin.y),
+                                       ImVec2(x + 7.0f, mmin.y),
+                                       ImVec2(x, mmin.y + 12.0f), c);
+          draw_list->AddLine(ImVec2(x, mmin.y + 12.0f), ImVec2(x, mmax.y), c, 1.0f);
+          draw_list->AddText(ImVec2(x + 6.0f, mmin.y + 14.0f), c, mk.mod.c_str());
+        }
+      }
+    }
   }
 }
 

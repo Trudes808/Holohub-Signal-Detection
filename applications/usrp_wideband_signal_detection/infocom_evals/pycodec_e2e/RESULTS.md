@@ -113,3 +113,21 @@ Iteration knobs on the table: panel placement/size, a wider BER history strip
 under the waterfalls, per-band decode markers drawn onto the detection panel,
 frames/s + pipeline-latency readouts (from the existing timing summaries), and
 a "last decoded payload" text ticker for arbitrary-payload demos.
+
+## Addendum 4 — dashboard v2 (2026-08-15)
+
+v2 adds the three requested elements:
+1. **Footer BER strip** (full-width, left): headline PN9 BER + frame/CRC counts
+   with the log-scaled instantaneous-BER bar history.
+2. **Decode markers** on the Detected Regions panel: a green (CRC ok) / orange
+   (CRC fail) flag + modulation label + drop-line at each recently-decoded
+   band's frequency (daemon streams `recent_decodes`; sub-GHz marker
+   frequencies are treated as baseband offsets from the channel center).
+3. **Payload ticker** (footer right): the last CRC-verified arbitrary-text
+   payload — fed by a new `framedtext` composite entry, so the demo shows a
+   real message that traveled composite → detector → snipper → blind decode.
+
+Composites are now >=1 ms only (framed [20,5,1] ms with 1024-bit FSK frames so
+every tier decodes; ordered [20,10,5,1] ms re-verified 32/32 at BER 0).
+
+![LIVE DECODE dashboard v2](img/hud_dashboard_v2.png)

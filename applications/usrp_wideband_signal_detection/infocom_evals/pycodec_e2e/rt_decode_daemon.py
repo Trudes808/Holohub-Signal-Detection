@@ -71,6 +71,12 @@ class Metrics:
         self.pn9_errors = 0
         self.by_mod: dict[str, int] = {}
         self.started = time.time()
+        self.recent: list[dict] = []      # last decodes for the dashboard markers
+        self.last_payload_text = ""       # last CRC-ok arbitrary payload (ticker)
+
+    def note_decode(self, f_hz: float, mod: str, crc_ok: bool):
+        self.recent.append({"f_hz": f_hz, "mod": mod, "crc_ok": bool(crc_ok), "t": time.time()})
+        self.recent = self.recent[-16:]
 
     def as_dict(self):
         return {
@@ -83,6 +89,10 @@ class Metrics:
             "pn9_ber": (self.pn9_errors / self.pn9_bits) if self.pn9_bits else None,
             "frames_by_modulation": self.by_mod,
             "uptime_s": round(time.time() - self.started, 1),
+            "recent_decodes": [{"f_hz": r["f_hz"], "mod": r["mod"], "crc_ok": r["crc_ok"],
+                                "age_s": round(time.time() - r["t"], 1)}
+                               for r in self.recent if time.time() - r["t"] < 30.0],
+            "last_payload_text": self.last_payload_text,
         }
 
 
@@ -97,6 +107,7 @@ def process_annotation(a, data, metrics: Metrics) -> str:
     # A detection box can merge several frequency-stacked signals into one
     # snippet: channelize each occupied sub-band, then rate-estimate + frame-
     # decode per band, all blind.
+    snip_center = float(a.get("wfgt:center_frequency", 0.0))
     frames = []
     band_info = []
     try:
@@ -105,6 +116,14 @@ def process_annotation(a, data, metrics: Metrics) -> str:
             got, how = decode_band(ch, chfs, bw)
             frames.extend(got)
             band_info.append(f"{center/1e6:+.1f}MHz/{how}:{len(got)}")
+            for f in got:
+                metrics.note_decode(snip_center + center, f.payload_mod, f.payload_crc_ok)
+                if f.payload_crc_ok and not f.pn9_payload and f.payload_bits is not None:
+                    from pycodec.pn9 import bytes_from_bits
+                    raw = bytes_from_bits(f.payload_bits)
+                    text = "".join(chr(b) if 32 <= b < 127 else "" for b in raw)[:160]
+                    if len(text) > 8:
+                        metrics.last_payload_text = text
     except Exception as e:
         return f"decode error: {e}"
     dt_ms = (time.time() - t0) * 1e3
