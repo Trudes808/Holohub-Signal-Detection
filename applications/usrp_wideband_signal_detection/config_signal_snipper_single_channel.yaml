@@ -35,21 +35,21 @@ advanced_network:
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144   # headroom against rx_q_errors micro-drops at full rate (matches the perf configs)
         buf_size: 42
       - name: "CH1_CHDR_Headers_RX_CPU"
         kind: "huge"
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144   # headroom against rx_q_errors micro-drops at full rate (matches the perf configs)
         buf_size: 64
       - name: "CH1_Data_RX_GPU"
         kind: "huge"   # GB10 integrated GPU: NIC DMAs into host hugepages, GPU reads coherently (see notes/gb10_unified_memory_ingest.md)
         affinity: 0
         access:
           - local
-        num_bufs: 131072
+        num_bufs: 262144   # headroom against rx_q_errors micro-drops at full rate (matches the perf configs)
         buf_size: 4096
 
     interfaces:
@@ -95,7 +95,7 @@ chdr_converter:
   log_data: false
   partial_batch_drop_timeout_ms: 250
   degraded_reset_on_rx_queue_warning: false
-  degraded_shutdown_on_rx_queue_warning_threshold: 3
+  degraded_shutdown_on_rx_queue_warning_threshold: 0   # 3 caused a full channel resync (data-flushing panic reset) on NIC micro-drop warnings — same fix as the perf configs (2026-08-15 smoke test: 24 panic resets/60s with 3, clean with 0)
   degraded_shutdown_force_exit_timeout_ms: 2000
   degraded_reset_partial_flush_threshold: 3
   degraded_reset_cooldown_ms: 1000

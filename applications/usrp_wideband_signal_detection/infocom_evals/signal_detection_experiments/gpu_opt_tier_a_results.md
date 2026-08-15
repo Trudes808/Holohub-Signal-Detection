@@ -114,3 +114,16 @@ chdr→fft remains ~322 ms startup-fill backlog (the Tier A.4 latency candidate)
 
 The committed dual config now ships `emit_stride: 1`: **every frame of both 500-class Msps
 channels is examined by the detector, with zero loss anywhere in the chain.**
+
+## Addendum 4 — single-channel re-measure + snipper smoke test (2026-08-15)
+
+- **Single channel is now 100% too**: 60 s at full 491.52 Msps, cumulative `rx_out_of_buffer`
+  delta **0** (baseline binary had 622,410 / 2.2%). chdr→fft latency improved ~200 → **160 ms**
+  (max 162 — rock stable). Detector: input 0.002 + power 0.4 + pipeline 1.97 ms/frame.
+- **Signal snipper smoke test**: first run showed 24 data-flushing panic resets/60 s — the
+  snipper config had missed two fixes validated on the perf configs
+  (`degraded_shutdown_on_rx_queue_warning_threshold: 3` → 0, RX `num_bufs` 131072 → 262144).
+  With those applied: panic resets **0**, NIC drops **0**, `queued == emitted` in every window,
+  127 SigMF snippet files written. The profile oscillates (falls ~1 s behind under snip+write
+  bursts, catches up at ~0.67 Mpps through the RX pools) — loss-free, but running near its
+  ceiling; benign "Fell behind" log lines during the catch-ups.

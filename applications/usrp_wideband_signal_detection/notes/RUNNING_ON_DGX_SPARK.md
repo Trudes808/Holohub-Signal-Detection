@@ -155,7 +155,7 @@ Reference capture used to validate this port:
 
 | Scenario | Ingest | chdr→fft latency | Frame coverage |
 | --- | --- | --- | --- |
-| 1 channel, coherent | 491.52 Msps ingest | ~200 ms (batch 256) | **97.8% measured** (2.2% NIC micro-drops); detection on every processed frame |
+| 1 channel, coherent | 491.52 Msps ingest | ~160 ms (batch 256) | **100% measured** (zero NIC drops, 60 s run 2026-08-15 post-optimization); detection on every frame |
 | 2 channels, coherent | 2× 491.52 Msps ingest | ~320 ms (batch 512, 8 workers, **emit_stride 1**) | **100% measured** (zero NIC drops, two 60 s runs 2026-08-15) with **detection on EVERY frame** — the full-rate per-frame goal, reached via the Tier A + Tier B GPU work (`gpu_optimization_plan.md`) |
 | 1 channel, cuda_dino | full wire rate; DINO throttles processing via backpressure valve | DINO-bound (~fft→preview 320 ms+) | subset (ViT inference cost) |
 
@@ -167,7 +167,7 @@ exactly full rate on the wire (480k pps × channels × seconds, to the packet). 
 | Stage | Single channel | Dual channel (post Tier A+B) |
 | --- | --- | --- |
 | Wire → NIC | 0 (exact) | 0 (exact) |
-| NIC → app (RX out-of-buffers) | −2.2% (622,410 pkts) | **0** (was −20.9% before commit `ab8e7f78`) |
+| NIC → app (RX out-of-buffers) | **0** (was −2.2% pre-optimization) | **0** (was −20.9% before commit `ab8e7f78`) |
 | Inside the pipeline (converter/FFT/display) | **0** — 0 partial drops, 0 panic resets | **0** — 0 partial drops, 0 panic resets, out-queue depth ~1 |
 | Detection cadence | every frame | **every frame** (`emit_stride: 1`, since 2026-08-15) |
 
