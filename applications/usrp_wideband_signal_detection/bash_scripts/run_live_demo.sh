@@ -55,6 +55,17 @@ if pgrep -f "rx_to_remote_udp.py" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Verify the physical radio topology BEFORE launching (cables/IPs get shuffled on a shared
+# bench; a crossed topology otherwise fails as a silent 0-packet run). Also enforces the
+# canonical host addressing when the wiring checks out. Skip with SKIP_TOPOLOGY_CHECK=1.
+if [[ "${SKIP_TOPOLOGY_CHECK:-0}" != "1" ]]; then
+  echo "==> Checking radio topology"
+  if ! "${SCRIPT_DIR}/check_radio_topology.sh"; then
+    echo "Radio topology check failed — fix the wiring above (or SKIP_TOPOLOGY_CHECK=1 to override)." >&2
+    exit 1
+  fi
+fi
+
 echo "==> Syncing configs / rebuilding if needed"
 "${SCRIPT_DIR}/rebuild_demo_container_app.sh"
 

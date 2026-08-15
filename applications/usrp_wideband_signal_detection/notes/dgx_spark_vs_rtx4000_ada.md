@@ -87,7 +87,7 @@ Tier A code-level GPU work, commit `ab8e7f78` — see `gpu_optimization_plan.md`
 | | Ingest | Coverage | Latency | Visualization |
 | --- | --- | --- | --- | --- |
 | Single-channel | 491.52 Msps | **97.8% measured** | ~200 ms | full rate |
-| Dual-channel | 2× 491.52 Msps | **100% measured** (zero NIC drops); detection every 2nd frame | ~320 ms | ~36 fps/ch |
+| Dual-channel | 2× 491.52 Msps | **100% measured** (zero NIC drops) with **detection on every frame** (2026-08-15, after Tier B round 1) | ~320 ms | ~36 fps/ch |
 
 **2026-08-13 revision to this note's conclusion.** The original diagnosis above attributed the
 dual-channel gap entirely to the memory system. The Tier A optimization pass showed that a large
@@ -109,5 +109,6 @@ What closing the remaining (stride-1) gap takes:
 3. **Different hardware class**: any discrete GPU with dedicated GDDR restores the isolation the
    x86 bench had.
 
-The Spark's trade after Tier A: a ~1 kW bench collapsed into a ~140 W box that ingests dual
-500-class Msps at **100% coverage** with live detection (every 2nd frame) and visualization.
+The Spark's trade after Tier A + Tier B round 1: a ~1 kW bench collapsed into a ~140 W box that
+ingests dual 500-class Msps at **100% coverage with per-frame detection** and live
+visualization — full parity with the x86 bench's coverage on ~1/7th the power.

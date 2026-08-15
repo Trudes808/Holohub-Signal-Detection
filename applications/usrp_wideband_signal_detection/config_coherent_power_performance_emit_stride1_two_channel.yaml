@@ -106,7 +106,7 @@ chdr_converter:
   channel_center_frequencies_hz: "2400e6,1000e6"
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
-  num_ffts_per_batch: 512   # dual-channel full rate exceeds the GB10 pipeline ceiling (~24k FFT/s aggregate); 512 sheds the excess QUIETLY at assembly (out_q stays small, RX pools healthy). 256 sheds via out_q backpressure -> RX mempool exhaustion -> NIC drops + error spam. For lossless dual, stream at --rate 250e6. Must equal fft.num_bursts.
+  num_ffts_per_batch: 512   # frame size (21.3 ms of RF per batch). Since the Tier A+B GPU work (2026-08-15), dual full rate is LOSSLESS at this setting with per-frame detection. Historical: 256 sheds via out_q backpressure -> RX mempool exhaustion -> NIC drops + error spam; avoid. Must equal fft.num_bursts.
   num_simul_batches: 4   # hard max: chdr_rx supports 4 in-flight batch slots (app aborts on more)
   num_channels: 2
   log_packets: false
@@ -206,7 +206,7 @@ coherent_power_signal_detector:
   live_emit_mask_cols: 20480
   live_emit_freq_persistence_window: 45
   live_emit_freq_persistence_min_hits: 11
-  emit_stride: 2   # detect every 2nd frame. Post-Tier-A this ingests at 100% (zero NIC drops, 60 s measured). stride 1 last measured ~87% ingest (Tier B in progress — see notes/gpu_optimization_plan.md)
+  emit_stride: 1   # per-frame detection at full dual rate — GOAL STATE, measured 2026-08-15: two 60 s runs, zero NIC drops, zero shed, full 0.48 Mpps/ch (gpu_optimization_plan.md; needed Tier A + Tier B round 1)
   emit_mask_diagnostic_counts: false   # skip the 4 diagnostic full-mask count passes per frame (audit-log only); the emitted-mask count still runs
   log_detections: false
   save_performance_path_artifacts: false

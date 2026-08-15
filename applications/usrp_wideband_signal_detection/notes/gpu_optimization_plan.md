@@ -1,6 +1,12 @@
 # GB10 code-level GPU optimization plan (dual-channel gap closure)
 
-**Status: design agreed 2026-08-13; Tier A in progress.**
+**Status: GOAL MET 2026-08-15.** Per-frame detection (`emit_stride: 1`) at full dual
+2× 491.52 Msps, live over the air: two 60 s runs with zero NIC drops, zero shed, full
+0.48 Mpps per channel, detector pipeline ~7 ms/frame, masks bit-exact throughout. It took
+Tier A (de-serialization) + Tier B round 1 (fused input+power, tiled u8 transpose, gated
+diagnostic counts). The dual config now ships with `emit_stride: 1`. Rounds 3a+ (fftshift
+fold, morphology tiling at live geometry) remain available as optional headroom for latency
+work or a future third channel, ranked in the results doc.
 
 ## Goal, bar, and scope (agreed)
 

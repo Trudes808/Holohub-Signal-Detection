@@ -94,3 +94,23 @@ the earlier dynamic-variant ranking for stride-1 work):
 Next round (3a): fftshift fold — detector side is one index remap in the fused kernel; preview
 and cuda_dino need an `apply_fftshift` fft-op param (default true) so untouched paths keep the
 shift.
+
+## Addendum 3 — GOAL MET: per-frame detection at full dual rate (2026-08-15, radio restored)
+
+Radio re-connected (topology re-verified: control 192.168.21.2 on enp1s0f1np1, data
+192.168.10.2 on enp1s0f0np0). Live 60 s measurements on commit c6f29a42's binary — first live
+test of the Tier B round-1 kernels (tiled transpose + gated diagnostic counts):
+
+| Run | NIC `rx_out_of_buffer` delta | shed warnings | rate/window | detector (event-based) |
+| --- | --- | --- | --- | --- |
+| dual `emit_stride: 2` | **0** | 0 | 0.481 Mpps/ch, queued==emitted | input 0.08 + power 1.5 + pipeline **5.0 ms** |
+| dual `emit_stride: 1` | **0** | 0 | 0.471–0.481 Mpps/ch, queued==emitted | input 0.1 + power 1.4 + pipeline **6.9–7.1 ms** |
+| dual `emit_stride: 1` (confirm) | **0** | 0 | 0.481 Mpps/ch, out_q 0 | — |
+
+Progression of the stride-1 gap: 85% (Tier A) → 87.5% (+ fused input+power) → **100%**
+(+ tiled transpose + gated counts). Pipeline stage at stride 2 dropped 7.4–8.0 → 5.0 ms/frame
+with the round-1 kernels. FFT→detector queue wait at stride 1 is ~22 ms (stable, not growing);
+chdr→fft remains ~322 ms startup-fill backlog (the Tier A.4 latency candidate).
+
+The committed dual config now ships `emit_stride: 1`: **every frame of both 500-class Msps
+channels is examined by the detector, with zero loss anywhere in the chain.**

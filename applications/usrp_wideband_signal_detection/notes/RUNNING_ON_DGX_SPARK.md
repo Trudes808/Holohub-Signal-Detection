@@ -156,7 +156,7 @@ Reference capture used to validate this port:
 | Scenario | Ingest | chdr→fft latency | Frame coverage |
 | --- | --- | --- | --- |
 | 1 channel, coherent | 491.52 Msps ingest | ~200 ms (batch 256) | **97.8% measured** (2.2% NIC micro-drops); detection on every processed frame |
-| 2 channels, coherent | 2× 491.52 Msps ingest | ~320 ms (batch 512, 8 workers, emit_stride 2) | **100% measured** (zero NIC drops) since the Tier A GPU work (commit `ab8e7f78`); detection on every 2nd processed frame (~50% of RF time) |
+| 2 channels, coherent | 2× 491.52 Msps ingest | ~320 ms (batch 512, 8 workers, **emit_stride 1**) | **100% measured** (zero NIC drops, two 60 s runs 2026-08-15) with **detection on EVERY frame** — the full-rate per-frame goal, reached via the Tier A + Tier B GPU work (`gpu_optimization_plan.md`) |
 | 1 channel, cuda_dino | full wire rate; DINO throttles processing via backpressure valve | DINO-bound (~fft→preview 320 ms+) | subset (ViT inference cost) |
 
 **Measured loss budget (60 s validation runs; dual re-measured 2026-08-13 after the Tier A
@@ -164,20 +164,21 @@ GPU optimizations — see `gpu_optimization_plan.md` and
 `../infocom_evals/signal_detection_experiments/gpu_opt_tier_a_results.md`).** The X410 delivers
 exactly full rate on the wire (480k pps × channels × seconds, to the packet). Where losses occur:
 
-| Stage | Single channel | Dual channel (post-Tier-A) |
+| Stage | Single channel | Dual channel (post Tier A+B) |
 | --- | --- | --- |
 | Wire → NIC | 0 (exact) | 0 (exact) |
 | NIC → app (RX out-of-buffers) | −2.2% (622,410 pkts) | **0** (was −20.9% before commit `ab8e7f78`) |
 | Inside the pipeline (converter/FFT/display) | **0** — 0 partial drops, 0 panic resets | **0** — 0 partial drops, 0 panic resets, out-queue depth ~1 |
-| Detection cadence | every frame | every 2nd frame (`emit_stride: 2`) |
+| Detection cadence | every frame | **every frame** (`emit_stride: 1`, since 2026-08-15) |
 
-Interpretation: the pre-Tier-A 20.9% dual loss turned out to be mostly **host-side
+Interpretation: the pre-optimization 20.9% dual loss turned out to be mostly **host-side
 serialization** (per-stage timing syncs, blocking counter readbacks, per-frame
-cudaMalloc/cudaFree) masquerading as a GPU-bandwidth ceiling; removing it freed the pipeline to
-consume at full dual rate with no config change. Per-frame detection (`emit_stride: 1`) still
-sheds ~15% and is the target of the Tier B fusion work. The standing ~320 ms chdr→fft latency is
-a startup-fill queue backlog that never drains at matched rates — a separate latency (not loss)
-phenomenon.
+cudaMalloc/cudaFree) masquerading as a GPU-bandwidth ceiling; Tier A removed it (100% at
+detection every 2nd frame), and the Tier B round-1 kernels (fused input+power, tiled u8
+transpose, gated diagnostic counts) bought the rest — **full dual rate with per-frame detection,
+zero loss anywhere** (two 60 s runs, cumulative NIC counter delta 0, detector pipeline
+~7 ms/frame). The standing ~320 ms chdr→fft latency is a startup-fill queue backlog that never
+drains at matched rates — a separate latency (not loss) phenomenon.
 
 Knobs: `chdr_converter.num_ffts_per_batch` (= `fft.num_bursts`) trades latency vs converter load;
 `scheduler.worker_thread_number: 8` needed for dual-channel symmetry; `render_every_n_frames`
