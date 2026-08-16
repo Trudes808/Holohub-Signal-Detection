@@ -157,3 +157,110 @@ marker on the detection panel:
 (Notes: detector warmup consumes the first 30 dB step for the linear signals
 — the dynamic floor is still learning; with real noise the detector produces
 per-signal decimated snips, exercising the decimation path end-to-end.)
+
+## Addendum 6 — ML classifier informs the decoder: 3 models, 3 metrics (2026-08-16)
+
+The decode stage now has an AMC (automatic modulation classification) front:
+every channelized sub-band is classified by **three literature models** before
+decoding, and the gate model's prediction **routes the decoder** (NOISE →
+skip, FSK → discriminator, OFDM → OFDM chain, PSK/QAM → linear). 4-family +
+noise problem: PSK / QAM / FSK / OFDM / NOISE. Composite for this experiment
+carries exactly one modulation per family: `comprehensive_4class_py`
+(BPSK, 16QAM, 4FSK, OFDM-QPSK + a BPSK framedtext entry for the ticker).
+
+Models (`amc/models.py`, weights committed under `amc/weights/`):
+
+| model | source | input | params | val acc* |
+|---|---|---|---|---|
+| VT-CNN2 | O'Shea et al. 2016 | 2×128 IQ | 2.83 M | 0.77 |
+| ResNet1D | O'Shea et al. 2018 | 2×1024 IQ | 0.16 M | 0.95 |
+| T-PRIME LG | Belgiovine et al., INFOCOM 2024 (genesys-neu/t-prime) | 64×128-sample tokens | 6.83 M | 0.96 |
+
+*synthetic val, uniform 0–30 dB in-band SNR.
+
+Training data is pycodec-synthesized **through the exact inference
+front-end** (`amc/synth.py`): snipper decimation ladder, `channelize()` with
+jittered bandwidth estimates, stacked-slot neighbor leakage, noise added
+before the channel filter, and a stratified payload grid (PN9 / mid-stream
+PN9 / repeating-ASCII / random × 512–4096 bits).
+
+### Truth-scored run on the 4-class composite (24 placements, blind decode)
+
+- decode: **1913 frames, 1908 CRC-ok**; BPSK 400, 16QAM 1015, 4FSK 72,
+  OFDM-QPSK 426; GRCON text payload recovered on the ticker
+- **BER attempted 3.27e-04** (errors / bits over decoded frames)
+- **BER whole 1.48e-03** (lost bits count 100% wrong: 8192 of 7,114,752
+  expected bits never decoded — two 16QAM frames at snip boundaries)
+- classification accuracy vs TX truth (32 sub-bands), avg inference / band:
+
+| model | real-snip acc | latency |
+|---|---|---|
+| VT-CNN2 | 59.4 % | 1.0 ms |
+| ResNet1D | 93.8 % | 1.4 ms |
+| **T-PRIME (gate)** | **100 %** | 1.3 ms |
+
+PSK↔QAM misroutes are harmless by construction (same linear branch; the
+frame header resolves the constellation) — a useful robustness property of
+classifier-informed routing over classifier-decided demodulation.
+
+### Low-SNR staircase (`pycodec.snr_staircase_4class`)
+
+BPSK/4FSK/16QAM/OFDM at −60/−20/+20/+60 MHz, constant noise floor, signal
+power stepped 30→6 dB (15 ms bursts). Whole vs attempted BER per step
+(whole = 1.0 means the detector never boxed it or the classifier gated it
+to NOISE — exactly what the metric is for):
+
+| step | BPSK | 4FSK | 16QAM | OFDM |
+|---|---|---|---|---|
+| 30 dB | 1.9e-2 / 0 | 0 / 0 | 5.1e-3 / 0 | 8.9e-1 / 0 |
+| 20 dB | 1.9e-2 / 0 | 2.5e-2 / 1.2e-3 | lost | 9.1e-3 / 9.7e-4 |
+| 15 dB | lost | 1.2e-2 / 1.2e-2 | lost | 1.7e-1 / 4.5e-2 |
+| 12 dB | lost | 1.6e-2 / 1.6e-2 | 9.7e-1 / 1.4e-1 | lost |
+| ≤9 dB | lost | lost | lost | lost |
+
+(whole / attempted; "lost" = whole 1.0. Cells are single 15 ms bursts, so
+detection at threshold SNR is one-shot stochastic — 4FSK's narrowband PSD
+holds to 12 dB, wideband signals die at 12–15 dB, and at ≤9 dB the models
+increasingly answer NOISE, gating decode off.)
+
+### Shortcut-learning lessons (cost 4 training rounds to find)
+
+Synthetic AMC training data must randomize EVERY nuisance dimension, or
+high-capacity models learn the leak at 1.0 confidence and synthetic
+validation never shows it (96–98% val with class-wide flips on real snips):
+
+1. **Front-end**: windows must pass the real `channelize()` (filter droop,
+   band edges) — fixed all-real-OFDM→NOISE.
+2. **Frame geometry**: fixed 2048-bit payloads made frame period a class
+   cue — real 4096-bit 16QAM matched the synthetic BPSK period → PSK 1.0.
+3. **Payload content**: pure-random training bits made PN9's 511-bit
+   periodicity out-of-distribution → real PN9 16QAM → PSK 0.98.
+4. **Joint coverage**: content×length must be a full grid per member —
+   with 4 random draws the (PN9×4096) cell was usually missing, so the
+   frame-spanning T-PRIME window still failed while the 1024-sample
+   ResNet was already fixed.
+
+Debugging method that worked: 2×2 isolation builds classified directly
+(content × length), not more training.
+
+Side find: the classifier pipeline exposed a latent pycodec bug — 4FSK's
+fixed ±2.0 slicer threshold produced 3–5% BER on clean signals whenever the
+frame's 2FSK/4FSK symbol mix shifted the burst-global scaling. Fixed with a
+per-block 2-mean Lloyd level split (waveform repo 8270095); 4FSK now decodes
+BER 0 at any payload length. The daemon also gained a tight-band ×2
+upsampler: per-signal snips arrive at ~1.5× occupied bandwidth, where the
+blind rate estimator's search cap excluded the true symbol rate.
+
+### Reproduce
+
+```bash
+# train (GPU, ~20 min):  .venv-ml/bin/python -m amc.train
+# clean run:
+.venv-ml/bin/python rt_decode_daemon.py --snips <snips> --once \
+  --truth-meta .../comprehensive_4class_py.sigmf-meta
+# staircase: python3 -m pycodec.snr_staircase_4class, snip, same daemon
+```
+
+Dashboard: sidebar now shows BER att / BER whole and a CLASSIFIER block
+(3 models, live accuracy + latency, '>' marks the gate). Capture:
+`img/hud_dashboard_amc.png`.

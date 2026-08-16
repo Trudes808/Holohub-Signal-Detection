@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Real-time decode stage: consume signal_snipper SigMF output, decode framed
-bursts with ZERO ground truth, publish live BER metrics.
-
-This is the decode "operator" of the demo pipeline, run as a sidecar process:
+"""Real-time decode stage: consume signal_snipper SigMF output, classify each
+sub-band with three AMC models (VT-CNN2 / ResNet1D / T-PRIME), let the gate
+model route the decoder, and publish live BER + classification metrics.
 
     detector -> signal_snipper -> sigmf_file_sink --(SigMF packs on disk)-->
-        THIS DAEMON: blind symbol-rate estimate -> frame sync -> header
-        (modulation/length/CRC) -> payload decode -> CRC32 + PN9 BER
+        THIS DAEMON: find_subbands -> channelize -> AMC (all 3 models) ->
+        gate model routes: NOISE->skip, FSK->discriminator, OFDM->OFDM chain,
+        PSK/QAM->linear -> frame sync/header/CRC32 -> PN9 BER
 
-It polls the snippet directory, decodes every NEW snippet annotation as it
-appears, prints one line per snippet plus a rolling aggregate, and writes the
-running metrics to a JSON file (rt_metrics.json next to the snippets) that a
-future HoloViz overlay can render.
+Metrics (rt_metrics.json, atomic): the classic decode aggregates, plus
+  - per-model classification accuracy vs truth (--truth-meta) and latency
+  - ber_attempted: bit errors / bits over frames we actually decoded
+  - ber_whole:     lost bits count 100% wrong — expected bits come from the
+                   composite TX annotations (frames = placement//entry length)
+
+Without AMC weights (or torch), falls back to the blind family cascade.
 
 Usage:
-    python3 rt_decode_daemon.py --snips /tmp/usrp_spectrograms/<run>/snippets \
-        [--poll 0.5] [--once] [--idle-exit 30]
+    .venv-ml/bin/python rt_decode_daemon.py --snips <dir> [--poll 0.5] [--once]
+        [--idle-exit 30] [--metrics-out <json>] [--no-amc] [--gate tprime]
+        [--truth-meta <composite.sigmf-meta>] [--truth-lib <library root>]
 """
 from __future__ import annotations
 
@@ -42,10 +46,109 @@ PROFILE = dict(sps=8, pulse_shape="rrc", rolloff=0.35, span_symbols=10)
 FSK_PROFILE = dict(sps=8, h=0.5, bt=0.5)
 
 
+def family_of(mod: str) -> str:
+    """Map a modulation / entry class tag to its AMC family."""
+    m = (mod or "").upper()
+    if m.startswith("OFDM"):
+        return "OFDM"
+    if m.endswith("FSK") or m == "GFSK":
+        return "FSK"
+    if "QAM" in m:
+        return "QAM"
+    if m in ("BPSK", "QPSK", "8PSK") or "PSK" in m:
+        return "PSK"
+    return "NOISE"
+
+
+class TruthScorer:
+    """Ground truth from the composite TX annotations + waveform library:
+    per-band family labels (classification accuracy) and expected PN9 bits
+    (whole-BER denominator: a bit never decoded counts 100% wrong)."""
+
+    def __init__(self, meta_path: str, lib_root: str):
+        meta = json.load(open(meta_path))
+        self.placements = []
+        self.sync_regions = []   # ZC sync + metadata bursts: excluded from scoring
+        for a in meta.get("annotations", []):
+            if a.get("wfgt:kind") in ("zadoff_chu", "metadata"):
+                self.sync_regions.append(dict(
+                    start=int(a["core:sample_start"]), count=int(a["core:sample_count"]),
+                    f_lo=float(a.get("core:freq_lower_edge", -1e12)),
+                    f_hi=float(a.get("core:freq_upper_edge", 1e12))))
+                continue
+            if a.get("wfgt:kind") != "waveform":
+                continue
+            if "wfgt:source_mat" in a:   # composer placements: look up the library entry
+                src = a["wfgt:source_mat"]
+                j = json.load(open(os.path.join(lib_root, src.replace(".mat", ".json"))))
+                frame_bits = int((j.get("pycodecFrame") or {}).get("payload_len_bits", 0))
+                entry_len = int(a.get("wfgt:original_length_samples")
+                                or j["numOutputSamples"])
+                pn9 = "framedtext" not in j.get("waveformName", "")
+            else:   # synthetic captures (SNR staircase) carry the frame geometry inline
+                frame_bits = int(a.get("wfgt:frame_payload_bits", 0))
+                entry_len = int(a.get("wfgt:frame_len_samples", 0)) or 1
+                pn9 = bool(a.get("wfgt:pn9", True))
+            self.placements.append(dict(
+                start=int(a["core:sample_start"]), count=int(a["core:sample_count"]),
+                f_lo=float(a["core:freq_lower_edge"]),
+                f_hi=float(a["core:freq_upper_edge"]),
+                family=family_of(a.get("wfgt:class") or a.get("wfgt:modulation")),
+                frames=int(a["core:sample_count"]) // entry_len,
+                frame_bits=frame_bits,
+                label=str(a.get("core:label", "?")),
+                pn9=pn9))
+        self.bits_expected = sum(p["frames"] * p["frame_bits"]
+                                 for p in self.placements if p["pn9"])
+        self.frames_expected = sum(p["frames"] for p in self.placements if p["pn9"])
+        self.by_family_expected: dict[str, int] = {}
+        for p in self.placements:
+            if p["pn9"]:
+                self.by_family_expected[p["family"]] = \
+                    self.by_family_expected.get(p["family"], 0) + p["frames"] * p["frame_bits"]
+
+    def lookup(self, orig_start: int, orig_count: int, f_center: float,
+               margin_hz: float = 3e6) -> tuple[str, int | None]:
+        """(truth family, placement index) for a band; family SYNC (excluded
+        from scoring) when the band only matches a composer sync/metadata
+        burst. Exact frequency containment beats margin matches so neighbor
+        slots don't steal bands."""
+        for margin in (0.0, margin_hz):
+            best, best_ov = None, 0
+            for i, p in enumerate(self.placements):
+                ov = min(orig_start + orig_count, p["start"] + p["count"]) - \
+                    max(orig_start, p["start"])
+                if ov <= 0:
+                    continue
+                if f_center < p["f_lo"] - margin or f_center > p["f_hi"] + margin:
+                    continue
+                if ov > best_ov:
+                    best, best_ov = (i, p), ov
+            if best is not None:
+                return best[1]["family"], best[0]
+        for r in self.sync_regions:
+            if (min(orig_start + orig_count, r["start"] + r["count"]) >
+                    max(orig_start, r["start"]) and
+                    r["f_lo"] - margin_hz <= f_center <= r["f_hi"] + margin_hz):
+                return "SYNC", None
+        return "NOISE", None
+
+
+def load_classifier(weights: str | None, device: str | None, gate: str):
+    try:
+        from amc.classify import AmcClassifier
+        clf = AmcClassifier(weights_dir=weights, device=device, gate=gate)
+        print(f"amc: 3-model classifier ready on {clf.device}, gate={gate}", flush=True)
+        return clf
+    except Exception as e:
+        print(f"amc: classifier unavailable ({e}) — falling back to blind cascade",
+              flush=True)
+        return None
+
+
 def decode_band(ch, chfs, bw):
-    """Family cascade for one channelized sub-band: constant envelope -> FSK;
-    otherwise linear framed; if that finds nothing, OFDM at the snapped
-    profile rate (OFDM has high PAPR, so it lands in the 'else' branch)."""
+    """Legacy blind family cascade (no classifier): constant envelope -> FSK;
+    otherwise linear framed; if that finds nothing, OFDM at the snapped rate."""
     if envelope_cv(ch) < 0.15:
         rs = estimate_symbol_rate_fsk(ch, chfs, lo_hz=max(0.2e6, 0.1 * bw),
                                       hi_hz=max(1e6, min(bw, 0.45 * chfs)))
@@ -56,13 +159,33 @@ def decode_band(ch, chfs, bw):
     if frames:
         return frames, f"lin/rs{rs/1e6:.2f}"
     frames = decode_frames_ofdm(ch, chfs, snap_profile_rate(bw))
-    for f in frames:  # distinguish the transport family in the metrics
+    for f in frames:
         f.payload_mod = f"OFDM-{f.payload_mod}"
     return frames, f"ofdm/fs{snap_profile_rate(bw)/1e6:.2f}"
 
 
+def decode_band_routed(ch, chfs, bw, family):
+    """Classifier-informed routing: the predicted family picks the decode
+    branch outright (no fallback — a wrong route honestly loses those bits,
+    which is exactly what ber_whole is for)."""
+    if family == "NOISE":
+        return [], "amc:skip"
+    if family == "FSK":
+        rs = estimate_symbol_rate_fsk(ch, chfs, lo_hz=max(0.2e6, 0.1 * bw),
+                                      hi_hz=max(1e6, min(bw, 0.45 * chfs)))
+        return decode_frames_fsk(ch, chfs, rs, **FSK_PROFILE), f"amc-fsk/rs{rs/1e6:.2f}"
+    if family == "OFDM":
+        frames = decode_frames_ofdm(ch, chfs, snap_profile_rate(bw))
+        for f in frames:
+            f.payload_mod = f"OFDM-{f.payload_mod}"
+        return frames, f"amc-ofdm/fs{snap_profile_rate(bw)/1e6:.2f}"
+    rs = estimate_symbol_rate(ch, chfs, lo_hz=max(1e6, 0.3 * bw / 1.35),
+                              hi_hz=max(2e6, min(1.2 * bw, 0.45 * chfs)))
+    return decode_frames(ch, chfs, rs, **PROFILE), f"amc-lin/rs{rs/1e6:.2f}"
+
+
 class Metrics:
-    def __init__(self):
+    def __init__(self, truth: TruthScorer | None = None, gate: str = "tprime"):
         self.snips = 0
         self.snips_with_frames = 0
         self.frames = 0
@@ -70,16 +193,48 @@ class Metrics:
         self.pn9_bits = 0
         self.pn9_errors = 0
         self.by_mod: dict[str, int] = {}
+        self.by_family: dict[str, dict] = {}
         self.started = time.time()
-        self.recent: list[dict] = []      # last decodes for the dashboard markers
-        self.last_payload_text = ""       # last CRC-ok arbitrary payload (ticker)
+        self.recent: list[dict] = []
+        self.last_payload_text = ""
+        self.truth = truth
+        self.gate = gate
+        self.cls: dict[str, dict] = {}
+        self.by_placement: dict[int, dict] = {}
 
     def note_decode(self, f_hz: float, mod: str, crc_ok: bool):
         self.recent.append({"f_hz": f_hz, "mod": mod, "crc_ok": bool(crc_ok), "t": time.time()})
         self.recent = self.recent[-16:]
 
+    def note_frame_bits(self, mod: str, bits: int, errors: int,
+                        pidx: int | None = None):
+        fam = family_of(mod)
+        d = self.by_family.setdefault(fam, {"bits": 0, "errors": 0})
+        d["bits"] += bits
+        d["errors"] += errors
+        if pidx is not None:
+            p = self.by_placement.setdefault(pidx, {"bits": 0, "errors": 0, "frames": 0})
+            p["bits"] += bits
+            p["errors"] += errors
+            p["frames"] += 1
+
+    def note_cls(self, name: str, label: str, ms: float, truth_fam: str | None):
+        c = self.cls.setdefault(name, {"n": 0, "ms_sum": 0.0, "truth_n": 0,
+                                       "correct": 0, "preds": {}, "confusion": {}})
+        c["n"] += 1
+        c["ms_sum"] += ms
+        c["preds"][label] = c["preds"].get(label, 0) + 1
+        # SYNC bands (composer ZC/metadata bursts) are neither of the 4
+        # families nor noise — the classifier never saw them, so skip scoring.
+        if truth_fam is not None and truth_fam != "SYNC":
+            c["truth_n"] += 1
+            if label == truth_fam:
+                c["correct"] += 1
+            key = f"{truth_fam}>{label}"
+            c["confusion"][key] = c["confusion"].get(key, 0) + 1
+
     def as_dict(self):
-        return {
+        d = {
             "snippets_seen": self.snips,
             "snippets_with_frames": self.snips_with_frames,
             "frames_decoded": self.frames,
@@ -87,6 +242,7 @@ class Metrics:
             "pn9_bits_compared": self.pn9_bits,
             "pn9_bit_errors": self.pn9_errors,
             "pn9_ber": (self.pn9_errors / self.pn9_bits) if self.pn9_bits else None,
+            "ber_attempted": (self.pn9_errors / self.pn9_bits) if self.pn9_bits else None,
             "frames_by_modulation": self.by_mod,
             "uptime_s": round(time.time() - self.started, 1),
             "recent_decodes": [{"f_hz": r["f_hz"], "mod": r["mod"], "crc_ok": r["crc_ok"],
@@ -94,9 +250,50 @@ class Metrics:
                                for r in self.recent if time.time() - r["t"] < 30.0],
             "last_payload_text": self.last_payload_text,
         }
+        if self.cls:
+            d["classifier"] = {"gate": self.gate, "models": {
+                name: {"n": c["n"],
+                       "acc": (c["correct"] / c["truth_n"]) if c["truth_n"] else None,
+                       "avg_ms": round(c["ms_sum"] / c["n"], 2) if c["n"] else None,
+                       "preds": c["preds"], "confusion": c["confusion"]}
+                for name, c in self.cls.items()}}
+        if self.truth is not None:
+            exp = self.truth.bits_expected
+            lost = max(0, exp - self.pn9_bits)
+            d["bits_expected"] = exp
+            d["bits_lost"] = lost
+            d["frames_expected"] = self.truth.frames_expected
+            d["ber_whole"] = ((self.pn9_errors + lost) / exp) if exp else None
+            d["ber_by_family"] = {}
+            for fam, fam_exp in self.truth.by_family_expected.items():
+                got = self.by_family.get(fam, {"bits": 0, "errors": 0})
+                fam_lost = max(0, fam_exp - got["bits"])
+                d["ber_by_family"][fam] = {
+                    "attempted": (got["errors"] / got["bits"]) if got["bits"] else None,
+                    "whole": ((got["errors"] + fam_lost) / fam_exp) if fam_exp else None,
+                    "bits_lost": fam_lost, "bits_expected": fam_exp}
+            # per-label rollup (labels like "16QAM@12dB" give the staircase table)
+            steps: dict[str, dict] = {}
+            for i, p in enumerate(self.truth.placements):
+                if not p["pn9"]:
+                    continue
+                s = steps.setdefault(p["label"], {"bits": 0, "errors": 0, "frames": 0,
+                                                  "bits_expected": 0})
+                got = self.by_placement.get(i, {"bits": 0, "errors": 0, "frames": 0})
+                s["bits"] += got["bits"]
+                s["errors"] += got["errors"]
+                s["frames"] += got["frames"]
+                s["bits_expected"] += p["frames"] * p["frame_bits"]
+            d["ber_by_label"] = {
+                lbl: {"attempted": (s["errors"] / s["bits"]) if s["bits"] else None,
+                      "whole": ((s["errors"] + max(0, s["bits_expected"] - s["bits"]))
+                                / s["bits_expected"]) if s["bits_expected"] else None,
+                      "frames": s["frames"], "bits_expected": s["bits_expected"]}
+                for lbl, s in steps.items()}
+        return d
 
 
-def process_annotation(a, data, metrics: Metrics) -> str:
+def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
     snip_fs = float(a.get("wfgt:snippet_sample_rate",
                           a.get("wfgt:orig_sample_rate", 245.76e6)))
     start, count = int(a["core:sample_start"]), int(a["core:sample_count"])
@@ -104,20 +301,44 @@ def process_annotation(a, data, metrics: Metrics) -> str:
     if iq.size < 4096:
         return None
     t0 = time.time()
-    # A detection box can merge several frequency-stacked signals into one
-    # snippet: channelize each occupied sub-band, then rate-estimate + frame-
-    # decode per band, all blind.
     snip_center = float(a.get("wfgt:center_frequency", 0.0))
+    orig_start = int(a.get("wfgt:orig_sample_start", 0))
+    orig_count = int(a.get("wfgt:orig_sample_count",
+                           count * int(a.get("wfgt:decimation_factor", 1))))
     frames = []
     band_info = []
     try:
         for center, bw in find_subbands(iq, snip_fs):
             ch, chfs = channelize(iq, snip_fs, center, bw)
-            got, how = decode_band(ch, chfs, bw)
+            if bw / chfs > 0.55:
+                # tight per-signal snips (snipper decimates to ~1.5x occ) leave
+                # <2.4 samples/symbol: the |iq|^2 rate line sits at/over the
+                # search cap and RRC timing starves — give the band headroom
+                from scipy.signal import resample_poly
+                ch = resample_poly(ch, 2, 1).astype(np.complex64)
+                chfs *= 2.0
+            truth_fam, truth_idx = (metrics.truth.lookup(orig_start, orig_count,
+                                                         snip_center + center)
+                                    if metrics.truth else (None, None))
+            if clf is not None:
+                res = clf.classify(ch)
+                for name, r in res.items():
+                    metrics.note_cls(name, r.label, r.ms, truth_fam)
+                pred = res[clf.gate].label
+                got, how = decode_band_routed(ch, chfs, bw, pred)
+                mark = ("" if truth_fam is None else
+                        "~sync" if truth_fam == "SYNC" else
+                        "=" if pred == truth_fam else f"!={truth_fam}")
+                how = f"{how}[{pred}{mark}]"
+            else:
+                got, how = decode_band(ch, chfs, bw)
             frames.extend(got)
             band_info.append(f"{center/1e6:+.1f}MHz/{how}:{len(got)}")
             for f in got:
                 metrics.note_decode(snip_center + center, f.payload_mod, f.payload_crc_ok)
+                if f.pn9_payload:
+                    metrics.note_frame_bits(f.payload_mod, f.payload_len_bits,
+                                            f.bit_errors, truth_idx)
                 if f.payload_crc_ok and not f.pn9_payload and f.payload_bits is not None:
                     from pycodec.pn9 import bytes_from_bits
                     raw = bytes_from_bits(f.payload_bits)
@@ -159,14 +380,31 @@ def main():
     ap.add_argument("--metrics-out", default=None,
                     help="where to write rt_metrics.json (default: inside --snips); "
                          "the HoloViz LIVE DECODE panel watches this path")
+    ap.add_argument("--no-amc", action="store_true", help="disable the classifier stage")
+    ap.add_argument("--amc-weights", default=None)
+    ap.add_argument("--amc-device", default=None, help="cuda|cpu (default: auto)")
+    ap.add_argument("--gate", default="tprime", choices=["tprime", "resnet1d", "vtcnn2"],
+                    help="which model's prediction routes the decoder")
+    ap.add_argument("--truth-meta", default=None,
+                    help="composite TX .sigmf-meta for classification accuracy + whole BER")
+    ap.add_argument("--truth-lib", default=os.path.join(PYCODEC_ROOT,
+                                                        "generated_waveforms_framed"),
+                    help="waveform library root (entry jsons) for expected-bits math")
     args = ap.parse_args()
     metrics_path = args.metrics_out or os.path.join(args.snips, "rt_metrics.json")
 
-    metrics = Metrics()
+    truth = TruthScorer(args.truth_meta, args.truth_lib) if args.truth_meta else None
+    if truth:
+        print(f"truth: {len(truth.placements)} placements, "
+              f"{truth.frames_expected} PN9 frames / {truth.bits_expected} bits expected",
+              flush=True)
+    clf = None if args.no_amc else load_classifier(args.amc_weights, args.amc_device,
+                                                   args.gate)
+    metrics = Metrics(truth=truth, gate=args.gate)
     seen: dict[str, int] = {}   # pack meta path -> annotations processed
     last_new = time.time()
-    print(f"rt_decode_daemon: watching {args.snips} (blind decode, profile {PROFILE})",
-          flush=True)
+    print(f"rt_decode_daemon: watching {args.snips} "
+          f"({'AMC-routed' if clf else 'blind cascade'}, profile {PROFILE})", flush=True)
     while True:
         new_work = False
         for mp in sorted(glob.glob(os.path.join(args.snips, "*.sigmf-meta"))):
@@ -184,7 +422,7 @@ def main():
             except (OSError, ValueError):
                 continue
             for a in anns[done:]:
-                line = process_annotation(a, data, metrics)
+                line = process_annotation(a, data, metrics, clf=clf)
                 if line:
                     print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
                 # stream metrics per snippet so the HoloViz panel updates live
@@ -201,10 +439,17 @@ def main():
             last_new = time.time()
             m = metrics.as_dict()
             ber = m["pn9_ber"]
+            extra = ""
+            if "ber_whole" in m and m["ber_whole"] is not None:
+                extra = f" whole {m['ber_whole']:.2e} (lost {m['bits_lost']})"
+            if "classifier" in m:
+                accs = {n: (f"{v['acc']:.3f}" if v["acc"] is not None else "-")
+                        for n, v in m["classifier"]["models"].items()}
+                extra += f" cls_acc {accs}"
             print(f"[{time.strftime('%H:%M:%S')}] === LIVE: frames {m['frames_decoded']} "
                   f"(crc_ok {m['frames_crc_ok']}) by_mod {m['frames_by_modulation']} "
                   f"PN9 BER {ber if ber is None else f'{ber:.2e}'} "
-                  f"({m['pn9_bit_errors']}/{m['pn9_bits_compared']}) ===", flush=True)
+                  f"({m['pn9_bit_errors']}/{m['pn9_bits_compared']}){extra} ===", flush=True)
             try:
                 tmp = metrics_path + ".tmp"
                 with open(tmp, "w") as f:

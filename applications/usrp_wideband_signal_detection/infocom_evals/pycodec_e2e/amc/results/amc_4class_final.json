@@ -1,0 +1,233 @@
+{
+ "snippets_seen": 30,
+ "snippets_with_frames": 16,
+ "frames_decoded": 1913,
+ "frames_crc_ok": 1908,
+ "pn9_bits_compared": 7106560,
+ "pn9_bit_errors": 2321,
+ "pn9_ber": 0.0003265996487752161,
+ "ber_attempted": 0.0003265996487752161,
+ "frames_by_modulation": {
+  "BPSK": 400,
+  "16QAM": 1015,
+  "4FSK": 72,
+  "OFDM-QPSK": 426
+ },
+ "uptime_s": 11.7,
+ "recent_decodes": [
+  {
+   "f_hz": -60180000.00000001,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -60180000.00000001,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -60180000.00000001,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -60180000.00000001,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -60180000.00000001,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -60180000.00000001,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -60180000.00000001,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -60180000.00000001,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -180000.00000000745,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -180000.00000000745,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -180000.00000000745,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -180000.00000000745,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -180000.00000000745,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -180000.00000000745,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -180000.00000000745,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -180000.00000000745,
+   "mod": "OFDM-QPSK",
+   "crc_ok": true,
+   "age_s": 0.0
+  }
+ ],
+ "last_payload_text": "GRCON 2026 -- this text was transmitted over the composite, detected, snipped, and decoded live with zero side information. GRCON 2026 -- this text was transmit",
+ "classifier": {
+  "gate": "tprime",
+  "models": {
+   "vtcnn2": {
+    "n": 57,
+    "acc": 0.59375,
+    "avg_ms": 1.0,
+    "preds": {
+     "OFDM": 44,
+     "PSK": 5,
+     "QAM": 6,
+     "FSK": 2
+    },
+    "confusion": {
+     "PSK>OFDM": 7,
+     "PSK>PSK": 5,
+     "QAM>OFDM": 4,
+     "QAM>QAM": 6,
+     "FSK>FSK": 2,
+     "OFDM>OFDM": 6,
+     "FSK>OFDM": 2
+    }
+   },
+   "resnet1d": {
+    "n": 57,
+    "acc": 0.9375,
+    "avg_ms": 1.36,
+    "preds": {
+     "OFDM": 33,
+     "PSK": 12,
+     "QAM": 8,
+     "FSK": 4
+    },
+    "confusion": {
+     "PSK>PSK": 12,
+     "QAM>QAM": 8,
+     "FSK>FSK": 4,
+     "OFDM>OFDM": 6,
+     "QAM>OFDM": 2
+    }
+   },
+   "tprime": {
+    "n": 57,
+    "acc": 1.0,
+    "avg_ms": 1.34,
+    "preds": {
+     "OFDM": 29,
+     "PSK": 12,
+     "QAM": 10,
+     "FSK": 4,
+     "NOISE": 2
+    },
+    "confusion": {
+     "PSK>PSK": 12,
+     "QAM>QAM": 10,
+     "FSK>FSK": 4,
+     "OFDM>OFDM": 6
+    }
+   }
+  }
+ },
+ "bits_expected": 7114752,
+ "bits_lost": 8192,
+ "frames_expected": 1791,
+ "ber_whole": 0.0014776340763529073,
+ "ber_by_family": {
+  "PSK": {
+   "attempted": 0.00010791723278985508,
+   "whole": 0.00010791723278985508,
+   "bits_lost": 0,
+   "bits_expected": 1130496
+  },
+  "QAM": {
+   "attempted": 0.0005289312653940887,
+   "whole": 0.0024944594241642086,
+   "bits_lost": 8192,
+   "bits_expected": 4165632
+  },
+  "FSK": {
+   "attempted": 0.0,
+   "whole": 0.0,
+   "bits_lost": 0,
+   "bits_expected": 73728
+  },
+  "OFDM": {
+   "attempted": 0.0,
+   "whole": 0.0,
+   "bits_lost": 0,
+   "bits_expected": 1744896
+  }
+ },
+ "ber_by_label": {
+  "BPSK": {
+   "attempted": 0.00010791723278985508,
+   "whole": 0.00010791723278985508,
+   "frames": 276,
+   "bits_expected": 1130496
+  },
+  "16QAM": {
+   "attempted": 0.0005289312653940887,
+   "whole": 0.0024944594241642086,
+   "frames": 1015,
+   "bits_expected": 4165632
+  },
+  "GFSK": {
+   "attempted": 0.0,
+   "whole": 0.0,
+   "frames": 72,
+   "bits_expected": 73728
+  },
+  "OFDM": {
+   "attempted": 0.0,
+   "whole": 0.0,
+   "frames": 426,
+   "bits_expected": 1744896
+  }
+ }
+}

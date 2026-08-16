@@ -2124,6 +2124,18 @@ struct DecodeMetricsSnapshot {
   std::deque<float> inst_ber_history;   // last N poll-interval BERs
   std::vector<DecodeMarker> recent;     // decode markers for the detection panel
   std::string last_payload_text;        // footer ticker
+  // AMC classifier stage (present when the daemon runs the 3-model classifier)
+  struct ClsModel {
+    std::string name;
+    double acc = -1.0;                  // -1 = no truth reference in this run
+    double avg_ms = -1.0;
+    uint64_t n = 0;
+  };
+  std::vector<ClsModel> cls_models;     // vtcnn2, resnet1d, tprime
+  std::string cls_gate;                 // which model routes the decoder
+  double ber_whole = -1.0;              // lost bits count 100% wrong
+  uint64_t bits_lost = 0;
+  uint64_t bits_expected = 0;
 };
 
 std::mutex& decode_metrics_mutex() {
@@ -2257,6 +2269,43 @@ void poll_decode_metrics() {
     const auto q2 = text.find('"', q1 + 1);
     if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1) {
       next.last_payload_text = text.substr(q1 + 1, q2 - q1 - 1);
+    }
+  }
+  // Whole-run BER (truth-scored daemon runs): bits never decoded count 100%.
+  json_find_double(text, "ber_whole", next.ber_whole);
+  json_find_u64(text, "bits_lost", next.bits_lost);
+  json_find_u64(text, "bits_expected", next.bits_expected);
+  // classifier: {"gate": "...", "models": {"vtcnn2": {"n":..,"acc":..,"avg_ms":..,...}}}
+  const auto cls_pos = text.find("\"classifier\"");
+  if (cls_pos != std::string::npos) {
+    const auto gate_pos = text.find("\"gate\"", cls_pos);
+    if (gate_pos != std::string::npos) {
+      const auto q1 = text.find('"', text.find(':', gate_pos));
+      const auto q2 = text.find('"', q1 + 1);
+      if (q1 != std::string::npos && q2 != std::string::npos) {
+        next.cls_gate = text.substr(q1 + 1, q2 - q1 - 1);
+      }
+    }
+    // search from "models" so the gate VALUE (e.g. "tprime") is not matched
+    const auto models_pos = text.find("\"models\"", cls_pos);
+    if (models_pos != std::string::npos) {
+      for (const char* name : {"vtcnn2", "resnet1d", "tprime"}) {
+        const auto mpos = text.find(std::string("\"") + name + "\"", models_pos);
+        if (mpos == std::string::npos) continue;
+        const auto open = text.find('{', mpos);
+        if (open == std::string::npos) continue;
+        // n / acc / avg_ms precede the nested preds/confusion dicts, so the
+        // substring up to the first '}' contains them all
+        const auto close = text.find('}', open);
+        if (close == std::string::npos) continue;
+        const std::string item = text.substr(open, close - open + 1);
+        DecodeMetricsSnapshot::ClsModel m;
+        m.name = name;
+        json_find_u64(item, "n", m.n);
+        json_find_double(item, "acc", m.acc);
+        json_find_double(item, "avg_ms", m.avg_ms);
+        next.cls_models.push_back(std::move(m));
+      }
     }
   }
   if (next.bits > prev_bits) {
@@ -2431,21 +2480,48 @@ void render_visualization_ui_overlay() {
                          line);
       sidebar_text_y += 18.0f;
 
-      // Aggregate PN9 BER: the demo's headline number, color-coded.
+      // Aggregate PN9 BER: the demo's headline number, color-coded. When the
+      // daemon runs truth-scored, this is the ATTEMPTED-decode BER and a
+      // second WHOLE line charges 100% for every bit never decoded.
+      const bool have_whole = dm.bits_expected > 0;
+      const char* ber_label = have_whole ? "BER att" : "PN9 BER";
       ImU32 ber_color = accent_green;
       char ber_line[64];
       if (dm.ber < 0.0 || dm.bits == 0) {
-        std::snprintf(ber_line, sizeof(ber_line), "PN9 BER  --");
+        std::snprintf(ber_line, sizeof(ber_line), "%s  --", ber_label);
         ber_color = panel_muted;
       } else if (dm.errors == 0) {
-        std::snprintf(ber_line, sizeof(ber_line), "PN9 BER  0.0");
+        std::snprintf(ber_line, sizeof(ber_line), "%s  0.0", ber_label);
       } else {
-        std::snprintf(ber_line, sizeof(ber_line), "PN9 BER  %.2e", dm.ber);
+        std::snprintf(ber_line, sizeof(ber_line), "%s  %.2e", ber_label, dm.ber);
         ber_color = dm.ber < 1e-3 ? IM_COL32(255, 212, 89, 255) : accent_orange;
       }
       draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.6f,
                          ImVec2(x0, sidebar_text_y), ber_color, ber_line);
       sidebar_text_y += 28.0f;
+
+      if (have_whole) {
+        char whole_line[96];
+        ImU32 whole_color = accent_green;
+        if (dm.ber_whole < 0.0) {
+          std::snprintf(whole_line, sizeof(whole_line), "BER whole  --");
+          whole_color = panel_muted;
+        } else if (dm.ber_whole == 0.0) {
+          std::snprintf(whole_line, sizeof(whole_line), "BER whole  0.0");
+        } else {
+          std::snprintf(whole_line, sizeof(whole_line), "BER whole  %.2e", dm.ber_whole);
+          whole_color = dm.ber_whole < 1e-3 ? IM_COL32(255, 212, 89, 255) : accent_orange;
+        }
+        draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.25f,
+                           ImVec2(x0, sidebar_text_y), whole_color, whole_line);
+        sidebar_text_y += 20.0f;
+        if (dm.bits_lost > 0) {
+          std::snprintf(whole_line, sizeof(whole_line), "%.2f Mbit lost of %.2f expected",
+                        dm.bits_lost / 1e6, dm.bits_expected / 1e6);
+          draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_muted, whole_line);
+          sidebar_text_y += 16.0f;
+        }
+      }
 
       const double mbit = dm.bits / 1e6;
       const double thr = dm.uptime_s > 0.0 ? dm.bits / dm.uptime_s / 1e6 : 0.0;
@@ -2479,6 +2555,44 @@ void render_visualization_ui_overlay() {
         }
         draw_list->AddText(ImVec2(x0 + 4.0f, sidebar_text_y + 2.0f), panel_muted, "inst BER");
         sidebar_text_y = base_y + 8.0f;
+      }
+
+      // ---- CLASSIFIER block: the 3 AMC models side by side; the gate model
+      // (marked >) routes the decoder (NOISE -> skip, family -> branch).
+      // Rendered BEFORE the per-mod bars so the model rows never fall off
+      // the bottom of the sidebar. ----
+      if (!dm.cls_models.empty()) {
+        sidebar_text_y += 6.0f;
+        draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.25f,
+                           ImVec2(x0, sidebar_text_y), accent_blue, "CLASSIFIER");
+        draw_list->AddText(ImVec2(x0 + 108.0f, sidebar_text_y + 3.0f), panel_muted,
+                           "4 family + noise");
+        sidebar_text_y += 22.0f;
+        for (const auto& m : dm.cls_models) {
+          const bool is_gate = m.name == dm.cls_gate;
+          const char* disp = m.name == "vtcnn2" ? "VT-CNN2"
+                             : (m.name == "resnet1d" ? "ResNet1D" : "T-PRIME");
+          std::snprintf(line, sizeof(line), "%s%s", is_gate ? "> " : "  ", disp);
+          draw_list->AddText(ImVec2(x0, sidebar_text_y),
+                             is_gate ? panel_text : panel_muted, line);
+          ImU32 acc_color = panel_muted;
+          if (m.acc < 0.0) {
+            std::snprintf(line, sizeof(line), "--");
+          } else {
+            std::snprintf(line, sizeof(line), "%.1f%%", 100.0 * m.acc);
+            acc_color = m.acc >= 0.95 ? accent_green
+                        : (m.acc >= 0.80 ? IM_COL32(255, 212, 89, 255) : accent_orange);
+          }
+          draw_list->AddText(ImVec2(x0 + 92.0f, sidebar_text_y), acc_color, line);
+          if (m.avg_ms >= 0.0) {
+            std::snprintf(line, sizeof(line), "%.1f ms", m.avg_ms);
+            draw_list->AddText(ImVec2(x0 + 150.0f, sidebar_text_y), panel_muted, line);
+          }
+          sidebar_text_y += 17.0f;
+        }
+        draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_muted,
+                           "'>' gates the decoder; acc vs TX truth");
+        sidebar_text_y += 18.0f;
       }
 
       // Per-modulation frame counts as mini bars.

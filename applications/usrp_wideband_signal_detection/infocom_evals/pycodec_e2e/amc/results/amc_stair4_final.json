@@ -1,0 +1,362 @@
+{
+ "snippets_seen": 30,
+ "snippets_with_frames": 15,
+ "frames_decoded": 714,
+ "frames_crc_ok": 372,
+ "pn9_bits_compared": 2411520,
+ "pn9_bit_errors": 25540,
+ "pn9_ber": 0.01059083067940552,
+ "ber_attempted": 0.01059083067940552,
+ "frames_by_modulation": {
+  "BPSK": 104,
+  "4FSK": 167,
+  "16QAM": 201,
+  "OFDM-QPSK": 242
+ },
+ "uptime_s": 3.1,
+ "recent_decodes": [
+  {
+   "f_hz": -19955863.636363637,
+   "mod": "4FSK",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -19955863.636363637,
+   "mod": "4FSK",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -19955863.636363637,
+   "mod": "4FSK",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -19955863.636363637,
+   "mod": "4FSK",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -19955863.636363637,
+   "mod": "4FSK",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -19955863.636363637,
+   "mod": "4FSK",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -19955863.636363637,
+   "mod": "4FSK",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -19955863.636363637,
+   "mod": "4FSK",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": -19955863.636363637,
+   "mod": "4FSK",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": 20287636.363636363,
+   "mod": "16QAM",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": 20287636.363636363,
+   "mod": "16QAM",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": 20287636.363636363,
+   "mod": "16QAM",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": 20287636.363636363,
+   "mod": "16QAM",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": 20287636.363636363,
+   "mod": "16QAM",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": 20287636.363636363,
+   "mod": "16QAM",
+   "crc_ok": false,
+   "age_s": 0.0
+  },
+  {
+   "f_hz": 20287636.363636363,
+   "mod": "16QAM",
+   "crc_ok": false,
+   "age_s": 0.0
+  }
+ ],
+ "last_payload_text": "",
+ "classifier": {
+  "gate": "tprime",
+  "models": {
+   "vtcnn2": {
+    "n": 29,
+    "acc": 0.4827586206896552,
+    "avg_ms": 0.8,
+    "preds": {
+     "PSK": 4,
+     "FSK": 5,
+     "OFDM": 4,
+     "NOISE": 14,
+     "QAM": 2
+    },
+    "confusion": {
+     "PSK>PSK": 4,
+     "FSK>FSK": 5,
+     "QAM>OFDM": 1,
+     "OFDM>NOISE": 5,
+     "QAM>QAM": 2,
+     "QAM>NOISE": 5,
+     "OFDM>OFDM": 3,
+     "PSK>NOISE": 4
+    }
+   },
+   "resnet1d": {
+    "n": 29,
+    "acc": 0.7586206896551724,
+    "avg_ms": 1.2,
+    "preds": {
+     "PSK": 11,
+     "FSK": 3,
+     "QAM": 7,
+     "OFDM": 4,
+     "NOISE": 4
+    },
+    "confusion": {
+     "PSK>PSK": 8,
+     "FSK>FSK": 3,
+     "QAM>QAM": 7,
+     "OFDM>OFDM": 4,
+     "OFDM>NOISE": 4,
+     "FSK>PSK": 2,
+     "QAM>PSK": 1
+    }
+   },
+   "tprime": {
+    "n": 29,
+    "acc": 0.4827586206896552,
+    "avg_ms": 1.08,
+    "preds": {
+     "PSK": 7,
+     "FSK": 5,
+     "QAM": 1,
+     "NOISE": 12,
+     "OFDM": 4
+    },
+    "confusion": {
+     "PSK>PSK": 4,
+     "FSK>FSK": 5,
+     "QAM>QAM": 1,
+     "OFDM>NOISE": 4,
+     "QAM>PSK": 3,
+     "OFDM>OFDM": 4,
+     "QAM>NOISE": 4,
+     "PSK>NOISE": 4
+    }
+   }
+  }
+ },
+ "bits_expected": 9375744,
+ "bits_lost": 6964224,
+ "frames_expected": 2478,
+ "ber_whole": 0.7455156625436872,
+ "ber_by_family": {
+  "PSK": {
+   "attempted": 0.0,
+   "whole": 0.6729559748427673,
+   "bits_lost": 876544,
+   "bits_expected": 1302528
+  },
+  "FSK": {
+   "attempted": 0.007344685628742515,
+   "whole": 0.34216889880952384,
+   "bits_lost": 87040,
+   "bits_expected": 258048
+  },
+  "QAM": {
+   "attempted": 0.004982412157960199,
+   "whole": 0.8290610810630342,
+   "bits_lost": 3969024,
+   "bits_expected": 4792320
+  },
+  "OFDM": {
+   "attempted": 0.02036052104855372,
+   "whole": 0.6787632060890921,
+   "bits_lost": 2031616,
+   "bits_expected": 3022848
+  }
+ },
+ "ber_by_label": {
+  "BPSK@30dB": {
+   "attempted": 0.0,
+   "whole": 0.018867924528301886,
+   "frames": 52,
+   "bits_expected": 217088
+  },
+  "4FSK@30dB": {
+   "attempted": 0.0,
+   "whole": 0.0,
+   "frames": 42,
+   "bits_expected": 43008
+  },
+  "16QAM@30dB": {
+   "attempted": 0.0,
+   "whole": 0.005128205128205128,
+   "frames": 194,
+   "bits_expected": 798720
+  },
+  "OFDM@30dB": {
+   "attempted": 0.0,
+   "whole": 0.8943089430894309,
+   "frames": 13,
+   "bits_expected": 503808
+  },
+  "BPSK@20dB": {
+   "attempted": 0.0,
+   "whole": 0.018867924528301886,
+   "frames": 52,
+   "bits_expected": 217088
+  },
+  "4FSK@20dB": {
+   "attempted": 0.0011909298780487805,
+   "whole": 0.024972098214285716,
+   "frames": 41,
+   "bits_expected": 43008
+  },
+  "16QAM@20dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 798720
+  },
+  "OFDM@20dB": {
+   "attempted": 0.0009725601946721312,
+   "whole": 0.00909473450203252,
+   "frames": 122,
+   "bits_expected": 503808
+  },
+  "BPSK@15dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 217088
+  },
+  "4FSK@15dB": {
+   "attempted": 0.011858258928571428,
+   "whole": 0.011858258928571428,
+   "frames": 42,
+   "bits_expected": 43008
+  },
+  "16QAM@15dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 798720
+  },
+  "OFDM@15dB": {
+   "attempted": 0.0449401285046729,
+   "whole": 0.16917555894308944,
+   "frames": 107,
+   "bits_expected": 503808
+  },
+  "BPSK@12dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 217088
+  },
+  "4FSK@12dB": {
+   "attempted": 0.016183035714285716,
+   "whole": 0.016183035714285716,
+   "frames": 42,
+   "bits_expected": 43008
+  },
+  "16QAM@12dB": {
+   "attempted": 0.14306640625,
+   "whole": 0.96923828125,
+   "frames": 7,
+   "bits_expected": 798720
+  },
+  "OFDM@12dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 503808
+  },
+  "BPSK@9dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 217088
+  },
+  "4FSK@9dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 43008
+  },
+  "16QAM@9dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 798720
+  },
+  "OFDM@9dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 503808
+  },
+  "BPSK@6dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 217088
+  },
+  "4FSK@6dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 43008
+  },
+  "16QAM@6dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 798720
+  },
+  "OFDM@6dB": {
+   "attempted": null,
+   "whole": 1.0,
+   "frames": 0,
+   "bits_expected": 503808
+  }
+ }
+}
