@@ -264,3 +264,74 @@ blind rate estimator's search cap excluded the true symbol rate.
 Dashboard: sidebar now shows BER att / BER whole and a CLASSIFIER block
 (3 models, live accuracy + latency, '>' marks the gate). Capture:
 `img/hud_dashboard_amc.png`.
+
+## Addendum 7 — validation: decode + BER are downstream of classification (2026-08-17)
+
+No OTA TX is available, so the ordering claim is validated **causally**: the
+same snippet set (4-class composite, 24 placements) decoded three times with
+only the gate changed. If classification truly drives the decoder, a perfect
+gate must match-or-beat the blind cascade, and a weak gate must lose bits
+exactly where it misroutes — and only the whole-BER metric should see it.
+
+| run | gate | frames | CRC-ok | BER attempted | BER whole | bits lost |
+|---|---|---|---|---|---|---|
+| A | none (blind cascade) | 1911 | 1906 | 3.27e-04 | 1.77e-03 | 10,240 |
+| B | **T-PRIME (100% acc)** | **1913** | **1908** | 3.27e-04 | **1.48e-03** | **8,192** |
+| C | VT-CNN2 (59% acc) | 1275 | 1272 | 4.72e-04 | **3.46e-01** | 2,457,600 |
+
+Reading:
+
+- **B vs A**: classifier-informed routing decodes 2 more frames than the
+  envelope-heuristic cascade (one band the heuristic tried in the wrong
+  order) — informing the decoder costs nothing when the classifier is right,
+  and the ~1 ms/band classification replaces the cascade's trial decoding.
+- **C vs B is the causal proof**: with the weak gate, VT-CNN2 sends 7 PSK
+  and 4 QAM bands to the OFDM branch, and those bands decode **zero frames**
+  (no fallback by design). Per-family whole BER: PSK 0.71, QAM 0.39,
+  FSK 0.22 — while OFDM, which VT-CNN2 classifies correctly 6/6, stays at
+  **0.0**. The damage lands precisely where the misclassifications are.
+- **The metric pair works as designed**: run C's *attempted* BER barely
+  moves (4.72e-04 — the frames that do decode are fine); the 2.46 Mbit
+  routing loss is visible **only** in whole BER (3.46e-01). A system scored
+  on attempted BER alone would look healthy while dropping a third of its
+  traffic.
+
+Per-band ordering is also visible directly in the daemon log — each band
+line encodes classify → route → decode left to right:
+
+```
+bands[-60.1MHz/amc-lin/rs30.72[QAM=]:318]   ← classified QAM (= matches truth),
+                                              routed to the linear branch,
+                                              318 frames decoded
+bands[+0.0MHz/amc:skip[NOISE=]:0]           ← classified NOISE: decode withheld
+bands[-60.0MHz/amc-ofdm/fs61.44[OFDM~sync]:0] ← composer sync burst (excluded
+                                                from accuracy scoring)
+```
+
+Raw metrics: `amc/results/amc_ab_blind.json`, `amc/results/amc_4class_final.json`,
+`amc/results/amc_ab_vtcnn2.json`.
+
+### Dashboard walkthrough
+
+![AMC dashboard: classifier block, dual BER, decode markers, payload ticker](img/hud_dashboard_amc.png)
+
+Live capture (`img/hud_dashboard_amc.png`, headless render-buffer screenshot,
+X410 streaming 491.52 Msps into the detector while the decode daemon swept
+the 4-class snippets):
+
+- **Detected Regions of Interest** (bottom-left panel): detector output with
+  green **decode markers** — triangle + dropline labeled with the decoded
+  modulation (here OFDM-QPSK) at the band's frequency; green = CRC-ok,
+  orange = CRC-fail.
+- **LIVE DECODE** (sidebar): frames + CRC%, then the two BER numbers —
+  **BER att 3.27e-04** (decoded frames only) above **BER whole 1.48e-03**
+  with the lost-bit budget spelled out ("0.01 Mbit lost of 7.11 expected").
+- **CLASSIFIER** (sidebar): the three models with live accuracy vs TX truth
+  and per-band inference latency; `>` marks the gate that routes the
+  decoder — `VT-CNN2 59.4% / ResNet1D 93.8% / > T-PRIME 100.0%` at
+  ~1 ms/band on the GB10.
+- **Per-modulation bars**: decoded frame counts per modulation identity
+  (BPSK/16QAM/4FSK/OFDM-QPSK).
+- **Footer**: instantaneous-BER strip (left) and the **LAST DECODED
+  PAYLOAD** ticker (right) showing the GRCON text recovered through
+  detect → classify → route → decode with zero side information.
