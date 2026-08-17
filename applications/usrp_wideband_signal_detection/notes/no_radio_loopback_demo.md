@@ -67,6 +67,35 @@ Expected: the waterfall shows the composite's actual slot structure (much
 prettier than ambient spectrum), detection boxes on every burst, decode
 markers + CLASSIFIER panel + dual BER live, GRCON text on the ticker.
 
+## Dashboard demo controls (gate / SNR / detector from the UI)
+
+The windowed dashboard now has a **DEMO CONTROLS** panel (above Display
+Controls; appears when the config sets `visualization.renderer.demo_control_json`,
+wired in the 3 demo configs to `/workspace/spectrograms/demo_control.json`
+= host `/tmp/usrp_spectrograms/demo_control.json`). Selections are written
+atomically to that JSON and honored by two watchers:
+
+- **Gate** (VT-CNN2 / ResNet1D / T-PRIME): `rt_decode_daemon.py` applies it
+  live within one poll (~0.5 s); the CLASSIFIER panel's `>` marker follows.
+  Validated offline 2026-08-17 (gate flip mid-sweep).
+- **SNR** (Clean / 30 / 20 / 15 / 12 / 9 / 6 / Stair): run
+  `sudo python3 infocom_evals/pycodec_e2e/demo_conductor.py` on the host —
+  it switches which pcap tcpreplay loops (~1 s gap). Per-SNR pcaps are
+  pregenerated (`snr_single_<db>db.pcap`, noise floor referenced to the
+  30 dB step so the detector floor holds across switches; "Clean" = the
+  noise-free 4-class composite, so expect the dynamic floor to dip and
+  re-learn for ~1 s on that transition). Conductor dry-run validated
+  (`--dry`); the wire step needs the loopback cable.
+- **Detector** (CoherentPower / CUDA-DINO): the conductor restarts the app
+  with the other config (~15 s blink; selections persist — the panel
+  re-reads the control file on startup). NOTE: cuda_dino needs its
+  TorchScript weights present in the container; verify before demoing that
+  button, and check the conductor's XAUTHORITY matches the desktop session
+  for the windowed relaunch.
+
+Demo-day order: app (windowed, on the desktop session) → conductor →
+daemon → click things.
+
 ## Notes / gotchas
 
 - `replay_rx_to_buff.py --live` (raw socket) cannot sustain 245.76 Msps —

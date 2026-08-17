@@ -2326,6 +2326,96 @@ DecodeMetricsSnapshot decode_metrics_snapshot() {
   return decode_metrics_storage();
 }
 
+// ---- Demo controls: dashboard-side selections written to a sidecar JSON.
+// Consumers: rt_decode_daemon.py (gate model, applied live) and
+// demo_conductor.py (SNR -> which replay pcap loops; detector -> app
+// restart with the other pipeline config). ----
+struct DemoControlState {
+  int gate = 2;       // index into kDemoGateNames (default tprime)
+  int snr = 0;        // index into kDemoSnrNames (default clean composite)
+  int detector = 0;   // index into kDemoDetectorNames
+  uint64_t seq = 0;
+  bool loaded = false;
+};
+static const char* const kDemoGateNames[] = {"vtcnn2", "resnet1d", "tprime"};
+static const char* const kDemoGateLabels[] = {"VT-CNN2", "ResNet1D", "T-PRIME"};
+static const char* const kDemoSnrNames[] = {"clean", "30", "20", "15", "12", "9", "6",
+                                            "staircase"};
+static const char* const kDemoSnrLabels[] = {"Clean", "30", "20", "15", "12", "9", "6",
+                                             "Stair"};
+static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino"};
+static const char* const kDemoDetectorLabels[] = {"CoherentPower", "CUDA-DINO"};
+
+std::mutex& demo_control_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+DemoControlState& demo_control_storage() {
+  static DemoControlState s;
+  return s;
+}
+
+std::string& demo_control_path_storage() {
+  static std::string p;
+  return p;
+}
+
+void set_visualization_demo_control_path(const std::string& path) {
+  std::lock_guard<std::mutex> lock(demo_control_mutex());
+  demo_control_path_storage() = path;
+}
+
+bool json_find_string(const std::string& text, const std::string& key, std::string& out) {
+  const auto pos = text.find("\"" + key + "\"");
+  if (pos == std::string::npos) return false;
+  const auto q1 = text.find('"', text.find(':', pos));
+  if (q1 == std::string::npos) return false;
+  const auto q2 = text.find('"', q1 + 1);
+  if (q2 == std::string::npos) return false;
+  out = text.substr(q1 + 1, q2 - q1 - 1);
+  return true;
+}
+
+template <size_t N>
+int demo_option_index(const char* const (&names)[N], const std::string& value, int fallback) {
+  for (size_t i = 0; i < N; ++i) {
+    if (value == names[i]) return static_cast<int>(i);
+  }
+  return fallback;
+}
+
+// Re-adopt selections from an existing control file so an app restart (e.g.
+// the detector switch itself) does not silently reset the demo state.
+void demo_control_load_once(DemoControlState& st, const std::string& path) {
+  if (st.loaded) return;
+  st.loaded = true;
+  std::ifstream in(path);
+  if (!in.is_open()) return;
+  std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::string v;
+  if (json_find_string(text, "gate", v)) st.gate = demo_option_index(kDemoGateNames, v, st.gate);
+  if (json_find_string(text, "snr", v)) st.snr = demo_option_index(kDemoSnrNames, v, st.snr);
+  if (json_find_string(text, "detector", v)) {
+    st.detector = demo_option_index(kDemoDetectorNames, v, st.detector);
+  }
+  json_find_u64(text, "seq", st.seq);
+}
+
+void demo_control_write(const DemoControlState& st, const std::string& path) {
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream out(tmp);
+    if (!out.is_open()) return;
+    out << "{\n \"gate\": \"" << kDemoGateNames[st.gate] << "\",\n"
+        << " \"snr\": \"" << kDemoSnrNames[st.snr] << "\",\n"
+        << " \"detector\": \"" << kDemoDetectorNames[st.detector] << "\",\n"
+        << " \"seq\": " << st.seq << "\n}\n";
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);  // atomic for the pollers
+}
+
 void update_visualization_ui_state(const VisualizationUiState& state) {
   std::lock_guard<std::mutex> lock(visualization_ui_state_mutex());
   visualization_ui_state_storage() = state;
@@ -2422,6 +2512,58 @@ void render_visualization_ui_overlay() {
   }
   ImGui::PopStyleVar(2);
   ImGui::End();
+
+  // ---- DEMO CONTROLS: gate model / SNR pcap / detector selections, written
+  // to the control sidecar for the daemon + replay conductor. Only rendered
+  // when a control path is configured (demo_control_json param). ----
+  {
+    std::string ctl_path;
+    {
+      std::lock_guard<std::mutex> lock(demo_control_mutex());
+      ctl_path = demo_control_path_storage();
+    }
+    if (!ctl_path.empty()) {
+      std::lock_guard<std::mutex> lock(demo_control_mutex());
+      auto& st = demo_control_storage();
+      demo_control_load_once(st, ctl_path);
+      ImGui::SetNextWindowBgAlpha(0.82f);
+      ImGui::SetNextWindowPos(ImVec2(display_size.x * 0.5f, display_size.y - 86.0f),
+                              ImGuiCond_Always,
+                              ImVec2(0.5f, 1.0f));
+      ImGui::Begin("Demo Controls",
+                   nullptr,
+                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
+                       ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                       ImGuiWindowFlags_NoSavedSettings);
+      ImGui::SetWindowFontScale(1.3f);
+      ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 4.0f));
+      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 6.0f));
+      bool changed = false;
+      ImGui::TextUnformatted("Gate");
+      for (int i = 0; i < 3; ++i) {
+        ImGui::SameLine();
+        changed |= ImGui::RadioButton(kDemoGateLabels[i], &st.gate, i);
+      }
+      ImGui::TextUnformatted("SNR ");
+      for (int i = 0; i < 8; ++i) {
+        ImGui::SameLine();
+        changed |= ImGui::RadioButton(kDemoSnrLabels[i], &st.snr, i);
+      }
+      ImGui::TextUnformatted("Det ");
+      for (int i = 0; i < 2; ++i) {
+        ImGui::SameLine();
+        changed |= ImGui::RadioButton(kDemoDetectorLabels[i], &st.detector, i);
+      }
+      ImGui::SameLine();
+      ImGui::TextDisabled("(detector switch restarts the app)");
+      if (changed) {
+        st.seq += 1;
+        demo_control_write(st, ctl_path);
+      }
+      ImGui::PopStyleVar(2);
+      ImGui::End();
+    }
+  }
 
   const ImVec2 sidebar_min = rect_min(state.sidebar_rect);
   draw_list->AddText(ImVec2(sidebar_min.x + 16.0f, sidebar_min.y + 16.0f), panel_text, "Channel Info");
@@ -2897,6 +3039,13 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
              "LIVE DECODE panel (frames, CRC, PN9 BER, per-modulation counts, BER sparkline) "
              "renders in the sidebar. Empty disables the panel.",
              std::string(""));
+  spec.param(demo_control_json_,
+             "demo_control_json",
+             "Demo Control JSON",
+             "Path the DEMO CONTROLS panel writes its selections to (gate model / SNR pcap / "
+             "detector). rt_decode_daemon.py applies the gate live; demo_conductor.py switches "
+             "the replay pcap and restarts the app on detector change. Empty hides the panel.",
+             std::string(""));
   spec.param(center_frequency_hz_, "center_frequency_hz", "Center Frequency", "Center frequency for display in Hz.", 0.0);
   spec.param(span_hz_, "span_hz", "Span Hz", "Frequency span shown on calibrated plot axes in Hz.", 0.0);
   spec.param(fft_size_, "fft_size", "FFT Size", "FFT size shown in analyzer readouts.", 20480);
@@ -2954,6 +3103,10 @@ void SpectrogramToHolovizOp::initialize() {
   if (!decode_metrics_json_.get().empty()) {
     set_visualization_decode_metrics_path(decode_metrics_json_.get());
     HOLOSCAN_LOG_INFO("LIVE DECODE panel enabled: watching {}", decode_metrics_json_.get());
+  }
+  if (!demo_control_json_.get().empty()) {
+    set_visualization_demo_control_path(demo_control_json_.get());
+    HOLOSCAN_LOG_INFO("DEMO CONTROLS panel enabled: writing {}", demo_control_json_.get());
   }
   render_stop_ = false;
   render_work_pending_ = false;

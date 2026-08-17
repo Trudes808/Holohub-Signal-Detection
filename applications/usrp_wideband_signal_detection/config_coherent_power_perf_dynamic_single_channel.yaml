@@ -133,6 +133,7 @@ visualization:
     timing_summary_enable: true
     timing_summary_every_n: 128
     decode_metrics_json: "/workspace/spectrograms/rt_metrics.json"   # LIVE DECODE sidebar panel (written by rt_decode_daemon.py --metrics-out)
+    demo_control_json: "/workspace/spectrograms/demo_control.json"   # DEMO CONTROLS panel -> daemon gate + replay conductor
     channel_filter: 0
     tensor_name: "spectrogram"
     demo_title: "Enabling RF AI for Ultra Wideband Real Time Applications"

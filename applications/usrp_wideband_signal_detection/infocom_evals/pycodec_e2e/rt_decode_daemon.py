@@ -385,6 +385,10 @@ def main():
     ap.add_argument("--amc-device", default=None, help="cuda|cpu (default: auto)")
     ap.add_argument("--gate", default="tprime", choices=["tprime", "resnet1d", "vtcnn2"],
                     help="which model's prediction routes the decoder")
+    ap.add_argument("--control-json", default=None,
+                    help="demo_control.json written by the dashboard's DEMO CONTROLS "
+                         "panel; the 'gate' field is applied live "
+                         "(default: demo_control.json next to --metrics-out)")
     ap.add_argument("--truth-meta", default=None,
                     help="composite TX .sigmf-meta for classification accuracy + whole BER")
     ap.add_argument("--truth-lib", default=os.path.join(PYCODEC_ROOT,
@@ -392,6 +396,8 @@ def main():
                     help="waveform library root (entry jsons) for expected-bits math")
     args = ap.parse_args()
     metrics_path = args.metrics_out or os.path.join(args.snips, "rt_metrics.json")
+    control_path = args.control_json or os.path.join(os.path.dirname(metrics_path),
+                                                     "demo_control.json")
 
     truth = TruthScorer(args.truth_meta, args.truth_lib) if args.truth_meta else None
     if truth:
@@ -405,7 +411,29 @@ def main():
     last_new = time.time()
     print(f"rt_decode_daemon: watching {args.snips} "
           f"({'AMC-routed' if clf else 'blind cascade'}, profile {PROFILE})", flush=True)
+    control_mtime = 0.0
     while True:
+        # live gate switch from the dashboard's DEMO CONTROLS panel
+        if clf is not None:
+            try:
+                mt = os.path.getmtime(control_path)
+                if mt != control_mtime:
+                    control_mtime = mt
+                    gate = json.load(open(control_path)).get("gate")
+                    if gate in clf.models and gate != clf.gate:
+                        clf.gate = gate
+                        metrics.gate = gate
+                        print(f"[{time.strftime('%H:%M:%S')}] === DEMO CONTROL: gate -> {gate} ===",
+                              flush=True)
+                        try:  # reflect the '>' marker immediately, before new snips
+                            tmp = metrics_path + ".tmp"
+                            with open(tmp, "w") as f:
+                                json.dump(metrics.as_dict(), f, indent=1)
+                            os.replace(tmp, metrics_path)
+                        except OSError:
+                            pass
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
         new_work = False
         for mp in sorted(glob.glob(os.path.join(args.snips, "*.sigmf-meta"))):
             try:

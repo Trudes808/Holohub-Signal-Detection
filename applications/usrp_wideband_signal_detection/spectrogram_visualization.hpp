@@ -173,6 +173,7 @@ class SpectrogramToHolovizOp : public Operator {
   Parameter<std::string> detector_label_;
   Parameter<std::string> demo_title_;
   Parameter<std::string> decode_metrics_json_;
+  Parameter<std::string> demo_control_json_;
   Parameter<std::string> demo_subtitle_;
   Parameter<double> center_frequency_hz_;
   Parameter<double> span_hz_;
