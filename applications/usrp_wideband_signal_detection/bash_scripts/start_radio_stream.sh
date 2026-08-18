@@ -35,6 +35,11 @@ DURATION=${DURATION:-}                   # empty = stream until Ctrl-C
 
 cd "${SCRIPT_DIR}/../../usrp_freq_detection"
 
+# UHD's python bindings install to /usr/local site-packages, which root's
+# python3 does not search — without this, the sudo'd run_live_demo.sh path
+# dies with "No module named 'uhd'" while a user shell works fine.
+export PYTHONPATH="/usr/local/lib/python3.12/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
+
 # shellcheck disable=SC2086  # word-splitting of the multi-value vars is intentional
 exec python3 rx_to_remote_udp.py \
   --args "addr=${CTRL_ADDR}" \
