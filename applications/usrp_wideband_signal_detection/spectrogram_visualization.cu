@@ -2341,8 +2341,6 @@ static const char* const kDemoGateNames[] = {"vtcnn2", "resnet1d", "tprime"};
 static const char* const kDemoGateLabels[] = {"VT-CNN2", "ResNet1D", "T-PRIME"};
 static const char* const kDemoSnrNames[] = {"clean", "30", "20", "15", "12", "9", "6",
                                             "staircase"};
-static const char* const kDemoSnrLabels[] = {"Clean", "30", "20", "15", "12", "9", "6",
-                                             "Stair"};
 static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino"};
 static const char* const kDemoDetectorLabels[] = {"CoherentPower", "CUDA-DINO"};
 
@@ -2526,36 +2524,27 @@ void render_visualization_ui_overlay() {
       std::lock_guard<std::mutex> lock(demo_control_mutex());
       auto& st = demo_control_storage();
       demo_control_load_once(st, ctl_path);
+      // Compact dropdowns, parked top-left inside the banner (pure chrome):
+      // anywhere near the bottom collides with the detection panel and its
+      // frequency axis labels.
       ImGui::SetNextWindowBgAlpha(0.82f);
-      ImGui::SetNextWindowPos(ImVec2(display_size.x * 0.5f, display_size.y - 86.0f),
-                              ImGuiCond_Always,
-                              ImVec2(0.5f, 1.0f));
+      ImGui::SetNextWindowPos(ImVec2(24.0f, 16.0f), ImGuiCond_Always, ImVec2(0.0f, 0.0f));
       ImGui::Begin("Demo Controls",
                    nullptr,
                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
                        ImGuiWindowFlags_NoSavedSettings);
-      ImGui::SetWindowFontScale(1.3f);
-      ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 4.0f));
-      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 6.0f));
+      ImGui::SetWindowFontScale(1.2f);
+      ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 3.0f));
+      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 5.0f));
+      ImGui::PushItemWidth(170.0f);
       bool changed = false;
-      ImGui::TextUnformatted("Gate");
-      for (int i = 0; i < 3; ++i) {
-        ImGui::SameLine();
-        changed |= ImGui::RadioButton(kDemoGateLabels[i], &st.gate, i);
-      }
-      ImGui::TextUnformatted("SNR ");
-      for (int i = 0; i < 8; ++i) {
-        ImGui::SameLine();
-        changed |= ImGui::RadioButton(kDemoSnrLabels[i], &st.snr, i);
-      }
-      ImGui::TextUnformatted("Det ");
-      for (int i = 0; i < 2; ++i) {
-        ImGui::SameLine();
-        changed |= ImGui::RadioButton(kDemoDetectorLabels[i], &st.detector, i);
-      }
-      ImGui::SameLine();
-      ImGui::TextDisabled("(detector switch restarts the app)");
+      changed |= ImGui::Combo("Gate", &st.gate, kDemoGateLabels, 3);
+      static const char* const kSnrCombo[] = {"Clean", "30 dB", "20 dB", "15 dB",
+                                              "12 dB", "9 dB", "6 dB", "Staircase"};
+      changed |= ImGui::Combo("SNR", &st.snr, kSnrCombo, 8);
+      changed |= ImGui::Combo("Detector", &st.detector, kDemoDetectorLabels, 2);
+      ImGui::PopItemWidth();
       if (changed) {
         st.seq += 1;
         demo_control_write(st, ctl_path);

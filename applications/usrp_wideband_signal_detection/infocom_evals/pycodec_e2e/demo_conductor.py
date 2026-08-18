@@ -25,8 +25,7 @@ import subprocess
 import sys
 import time
 
-COMPOSITES = os.path.expanduser(
-    "~/Documents/holoscan_waveform_generation/composition/composites")
+COMPOSITES = "/home/genesys-dgx1/Documents/holoscan_waveform_generation/composition/composites"  # fixed: ~ expands to /root under sudo
 PCAP_BY_SNR = {
     "clean": "comprehensive_4class_py.pcap",
     "staircase": "snr_staircase_4class.pcap",
@@ -56,6 +55,13 @@ class Conductor:
         return None
 
     def set_snr(self, snr: str):
+        if self.args.no_replay:
+            if snr != self.snr:
+                print(f"[conductor] snr '{snr}' noted — replay disabled (--no-replay: "
+                      "live-radio mode; SNR selection drives the loopback pcaps only)",
+                      flush=True)
+            self.snr = snr
+            return
         pcap = PCAP_BY_SNR.get(snr)
         if pcap is None:
             print(f"[conductor] unknown snr '{snr}', ignoring", flush=True)
@@ -87,10 +93,15 @@ class Conductor:
         self.run_or_print(["docker", "exec", CONTAINER, "bash", "-lc",
                            "pkill -f '(^|/)usrp_wideband_signal_detection( |$)' || true"])
         time.sleep(2 if not self.args.dry else 0)
-        self.run_or_print(["docker", "exec", "-d", "-e", f"DISPLAY={self.args.display}",
-                           "-e", "XAUTHORITY=/tmp/.docker.xauth",
+        # mirror run_live_demo.sh's launch env: stream rate/center + XDG dir
+        self.run_or_print(["docker", "exec", "-d",
+                           "-e", f"DISPLAY={self.args.display}",
+                           "-e", f"USRP_SAMPLE_RATE_HZ={self.args.rate_hz:.0f}",
+                           "-e", f"USRP_CENTER_FREQ_HZ={self.args.center_hz:.0f}",
                            CONTAINER, "bash", "-lc",
-                           f"cd {BUILD_APP_DIR} && ./usrp_wideband_signal_detection {cfg} "
+                           "mkdir -p /tmp/xdg-runtime-root && chmod 700 /tmp/xdg-runtime-root && "
+                           "export XDG_RUNTIME_DIR=/tmp/xdg-runtime-root && "
+                           f"cd {BUILD_APP_DIR} && exec ./usrp_wideband_signal_detection {cfg} "
                            f"> /workspace/spectrograms/demo_app.log 2>&1"])
         self.detector = detector
 
@@ -124,8 +135,15 @@ def main():
     ap.add_argument("--pcap-dir", default=COMPOSITES)
     ap.add_argument("--iface", default="enP2p1s0f0np0")
     ap.add_argument("--display", default=os.environ.get("DISPLAY", ":1"))
+    ap.add_argument("--rate-hz", type=float, default=491.52e6,
+                    help="stream rate the relaunched app adopts "
+                         "(491.52e6 live radio, 245.76e6 loopback replay)")
+    ap.add_argument("--center-hz", type=float, default=2.4e9)
     ap.add_argument("--poll", type=float, default=0.5)
     ap.add_argument("--dry", action="store_true", help="print actions instead of executing")
+    ap.add_argument("--no-replay", action="store_true",
+                    help="live-radio mode: honor detector switches but ignore SNR "
+                         "selections (those drive the loopback replay pcaps)")
     args = ap.parse_args()
     c = Conductor(args)
     try:
