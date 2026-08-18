@@ -14,18 +14,18 @@
   "power_floor": {
     "path": "calibration/dino_coherence_per_freq_power_floor.npy",
     "quantile": 0.98,
-    "covered_median_db": -9.851771354675293,
-    "covered_min_db": -12.318690299987793,
-    "covered_max_db": 6.440782070159912
+    "covered_median_db": 15.980392456054688,
+    "covered_min_db": 15.578712463378906,
+    "covered_max_db": 16.33406639099121
   },
   "gate_threshold": {
     "path": "calibration/dino_coherence_per_freq_gate_threshold.npy",
     "quantile": 0.98,
     "covered_rows": 9656,
     "sentinel_value": 1.0,
-    "covered_median": 0.06171324849128723,
-    "covered_min": 0.03728257492184639,
-    "covered_max": 0.4785497784614563
+    "covered_median": 0.06811074912548065,
+    "covered_min": 0.060733404010534286,
+    "covered_max": 0.074395552277565
   },
-  "created": "2026-07-06T16:41:05"
+  "created": "2026-08-18T18:46:32"
 }

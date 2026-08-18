@@ -33,8 +33,14 @@ PCAP_BY_SNR = {
 }
 CONFIG_BY_DETECTOR = {
     "coherent_power": "config_signal_snipper_single_channel.yaml",
-    "cuda_dino": "config_cuda_dino_performance_single_channel.yaml",
+    "cuda_dino": "config_cuda_dino_performance_single_channel.yaml",  # live air (bench-era floors)
 }
+# Loopback replay runs at the composites' rate, which is what the DINO
+# coherence gate was calibrated against (2026-08-18) — use the calibrated
+# config there; per-frequency floors are span-specific so live air keeps
+# the base config.
+CUDA_DINO_CALIBRATED = ("/workspace/holohub/applications/usrp_wideband_signal_detection/"
+                        "calibration/config_cuda_dino_coherence_calibrated_single_channel.yaml")
 CONTAINER = os.environ.get("CONTAINER_NAME", "usrp_x410_sig_det_sat3737")
 BUILD_APP_DIR = ("/workspace/holohub/build/usrp_wideband_signal_detection/"
                  "applications/usrp_wideband_signal_detection")
@@ -90,6 +96,8 @@ class Conductor:
         if cfg is None:
             print(f"[conductor] unknown detector '{detector}', ignoring", flush=True)
             return
+        if detector == "cuda_dino" and not self.args.no_replay:
+            cfg = CUDA_DINO_CALIBRATED
         self.run_or_print(["docker", "exec", CONTAINER, "bash", "-lc",
                            "pkill -f '(^|/)usrp_wideband_signal_detection( |$)' || true"])
         time.sleep(2 if not self.args.dry else 0)
