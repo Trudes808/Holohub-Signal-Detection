@@ -120,6 +120,8 @@ logger:
 visualization:
   enable: true
   renderer:
+    decode_metrics_json: "/workspace/spectrograms/rt_metrics.json"   # LIVE DECODE sidebar panel
+    demo_control_json: "/workspace/spectrograms/demo_control.json"   # DEMO CONTROLS panel -> daemon gate + replay conductor
     num_channels: 1
     history_frames: 1
     output_height: 720
