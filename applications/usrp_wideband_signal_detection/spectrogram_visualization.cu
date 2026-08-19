@@ -2147,8 +2147,13 @@ struct DecodeMetricsSnapshot {
     double acc[4] = {-1.0, -1.0, -1.0, -1.0};   // PSK, QAM, FSK, OFDM
     double ber = -1.0;
     uint64_t frames = 0;
+    uint64_t snips = 0;                          // snippets written at this SNR
+    double gb = -1.0;                            // snippet bytes stored (GB)
   };
   std::vector<SnrRow> snr_rows;
+  double data_saved_gb = -1.0;                   // total snippet bytes stored
+  double full_capture_gb = -1.0;                 // full-rate cf32 baseline
+  uint64_t data_snips = 0;
 };
 
 std::mutex& decode_metrics_mutex() {
@@ -2328,10 +2333,15 @@ void poll_decode_metrics() {
         json_find_double(row, "acc_OFDM", r.acc[3]);
         json_find_double(row, "ber", r.ber);
         json_find_u64(row, "frames", r.frames);
+        json_find_u64(row, "snips", r.snips);
+        json_find_double(row, "gb", r.gb);
         next.snr_rows.push_back(std::move(r));
       }
     }
   }
+  json_find_double(text, "data_saved_gb", next.data_saved_gb);
+  json_find_double(text, "full_capture_gb", next.full_capture_gb);
+  json_find_u64(text, "data_snips", next.data_snips);
   // Whole-run BER (truth-scored daemon runs): bits never decoded count 100%.
   json_find_double(text, "ber_whole", next.ber_whole);
   json_find_u64(text, "bits_lost", next.bits_lost);
@@ -3018,14 +3028,27 @@ void render_visualization_ui_overlay() {
       draw_list->AddRectFilled(ImVec2(tx0, fy0), ImVec2(tx1, fy1), IM_COL32(13, 18, 27, 235), 6.0f);
       draw_list->AddRect(ImVec2(tx0, fy0), ImVec2(tx1, fy1), panel_border, 6.0f, 0, 1.0f);
       draw_list->AddText(ImVec2(tx0 + 12.0f, fy0 + 4.0f), accent_blue, "CLASSIFIER x SNR");
-      draw_list->AddText(ImVec2(tx0 + 168.0f, fy0 + 6.0f), panel_muted,
-                         "gate acc per class / decoded BER");
-      const float col[7] = {tx0 + 12.0f, tx0 + 90.0f, tx0 + 152.0f, tx0 + 214.0f,
-                            tx0 + 276.0f, tx0 + 348.0f, tx0 + 452.0f};
+      if (dm.data_saved_gb >= 0.0 && dm.full_capture_gb > 0.0) {
+        char totals[128];
+        const double reduction = dm.data_saved_gb > 1e-9
+                                     ? dm.full_capture_gb / dm.data_saved_gb : 0.0;
+        std::snprintf(totals, sizeof(totals),
+                      "stored %.2f GB (%llu snips) vs %.0f GB full-rate = %.0fx less",
+                      dm.data_saved_gb,
+                      static_cast<unsigned long long>(dm.data_snips),
+                      dm.full_capture_gb, reduction);
+        draw_list->AddText(ImVec2(tx0 + 168.0f, fy0 + 6.0f), accent_green, totals);
+      } else {
+        draw_list->AddText(ImVec2(tx0 + 168.0f, fy0 + 6.0f), panel_muted,
+                           "gate acc per class / decoded BER");
+      }
+      const float col[9] = {tx0 + 12.0f, tx0 + 86.0f, tx0 + 142.0f, tx0 + 198.0f,
+                            tx0 + 254.0f, tx0 + 318.0f, tx0 + 408.0f, tx0 + 490.0f,
+                            tx0 + 572.0f};
       float ty = fy0 + 24.0f;
-      static const char* const kColHdr[7] = {"SNR", "PSK", "QAM", "FSK", "OFDM",
-                                             "BER", "frames"};
-      for (int c = 0; c < 7; ++c) {
+      static const char* const kColHdr[9] = {"SNR", "PSK", "QAM", "FSK", "OFDM",
+                                             "BER", "frames", "snips", "GB"};
+      for (int c = 0; c < 9; ++c) {
         draw_list->AddText(ImVec2(col[c], ty), panel_muted, kColHdr[c]);
       }
       ty += 14.0f;
@@ -3062,6 +3085,12 @@ void render_visualization_ui_overlay() {
         }
         std::snprintf(cell, sizeof(cell), "%llu", static_cast<unsigned long long>(r.frames));
         draw_list->AddText(ImVec2(col[6], ty), panel_muted, cell);
+        std::snprintf(cell, sizeof(cell), "%llu", static_cast<unsigned long long>(r.snips));
+        draw_list->AddText(ImVec2(col[7], ty), panel_muted, cell);
+        if (r.gb >= 0.0) {
+          std::snprintf(cell, sizeof(cell), "%.2f", r.gb);
+          draw_list->AddText(ImVec2(col[8], ty), panel_text, cell);
+        }
         ty += 13.0f;
       }
 

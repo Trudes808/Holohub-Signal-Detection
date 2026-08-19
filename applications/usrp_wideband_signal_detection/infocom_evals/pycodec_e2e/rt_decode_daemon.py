@@ -203,6 +203,10 @@ class Metrics:
         self.by_placement: dict[int, dict] = {}
         self.snr_bucket = "clean"          # DEMO CONTROLS snr selection
         self.by_snr: dict[str, dict] = {}  # bucket -> per-class gate acc + BER
+        self.data_bytes = 0                # snippet bytes written to disk
+        self.data_files = 0
+        self.data_snips = 0
+        self.stream_rate_hz = 245.76e6     # for the full-capture baseline
 
     def note_decode(self, f_hz: float, mod: str, crc_ok: bool):
         self.recent.append({"f_hz": f_hz, "mod": mod, "crc_ok": bool(crc_ok), "t": time.time()})
@@ -220,12 +224,27 @@ class Metrics:
             p["errors"] += errors
             p["frames"] += 1
 
+    def _bucket(self) -> dict:
+        return self.by_snr.setdefault(self.snr_bucket,
+                                      {"per": {}, "bits": 0, "errors": 0, "frames": 0,
+                                       "bytes": 0, "files": 0, "snips": 0})
+
+    def note_data(self, new_bytes: int, new_files: int = 0, new_snips: int = 0):
+        """Snippet-sink output accounting (bytes/files/snippets), attributed
+        to the active SNR selection — the data-reduction story."""
+        b = self._bucket()
+        b["bytes"] += new_bytes
+        b["files"] += new_files
+        b["snips"] += new_snips
+        self.data_bytes += new_bytes
+        self.data_files += new_files
+        self.data_snips += new_snips
+
     def note_band_snr(self, truth, pred, bits: int, errors: int, nframes: int):
         """Accumulate per-SNR-selection stats (gate-model accuracy per class,
         BER, frames) for the footer table. Bucketed by the DEMO CONTROLS snr
         at decode time (a few seconds of pipeline skew after a switch)."""
-        b = self.by_snr.setdefault(self.snr_bucket,
-                                   {"per": {}, "bits": 0, "errors": 0, "frames": 0})
+        b = self._bucket()
         b["bits"] += bits
         b["errors"] += errors
         b["frames"] += nframes
@@ -311,17 +330,29 @@ class Metrics:
             d["by_snr"] = {}
             for lbl, b in self.by_snr.items():
                 row = {"ber": (b["errors"] / b["bits"]) if b["bits"] else None,
-                       "frames": b["frames"]}
+                       "frames": b["frames"],
+                       "snips": b.get("snips", 0),
+                       "files": b.get("files", 0),
+                       "gb": round(b.get("bytes", 0) / 1e9, 3)}
                 for fam in ("PSK", "QAM", "FSK", "OFDM"):
                     c = b["per"].get(fam)
                     row[f"acc_{fam}"] = (c[0] / c[1]) if c and c[1] else None
                 d["by_snr"][lbl] = row
+        # data-reduction story: what the snipper stored vs capturing the full
+        # stream (cf32) for the daemon's whole uptime
+        d["data_saved_gb"] = round(self.data_bytes / 1e9, 3)
+        d["data_files"] = self.data_files
+        d["data_snips"] = self.data_snips
+        d["full_capture_gb"] = round(
+            (time.time() - self.started) * self.stream_rate_hz * 8.0 / 1e9, 2)
         return d
 
 
 def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
     snip_fs = float(a.get("wfgt:snippet_sample_rate",
                           a.get("wfgt:orig_sample_rate", 245.76e6)))
+    metrics.stream_rate_hz = max(metrics.stream_rate_hz,
+                                 float(a.get("wfgt:orig_sample_rate", 0.0)))
     start, count = int(a["core:sample_start"]), int(a["core:sample_count"])
     iq = np.asarray(data[start:start + count], dtype=np.complex64)
     if iq.size < 4096:
@@ -447,6 +478,47 @@ def main():
                                                    args.gate)
     metrics = Metrics(truth=truth, gate=args.gate)
     seen: dict[str, int] = {}   # pack meta path -> annotations processed
+    pack_sizes: dict[str, int] = {}     # data path -> bytes seen (sink accounting)
+    meta_mtimes: dict[str, float] = {}
+    meta_counts: dict[str, int] = {}
+
+    def scan_data_stats():
+        """Account every byte/file/snippet the sink writes, independent of
+        what the decoder gets to; prune tracking for janitored files."""
+        live = set()
+        for dp in glob.glob(os.path.join(args.snips, "*.sigmf-data")):
+            live.add(dp)
+            try:
+                sz = os.path.getsize(dp)
+            except OSError:
+                continue
+            prev = pack_sizes.get(dp)
+            if prev is None:
+                metrics.note_data(sz, new_files=1)
+                pack_sizes[dp] = sz
+            elif sz > prev:
+                metrics.note_data(sz - prev)
+                pack_sizes[dp] = sz
+        for gone in set(pack_sizes) - live:
+            del pack_sizes[gone]
+        for mp2 in glob.glob(os.path.join(args.snips, "*.sigmf-meta")):
+            try:
+                mt2 = os.path.getmtime(mp2)
+            except OSError:
+                continue
+            if meta_mtimes.get(mp2) == mt2:
+                continue
+            meta_mtimes[mp2] = mt2
+            try:
+                n_ann = len(json.load(open(mp2)).get("annotations", []))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if n_ann > meta_counts.get(mp2, 0):
+                metrics.note_data(0, new_snips=n_ann - meta_counts.get(mp2, 0))
+                meta_counts[mp2] = n_ann
+        for gone in set(meta_mtimes) - set(glob.glob(os.path.join(args.snips, "*.sigmf-meta"))):
+            meta_mtimes.pop(gone, None)
+            meta_counts.pop(gone, None)
     last_new = time.time()
     print(f"rt_decode_daemon: watching {args.snips} "
           f"({'AMC-routed' if clf else 'blind cascade'}, profile {PROFILE})", flush=True)
@@ -486,6 +558,7 @@ def main():
 
     while True:
         check_control()
+        scan_data_stats()
         new_work = False
         packs_this_pass = 0
         # newest first: under a live looped replay the daemon cannot drain the
