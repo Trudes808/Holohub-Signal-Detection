@@ -482,9 +482,17 @@ def main():
     meta_mtimes: dict[str, float] = {}
     meta_counts: dict[str, int] = {}
 
+    last_scan = [0.0]
+
     def scan_data_stats():
         """Account every byte/file/snippet the sink writes, independent of
-        what the decoder gets to; prune tracking for janitored files."""
+        what the decoder gets to; prune tracking for janitored files.
+        Time-throttled and called per-annotation: one pack can take a minute
+        to decode, and bytes written meanwhile must land in the SNR bucket
+        that was active when they were written, not in a later lump."""
+        if time.time() - last_scan[0] < 1.0:
+            return
+        last_scan[0] = time.time()
         live = set()
         for dp in glob.glob(os.path.join(args.snips, "*.sigmf-data")):
             live.add(dp)
@@ -581,6 +589,7 @@ def main():
                 continue
             for a in anns[done:]:
                 check_control()
+                scan_data_stats()
                 line = process_annotation(a, data, metrics, clf=clf)
                 if line:
                     print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
