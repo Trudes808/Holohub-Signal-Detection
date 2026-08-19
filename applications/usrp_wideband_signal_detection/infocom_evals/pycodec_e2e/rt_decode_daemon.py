@@ -226,8 +226,8 @@ class Metrics:
 
     def _bucket(self) -> dict:
         return self.by_snr.setdefault(self.snr_bucket,
-                                      {"per": {}, "bits": 0, "errors": 0, "frames": 0,
-                                       "bytes": 0, "files": 0, "snips": 0})
+                                      {"acc": {}, "per_gate": {}, "bytes": 0,
+                                       "files": 0, "snips": 0})
 
     def note_data(self, new_bytes: int, new_files: int = 0, new_snips: int = 0):
         """Snippet-sink output accounting (bytes/files/snippets), attributed
@@ -240,19 +240,23 @@ class Metrics:
         self.data_files += new_files
         self.data_snips += new_snips
 
-    def note_band_snr(self, truth, pred, bits: int, errors: int, nframes: int):
-        """Accumulate per-SNR-selection stats (gate-model accuracy per class,
-        BER, frames) for the footer table. Bucketed by the DEMO CONTROLS snr
-        at decode time (a few seconds of pipeline skew after a switch)."""
+    def note_band_snr(self, truth, labels: dict, gate: str,
+                      bits: int, errors: int, nframes: int):
+        """Per-SNR footer stats. Classification accuracy accumulates for ALL
+        models simultaneously (each classifies every band); decode stats
+        (BER/frames) accumulate under the ACTIVE gate, since routing decides
+        what decodes — dwell at an SNR under each gate to compare."""
         b = self._bucket()
-        b["bits"] += bits
-        b["errors"] += errors
-        b["frames"] += nframes
+        gstats = b["per_gate"].setdefault(gate, {"bits": 0, "errors": 0, "frames": 0})
+        gstats["bits"] += bits
+        gstats["errors"] += errors
+        gstats["frames"] += nframes
         if truth not in (None, "SYNC"):
-            c = b["per"].setdefault(truth, [0, 0])
-            c[1] += 1
-            if pred == truth:
-                c[0] += 1
+            for name, label in labels.items():
+                c = b["acc"].setdefault(name, [0, 0])
+                c[1] += 1
+                if label == truth:
+                    c[0] += 1
 
     def note_cls(self, name: str, label: str, ms: float, truth_fam: str | None):
         c = self.cls.setdefault(name, {"n": 0, "ms_sum": 0.0, "truth_n": 0,
@@ -329,14 +333,16 @@ class Metrics:
         if self.by_snr:
             d["by_snr"] = {}
             for lbl, b in self.by_snr.items():
-                row = {"ber": (b["errors"] / b["bits"]) if b["bits"] else None,
-                       "frames": b["frames"],
-                       "snips": b.get("snips", 0),
+                row = {"snips": b.get("snips", 0),
                        "files": b.get("files", 0),
                        "gb": round(b.get("bytes", 0) / 1e9, 6)}
-                for fam in ("PSK", "QAM", "FSK", "OFDM"):
-                    c = b["per"].get(fam)
-                    row[f"acc_{fam}"] = (c[0] / c[1]) if c and c[1] else None
+                for name in ("vtcnn2", "resnet1d", "tprime"):
+                    c = b.get("acc", {}).get(name)
+                    row[f"acc_{name}"] = (c[0] / c[1]) if c and c[1] else None
+                    g = b.get("per_gate", {}).get(name)
+                    row[f"ber_{name}"] = ((g["errors"] / g["bits"])
+                                          if g and g["bits"] else None)
+                    row[f"frames_{name}"] = g["frames"] if g else 0
                 d["by_snr"][lbl] = row
         # data-reduction story: what the snipper stored vs capturing the full
         # stream (cf32) for the daemon's whole uptime
@@ -396,7 +402,7 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                         "=" if pred == t else f"!={t}")
                 how = f"{how}[{pred}{mark}]"
                 metrics.note_band_snr(
-                    t, pred,
+                    t, {name: r.label for name, r in res.items()}, clf.gate,
                     sum(f.payload_len_bits for f in got if f.pn9_payload),
                     sum(f.bit_errors for f in got if f.pn9_payload),
                     len(got))

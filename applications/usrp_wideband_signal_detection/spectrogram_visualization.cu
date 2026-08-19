@@ -2144,9 +2144,9 @@ struct DecodeMetricsSnapshot {
   // per-SNR-selection stats (footer table): gate acc per class + BER + frames
   struct SnrRow {
     std::string label;
-    double acc[4] = {-1.0, -1.0, -1.0, -1.0};   // PSK, QAM, FSK, OFDM
-    double ber = -1.0;
-    uint64_t frames = 0;
+    double acc[3] = {-1.0, -1.0, -1.0};          // per MODEL: vtcnn2/resnet1d/tprime
+    double ber[3] = {-1.0, -1.0, -1.0};          // per GATE (dwell under each gate)
+    uint64_t frames3[3] = {0, 0, 0};             // per GATE
     uint64_t snips = 0;                          // snippets written at this SNR
     double gb = -1.0;                            // snippet bytes stored (GB)
   };
@@ -2333,12 +2333,12 @@ void poll_decode_metrics() {
         const std::string row = block.substr(ropen, rclose - ropen + 1);
         DecodeMetricsSnapshot::SnrRow r;
         r.label = lbl;
-        json_find_double(row, "acc_PSK", r.acc[0]);
-        json_find_double(row, "acc_QAM", r.acc[1]);
-        json_find_double(row, "acc_FSK", r.acc[2]);
-        json_find_double(row, "acc_OFDM", r.acc[3]);
-        json_find_double(row, "ber", r.ber);
-        json_find_u64(row, "frames", r.frames);
+        static const char* const kModelKeys[3] = {"vtcnn2", "resnet1d", "tprime"};
+        for (int mi = 0; mi < 3; ++mi) {
+          json_find_double(row, std::string("acc_") + kModelKeys[mi], r.acc[mi]);
+          json_find_double(row, std::string("ber_") + kModelKeys[mi], r.ber[mi]);
+          json_find_u64(row, std::string("frames_") + kModelKeys[mi], r.frames3[mi]);
+        }
         json_find_u64(row, "snips", r.snips);
         json_find_double(row, "gb", r.gb);
         next.snr_rows.push_back(std::move(r));
@@ -3048,54 +3048,61 @@ void render_visualization_ui_overlay() {
         draw_list->AddText(ImVec2(tx0 + 168.0f, fy0 + 6.0f), panel_muted,
                            "gate acc per class / decoded BER");
       }
-      const float col[9] = {tx0 + 12.0f, tx0 + 86.0f, tx0 + 142.0f, tx0 + 198.0f,
-                            tx0 + 254.0f, tx0 + 318.0f, tx0 + 408.0f, tx0 + 490.0f,
-                            tx0 + 572.0f};
+      // triples are VT-CNN2 / ResNet1D / T-PRIME; acc is simultaneous for all
+      // models, BER/frames accumulate under whichever gate was active
+      const float kAccX = tx0 + 74.0f, kBerX = tx0 + 236.0f, kFrX = tx0 + 452.0f;
+      const float kSnipsX = tx0 + 624.0f, kDataX = tx0 + 700.0f;
+      const float dAcc = 52.0f, dBer = 70.0f, dFr = 55.0f;
       float ty = fy0 + 24.0f;
-      static const char* const kColHdr[9] = {"SNR", "PSK", "QAM", "FSK", "OFDM",
-                                             "BER", "frames", "snips", "data"};
-      for (int c = 0; c < 9; ++c) {
-        draw_list->AddText(ImVec2(col[c], ty), panel_muted, kColHdr[c]);
-      }
+      draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_muted, "SNR");
+      draw_list->AddText(ImVec2(kAccX, ty), panel_muted, "acc V / R / T");
+      draw_list->AddText(ImVec2(kBerX, ty), panel_muted, "BER V / R / T");
+      draw_list->AddText(ImVec2(kFrX, ty), panel_muted, "frames V / R / T");
+      draw_list->AddText(ImVec2(kSnipsX, ty), panel_muted, "snips");
+      draw_list->AddText(ImVec2(kDataX, ty), panel_muted, "data");
       ty += 14.0f;
       if (dm.snr_rows.empty()) {
         draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_muted,
-                           "(accumulates as bands decode; switch SNR to fill rows)");
+                           "(accumulates as bands decode; dwell per gate to compare)");
       }
       char cell[32];
       for (const auto& r : dm.snr_rows) {
         if (ty > fy1 - 12.0f) break;
-        draw_list->AddText(ImVec2(col[0], ty), panel_text,
+        draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_text,
                            r.label == "staircase" ? "stair" :
                            (r.label == "clean" ? "clean" : (r.label + " dB").c_str()));
-        for (int c = 0; c < 4; ++c) {
-          if (r.acc[c] < 0.0) {
-            draw_list->AddText(ImVec2(col[c + 1], ty), panel_muted, "--");
+        for (int mi = 0; mi < 3; ++mi) {
+          if (r.acc[mi] < 0.0) {
+            draw_list->AddText(ImVec2(kAccX + mi * dAcc, ty), panel_muted, "--");
           } else {
-            std::snprintf(cell, sizeof(cell), "%.0f%%", 100.0 * r.acc[c]);
-            const ImU32 cc = r.acc[c] >= 0.95 ? accent_green
-                             : (r.acc[c] >= 0.80 ? IM_COL32(255, 212, 89, 255)
-                                                  : accent_orange);
-            draw_list->AddText(ImVec2(col[c + 1], ty), cc, cell);
+            std::snprintf(cell, sizeof(cell), "%.0f%%", 100.0 * r.acc[mi]);
+            const ImU32 cc = r.acc[mi] >= 0.95 ? accent_green
+                             : (r.acc[mi] >= 0.80 ? IM_COL32(255, 212, 89, 255)
+                                                   : accent_orange);
+            draw_list->AddText(ImVec2(kAccX + mi * dAcc, ty), cc, cell);
           }
+          if (r.ber[mi] < 0.0) {
+            draw_list->AddText(ImVec2(kBerX + mi * dBer, ty), panel_muted, "--");
+          } else if (r.ber[mi] == 0.0) {
+            draw_list->AddText(ImVec2(kBerX + mi * dBer, ty), accent_green, "0.0");
+          } else {
+            std::snprintf(cell, sizeof(cell), "%.0e", r.ber[mi]);
+            draw_list->AddText(ImVec2(kBerX + mi * dBer, ty),
+                               r.ber[mi] < 1e-3 ? IM_COL32(255, 212, 89, 255)
+                                                 : accent_orange,
+                               cell);
+          }
+          if (r.frames3[mi] >= 10000) {
+            std::snprintf(cell, sizeof(cell), "%.0fk", r.frames3[mi] / 1000.0);
+          } else {
+            std::snprintf(cell, sizeof(cell), "%llu",
+                          static_cast<unsigned long long>(r.frames3[mi]));
+          }
+          draw_list->AddText(ImVec2(kFrX + mi * dFr, ty), panel_muted, cell);
         }
-        if (r.ber < 0.0) {
-          draw_list->AddText(ImVec2(col[5], ty), panel_muted, "--");
-        } else if (r.ber == 0.0) {
-          draw_list->AddText(ImVec2(col[5], ty), accent_green, "0.0");
-        } else {
-          std::snprintf(cell, sizeof(cell), "%.1e", r.ber);
-          draw_list->AddText(ImVec2(col[5], ty),
-                             r.ber < 1e-3 ? IM_COL32(255, 212, 89, 255) : accent_orange,
-                             cell);
-        }
-        std::snprintf(cell, sizeof(cell), "%llu", static_cast<unsigned long long>(r.frames));
-        draw_list->AddText(ImVec2(col[6], ty), panel_muted, cell);
         std::snprintf(cell, sizeof(cell), "%llu", static_cast<unsigned long long>(r.snips));
-        draw_list->AddText(ImVec2(col[7], ty), panel_muted, cell);
+        draw_list->AddText(ImVec2(kSnipsX, ty), panel_muted, cell);
         if (r.gb >= 0.0) {
-          // auto units: low-SNR snippets are genuinely tiny (that IS the
-          // data-reduction story) — "0.00 GB" reads as broken
           if (r.gb >= 1.0) {
             std::snprintf(cell, sizeof(cell), "%.2f GB", r.gb);
           } else if (r.gb >= 1e-3) {
@@ -3103,7 +3110,7 @@ void render_visualization_ui_overlay() {
           } else {
             std::snprintf(cell, sizeof(cell), "%.0f KB", r.gb * 1e6);
           }
-          draw_list->AddText(ImVec2(col[8], ty), panel_text, cell);
+          draw_list->AddText(ImVec2(kDataX, ty), panel_text, cell);
         }
         ty += 13.0f;
       }
