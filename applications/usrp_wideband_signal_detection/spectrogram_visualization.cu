@@ -2136,6 +2136,11 @@ struct DecodeMetricsSnapshot {
   double ber_whole = -1.0;              // lost bits count 100% wrong
   uint64_t bits_lost = 0;
   uint64_t bits_expected = 0;
+  // windowed live rates (poll-interval deltas, EMA-smoothed): the cumulative
+  // counters barely move on an SNR change, these collapse immediately
+  double snips_decoded_pct = -1.0;      // % of new snippets that yielded frames
+  double frames_per_s = -1.0;
+  double secs_since_update = 0.0;       // staleness: no new snips -> rates decay
 };
 
 std::mutex& decode_metrics_mutex() {
@@ -2151,6 +2156,11 @@ DecodeMetricsSnapshot& decode_metrics_storage() {
 std::string& decode_metrics_path_storage() {
   static std::string p;
   return p;
+}
+
+std::chrono::steady_clock::time_point& decode_metrics_last_parse() {
+  static std::chrono::steady_clock::time_point t;
+  return t;
 }
 
 void set_visualization_decode_metrics_path(const std::string& path) {
@@ -2186,6 +2196,10 @@ void poll_decode_metrics() {
   static std::chrono::steady_clock::time_point last_poll;
   static std::filesystem::file_time_type last_mtime;
   static uint64_t prev_bits = 0, prev_errors = 0;
+  static uint64_t prev_frames = 0, prev_snips = 0, prev_snips_hit = 0;
+  static std::chrono::steady_clock::time_point last_change;
+  static bool have_change = false;
+  static double ema_fps = -1.0, ema_hit = -1.0;
 
   std::lock_guard<std::mutex> lock(decode_metrics_mutex());
   const std::string path = decode_metrics_path_storage();
@@ -2316,6 +2330,37 @@ void poll_decode_metrics() {
   }
   prev_bits = next.bits;
   prev_errors = next.errors;
+  // windowed frames/s + snips-decoded% from counter deltas between metric
+  // writes; daemon restarts (counters shrink) reset the baseline
+  uint64_t snips = 0, snips_hit = 0;
+  json_find_u64(text, "snippets_seen", snips);
+  json_find_u64(text, "snippets_with_frames", snips_hit);
+  const auto now_tp = std::chrono::steady_clock::now();
+  if (next.frames < prev_frames || snips < prev_snips) {
+    have_change = false;
+    ema_fps = ema_hit = -1.0;
+  }
+  if (have_change) {
+    const double dt = std::chrono::duration<double>(now_tp - last_change).count();
+    if (dt > 0.05) {
+      const double fps = static_cast<double>(next.frames - prev_frames) / dt;
+      ema_fps = ema_fps < 0.0 ? fps : 0.7 * ema_fps + 0.3 * fps;
+      if (snips > prev_snips) {
+        const double hit = 100.0 * static_cast<double>(snips_hit - prev_snips_hit) /
+                           static_cast<double>(snips - prev_snips);
+        ema_hit = ema_hit < 0.0 ? hit : 0.7 * ema_hit + 0.3 * hit;
+      }
+    }
+  }
+  prev_frames = next.frames;
+  prev_snips = snips;
+  prev_snips_hit = snips_hit;
+  last_change = now_tp;
+  have_change = true;
+  next.frames_per_s = ema_fps;
+  next.snips_decoded_pct = ema_hit;
+  next.secs_since_update = 0.0;
+  decode_metrics_last_parse() = now_tp;
   next.valid = next.frames > 0 || next.bits > 0;
   s = std::move(next);
 }
@@ -2323,7 +2368,10 @@ void poll_decode_metrics() {
 DecodeMetricsSnapshot decode_metrics_snapshot() {
   poll_decode_metrics();
   std::lock_guard<std::mutex> lock(decode_metrics_mutex());
-  return decode_metrics_storage();
+  DecodeMetricsSnapshot copy = decode_metrics_storage();
+  copy.secs_since_update = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - decode_metrics_last_parse()).count();
+  return copy;
 }
 
 // ---- Demo controls: dashboard-side selections written to a sidecar JSON.
@@ -2658,7 +2706,29 @@ void render_visualization_ui_overlay() {
       const double thr = dm.uptime_s > 0.0 ? dm.bits / dm.uptime_s / 1e6 : 0.0;
       std::snprintf(line, sizeof(line), "%.1f Mbit checked   %.1f Mb/s", mbit, thr);
       draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_muted, line);
-      sidebar_text_y += 20.0f;
+      sidebar_text_y += 18.0f;
+
+      // Windowed live rates: unlike the cumulative counters, these collapse
+      // the moment the SNR selection kills the decode.
+      {
+        const bool stale = dm.secs_since_update > 4.0;
+        const double fps = (stale || dm.frames_per_s < 0.0) ? 0.0 : dm.frames_per_s;
+        std::snprintf(line, sizeof(line), "%.1f frames/s", fps);
+        draw_list->AddText(ImVec2(x0, sidebar_text_y),
+                           fps > 0.5 ? panel_text : accent_orange, line);
+        draw_list->AddText(ImVec2(x0 + 108.0f, sidebar_text_y), panel_muted, "snips dec");
+        ImU32 hit_color = panel_muted;
+        if (dm.snips_decoded_pct < 0.0 || stale) {
+          std::snprintf(line, sizeof(line), "--");
+        } else {
+          std::snprintf(line, sizeof(line), "%.0f%%", dm.snips_decoded_pct);
+          hit_color = dm.snips_decoded_pct >= 80.0 ? accent_green
+                      : (dm.snips_decoded_pct >= 50.0 ? IM_COL32(255, 212, 89, 255)
+                                                       : accent_orange);
+        }
+        draw_list->AddText(ImVec2(x0 + 178.0f, sidebar_text_y), hit_color, line);
+        sidebar_text_y += 20.0f;
+      }
 
       // Instantaneous-BER sparkline (per poll interval, log-scaled bars).
       if (!dm.inst_ber_history.empty()) {
