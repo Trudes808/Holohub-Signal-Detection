@@ -52,6 +52,8 @@ class Conductor:
         self.replay: subprocess.Popen | None = None
         self.snr = None
         self.detector = None
+        self.current_cfg = None
+        self.pps = 240000
 
     def run_or_print(self, cmd, **kw):
         print(f"[conductor] {'DRY: ' if self.args.dry else ''}{' '.join(cmd)}", flush=True)
@@ -84,20 +86,14 @@ class Conductor:
                     self.replay.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self.replay.kill()
-        cmd = ["tcpreplay", "--preload-pcap", "--loop", "0", "--pps", "240000",
+        cmd = ["tcpreplay", "--preload-pcap", "--loop", "0", "--pps", str(self.pps),
                "-i", self.args.iface, path]
         print(f"[conductor] {'DRY: ' if self.args.dry else ''}{' '.join(cmd)}", flush=True)
         if not self.args.dry:
             self.replay = subprocess.Popen(cmd)
         self.snr = snr
 
-    def set_detector(self, detector: str):
-        cfg = CONFIG_BY_DETECTOR.get(detector)
-        if cfg is None:
-            print(f"[conductor] unknown detector '{detector}', ignoring", flush=True)
-            return
-        if detector == "cuda_dino" and not self.args.no_replay:
-            cfg = CUDA_DINO_CALIBRATED
+    def _launch_app(self, cfg: str):
         self.run_or_print(["docker", "exec", CONTAINER, "bash", "-lc",
                            "pkill -f '(^|/)usrp_wideband_signal_detection( |$)' || true"])
         time.sleep(2 if not self.args.dry else 0)
@@ -111,6 +107,49 @@ class Conductor:
                            "export XDG_RUNTIME_DIR=/tmp/xdg-runtime-root && "
                            f"cd {BUILD_APP_DIR} && exec ./usrp_wideband_signal_detection {cfg} "
                            f"> /workspace/spectrograms/demo_app.log 2>&1"])
+
+    def _app_alive(self) -> bool:
+        if self.args.dry:
+            return True
+        r = subprocess.run(["docker", "exec", CONTAINER, "bash", "-lc",
+                            "pgrep -f '(^|/)usrp_wideband_signal_detection( |$)' >/dev/null"],
+                           check=False)
+        return r.returncode == 0
+
+    def set_detector(self, detector: str):
+        cfg = CONFIG_BY_DETECTOR.get(detector)
+        if cfg is None:
+            print(f"[conductor] unknown detector '{detector}', ignoring", flush=True)
+            return
+        if detector == "cuda_dino" and not self.args.no_replay:
+            cfg = CUDA_DINO_CALIBRATED
+        # DINO cannot sustain the full-rate replay on GB10 (the converter's
+        # degraded-shutdown watchdog exits the app) — halve the packet rate
+        want_pps = 120000 if detector == "cuda_dino" else 240000
+        if want_pps != self.pps and not self.args.no_replay:
+            self.pps = want_pps
+            print(f"[conductor] replay rate -> {self.pps} pps for {detector}", flush=True)
+            if self.snr is not None:
+                snr, self.snr = self.snr, None
+                self.set_snr(snr)
+        prev_cfg = self.current_cfg
+        self._launch_app(cfg)
+        self.current_cfg = cfg
+        # survival check: if the new pipeline dies (e.g. can't keep up), roll
+        # back instead of leaving the demo dead with no window
+        if not self.args.dry:
+            time.sleep(10)
+            if not self._app_alive():
+                print(f"[conductor] APP DIED after switching to {detector} ({cfg}) — "
+                      f"rolling back to {prev_cfg or CONFIG_BY_DETECTOR['coherent_power']}",
+                      flush=True)
+                self.pps = 240000
+                if self.snr is not None:
+                    snr, self.snr = self.snr, None
+                    self.set_snr(snr)
+                self._launch_app(prev_cfg or CONFIG_BY_DETECTOR["coherent_power"])
+                self.current_cfg = prev_cfg or CONFIG_BY_DETECTOR["coherent_power"]
+                return
         self.detector = detector
 
     def watch(self):
