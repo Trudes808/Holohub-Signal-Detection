@@ -412,6 +412,33 @@ args_no_band_truth = False
 args_center_hz = 2.4e9   # channel tune: live snips tag ABSOLUTE RF centers
 
 
+class PackReader:
+    """Per-slice np.fromfile reads instead of np.memmap. The sigmf sink
+    rewrites pack files in place as they accumulate snippets, which SIGBUSes
+    a live memmap (the daemon died twice this way under the snip flood);
+    plain reads just come back short, which the callers already tolerate."""
+
+    def __init__(self, path):
+        self.path = path
+        if not os.path.exists(path):
+            raise OSError(path)
+
+    def size_bytes(self) -> int:
+        try:
+            return os.path.getsize(self.path)
+        except OSError:
+            return 0
+
+    def __getitem__(self, sl):
+        start = int(sl.start or 0)
+        stop = int(sl.stop if sl.stop is not None else start)
+        n = max(0, stop - start)
+        try:
+            return np.fromfile(self.path, dtype="<c8", count=n, offset=start * 8)
+        except OSError:
+            return np.empty(0, dtype="<c8")
+
+
 def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
     snip_fs = float(a.get("wfgt:snippet_sample_rate",
                           a.get("wfgt:orig_sample_rate", 245.76e6)))
@@ -689,13 +716,19 @@ def main():
                 continue
             dp = mp.replace(".sigmf-meta", ".sigmf-data")
             try:
-                data = np.memmap(dp, dtype="<c8", mode="r")
+                data = PackReader(dp)
             except (OSError, ValueError):
                 continue
+            processed = done
             for a in anns[done:]:
+                # pack data still being flushed: retry the remainder next pass
+                end = int(a.get("core:sample_start", 0)) + int(a.get("core:sample_count", 0))
+                if end * 8 > data.size_bytes():
+                    break
                 check_control()
                 scan_data_stats()
                 line = process_annotation(a, data, metrics, clf=clf)
+                processed += 1
                 if line:
                     print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
                 # stream metrics per snippet so the HoloViz panel updates live
@@ -706,7 +739,7 @@ def main():
                     os.replace(tmp, metrics_path)
                 except OSError:
                     pass
-            seen[mp] = len(anns)
+            seen[mp] = processed
             new_work = True
             packs_this_pass += 1
             if packs_this_pass >= 3:

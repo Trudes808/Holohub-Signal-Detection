@@ -2458,8 +2458,8 @@ static const char* const kDemoGateNames[] = {"vtcnn2", "resnet1d", "tprime"};
 static const char* const kDemoGateLabels[] = {"VT-CNN2", "ResNet1D", "T-PRIME"};
 static const char* const kDemoSnrNames[] = {"clean", "30", "20", "15", "12", "9", "6",
                                             "0", "-5", "-10", "staircase"};
-static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino"};
-static const char* const kDemoDetectorLabels[] = {"CoherentPower", "CUDA-DINO"};
+static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino", "cuda_dino_finetuned"};
+static const char* const kDemoDetectorLabels[] = {"CoherentPower", "CUDA-DINO", "DINO-FT (M2_dr)"};
 
 std::mutex& demo_control_mutex() {
   static std::mutex m;
@@ -2661,7 +2661,7 @@ void render_visualization_ui_overlay() {
                                               "12 dB", "9 dB", "6 dB", "0 dB",
                                               "-5 dB", "-10 dB", "Staircase"};
       changed |= ImGui::Combo("SNR", &st.snr, kSnrCombo, 11);
-      changed |= ImGui::Combo("Detector", &st.detector, kDemoDetectorLabels, 2);
+      changed |= ImGui::Combo("Detector", &st.detector, kDemoDetectorLabels, 3);
       ImGui::PopItemWidth();
       if (changed) {
         st.seq += 1;
@@ -3782,6 +3782,25 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
               current_frame_mask->width);
           backfilled_mask_count += patched_current_mask ? 1 : 0;
           state.overlay_available = patched_current_mask || state.overlay_available;
+        }
+
+        // Strided detectors (e.g. DINO-FT at emit_stride 16) only mask every Nth frame; hold the
+        // most recent mask over the unmasked frames so the ROI history reads as a continuous
+        // ribbon instead of one thin row per inference. Stride-1 detectors always take the
+        // current-frame branch above, so this is a no-op for them. Age-capped so a dead
+        // detector's last boxes do not linger on screen.
+        constexpr int64_t kMaskPersistMaxFrames = 48;
+        if (!current_frame_mask.has_value() && !state.latest_mask.pixels.empty() &&
+            state.latest_mask_frame_number > 0 &&
+            static_cast<int64_t>(spectrogram.frame_number) - state.latest_mask_frame_number <=
+                kMaskPersistMaxFrames) {
+          const bool patched_persisted_mask = patch_history_mask_for_frame(
+              state,
+              static_cast<int64_t>(spectrogram.frame_number) +
+                  static_cast<int64_t>(mask_frame_offset_.get()),
+              state.latest_mask.pixels,
+              state.latest_mask.width);
+          state.overlay_available = patched_persisted_mask || state.overlay_available;
         }
 
         latest_rendered_frame_numbers_[channel_index] = spectrogram.frame_number;

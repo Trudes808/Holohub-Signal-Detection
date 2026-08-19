@@ -46,7 +46,9 @@ sudo docker exec "${CONTAINER_NAME}" bash -lc \
   "pkill -f '(^|/)usrp_wideband_signal_detection( |\$)' || true"
 sleep 2
 sudo docker exec "${CONTAINER_NAME}" bash -lc \
-  "cp '/workspace/holohub/applications/usrp_wideband_signal_detection/config_snipper_viz_demo.yaml' '${BUILD_APP_DIR}/' 2>/dev/null || true"
+  "cp '/workspace/holohub/applications/usrp_wideband_signal_detection/config_snipper_viz_demo.yaml' \
+      '/workspace/holohub/applications/usrp_wideband_signal_detection/config_dino_finetuned_viz_demo.yaml' \
+      '${BUILD_APP_DIR}/' 2>/dev/null || true"
 sudo docker exec -d -e DISPLAY="${DEMO_DISPLAY}" \
   -e USRP_SAMPLE_RATE_HZ="${RATE_HZ}" -e USRP_CENTER_FREQ_HZ="${CENTER_HZ}" \
   "${CONTAINER_NAME}" bash -lc \

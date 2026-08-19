@@ -177,6 +177,7 @@ target_link_libraries(usrp_wideband_signal_detection
   matx::matx
   holoscan::ops::coherent_power_signal_detector
   holoscan::ops::cuda_dino_detector
+  holoscan::ops::finetuned_dino_detector
   holoscan::ops::mask_replay_detector
   CUDA::cudart
   holoscan::core
@@ -251,6 +252,7 @@ target_link_libraries(run_offline_cuda_detector_eval
   holoscan::ops::fft
   holoscan::ops::spectrogram
   holoscan::ops::cuda_dino_detector
+  holoscan::ops::finetuned_dino_detector
   holoscan::ops::coherent_power_signal_detector
   holoscan::ops::mask_replay_detector
 )
@@ -302,6 +304,7 @@ target_include_directories(usrp_wideband_signal_detection
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/cuda_dino_detector
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../operators/finetuned_dino_detector
 )
 
 target_include_directories(offline_spectrogram_visualizer
@@ -334,6 +337,7 @@ endforeach()
     config_coherent_power_perf_perfreq_single_channel.yaml
     config_coherent_power_perf_dynamic_single_channel.yaml
     config_cuda_dino_performance_single_channel.yaml
+    config_cuda_dino_finetuned_performance_single_channel.yaml
     config_coherent_power_performance_single_channel_replay.yaml
     config_coherent_power_capture_chdr_single_channel.yaml
     config_coherent_power_performance_emit_stride1_two_channel.yaml

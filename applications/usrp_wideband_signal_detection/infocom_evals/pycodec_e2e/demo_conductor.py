@@ -36,6 +36,9 @@ PCAP_BY_SNR = {
 CONFIG_BY_DETECTOR = {
     "coherent_power": "config_snipper_viz_demo.yaml",  # viz-enabled; the plain snipper config is HEADLESS
     "cuda_dino": "config_cuda_dino_performance_single_channel.yaml",  # live air (bench-era floors)
+    # Fine-tuned DINOv3 segmenter (M2_dr): its emit_stride=16 handles the GB10 compute budget,
+    # so replay stays at the full 240 kpps (fresh mask every ~340 ms).
+    "cuda_dino_finetuned": "config_dino_finetuned_viz_demo.yaml",
 }
 # Loopback replay runs at the composites' rate, which is what the DINO
 # coherence gate was calibrated against (2026-08-18) — use the calibrated

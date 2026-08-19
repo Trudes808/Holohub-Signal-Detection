@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(finetuned_dino_detector LANGUAGES CXX CUDA)
 
-set(CMAKE_CUDA_ARCHITECTURES "70;80;90")
+set(CMAKE_CUDA_ARCHITECTURES "90;121")
 
 find_package(holoscan 2.5.0 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
@@ -18,6 +18,16 @@ set(CUDA_LINK_DIRS
   "/usr/local/cuda-12.6/targets/x86_64-linux/lib"
   "/usr/local/cuda-12.6/lib64"
 )
+
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "import importlib.util, pathlib; spec = importlib.util.find_spec('nvidia.nvjitlink'); print(pathlib.Path(spec.submodule_search_locations[0]) / 'lib' if spec and spec.submodule_search_locations else '')"
+  OUTPUT_VARIABLE PY_NVJITLINK_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+if(PY_NVJITLINK_DIR AND EXISTS "${PY_NVJITLINK_DIR}/libnvJitLink.so.12")
+  list(APPEND CUDA_LINK_DIRS ${PY_NVJITLINK_DIR})
+endif()
 
 # --- Torch discovery (mirrors operators/cuda_dino_detector/CMakeLists.txt) ---
 execute_process(
@@ -44,6 +54,11 @@ list(REMOVE_DUPLICATES TORCH_INCLUDE_HINTS)
 if(TORCH_SEARCH_HINTS)
   list(PREPEND CMAKE_PREFIX_PATH ${TORCH_SEARCH_HINTS})
 endif()
+# GB10 (sm_121 / capability 12.1): Torch's Caffe2 CUDA autodetect misparses 12.1 and injects a
+# bogus `-gencode arch=compute_20,code=sm_121` (nvcc fatal: Unsupported gpu architecture). Pin
+# TORCH_CUDA_ARCH_LIST before find_package(Torch) so the flags are valid without relying on the
+# TORCH_CUDA_ARCH_LIST environment variable being exported by the build wrapper.
+set(TORCH_CUDA_ARCH_LIST "9.0;12.1")
 find_package(Torch QUIET PATHS ${TORCH_SEARCH_HINTS})
 if(NOT Torch_FOUND)
   find_package(Torch QUIET)
@@ -70,8 +85,30 @@ if(Torch_FOUND)
   foreach(D IN LISTS TORCH_INCLUDE_DIRS TORCH_INCLUDE_HINTS)
     target_include_directories(finetuned_dino_detector PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${D}>)
   endforeach()
+
+  set(OP_NVJITLINK_LINK_ITEM "")
+  if(TARGET CUDA::nvJitLink)
+    set(OP_NVJITLINK_LINK_ITEM CUDA::nvJitLink)
+  else()
+    unset(OP_NVJITLINK_LINK_ITEM CACHE)
+    find_library(OP_NVJITLINK_LINK_ITEM
+      NAMES libnvJitLink.so.12 nvJitLink
+      PATHS ${CUDA_LINK_DIRS}
+      NO_DEFAULT_PATH
+    )
+  endif()
+  if(OP_NVJITLINK_LINK_ITEM)
+    target_link_libraries(finetuned_dino_detector PRIVATE ${OP_NVJITLINK_LINK_ITEM})
+  endif()
+
   list(REMOVE_DUPLICATES CUDA_LINK_DIRS)
   target_link_directories(finetuned_dino_detector PRIVATE ${CUDA_LINK_DIRS})
+  foreach(CUDA_LINK_DIR IN LISTS CUDA_LINK_DIRS)
+    if(EXISTS "${CUDA_LINK_DIR}")
+      target_link_options(finetuned_dino_detector PRIVATE "LINKER:-rpath-link,${CUDA_LINK_DIR}")
+    endif()
+  endforeach()
+
   target_compile_options(finetuned_dino_detector PRIVATE ${TORCH_CXX_FLAGS})
   target_compile_definitions(finetuned_dino_detector PRIVATE HOLOHUB_HAS_TORCH=1)
 endif()

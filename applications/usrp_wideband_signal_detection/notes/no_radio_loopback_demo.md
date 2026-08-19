@@ -129,12 +129,24 @@ atomically to that JSON and honored by two watchers:
   noise-free 4-class composite, so expect the dynamic floor to dip and
   re-learn for ~1 s on that transition). Conductor dry-run validated
   (`--dry`); the wire step needs the loopback cable.
-- **Detector** (CoherentPower / CUDA-DINO): the conductor restarts the app
-  with the other config (~15 s blink; selections persist — the panel
-  re-reads the control file on startup). NOTE: cuda_dino needs its
+- **Detector** (CoherentPower / CUDA-DINO / DINO-FT (M2_dr)): the conductor
+  restarts the app with the other config (~15 s blink; selections persist —
+  the panel re-reads the control file on startup). NOTE: cuda_dino needs its
   TorchScript weights present in the container; verify before demoing that
   button, and check the conductor's XAUTHORITY matches the desktop session
   for the windowed relaunch.
+- **DINO-FT (M2_dr)** is Sage's fine-tuned DINOv3 segmenter as a real-time
+  operator (`operators/finetuned_dino_detector/`, config
+  `config_dino_finetuned_viz_demo.yaml`). Needs
+  `dino_fine_tuning/weights/finetuned_dino_m2_dr_bf16.ts` + `.meta.json` in
+  the checkout (bind-mounted into the container; sha256s in the handoff doc
+  `~/Downloads/finetuned_dino_realtime_handoff.md`). It taps raw IQ and runs
+  its own 1024-pt FFT (240 kHz/bin — the training physics; replay's
+  245.76 MS/s is exactly the top of its rate-invariant training range).
+  GB10 budget: ~10.4 ms/tile ⇒ `emit_stride: 16` in the demo config keeps
+  full-rate 240 kpps replay with a fresh mask every ~340 ms. Unlike the
+  zero-shot cuda_dino it needs no coherence calibration and masks individual
+  bursts (finer than coherent_power's persistence boxes).
 
 Demo-day order: app (windowed, on the desktop session) → conductor →
 daemon → click things.
