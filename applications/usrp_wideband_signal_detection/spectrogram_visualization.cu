@@ -3047,7 +3047,7 @@ void render_visualization_ui_overlay() {
                             tx0 + 572.0f};
       float ty = fy0 + 24.0f;
       static const char* const kColHdr[9] = {"SNR", "PSK", "QAM", "FSK", "OFDM",
-                                             "BER", "frames", "snips", "GB"};
+                                             "BER", "frames", "snips", "data"};
       for (int c = 0; c < 9; ++c) {
         draw_list->AddText(ImVec2(col[c], ty), panel_muted, kColHdr[c]);
       }
@@ -3088,7 +3088,15 @@ void render_visualization_ui_overlay() {
         std::snprintf(cell, sizeof(cell), "%llu", static_cast<unsigned long long>(r.snips));
         draw_list->AddText(ImVec2(col[7], ty), panel_muted, cell);
         if (r.gb >= 0.0) {
-          std::snprintf(cell, sizeof(cell), "%.2f", r.gb);
+          // auto units: low-SNR snippets are genuinely tiny (that IS the
+          // data-reduction story) — "0.00 GB" reads as broken
+          if (r.gb >= 1.0) {
+            std::snprintf(cell, sizeof(cell), "%.2f GB", r.gb);
+          } else if (r.gb >= 1e-3) {
+            std::snprintf(cell, sizeof(cell), "%.0f MB", r.gb * 1e3);
+          } else {
+            std::snprintf(cell, sizeof(cell), "%.0f KB", r.gb * 1e6);
+          }
           draw_list->AddText(ImVec2(col[8], ty), panel_text, cell);
         }
         ty += 13.0f;

@@ -333,7 +333,7 @@ class Metrics:
                        "frames": b["frames"],
                        "snips": b.get("snips", 0),
                        "files": b.get("files", 0),
-                       "gb": round(b.get("bytes", 0) / 1e9, 3)}
+                       "gb": round(b.get("bytes", 0) / 1e9, 6)}
                 for fam in ("PSK", "QAM", "FSK", "OFDM"):
                     c = b["per"].get(fam)
                     row[f"acc_{fam}"] = (c[0] / c[1]) if c and c[1] else None
