@@ -2197,10 +2197,16 @@ bool json_find_double(const std::string& text, const std::string& key, double& o
   if (pos == std::string::npos) return false;
   const auto colon = text.find(':', pos);
   if (colon == std::string::npos) return false;
-  const auto value = text.substr(colon + 1, 32);
-  if (value.find("null") != std::string::npos) return false;
+  // inspect only the value token itself: a "null" belonging to the NEXT key
+  // within a fixed lookahead window must not kill a perfectly good number
+  size_t i = colon + 1;
+  while (i < text.size() &&
+         (text[i] == ' ' || text[i] == '\n' || text[i] == '\t' || text[i] == '\r')) {
+    ++i;
+  }
+  if (i >= text.size() || text[i] == 'n') return false;  // null value
   try {
-    out = std::stod(value);
+    out = std::stod(text.substr(i, 24));
   } catch (...) { return false; }
   return true;
 }
