@@ -322,13 +322,21 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                                     if metrics.truth else (None, None))
             if clf is not None:
                 res = clf.classify(ch)
-                for name, r in res.items():
-                    metrics.note_cls(name, r.label, r.ms, truth_fam)
                 pred = res[clf.gate].label
                 got, how = decode_band_routed(ch, chfs, bw, pred)
-                mark = ("" if truth_fam is None else
-                        "~sync" if truth_fam == "SYNC" else
-                        "=" if pred == truth_fam else f"!={truth_fam}")
+                # truth for accuracy: TX annotations when provided; otherwise
+                # decode-verified (>=3 CRC-ok frames prove the family via the
+                # frame headers). NOISE-gated / failed bands stay unscored.
+                t = truth_fam
+                if t is None:
+                    okf = [f for f in got if f.payload_crc_ok]
+                    if len(okf) >= 3:
+                        t = family_of(okf[0].payload_mod)
+                for name, r in res.items():
+                    metrics.note_cls(name, r.label, r.ms, t)
+                mark = ("" if t is None else
+                        "~sync" if t == "SYNC" else
+                        "=" if pred == t else f"!={t}")
                 how = f"{how}[{pred}{mark}]"
             else:
                 got, how = decode_band(ch, chfs, bw)

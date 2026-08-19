@@ -2722,7 +2722,7 @@ void render_visualization_ui_overlay() {
           sidebar_text_y += 17.0f;
         }
         draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_muted,
-                           "'>' gates the decoder; acc vs TX truth");
+                           "'>' gates the decoder; acc vs TX/decoded truth");
         sidebar_text_y += 18.0f;
       }
 
