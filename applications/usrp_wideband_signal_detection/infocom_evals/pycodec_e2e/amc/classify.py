@@ -46,10 +46,19 @@ class AmcClassifier:
     def _windows(self, iq: np.ndarray, n: int) -> np.ndarray:
         if iq.size < n:
             iq = np.tile(iq, int(np.ceil(n / iq.size)))
-        k = min(N_WINDOWS, max(1, iq.size // n))
+        # Live detection boxes bridge guard gaps, so an evenly-spread window
+        # can land on dead air (or a composer sync burst) and outvote the
+        # signal windows. Sample more candidates, keep only those within
+        # ~6 dB of the strongest, then classify up to N_WINDOWS of them.
+        k = min(2 * N_WINDOWS, max(1, iq.size // n))
         starts = np.linspace(0, iq.size - n, k).astype(int)
-        return np.stack([to_tensor(rms_normalize(iq[s:s + n]), self._name)
-                         for s in starts])
+        wins = [iq[s:s + n] for s in starts]
+        e = np.array([float(np.mean(np.abs(w) ** 2)) for w in wins])
+        kept = [w for w, ei in zip(wins, e) if ei >= 0.25 * e.max()]
+        if len(kept) > N_WINDOWS:
+            idx = np.linspace(0, len(kept) - 1, N_WINDOWS).astype(int)
+            kept = [kept[i] for i in idx]
+        return np.stack([to_tensor(rms_normalize(w), self._name) for w in kept])
 
     def classify(self, iq: np.ndarray) -> dict[str, ModelResult]:
         iq = np.asarray(iq, dtype=np.complex64)
@@ -59,7 +68,9 @@ class AmcClassifier:
                 t0 = time.time()
                 self._name = name
                 x = torch.from_numpy(self._windows(iq, WINDOW[name])).to(self.device)
-                probs = torch.softmax(net(x), dim=1).mean(0).cpu().numpy()
+                # median across windows: a lone outlier window (sync burst,
+                # residual gap) cannot outvote the signal windows
+                probs = torch.softmax(net(x), dim=1).median(0).values.cpu().numpy()
                 if self.device == "cuda":
                     torch.cuda.synchronize()
                 k = int(probs.argmax())

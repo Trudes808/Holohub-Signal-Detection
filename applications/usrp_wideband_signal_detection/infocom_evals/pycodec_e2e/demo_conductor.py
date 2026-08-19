@@ -32,7 +32,7 @@ PCAP_BY_SNR = {
     **{db: f"snr_single_{db}db.pcap" for db in ("30", "20", "15", "12", "9", "6")},
 }
 CONFIG_BY_DETECTOR = {
-    "coherent_power": "config_signal_snipper_single_channel.yaml",
+    "coherent_power": "config_snipper_viz_demo.yaml",  # viz-enabled; the plain snipper config is HEADLESS
     "cuda_dino": "config_cuda_dino_performance_single_channel.yaml",  # live air (bench-era floors)
 }
 # Loopback replay runs at the composites' rate, which is what the DINO
