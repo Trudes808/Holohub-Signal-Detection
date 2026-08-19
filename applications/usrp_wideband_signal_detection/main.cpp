@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <coherent_power_signal_detector.hpp>
 #include <cuda_dino_detector.hpp>
+#include <finetuned_dino_detector.hpp>
 #include <fft.hpp>
 #include <gxf/core/gxf.h>
 #include <holoscan/holoscan.hpp>
@@ -491,11 +492,15 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     const bool visualization_consumes_fft_directly =
       enable_visualization && coherent_power_fft_aligned_path;
     const bool detector_consumes_fft_directly = coherent_power_fft_aligned_path;
+    // The fine-tuned DINO detector taps RAW IQ (like signal_snipper) and runs its own dedicated FFT,
+    // so it consumes neither the FFT nor the spectrogram output; it must not force a spectrogramOp.
+    const bool detector_taps_iq =
+      enable_detector && detector_type == "cuda_dino_finetuned";
     const bool spectrogram_required =
       enable_spectrogram && (spectrogram_save_enabled ||
                              spectrogram_tensor_save_enabled ||
                              (enable_logger_branch && effective_log_from_spectrogram) ||
-                             (enable_detector && !detector_consumes_fft_directly) ||
+                             (enable_detector && !detector_consumes_fft_directly && !detector_taps_iq) ||
                              (enable_visualization && !visualization_consumes_fft_directly));
     const bool detector_uses_dino_style_stride =
       enable_detector && detector_type == "cuda_dino";
@@ -532,14 +537,17 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       exit(1);
     }
 
-    if (enable_detector && detector_type != "cuda_dino" && detector_type != "coherent_power") {
-      HOLOSCAN_LOG_ERROR("Unsupported pipeline.detector_type='{}'. Expected 'cuda_dino' or 'coherent_power'.",
+    if (enable_detector && detector_type != "cuda_dino" && detector_type != "coherent_power" &&
+        detector_type != "cuda_dino_finetuned") {
+      HOLOSCAN_LOG_ERROR("Unsupported pipeline.detector_type='{}'. Expected 'cuda_dino', "
+                         "'cuda_dino_finetuned' or 'coherent_power'.",
                          detector_type);
       exit(1);
     }
 
     std::vector<std::shared_ptr<holoscan::Operator>> spectrogramOps;
     std::vector<std::shared_ptr<holoscan::Operator>> cudaDinoDetectorOps;
+    std::vector<std::shared_ptr<holoscan::Operator>> finetunedDinoDetectorOps;
     std::vector<std::shared_ptr<holoscan::Operator>> coherentDetectorOps;
     if (spectrogram_required) {
       spectrogramOps.reserve(static_cast<size_t>(pipeline_channels));
@@ -564,6 +572,20 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
               from_config("cuda_dino_detector"),
               holoscan::Arg("channel_filter") = channel_index,
               holoscan::Arg("emit_stride") = (enable_fft_emit_stride ? 1 : configured_dino_emit_stride)));
+        }
+      } else if (detector_type == "cuda_dino_finetuned") {
+        const int detector_channels = from_config("finetuned_dino_detector.num_channels").as<int>();
+        if (detector_channels != pipeline_channels) {
+          HOLOSCAN_LOG_ERROR("finetuned_dino_detector.num_channels={} must match chdr_converter.num_channels={} for one-to-one channel routing.",
+                             detector_channels,
+                             pipeline_channels);
+          exit(1);
+        }
+        for (int channel_index = 0; channel_index < std::max(1, detector_channels); ++channel_index) {
+          finetunedDinoDetectorOps.push_back(make_operator<ops::FinetunedDinoDetector>(
+              std::string("finetunedDinoDetectorOpCh") + std::to_string(channel_index),
+              from_config("finetuned_dino_detector"),
+              holoscan::Arg("channel_filter") = channel_index));
         }
       } else {
         const int detector_channels = from_config("coherent_power_signal_detector.num_channels").as<int>();
@@ -649,7 +671,8 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       const std::string detector_label =
           (!enable_detector || detector_type == "cuda_dino")
               ? std::string("Dinov3")
-              : std::string("Coherent Power");
+              : (detector_type == "cuda_dino_finetuned" ? std::string("Dinov3 FT")
+                                                        : std::string("Coherent Power"));
       spectrogramVisualizerOp = make_operator<ops::SpectrogramToHolovizOp>(
         "spectrogramVisualizerOp",
         Arg("shutdown_scheduling_term") = visualization_shutdown_term,
@@ -676,7 +699,19 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           Arg("output_width") = from_config("visualization.renderer.output_width").as<int>(),
           Arg("output_height") = from_config("visualization.renderer.rows_per_frame").as<int>(),
           Arg("db_floor") = from_config("visualization.renderer.db_floor").as<float>(),
-          Arg("db_ceil") = from_config("visualization.renderer.db_ceil").as<float>()));
+          Arg("db_ceil") = from_config("visualization.renderer.db_ceil").as<float>(),
+          // Auto dB-floor follows the dynamic-color toggle; offset/pct/warmup are optional (defaults used
+          // if absent). from_config_or tolerates configs whose renderer block omits these keys.
+          Arg("dynamic_db_floor") =
+              usrp_wideband::from_config_or<bool>(*this, "visualization.renderer.dynamic_color_limits", false),
+          Arg("dynamic_db_floor_warmup_frames") =
+              usrp_wideband::from_config_or<int>(*this, "visualization.renderer.dynamic_color_warmup_frames", 60),
+          Arg("dynamic_db_floor_offset_db") =
+              usrp_wideband::from_config_or<float>(*this, "visualization.renderer.dynamic_db_floor_offset_db", 7.0f),
+          Arg("dynamic_db_floor_pct") =
+              usrp_wideband::from_config_or<float>(*this, "visualization.renderer.dynamic_db_floor_pct", 0.20f),
+          Arg("fft_size") = fft_runtime.actual_fft_size,
+          Arg("reference_fft_size") = fft_runtime.reference_fft_size));
         visualMaskGateOps.push_back(make_operator<ops::MaskPreviewOp>(
             std::string("visualMaskGateOpCh") + std::to_string(channel_index),
           Arg("channel_index") = channel_index,
@@ -750,6 +785,10 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         }
       } else if (detector_type == "cuda_dino") {
         for (auto& op : cudaDinoDetectorOps) {
+          add_operator(op);
+        }
+      } else if (detector_type == "cuda_dino_finetuned") {
+        for (auto& op : finetunedDinoDetectorOps) {
           add_operator(op);
         }
       }
@@ -826,6 +865,11 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           add_flow(detector_source, coherentDetectorOps[static_cast<size_t>(channel_index)]);
         } else if (detector_type == "cuda_dino") {
           add_flow(detector_source, cudaDinoDetectorOps[static_cast<size_t>(channel_index)]);
+        } else if (detector_type == "cuda_dino_finetuned") {
+          // Taps raw time-domain IQ upstream of the FFT (same port that feeds fftOp / snipper) and
+          // runs its own dedicated nfft-point FFT internally to match the model's trained geometry.
+          add_flow(chdrConverterOp, finetunedDinoDetectorOps[static_cast<size_t>(channel_index)],
+                   {{chdr_port, "iq_in"}});
         }
       }
 
@@ -839,6 +883,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
                    {{"mask_out", "mask_in"}});
         } else if (detector_type == "cuda_dino") {
           add_flow(cudaDinoDetectorOps[static_cast<size_t>(channel_index)], snipperOp,
+                   {{"mask_out", "mask_in"}});
+        } else if (detector_type == "cuda_dino_finetuned") {
+          add_flow(finetunedDinoDetectorOps[static_cast<size_t>(channel_index)], snipperOp,
                    {{"mask_out", "mask_in"}});
         }
         add_flow(snipperOp, sigmfFileSinkOps[static_cast<size_t>(channel_index)],
@@ -874,6 +921,10 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
                    {{"mask_out", "in"}});
         } else if (detector_type == "cuda_dino") {
           add_flow(cudaDinoDetectorOps[static_cast<size_t>(ch)],
+                   visualMaskGateOps[static_cast<size_t>(ch)],
+                   {{"mask_out", "in"}});
+        } else if (detector_type == "cuda_dino_finetuned") {
+          add_flow(finetunedDinoDetectorOps[static_cast<size_t>(ch)],
                    visualMaskGateOps[static_cast<size_t>(ch)],
                    {{"mask_out", "in"}});
         } else {
