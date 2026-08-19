@@ -95,6 +95,21 @@ app pkill from step 2.
 - The AMC classifier currently misreads wire-path snips even when decode is
   clean (domain gap under investigation) — hence `--no-amc` above.
 
+## Dashboard panels (final demo layout)
+
+- Sidebar LIVE DECODE: frames/CRC, BER att (+ whole when truth-scored),
+  windowed **frames/s** + **snips decoded %** (collapse immediately on SNR
+  changes — the cumulative numbers and survivor-averaged BER do not), inst-BER
+  sparkline, per-mod bars, CLASSIFIER block (3 models, live accuracy vs
+  decoded truth, '>' = gate).
+- Footer left: PN9 BER strip. Footer right: **CLASSIFIER x SNR** table —
+  one row per SNR selection visited: gate acc per class, decoded BER,
+  frames, snippets written, GB stored; header shows the data-reduction
+  headline ("stored X GB vs Y GB full-rate = Zx less", baseline = daemon
+  uptime x stream rate x 8 B cf32). Note: the clean composite is
+  artificially signal-dense, so the reduction factor is modest there and
+  grows at low SNR / on sparse real spectrum.
+
 ## Dashboard demo controls (gate / SNR / detector from the UI)
 
 The windowed dashboard now has a **DEMO CONTROLS** panel (above Display
