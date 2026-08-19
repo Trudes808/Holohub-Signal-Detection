@@ -419,31 +419,43 @@ def main():
     last_new = time.time()
     print(f"rt_decode_daemon: watching {args.snips} "
           f"({'AMC-routed' if clf else 'blind cascade'}, profile {PROFILE})", flush=True)
-    control_mtime = 0.0
+    control_state = {"mtime": 0.0}
+
+    def check_control():
+        """Apply DEMO CONTROLS gate switches. Called per-snippet: a live
+        backlog can keep one outer loop iteration busy for minutes."""
+        if clf is None:
+            return
+        try:
+            mt = os.path.getmtime(control_path)
+            if mt == control_state["mtime"]:
+                return
+            control_state["mtime"] = mt
+            gate = json.load(open(control_path)).get("gate")
+            if gate in clf.models and gate != clf.gate:
+                clf.gate = gate
+                metrics.gate = gate
+                print(f"[{time.strftime('%H:%M:%S')}] === DEMO CONTROL: gate -> {gate} ===",
+                      flush=True)
+                try:  # reflect the '>' marker immediately, before new snips
+                    tmp = metrics_path + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump(metrics.as_dict(), f, indent=1)
+                    os.replace(tmp, metrics_path)
+                except OSError:
+                    pass
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
     while True:
-        # live gate switch from the dashboard's DEMO CONTROLS panel
-        if clf is not None:
-            try:
-                mt = os.path.getmtime(control_path)
-                if mt != control_mtime:
-                    control_mtime = mt
-                    gate = json.load(open(control_path)).get("gate")
-                    if gate in clf.models and gate != clf.gate:
-                        clf.gate = gate
-                        metrics.gate = gate
-                        print(f"[{time.strftime('%H:%M:%S')}] === DEMO CONTROL: gate -> {gate} ===",
-                              flush=True)
-                        try:  # reflect the '>' marker immediately, before new snips
-                            tmp = metrics_path + ".tmp"
-                            with open(tmp, "w") as f:
-                                json.dump(metrics.as_dict(), f, indent=1)
-                            os.replace(tmp, metrics_path)
-                        except OSError:
-                            pass
-            except (OSError, json.JSONDecodeError, ValueError):
-                pass
+        check_control()
         new_work = False
-        for mp in sorted(glob.glob(os.path.join(args.snips, "*.sigmf-meta"))):
+        packs_this_pass = 0
+        # newest first: under a live looped replay the daemon cannot drain the
+        # backlog, so track NOW and let the janitor age out what we skip
+        for mp in sorted(glob.glob(os.path.join(args.snips, "*.sigmf-meta")),
+                         key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+                         reverse=True):
             try:
                 meta = json.load(open(mp))
             except (json.JSONDecodeError, OSError):
@@ -458,6 +470,7 @@ def main():
             except (OSError, ValueError):
                 continue
             for a in anns[done:]:
+                check_control()
                 line = process_annotation(a, data, metrics, clf=clf)
                 if line:
                     print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
@@ -471,6 +484,9 @@ def main():
                     pass
             seen[mp] = len(anns)
             new_work = True
+            packs_this_pass += 1
+            if packs_this_pass >= 3:
+                break   # re-glob so freshly written packs jump the queue
         if new_work:
             last_new = time.time()
             m = metrics.as_dict()
