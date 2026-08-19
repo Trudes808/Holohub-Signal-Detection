@@ -45,6 +45,27 @@ from pycodec.ofdm import decode_frames_ofdm, snap_profile_rate  # noqa: E402
 PROFILE = dict(sps=8, pulse_shape="rrc", rolloff=0.35, span_symbols=10)
 FSK_PROFILE = dict(sps=8, h=0.5, bt=0.5)
 
+# Frequency-plan truth for the staircase-family replay captures (loop-invariant:
+# no time alignment needed). Center -> family, plus the burst geometry
+# (period samples @245.76M, payload bits per period) for whole-band BER:
+# a band that is misclassified / misrouted / undecoded gets its expected
+# bits charged at 100%.
+BAND_TRUTH_PLAN = [(-60e6, "PSK", 119616, 4096),
+                   (-20e6, "FSK", 150976, 1024),
+                   (0.0, "QAM", 86784, 8192),
+                   (60e6, "OFDM", 109056, 8192)]
+BAND_TRUTH_TOL_HZ = 12e6
+BAND_TRUTH_FS = 245.76e6
+
+
+def band_truth(f_center: float):
+    """(family, expected_bits_per_second) from the fixed staircase frequency
+    plan, or (None, 0) off-plan (treated as NOISE truth for accuracy)."""
+    for f, fam, period, pbits in BAND_TRUTH_PLAN:
+        if abs(f_center - f) <= BAND_TRUTH_TOL_HZ:
+            return fam, pbits * BAND_TRUTH_FS / period
+    return None, 0.0
+
 
 def family_of(mod: str) -> str:
     """Map a modulation / entry class tag to its AMC family."""
@@ -241,16 +262,20 @@ class Metrics:
         self.data_snips += new_snips
 
     def note_band_snr(self, truth, labels: dict, gate: str,
-                      bits: int, errors: int, nframes: int):
+                      bits: int, errors: int, nframes: int, wexp: int = 0):
         """Per-SNR footer stats. Classification accuracy accumulates for ALL
         models simultaneously (each classifies every band); decode stats
         (BER/frames) accumulate under the ACTIVE gate, since routing decides
         what decodes — dwell at an SNR under each gate to compare."""
         b = self._bucket()
-        gstats = b["per_gate"].setdefault(gate, {"bits": 0, "errors": 0, "frames": 0})
+        gstats = b["per_gate"].setdefault(gate, {"bits": 0, "errors": 0, "frames": 0,
+                                                 "wbits": 0, "werr": 0})
         gstats["bits"] += bits
         gstats["errors"] += errors
         gstats["frames"] += nframes
+        if wexp > 0:   # whole-band BER: undelivered bits count 100% wrong
+            gstats["wbits"] += wexp
+            gstats["werr"] += errors + max(0, wexp - bits)
         if truth not in (None, "SYNC"):
             for name, label in labels.items():
                 c = b["acc"].setdefault(name, [0, 0])
@@ -342,6 +367,8 @@ class Metrics:
                     g = b.get("per_gate", {}).get(name)
                     row[f"ber_{name}"] = ((g["errors"] / g["bits"])
                                           if g and g["bits"] else None)
+                    row[f"wber_{name}"] = ((g["werr"] / g["wbits"])
+                                           if g and g.get("wbits") else None)
                     row[f"frames_{name}"] = g["frames"] if g else 0
                 d["by_snr"][lbl] = row
         # data-reduction story: what the snipper stored vs capturing the full
@@ -352,6 +379,9 @@ class Metrics:
         d["full_capture_gb"] = round(
             (time.time() - self.started) * self.stream_rate_hz * 8.0 / 1e9, 2)
         return d
+
+
+args_no_band_truth = False
 
 
 def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
@@ -387,10 +417,18 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                 res = clf.classify(ch)
                 pred = res[clf.gate].label
                 got, how = decode_band_routed(ch, chfs, bw, pred)
-                # truth for accuracy: TX annotations when provided; otherwise
-                # decode-verified (>=3 CRC-ok frames prove the family via the
-                # frame headers). NOISE-gated / failed bands stay unscored.
+                # truth priority: TX annotations (offline) > fixed frequency
+                # plan (staircase-family replay, loop-invariant) >
+                # decode-verified (>=3 CRC-ok frames prove the family)
                 t = truth_fam
+                wexp = 0
+                if t is None and not args_no_band_truth:
+                    plan_fam, bps = band_truth(snip_center + center)
+                    if plan_fam is not None:
+                        t = plan_fam
+                        wexp = int(bps * (iq.size / snip_fs))
+                    else:
+                        t = "NOISE"
                 if t is None:
                     okf = [f for f in got if f.payload_crc_ok]
                     if len(okf) >= 3:
@@ -405,7 +443,7 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                     t, {name: r.label for name, r in res.items()}, clf.gate,
                     sum(f.payload_len_bits for f in got if f.pn9_payload),
                     sum(f.bit_errors for f in got if f.pn9_payload),
-                    len(got))
+                    len(got), wexp)
             else:
                 got, how = decode_band(ch, chfs, bw)
             frames.extend(got)
@@ -470,11 +508,16 @@ def main():
     ap.add_argument("--truth-lib", default=os.path.join(PYCODEC_ROOT,
                                                         "generated_waveforms_framed"),
                     help="waveform library root (entry jsons) for expected-bits math")
+    ap.add_argument("--no-band-truth", action="store_true",
+                    help="disable the fixed staircase frequency-plan truth "
+                         "(use when replaying content with a different plan)")
     args = ap.parse_args()
     metrics_path = args.metrics_out or os.path.join(args.snips, "rt_metrics.json")
     control_path = args.control_json or os.path.join(os.path.dirname(metrics_path),
                                                      "demo_control.json")
 
+    global args_no_band_truth
+    args_no_band_truth = args.no_band_truth
     truth = TruthScorer(args.truth_meta, args.truth_lib) if args.truth_meta else None
     if truth:
         print(f"truth: {len(truth.placements)} placements, "

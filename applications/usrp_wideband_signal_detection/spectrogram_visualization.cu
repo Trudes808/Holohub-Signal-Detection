@@ -2336,7 +2336,11 @@ void poll_decode_metrics() {
         static const char* const kModelKeys[3] = {"vtcnn2", "resnet1d", "tprime"};
         for (int mi = 0; mi < 3; ++mi) {
           json_find_double(row, std::string("acc_") + kModelKeys[mi], r.acc[mi]);
-          json_find_double(row, std::string("ber_") + kModelKeys[mi], r.ber[mi]);
+          // whole-band BER (lost/misrouted bands charged 1.0) when the
+          // frequency-plan truth is active, else attempted BER
+          if (!json_find_double(row, std::string("wber_") + kModelKeys[mi], r.ber[mi])) {
+            json_find_double(row, std::string("ber_") + kModelKeys[mi], r.ber[mi]);
+          }
           json_find_u64(row, std::string("frames_") + kModelKeys[mi], r.frames3[mi]);
         }
         json_find_u64(row, "snips", r.snips);
@@ -3057,7 +3061,7 @@ void render_visualization_ui_overlay() {
       float ty = fy0 + 24.0f;
       draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_muted, "SNR");
       draw_list->AddText(ImVec2(kAccX, ty), panel_muted, "acc V / R / T");
-      draw_list->AddText(ImVec2(kBerX, ty), panel_muted, "BER V / R / T");
+      draw_list->AddText(ImVec2(kBerX, ty), panel_muted, "wBER V / R / T");
       draw_list->AddText(ImVec2(kFrX, ty), panel_muted, "frames V / R / T");
       draw_list->AddText(ImVec2(kSnipsX, ty), panel_muted, "snips");
       draw_list->AddText(ImVec2(kDataX, ty), panel_muted, "data");
