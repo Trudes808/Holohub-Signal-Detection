@@ -27,7 +27,7 @@ import time
 
 COMPOSITES = "/home/genesys-dgx1/Documents/holoscan_waveform_generation/composition/composites"  # fixed: ~ expands to /root under sudo
 PCAP_BY_SNR = {
-    "clean": "comprehensive_4class_py.pcap",
+    "clean": "snr_clean_burst.pcap",   # noise-free staircase-family capture (same bands/bursts); the composer composite pcap remains for manual replay
     "staircase": "snr_staircase_4class.pcap",
     **{db: f"snr_single_{db}db.pcap" for db in ("30", "20", "15", "12", "9", "6")},
 }
