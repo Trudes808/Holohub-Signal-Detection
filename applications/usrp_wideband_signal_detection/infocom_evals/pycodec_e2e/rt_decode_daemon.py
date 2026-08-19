@@ -276,6 +276,12 @@ class Metrics:
         if wexp > 0:   # whole-band BER: undelivered bits count 100% wrong
             gstats["wbits"] += wexp
             gstats["werr"] += errors + max(0, wexp - bits)
+        if truth not in (None, "SYNC"):
+            for name, label in labels.items():
+                acc = b["acc"].setdefault(name, [0, 0])
+                acc[1] += 1
+                if label == truth:
+                    acc[0] += 1
 
     def note_band_channel(self, bits: int, errors: int, wexp: int):
         """Oracle-routed decode of the same band (correct branch regardless of
@@ -285,12 +291,6 @@ class Metrics:
         c = b.setdefault("channel", {"wbits": 0, "werr": 0})
         c["wbits"] += wexp
         c["werr"] += errors + max(0, wexp - bits)
-        if truth not in (None, "SYNC"):
-            for name, label in labels.items():
-                c = b["acc"].setdefault(name, [0, 0])
-                c[1] += 1
-                if label == truth:
-                    c[0] += 1
 
     def note_cls(self, name: str, label: str, ms: float, truth_fam: str | None):
         c = self.cls.setdefault(name, {"n": 0, "ms_sum": 0.0, "truth_n": 0,
