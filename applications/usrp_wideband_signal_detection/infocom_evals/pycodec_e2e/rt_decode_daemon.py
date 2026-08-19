@@ -276,6 +276,15 @@ class Metrics:
         if wexp > 0:   # whole-band BER: undelivered bits count 100% wrong
             gstats["wbits"] += wexp
             gstats["werr"] += errors + max(0, wexp - bits)
+
+    def note_band_channel(self, bits: int, errors: int, wexp: int):
+        """Oracle-routed decode of the same band (correct branch regardless of
+        the gate): gate-independent channel/modem whole-BER. Classifier cost
+        = wBER(gate) - chBER, visible directly on the table."""
+        b = self._bucket()
+        c = b.setdefault("channel", {"wbits": 0, "werr": 0})
+        c["wbits"] += wexp
+        c["werr"] += errors + max(0, wexp - bits)
         if truth not in (None, "SYNC"):
             for name, label in labels.items():
                 c = b["acc"].setdefault(name, [0, 0])
@@ -370,6 +379,9 @@ class Metrics:
                     row[f"wber_{name}"] = ((g["werr"] / g["wbits"])
                                            if g and g.get("wbits") else None)
                     row[f"frames_{name}"] = g["frames"] if g else 0
+                ch = b.get("channel")
+                row["chber"] = ((ch["werr"] / ch["wbits"])
+                                if ch and ch["wbits"] else None)
                 d["by_snr"][lbl] = row
         # data-reduction story: what the snipper stored vs capturing the full
         # stream (cf32) for the daemon's whole uptime
@@ -449,6 +461,17 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                     sum(f.payload_len_bits for f in got if f.pn9_payload),
                     sum(f.bit_errors for f in got if f.pn9_payload),
                     len(got), wexp)
+                if wexp > 0 and t in ("PSK", "QAM", "FSK", "OFDM"):
+                    if pred == t:      # gate matched truth: reuse the decode
+                        cgot = got
+                    else:              # oracle-routed decode (measurement only)
+                        try:
+                            cgot, _ = decode_band_routed(ch, chfs, bw, t)
+                        except Exception:
+                            cgot = []
+                    metrics.note_band_channel(
+                        sum(f.payload_len_bits for f in cgot if f.pn9_payload),
+                        sum(f.bit_errors for f in cgot if f.pn9_payload), wexp)
             else:
                 got, how = decode_band(ch, chfs, bw)
             frames.extend(got)

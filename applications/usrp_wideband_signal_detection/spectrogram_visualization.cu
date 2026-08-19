@@ -2149,6 +2149,7 @@ struct DecodeMetricsSnapshot {
     uint64_t frames3[3] = {0, 0, 0};             // per GATE
     uint64_t snips = 0;                          // snippets written at this SNR
     double gb = -1.0;                            // snippet bytes stored (GB)
+    double chber = -1.0;                         // oracle-routed channel whole-BER
   };
   std::vector<SnrRow> snr_rows;
   double data_saved_gb = -1.0;                   // total snippet bytes stored
@@ -2345,6 +2346,7 @@ void poll_decode_metrics() {
         }
         json_find_u64(row, "snips", r.snips);
         json_find_double(row, "gb", r.gb);
+        json_find_double(row, "chber", r.chber);
         next.snr_rows.push_back(std::move(r));
       }
     }
@@ -3055,13 +3057,15 @@ void render_visualization_ui_overlay() {
       }
       // triples are VT-CNN2 / ResNet1D / T-PRIME; acc is simultaneous for all
       // models, BER/frames accumulate under whichever gate was active
-      const float kAccX = tx0 + 74.0f, kBerX = tx0 + 236.0f, kFrX = tx0 + 452.0f;
-      const float kSnipsX = tx0 + 624.0f, kDataX = tx0 + 700.0f;
-      const float dAcc = 52.0f, dBer = 70.0f, dFr = 55.0f;
+      const float kAccX = tx0 + 74.0f, kBerX = tx0 + 226.0f, kChX = tx0 + 432.0f;
+      const float kFrX = tx0 + 500.0f;
+      const float kSnipsX = tx0 + 656.0f, kDataX = tx0 + 726.0f;
+      const float dAcc = 50.0f, dBer = 66.0f, dFr = 50.0f;
       float ty = fy0 + 24.0f;
       draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_muted, "SNR");
       draw_list->AddText(ImVec2(kAccX, ty), panel_muted, "acc V / R / T");
       draw_list->AddText(ImVec2(kBerX, ty), panel_muted, "wBER V / R / T");
+      draw_list->AddText(ImVec2(kChX, ty), panel_muted, "chBER");
       draw_list->AddText(ImVec2(kFrX, ty), panel_muted, "frames V / R / T");
       draw_list->AddText(ImVec2(kSnipsX, ty), panel_muted, "snips");
       draw_list->AddText(ImVec2(kDataX, ty), panel_muted, "data");
@@ -3096,6 +3100,19 @@ void render_visualization_ui_overlay() {
                                r.ber[mi] < 1e-3 ? IM_COL32(255, 212, 89, 255)
                                                  : accent_orange,
                                cell);
+          }
+          if (mi == 0) {   // channel column once per row, between BER and frames
+            if (r.chber < 0.0) {
+              draw_list->AddText(ImVec2(kChX, ty), panel_muted, "--");
+            } else if (r.chber == 0.0) {
+              draw_list->AddText(ImVec2(kChX, ty), accent_green, "0.0");
+            } else {
+              std::snprintf(cell, sizeof(cell), "%.0e", r.chber);
+              draw_list->AddText(ImVec2(kChX, ty),
+                                 r.chber < 1e-3 ? IM_COL32(255, 212, 89, 255)
+                                                 : accent_orange,
+                                 cell);
+            }
           }
           if (r.frames3[mi] >= 10000) {
             std::snprintf(cell, sizeof(cell), "%.0fk", r.frames3[mi] / 1000.0);

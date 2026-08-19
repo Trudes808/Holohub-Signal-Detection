@@ -43,7 +43,7 @@ PAD = 768           # channelize()/window margin
 FS0 = 245.76e6
 K_MAX = 4           # snipper decimation ladder: snip_fs = FS0 / 2^k
 CFO_FRAC_OCC = 0.05  # residual center error, fraction of the signal bandwidth
-SNR_DB = (0.0, 30.0)
+SNR_DB = (0.0, 45.0)   # Clean runs at 50 dB; keep the top of the range near it
 NEIGHBOR_P = 0.35   # chance of a stacked-slot neighbor leaking into the band
 # Payload length AND content are randomized per burst as a stratified
 # (content kind x length) grid: every nuisance dimension of the frame must
@@ -178,6 +178,26 @@ def _one_signal(member: str, rng: np.random.Generator) -> np.ndarray:
                 g = 10 ** (rng.uniform(-3, 3) / 20.0)
                 x = x + g * y * np.exp(1j * (2 * np.pi * df_n * n / snip_fs +
                                              rng.uniform(0, 2 * np.pi)))
+    # burst gating: live content transmits ~57%-duty bursts with raised-cosine
+    # edges (snr_staircase_4class); continuous-only training windows made the
+    # on/off transitions out-of-distribution
+    if rng.random() < 0.6:
+        period = int(rng.uniform(0.35e-3, 1.6e-3) * snip_fs / d)
+        duty = rng.uniform(0.4, 0.75)
+        on_n = max(256, int(period * duty))
+        env = np.zeros(L, dtype=np.float32)
+        ramp = 64
+        w = (0.5 - 0.5 * np.cos(np.pi * np.arange(ramp) / ramp)).astype(np.float32)
+        pos = int(rng.integers(0, max(1, period)))
+        while pos < L:
+            e = min(pos + on_n, L)
+            env[pos:e] = 1.0
+            if e - pos > 2 * ramp:
+                env[pos:pos + ramp] = w
+                env[e - ramp:e] = w[::-1]
+            pos += period
+        if env.max() > 0:
+            x = x * env
     snr = rng.uniform(*SNR_DB)
     noise_total = p_sig * (snip_fs / occ) / 10 ** (snr / 10.0)
     sigma = np.sqrt(noise_total / 2.0)
