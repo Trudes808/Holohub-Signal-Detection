@@ -57,8 +57,12 @@ STREAM_PARAMS_SIDECAR = "/tmp/usrp_stream_params.json"
 SAMPLES_PER_PACKET = 1024          # chdr_converter.num_complex_samples_per_packet
 BYTES_PER_SAMPLE = 4               # sc16: int16 I + int16 Q
 PAYLOAD_BYTES = SAMPLES_PER_PACKET * BYTES_PER_SAMPLE      # 4096
-CHDR_HEADER_LINE_BYTES = 32        # CHDR_W=256: 8B hdr + 8B timestamp + 16B pad
-CHDR_LENGTH = CHDR_HEADER_LINE_BYTES + PAYLOAD_BYTES        # 4128
+# 64B header line matches the CG_400 image this app's NIC split (42/64/4096) was built
+# against: 8B hdr + 8B timestamp + 48B pad. The old 32B default silently cost the LAST
+# 8 samples of every packet (the fixed split put 32B of payload into the header segment
+# and the converter's data segment came up short) -> ~1e-3 BER + impulsive floor.
+CHDR_HEADER_LINE_BYTES = int(__import__("os").environ.get("CHDR_HEADER_LINE_BYTES", "64"))
+CHDR_LENGTH = CHDR_HEADER_LINE_BYTES + PAYLOAD_BYTES        # 4160 (64B) / 4128 (32B)
 CHDR_PKT_TYPE_DATA_WITH_TS = 0x7
 CHDR_DST_EPID = 3
 ETHERTYPE_IPV4 = 0x0800
@@ -187,7 +191,8 @@ def build_chdr_header_line(seq_num: int, timestamp: int) -> bytes:
         | ((CHDR_PKT_TYPE_DATA_WITH_TS & 0x7) << 53)
         # eov(56)=0, eob(57)=0, vc(63:58)=0
     )
-    return struct.pack("<Q", header) + struct.pack("<Q", timestamp & 0xFFFFFFFFFFFFFFFF) + b"\x00" * 16
+    return (struct.pack("<Q", header) + struct.pack("<Q", timestamp & 0xFFFFFFFFFFFFFFFF)
+            + b"\x00" * (CHDR_HEADER_LINE_BYTES - 16))
 
 
 def mac_to_bytes(mac: str) -> bytes:

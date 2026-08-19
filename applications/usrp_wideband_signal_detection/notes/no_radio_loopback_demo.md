@@ -28,44 +28,72 @@ prepared and verified offline on 2026-08-17; the wire step needs the cable.
   - `~/Documents/holoscan_waveform_generation/composition/composites/snr_staircase_4class.pcap`
     (30→6 dB staircase: whole-vs-attempted BER divergence on the dashboard)
 
-## In-person bring-up (one cable, ~5 commands)
+## In-person bring-up (VALIDATED 2026-08-18 — this is the working recipe)
 
-1. **Cable**: QSFP between `enP2p1s0f0np0` (sender, kernel) and
-   `enp1s0f0np0` (receiver, DPDK). Verify both show LOWER_UP:
-   `ip -br link show | grep -E "enp1s0f0np0|enP2p1s0f0np0"`.
-2. **Sender MTU** (frames are ~4170 B):
-   `sudo ip link set enP2p1s0f0np0 up mtu 9000`
-3. **Stream-params sidecar** so the app auto-adopts the replayed rate/center
-   (the run wrapper consumes + deletes it at each launch):
-   ```bash
-   echo '{"sample_rate_hz": 245760000.0, "center_freq_hz": 2400000000.0, "source": "replay"}' \
-     | sudo tee /tmp/usrp_stream_params.json
-   ```
-4. **App** (from the app dir; snipper config for the decode demo, or the
-   dynamic single-channel config for detection-only):
-   `sudo ./bash_scripts/run_torchscript_performance_test.sh config_signal_snipper_single_channel.yaml`
-   (loopback needs no radio topology: `SKIP_TOPOLOGY_CHECK=1` if a wrapper
-   insists on it.)
-5. **Replay** (generator-printed recipe; `--pps 240000` = 1024-sample packets
-   at exactly 245.76 Msps, `--loop 0` sustains it, Ctrl-C stops):
-   `sudo tcpreplay --preload-pcap --loop 0 --pps 240000 -i enP2p1s0f0np0 ~/Documents/holoscan_waveform_generation/composition/composites/comprehensive_4class_py.pcap`
-   (pcap timestamps are written at true spacing, so omitting `--pps` also
-   replays at rate; swap in `snr_staircase_4class.pcap` for the BER-degradation
-   staircase.)
-6. **Decode daemon** (classifier-routed, live metrics for the dashboard):
-   ```bash
-   cd infocom_evals/pycodec_e2e
-   ~/Documents/holoscan_waveform_generation/.venv-ml/bin/python rt_decode_daemon.py \
-     --snips /tmp/usrp_spectrograms/<run>/snippets \
-     --truth-meta ~/Documents/holoscan_waveform_generation/composition/composites/comprehensive_4class_py.sigmf-meta \
-     --metrics-out /tmp/usrp_spectrograms/rt_metrics.json
-   ```
-   (drop `--truth-meta` for a fully blind demo — accuracy shows `--`,
-   whole BER is omitted, everything else works.)
+Cabling used: QSFP between the first CX7's two ports —
+`enp1s0f1np1` (sender) <-> `enp1s0f0np0` (DPDK receiver). The second CX7
+(`enP2p1s0*`) works too; pass its name as the sender everywhere below.
 
-Expected: the waterfall shows the composite's actual slot structure (much
-prettier than ambient spectrum), detection boxes on every burst, decode
-markers + CLASSIFIER panel + dual BER live, GRCON text on the ticker.
+```bash
+cd ~/Documents/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection
+
+# 0. X access for the container's window (resets on login/lock! rerun if the
+#    window ever fails to appear — it fails SILENTLY otherwise)
+DISPLAY=:1 xhost +local:
+
+# 1. sender port up at jumbo MTU
+sudo ip link set enp1s0f1np1 up mtu 9000
+
+# 2. the app: snipper + visualizer variant, replay rate pinned via env
+sudo docker exec usrp_x410_sig_det_sat3737 bash -lc \
+  "pkill -f '(^|/)usrp_wideband_signal_detection( |\$)' || true"
+sudo docker exec -d -e DISPLAY=:1 -e USRP_SAMPLE_RATE_HZ=245760000 \
+  -e USRP_CENTER_FREQ_HZ=2400000000 usrp_x410_sig_det_sat3737 bash -lc \
+  "mkdir -p /tmp/xdg-runtime-root && chmod 700 /tmp/xdg-runtime-root && \
+   export XDG_RUNTIME_DIR=/tmp/xdg-runtime-root && \
+   cd /workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection && \
+   exec ./usrp_wideband_signal_detection config_snipper_viz_demo.yaml \
+   > /workspace/spectrograms/demo_app.log 2>&1"
+
+# 3. the conductor (watches DEMO CONTROLS; starts/loops tcpreplay per the SNR
+#    dropdown; restarts the app on detector switches)
+cd infocom_evals/pycodec_e2e
+sudo bash -c '(python3 demo_conductor.py --iface enp1s0f1np1 \
+  --rate-hz 245760000 --display :1 > /tmp/usrp_spectrograms/conductor.log 2>&1 &)'
+
+# 4. the decode daemon (LIVE DECODE panel; --no-amc = blind cascade until the
+#    wire-path classifier gap is closed, then drop the flag for gate routing)
+(~/Documents/holoscan_waveform_generation/.venv-ml/bin/python rt_decode_daemon.py \
+  --snips /tmp/usrp_spectrograms/snippets --no-amc \
+  --metrics-out /tmp/usrp_spectrograms/rt_metrics.json \
+  > /tmp/usrp_spectrograms/daemon_live.log 2>&1 &)
+
+# 5. snippet janitor (looped replay writes ~500 MB/s of snippets at real time)
+sudo bash -c '(while true; do \
+  find /tmp/usrp_spectrograms/snippets -name "snip_pack*" -mmin +5 -delete 2>/dev/null; \
+  sleep 30; done > /dev/null 2>&1 &)'
+```
+
+Teardown: `sudo pkill -f '^tcpreplay'`, `sudo pkill -f '^python3 demo_conductor'`,
+`pkill -f 'rt_decode_daemon.py --snips'` (run each as its OWN command — a
+compound line whose text contains the pattern kills your own shell), and the
+app pkill from step 2.
+
+### Hard-won gotchas (2026-08-18 bring-up)
+
+- **pcap CHDR header line must be 64 B** for this app's 42/64/4096 NIC split
+  (matches the real X410 CG_400 packets). The tool's old 32 B default silently
+  ZEROED THE LAST 8 SAMPLES OF EVERY PACKET: ~1e-3 BER with packet-grid
+  structure, an impulsive floor that widened/merged detection boxes, and
+  classifier garbage — while spectrograms and masks looked fine.
+  `replay_rx_to_buff.py` now defaults to 64 B (`CHDR_HEADER_LINE_BYTES` env
+  to override); all committed pcap recipes regenerate correctly.
+- **`xhost +local:` resets** on login/lock — the app then runs fine but
+  windowless (no error in the log; `visualization.enable: false` in the plain
+  snipper config does the same, which is why `config_snipper_viz_demo.yaml`
+  exists).
+- The AMC classifier currently misreads wire-path snips even when decode is
+  clean (domain gap under investigation) — hence `--no-amc` above.
 
 ## Dashboard demo controls (gate / SNR / detector from the UI)
 
