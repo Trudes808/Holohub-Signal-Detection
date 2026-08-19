@@ -382,6 +382,7 @@ class Metrics:
 
 
 args_no_band_truth = False
+args_center_hz = 2.4e9   # channel tune: live snips tag ABSOLUTE RF centers
 
 
 def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
@@ -423,7 +424,11 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                 t = truth_fam
                 wexp = 0
                 if t is None and not args_no_band_truth:
-                    plan_fam, bps = band_truth(snip_center + center)
+                    # live snips tag absolute RF; the plan is baseband
+                    f_band = snip_center + center
+                    if abs(f_band) > 1e9:
+                        f_band -= args_center_hz
+                    plan_fam, bps = band_truth(f_band)
                     if plan_fam is not None:
                         t = plan_fam
                         wexp = int(bps * (iq.size / snip_fs))
@@ -508,6 +513,9 @@ def main():
     ap.add_argument("--truth-lib", default=os.path.join(PYCODEC_ROOT,
                                                         "generated_waveforms_framed"),
                     help="waveform library root (entry jsons) for expected-bits math")
+    ap.add_argument("--center-hz", type=float, default=2.4e9,
+                    help="channel tune frequency (converts live snips' absolute "
+                         "RF band centers to baseband for the frequency-plan truth)")
     ap.add_argument("--no-band-truth", action="store_true",
                     help="disable the fixed staircase frequency-plan truth "
                          "(use when replaying content with a different plan)")
@@ -516,8 +524,9 @@ def main():
     control_path = args.control_json or os.path.join(os.path.dirname(metrics_path),
                                                      "demo_control.json")
 
-    global args_no_band_truth
+    global args_no_band_truth, args_center_hz
     args_no_band_truth = args.no_band_truth
+    args_center_hz = args.center_hz
     truth = TruthScorer(args.truth_meta, args.truth_lib) if args.truth_meta else None
     if truth:
         print(f"truth: {len(truth.placements)} placements, "
