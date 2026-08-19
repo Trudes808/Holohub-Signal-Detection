@@ -489,6 +489,7 @@ def main():
     meta_counts: dict[str, int] = {}
 
     last_scan = [0.0]
+    primed = [False]
 
     def scan_data_stats():
         """Account every byte/file/snippet the sink writes, independent of
@@ -499,6 +500,9 @@ def main():
         if time.time() - last_scan[0] < 1.0:
             return
         last_scan[0] = time.time()
+        # first scan only PRIMES the baselines: pre-existing packs (from an
+        # earlier daemon run) must not lump into the current SNR bucket
+        attribute = primed[0]
         live = set()
         for dp in glob.glob(os.path.join(args.snips, "*.sigmf-data")):
             live.add(dp)
@@ -508,10 +512,12 @@ def main():
                 continue
             prev = pack_sizes.get(dp)
             if prev is None:
-                metrics.note_data(sz, new_files=1)
+                if attribute:
+                    metrics.note_data(sz, new_files=1)
                 pack_sizes[dp] = sz
             elif sz > prev:
-                metrics.note_data(sz - prev)
+                if attribute:
+                    metrics.note_data(sz - prev)
                 pack_sizes[dp] = sz
         for gone in set(pack_sizes) - live:
             del pack_sizes[gone]
@@ -528,11 +534,13 @@ def main():
             except (OSError, json.JSONDecodeError):
                 continue
             if n_ann > meta_counts.get(mp2, 0):
-                metrics.note_data(0, new_snips=n_ann - meta_counts.get(mp2, 0))
+                if attribute:
+                    metrics.note_data(0, new_snips=n_ann - meta_counts.get(mp2, 0))
                 meta_counts[mp2] = n_ann
         for gone in set(meta_mtimes) - set(glob.glob(os.path.join(args.snips, "*.sigmf-meta"))):
             meta_mtimes.pop(gone, None)
             meta_counts.pop(gone, None)
+        primed[0] = True
     last_new = time.time()
     print(f"rt_decode_daemon: watching {args.snips} "
           f"({'AMC-routed' if clf else 'blind cascade'}, profile {PROFILE})", flush=True)

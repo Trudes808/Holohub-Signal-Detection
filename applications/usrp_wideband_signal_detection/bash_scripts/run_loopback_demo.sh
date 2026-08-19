@@ -34,8 +34,9 @@ DISPLAY="${DEMO_DISPLAY}" xhost +local: >/dev/null
 echo "==> [2/7] sender port ${SENDER_IFACE} up @ MTU 9000 (replay frames are ~4.2 KB)"
 sudo ip link set "${SENDER_IFACE}" up mtu 9000
 
-echo "==> [3/7] scratch dirs + demo control state"
+echo "==> [3/7] scratch dirs + demo control state (fresh snippet dir for clean accounting)"
 sudo mkdir -p /tmp/usrp_spectrograms && sudo chmod 1777 /tmp/usrp_spectrograms
+sudo rm -rf /tmp/usrp_spectrograms/snippets
 printf '{"gate": "tprime", "snr": "clean", "detector": "coherent_power", "seq": 1}\n' \
   | sudo tee /tmp/usrp_spectrograms/demo_control.json > /dev/null
 sudo chmod 666 /tmp/usrp_spectrograms/demo_control.json
