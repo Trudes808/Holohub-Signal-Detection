@@ -157,7 +157,20 @@ class Conductor:
               f"pcaps {self.args.pcap_dir}, container {CONTAINER}"
               f"{', DRY RUN' if self.args.dry else ''})", flush=True)
         mtime = 0.0
+        alive_check = 0.0
         while True:
+            # keep-alive: ESC or the window X gracefully kills the app (HoloViz
+            # quits on ESC even when it was aimed at a dropdown) — revive it.
+            # Intentional stops kill this conductor first (stop script order).
+            now = time.time()
+            if self.detector is not None and now - alive_check > 5.0:
+                alive_check = now
+                if not self._app_alive():
+                    cfg = self.current_cfg or CONFIG_BY_DETECTOR.get(
+                        self.detector, CONFIG_BY_DETECTOR["coherent_power"])
+                    print(f"[conductor] app not running — reviving with {cfg}", flush=True)
+                    self._launch_app(cfg)
+                    self.current_cfg = cfg
             try:
                 mt = os.path.getmtime(self.args.control)
                 if mt != mtime:
