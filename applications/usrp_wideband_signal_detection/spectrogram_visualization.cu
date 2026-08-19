@@ -276,7 +276,7 @@ struct RgbColor {
 };
 
 constexpr int kHeaderHeight = 138;
-constexpr int kFooterHeight = 64;  // BER strip + payload ticker band
+constexpr int kFooterHeight = 140;  // BER strip + per-SNR classifier stats table
 constexpr int kSidebarWidth = 260;
 constexpr int kPsdHeight = 142;
 constexpr int kPanelPadding = 28;
@@ -2141,6 +2141,14 @@ struct DecodeMetricsSnapshot {
   double snips_decoded_pct = -1.0;      // % of new snippets that yielded frames
   double frames_per_s = -1.0;
   double secs_since_update = 0.0;       // staleness: no new snips -> rates decay
+  // per-SNR-selection stats (footer table): gate acc per class + BER + frames
+  struct SnrRow {
+    std::string label;
+    double acc[4] = {-1.0, -1.0, -1.0, -1.0};   // PSK, QAM, FSK, OFDM
+    double ber = -1.0;
+    uint64_t frames = 0;
+  };
+  std::vector<SnrRow> snr_rows;
 };
 
 std::mutex& decode_metrics_mutex() {
@@ -2190,6 +2198,15 @@ bool json_find_double(const std::string& text, const std::string& key, double& o
     out = std::stod(value);
   } catch (...) { return false; }
   return true;
+}
+
+size_t json_block_end(const std::string& text, size_t open) {
+  int depth = 0;
+  for (size_t i = open; i < text.size(); ++i) {
+    if (text[i] == '{') ++depth;
+    else if (text[i] == '}' && --depth == 0) return i;
+  }
+  return std::string::npos;
 }
 
 void poll_decode_metrics() {
@@ -2283,6 +2300,36 @@ void poll_decode_metrics() {
     const auto q2 = text.find('"', q1 + 1);
     if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1) {
       next.last_payload_text = text.substr(q1 + 1, q2 - q1 - 1);
+    }
+  }
+  // per-SNR stats table: {"by_snr": {"30": {"acc_PSK":..,"ber":..,"frames":..}}}
+  const auto by_snr_pos = text.find("\"by_snr\"");
+  if (by_snr_pos != std::string::npos) {
+    const auto bopen = text.find('{', by_snr_pos);
+    const auto bclose = bopen == std::string::npos ? std::string::npos
+                                                   : json_block_end(text, bopen);
+    if (bclose != std::string::npos) {
+      const std::string block = text.substr(bopen, bclose - bopen + 1);
+      static const char* const kSnrOrder[] = {"clean", "30", "20", "15", "12", "9", "6",
+                                              "staircase"};
+      for (const char* lbl : kSnrOrder) {
+        const auto lpos = block.find(std::string("\"") + lbl + "\":");
+        if (lpos == std::string::npos) continue;
+        const auto ropen = block.find('{', lpos);
+        const auto rclose = ropen == std::string::npos ? std::string::npos
+                                                       : json_block_end(block, ropen);
+        if (rclose == std::string::npos) continue;
+        const std::string row = block.substr(ropen, rclose - ropen + 1);
+        DecodeMetricsSnapshot::SnrRow r;
+        r.label = lbl;
+        json_find_double(row, "acc_PSK", r.acc[0]);
+        json_find_double(row, "acc_QAM", r.acc[1]);
+        json_find_double(row, "acc_FSK", r.acc[2]);
+        json_find_double(row, "acc_OFDM", r.acc[3]);
+        json_find_double(row, "ber", r.ber);
+        json_find_u64(row, "frames", r.frames);
+        next.snr_rows.push_back(std::move(r));
+      }
     }
   }
   // Whole-run BER (truth-scored daemon runs): bits never decoded count 100%.
@@ -2965,18 +3012,58 @@ void render_visualization_ui_overlay() {
         draw_list->AddText(ImVec2(chart_x1 + 8.0f, chart_y1 - 14.0f), panel_muted, "inst BER");
       }
 
-      // Payload ticker (right): last CRC-verified arbitrary payload.
+      // Per-SNR classifier stats table (right): gate-model accuracy per class
+      // + BER + frames, bucketed by the DEMO CONTROLS SNR selection.
       const float tx0 = split_x, tx1 = display_size.x - 16.0f;
       draw_list->AddRectFilled(ImVec2(tx0, fy0), ImVec2(tx1, fy1), IM_COL32(13, 18, 27, 235), 6.0f);
       draw_list->AddRect(ImVec2(tx0, fy0), ImVec2(tx1, fy1), panel_border, 6.0f, 0, 1.0f);
-      draw_list->AddText(ImVec2(tx0 + 12.0f, fy0 + 4.0f), accent_blue, "LAST DECODED PAYLOAD");
-      const std::string ticker = dm.last_payload_text.empty()
-                                     ? std::string("(no text payloads decoded yet)")
-                                     : ("\"" + dm.last_payload_text + "\"");
-      draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
-                         ImVec2(tx0 + 12.0f, fy0 + 26.0f),
-                         dm.last_payload_text.empty() ? panel_muted : panel_text,
-                         ticker.c_str(), nullptr, tx1 - tx0 - 24.0f);
+      draw_list->AddText(ImVec2(tx0 + 12.0f, fy0 + 4.0f), accent_blue, "CLASSIFIER x SNR");
+      draw_list->AddText(ImVec2(tx0 + 168.0f, fy0 + 6.0f), panel_muted,
+                         "gate acc per class / decoded BER");
+      const float col[7] = {tx0 + 12.0f, tx0 + 90.0f, tx0 + 152.0f, tx0 + 214.0f,
+                            tx0 + 276.0f, tx0 + 348.0f, tx0 + 452.0f};
+      float ty = fy0 + 24.0f;
+      static const char* const kColHdr[7] = {"SNR", "PSK", "QAM", "FSK", "OFDM",
+                                             "BER", "frames"};
+      for (int c = 0; c < 7; ++c) {
+        draw_list->AddText(ImVec2(col[c], ty), panel_muted, kColHdr[c]);
+      }
+      ty += 14.0f;
+      if (dm.snr_rows.empty()) {
+        draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_muted,
+                           "(accumulates as bands decode; switch SNR to fill rows)");
+      }
+      char cell[32];
+      for (const auto& r : dm.snr_rows) {
+        if (ty > fy1 - 12.0f) break;
+        draw_list->AddText(ImVec2(col[0], ty), panel_text,
+                           r.label == "staircase" ? "stair" :
+                           (r.label == "clean" ? "clean" : (r.label + " dB").c_str()));
+        for (int c = 0; c < 4; ++c) {
+          if (r.acc[c] < 0.0) {
+            draw_list->AddText(ImVec2(col[c + 1], ty), panel_muted, "--");
+          } else {
+            std::snprintf(cell, sizeof(cell), "%.0f%%", 100.0 * r.acc[c]);
+            const ImU32 cc = r.acc[c] >= 0.95 ? accent_green
+                             : (r.acc[c] >= 0.80 ? IM_COL32(255, 212, 89, 255)
+                                                  : accent_orange);
+            draw_list->AddText(ImVec2(col[c + 1], ty), cc, cell);
+          }
+        }
+        if (r.ber < 0.0) {
+          draw_list->AddText(ImVec2(col[5], ty), panel_muted, "--");
+        } else if (r.ber == 0.0) {
+          draw_list->AddText(ImVec2(col[5], ty), accent_green, "0.0");
+        } else {
+          std::snprintf(cell, sizeof(cell), "%.1e", r.ber);
+          draw_list->AddText(ImVec2(col[5], ty),
+                             r.ber < 1e-3 ? IM_COL32(255, 212, 89, 255) : accent_orange,
+                             cell);
+        }
+        std::snprintf(cell, sizeof(cell), "%llu", static_cast<unsigned long long>(r.frames));
+        draw_list->AddText(ImVec2(col[6], ty), panel_muted, cell);
+        ty += 13.0f;
+      }
 
       // Decode markers on each detection panel: flag at the decoded band's
       // frequency, green = CRC ok, orange = CRC fail. Marker f_hz below 1 GHz

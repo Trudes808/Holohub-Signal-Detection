@@ -201,6 +201,8 @@ class Metrics:
         self.gate = gate
         self.cls: dict[str, dict] = {}
         self.by_placement: dict[int, dict] = {}
+        self.snr_bucket = "clean"          # DEMO CONTROLS snr selection
+        self.by_snr: dict[str, dict] = {}  # bucket -> per-class gate acc + BER
 
     def note_decode(self, f_hz: float, mod: str, crc_ok: bool):
         self.recent.append({"f_hz": f_hz, "mod": mod, "crc_ok": bool(crc_ok), "t": time.time()})
@@ -217,6 +219,21 @@ class Metrics:
             p["bits"] += bits
             p["errors"] += errors
             p["frames"] += 1
+
+    def note_band_snr(self, truth, pred, bits: int, errors: int, nframes: int):
+        """Accumulate per-SNR-selection stats (gate-model accuracy per class,
+        BER, frames) for the footer table. Bucketed by the DEMO CONTROLS snr
+        at decode time (a few seconds of pipeline skew after a switch)."""
+        b = self.by_snr.setdefault(self.snr_bucket,
+                                   {"per": {}, "bits": 0, "errors": 0, "frames": 0})
+        b["bits"] += bits
+        b["errors"] += errors
+        b["frames"] += nframes
+        if truth not in (None, "SYNC"):
+            c = b["per"].setdefault(truth, [0, 0])
+            c[1] += 1
+            if pred == truth:
+                c[0] += 1
 
     def note_cls(self, name: str, label: str, ms: float, truth_fam: str | None):
         c = self.cls.setdefault(name, {"n": 0, "ms_sum": 0.0, "truth_n": 0,
@@ -290,6 +307,15 @@ class Metrics:
                                 / s["bits_expected"]) if s["bits_expected"] else None,
                       "frames": s["frames"], "bits_expected": s["bits_expected"]}
                 for lbl, s in steps.items()}
+        if self.by_snr:
+            d["by_snr"] = {}
+            for lbl, b in self.by_snr.items():
+                row = {"ber": (b["errors"] / b["bits"]) if b["bits"] else None,
+                       "frames": b["frames"]}
+                for fam in ("PSK", "QAM", "FSK", "OFDM"):
+                    c = b["per"].get(fam)
+                    row[f"acc_{fam}"] = (c[0] / c[1]) if c and c[1] else None
+                d["by_snr"][lbl] = row
         return d
 
 
@@ -338,6 +364,11 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                         "~sync" if t == "SYNC" else
                         "=" if pred == t else f"!={t}")
                 how = f"{how}[{pred}{mark}]"
+                metrics.note_band_snr(
+                    t, pred,
+                    sum(f.payload_len_bits for f in got if f.pn9_payload),
+                    sum(f.bit_errors for f in got if f.pn9_payload),
+                    len(got))
             else:
                 got, how = decode_band(ch, chfs, bw)
             frames.extend(got)
@@ -431,7 +462,13 @@ def main():
             if mt == control_state["mtime"]:
                 return
             control_state["mtime"] = mt
-            gate = json.load(open(control_path)).get("gate")
+            ctl = json.load(open(control_path))
+            snr = str(ctl.get("snr", "clean"))
+            if snr != metrics.snr_bucket:
+                metrics.snr_bucket = snr
+                print(f"[{time.strftime('%H:%M:%S')}] === DEMO CONTROL: snr bucket -> {snr} ===",
+                      flush=True)
+            gate = ctl.get("gate")
             if gate in clf.models and gate != clf.gate:
                 clf.gate = gate
                 metrics.gate = gate
