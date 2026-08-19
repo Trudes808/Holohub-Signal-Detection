@@ -29,7 +29,9 @@ COMPOSITES = "/home/genesys-dgx1/Documents/holoscan_waveform_generation/composit
 PCAP_BY_SNR = {
     "clean": "snr_clean_burst.pcap",   # noise-free staircase-family capture (same bands/bursts); the composer composite pcap remains for manual replay
     "staircase": "snr_staircase_4class.pcap",
-    **{db: f"snr_single_{db}db.pcap" for db in ("30", "20", "15", "12", "9", "6")},
+    **{db: f"snr_single_{db}db.pcap" for db in ("30", "20", "15", "12", "9", "6", "0")},
+    "-5": "snr_single_m5db.pcap",
+    "-10": "snr_single_m10db.pcap",
 }
 CONFIG_BY_DETECTOR = {
     "coherent_power": "config_snipper_viz_demo.yaml",  # viz-enabled; the plain snipper config is HEADLESS

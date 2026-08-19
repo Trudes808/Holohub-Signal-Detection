@@ -276,7 +276,7 @@ struct RgbColor {
 };
 
 constexpr int kHeaderHeight = 138;
-constexpr int kFooterHeight = 140;  // BER strip + per-SNR classifier stats table
+constexpr int kFooterHeight = 184;  // BER strip + per-SNR classifier stats table (11 rows)
 constexpr int kSidebarWidth = 260;
 constexpr int kPsdHeight = 142;
 constexpr int kPanelPadding = 28;
@@ -2322,7 +2322,7 @@ void poll_decode_metrics() {
     if (bclose != std::string::npos) {
       const std::string block = text.substr(bopen, bclose - bopen + 1);
       static const char* const kSnrOrder[] = {"clean", "30", "20", "15", "12", "9", "6",
-                                              "staircase"};
+                                              "0", "-5", "-10", "staircase"};
       for (const char* lbl : kSnrOrder) {
         const auto lpos = block.find(std::string("\"") + lbl + "\":");
         if (lpos == std::string::npos) continue;
@@ -2451,7 +2451,7 @@ struct DemoControlState {
 static const char* const kDemoGateNames[] = {"vtcnn2", "resnet1d", "tprime"};
 static const char* const kDemoGateLabels[] = {"VT-CNN2", "ResNet1D", "T-PRIME"};
 static const char* const kDemoSnrNames[] = {"clean", "30", "20", "15", "12", "9", "6",
-                                            "staircase"};
+                                            "0", "-5", "-10", "staircase"};
 static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino"};
 static const char* const kDemoDetectorLabels[] = {"CoherentPower", "CUDA-DINO"};
 
@@ -2652,8 +2652,9 @@ void render_visualization_ui_overlay() {
       bool changed = false;
       changed |= ImGui::Combo("Gate", &st.gate, kDemoGateLabels, 3);
       static const char* const kSnrCombo[] = {"Clean", "30 dB", "20 dB", "15 dB",
-                                              "12 dB", "9 dB", "6 dB", "Staircase"};
-      changed |= ImGui::Combo("SNR", &st.snr, kSnrCombo, 8);
+                                              "12 dB", "9 dB", "6 dB", "0 dB",
+                                              "-5 dB", "-10 dB", "Staircase"};
+      changed |= ImGui::Combo("SNR", &st.snr, kSnrCombo, 11);
       changed |= ImGui::Combo("Detector", &st.detector, kDemoDetectorLabels, 2);
       ImGui::PopItemWidth();
       if (changed) {
