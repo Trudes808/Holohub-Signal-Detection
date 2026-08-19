@@ -50,21 +50,36 @@ FSK_PROFILE = dict(sps=8, h=0.5, bt=0.5)
 # (period samples @245.76M, payload bits per period) for whole-band BER:
 # a band that is misclassified / misrouted / undecoded gets its expected
 # bits charged at 100%.
-BAND_TRUTH_PLAN = [(-60e6, "PSK", 119616, 4096),
-                   (-20e6, "FSK", 150976, 1024),
-                   (0.0, "QAM", 86784, 8192),
-                   (60e6, "OFDM", 109056, 8192)]
+# (center, family, burst period samples @245.76M, payload bits/period, symbol rate)
+BAND_TRUTH_PLAN = [(-60e6, "PSK", 119616, 4096, 15.36e6),
+                   (-20e6, "FSK", 150976, 1024, 1.92e6),
+                   (0.0, "QAM", 86784, 8192, 15.36e6),
+                   (60e6, "OFDM", 109056, 8192, 30.72e6)]
 BAND_TRUTH_TOL_HZ = 12e6
 BAND_TRUTH_FS = 245.76e6
 
 
 def band_truth(f_center: float):
-    """(family, expected_bits_per_second) from the fixed staircase frequency
-    plan, or (None, 0) off-plan (treated as NOISE truth for accuracy)."""
-    for f, fam, period, pbits in BAND_TRUTH_PLAN:
+    """(family, burst period seconds, bits per period, symbol rate) from the
+    fixed staircase plan, or (None, ...) off-plan (NOISE truth)."""
+    for f, fam, period, pbits, rs in BAND_TRUTH_PLAN:
         if abs(f_center - f) <= BAND_TRUTH_TOL_HZ:
-            return fam, pbits * BAND_TRUTH_FS / period
-    return None, 0.0
+            return fam, period / BAND_TRUTH_FS, pbits, rs
+    return None, 0.0, 0, 0.0
+
+
+def decode_band_oracle(ch, chfs, fam, rs):
+    """Oracle receiver: correct branch AND known symbol rate (blind rate
+    estimation is unreliable on short single-burst boxes, and that is not a
+    channel impairment)."""
+    if fam == "FSK":
+        return decode_frames_fsk(ch, chfs, rs, **FSK_PROFILE)
+    if fam == "OFDM":
+        frames = decode_frames_ofdm(ch, chfs, rs)
+        for f in frames:
+            f.payload_mod = f"OFDM-{f.payload_mod}"
+        return frames
+    return decode_frames(ch, chfs, rs, **PROFILE)
 
 
 def family_of(mod: str) -> str:
@@ -435,15 +450,19 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                 # decode-verified (>=3 CRC-ok frames prove the family)
                 t = truth_fam
                 wexp = 0
+                plan_rs = 0.0
                 if t is None and not args_no_band_truth:
                     # live snips tag absolute RF; the plan is baseband
                     f_band = snip_center + center
                     if abs(f_band) > 1e9:
                         f_band -= args_center_hz
-                    plan_fam, bps = band_truth(f_band)
+                    plan_fam, period_s, pbits, plan_rs = band_truth(f_band)
                     if plan_fam is not None:
                         t = plan_fam
-                        wexp = int(bps * (iq.size / snip_fs))
+                        # charge whole burst periods; a box exists because a
+                        # burst is there, so charge at least one
+                        dur = iq.size / snip_fs
+                        wexp = max(1, int(round(dur / period_s))) * pbits
                     else:
                         t = "NOISE"
                 if t is None:
@@ -462,13 +481,10 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                     sum(f.bit_errors for f in got if f.pn9_payload),
                     len(got), wexp)
                 if wexp > 0 and t in ("PSK", "QAM", "FSK", "OFDM"):
-                    if pred == t:      # gate matched truth: reuse the decode
-                        cgot = got
-                    else:              # oracle-routed decode (measurement only)
-                        try:
-                            cgot, _ = decode_band_routed(ch, chfs, bw, t)
-                        except Exception:
-                            cgot = []
+                    try:   # oracle: correct branch AND known symbol rate
+                        cgot = decode_band_oracle(ch, chfs, t, plan_rs)
+                    except Exception:
+                        cgot = []
                     metrics.note_band_channel(
                         sum(f.payload_len_bits for f in cgot if f.pn9_payload),
                         sum(f.bit_errors for f in cgot if f.pn9_payload), wexp)
