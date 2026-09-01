@@ -206,6 +206,7 @@ def main() -> int:
     SCRATCH.mkdir(parents=True, exist_ok=True)
 
     cells: dict[tuple, list[int]] = {}   # key -> [n, correct]
+    conf: dict[tuple, int] = {}          # (lane, variant, truth, store, model, pred) -> n
     recall_rows = []
     for variant in args.variants:
         stem = VARIANTS[variant]
@@ -244,6 +245,8 @@ def main() -> int:
                         c = cells.setdefault(key, [0, 0])
                         c[0] += 1
                         c[1] += int(pred == ci)
+                        ck = (lane, variant, cls, store, mdl, CLASSES10[pred])
+                        conf[ck] = conf.get(ck, 0) + 1
 
     with open(THIS / "codec_model_matrix.csv", "w", newline="") as f:
         w = csv.writer(f)
@@ -251,6 +254,11 @@ def main() -> int:
                     "n", "correct"])
         for key, (n, c) in sorted(cells.items()):
             w.writerow(list(key) + [n, c])
+    with open(THIS / "codec_model_confusions.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["lane", "variant", "truth", "storage_codec", "model_codec", "pred", "n"])
+        for key, n in sorted(conf.items()):
+            w.writerow(list(key) + [n])
     with open(THIS / "detection_recall.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["variant", "cls", "annotations", "snips_matched"])
         w.writeheader()

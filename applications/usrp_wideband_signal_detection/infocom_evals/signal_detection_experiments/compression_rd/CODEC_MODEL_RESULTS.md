@@ -94,6 +94,70 @@ under-detected; everything collapses at −10 dB nominal (detection-limited regi
 3. Retrain (paired, same seeds) and rerun `eval_codec_models.py` — the codec-null result is
    expected to persist; the dino-lane floor should move toward the gt-lane ceiling.
 
+## Appendix A — 4×4 grids per SNR (pooled SNR hides detector effects)
+
+Rows = storage codec (none/sc16/bfp12/bfp8), columns = model. GT lane, n=1,533 snips/variant:
+
+| GT lane | none | sc16 | bfp12 | bfp8 |
+|---|---|---|---|---|
+| clean (all stores identical ±.002) | .565–.566 | .560–.565 | .568–.572 | .558–.559 |
+| 30 | .564–.566 | .563–.564 | .573–.577 | .566–.567 |
+| 15 | .562–.565 | .571–.572 | .571–.573 | .565–.566 |
+| 0 | .436–.442 | .411–.417 | .406–.408 | .412–.413 |
+| −10 | .264–.270 | .231–.234 | .271 | .267 |
+
+DINO-FT lane, signal-truth boxes only (storage rows again identical ±.002; false
+boxes listed separately):
+
+| DINO lane | n | none | sc16 | bfp12 | bfp8 | false boxes | called NOISE (bfp8) |
+|---|---|---|---|---|---|---|---|
+| clean | 1,970 | .131 | .128 | .124 | .124 | 947 | 0.0% |
+| 30 | 1,889 | .172 | .177 | .177 | .156 | 4,619 | 5.3% |
+| 15 | 1,822 | .164 | .153 | .166 | .160 | 6,294 | 5.3% |
+| 0 | 1,669 | .085 | .083 | .100 | .101 | 7,583 | 7.2% |
+| −10 | 255 | .106 | .090 | .129 | .118 | 9,244 | 9.1% |
+
+Per-SNR reads: (1) the codec-null result holds at EVERY rung — storage rows are
+identical to ±.002 in all ten grids, model columns within ≤.03 (only faintly
+systematic: the sc16 model is a touch weaker at 0/−10 in the GT lane — watch after
+retrain). (2) The DINO-lane failure is SNR-INDEPENDENT (.12–.18 even at clean/30
+where GT gets .56 on the same signals) — the strongest evidence that detected-bw
+rate mismatch, not noise, is the mechanism. (3) Pure-AWGN noise training recognizes
+0% of real false boxes at clean (all signal-edge splatter), only 9% at −10.
+
+## Appendix B — confusion matrices
+
+`plot_confusions.py` renders row-normalized 10-class confusions from
+`codec_model_confusions.csv` (matched bfp8 cell — the codec-null result makes it
+representative): `confusions_gt.png` (GT lane per variant), `confusions_dino.png`
+(DINO lane incl. NOISE-truth false boxes).
+
+Confusion findings (they revise Result 3's story into one mechanism):
+
+1. **Broadband_FM is a junk attractor, and it explains BOTH lanes' losses.** GT lane at
+   clean/30/15: BPSK/QPSK/16QAM sit at 46–49% correct with essentially ALL remaining mass on
+   BBFM (46–51%) — NOT on each other; BT and OFDM also bleed 26–31% into BBFM. DINO lane:
+   the same attractor at full strength — BPSK 86–95%, QPSK 92–99%, 16QAM 87–90% → BBFM, and
+   even the NOISE-truth false boxes go 86% → BBFM at clean. Interpretation: decimation to
+   ~1.6 samples/symbol renders a single-carrier signal as a smooth rotating phasor —
+   exactly the wideband-FM prototype — and any additional rate/context distortion (the
+   snipper's detected-bw decimation, neighbor leakage, cleaner-than-trained inputs) pushes
+   windows further into that basin. Supporting evidence: 802.11ax, the ONE class that skips
+   decimation (full rate), is immune in both lanes (100% GT, 99% DINO at clean/30); and
+   accuracy at actual +5…+20 dB exceeds "clean" bins — noiseless inputs are outside the
+   trained SNR range and drift toward the constant-envelope prototype.
+2. **OFDM↔5G is the only true mutual confusion** (GT: 5G 63%/37%→OFDM; OFDM 63–68%/10–11%→5G)
+   — structurally honest at this window length.
+3. **The models almost never say NOISE** (5–9% on real false boxes, ≤20% even at −10 nominal)
+   — the pure-AWGN noise class carries no notion of signal-edge splatter.
+
+Consequences for the retrain (sharpens the remedy list): (a) rate-diversity augmentation is
+the single highest-leverage fix — it attacks the BBFM basin directly; (b) cap per-record
+window oversampling for the tiny FM classes (5 BBFM records supply 4,500 windows each —
+heavy oversampling likely broadened the BBFM prototype); (c) harvested false-positive boxes
+for the noise class; (d) extend the trained SNR range upward (or include noiseless draws) so
+"clean" is in-distribution.
+
 ## Caveats
 
 - Train/eval share library records (the composite is built from them), so results measure
