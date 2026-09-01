@@ -123,5 +123,31 @@ class TPrime(nn.Module):
         return self.classifier(x)
 
 
+class TPrimeC(nn.Module):
+    """Compressed-domain T-PRIME (codec-per-model experiment): tokens carry 256
+    interleaved mantissa-normalized I/Q reals + 2 window-relative block
+    exponents (matlab_ds.featurize), projected to d_model before the standard
+    T-PRIME encoder. Identical architecture for every codec; only the input's
+    mantissa precision differs."""
+
+    def __init__(self, classes: int = 10, in_feats: int = 258,
+                 d_model: int = 2 * TPRIME_SLICE, seq_len: int = TPRIME_SEQ,
+                 nlayers: int = 2, nhead: int = 8):
+        super().__init__()
+        self.inproj = nn.Linear(in_feats, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        layer = nn.TransformerEncoderLayer(d_model, nhead, batch_first=True)
+        self.encoder = nn.TransformerEncoder(layer, nlayers)
+        self.pre_classifier = nn.Linear(d_model * seq_len, d_model)
+        self.drop = nn.Dropout(0.5)
+        self.classifier = nn.Linear(d_model, classes)
+
+    def forward(self, x):
+        x = self.encoder(self.norm(self.inproj(x)))
+        x = torch.flatten(x, 1)
+        x = self.drop(torch.relu(self.pre_classifier(x)))
+        return self.classifier(x)
+
+
 def build(name: str) -> nn.Module:
     return {"vtcnn2": VTCNN2, "resnet1d": ResNet1D, "tprime": TPrime}[name]()
