@@ -83,6 +83,13 @@ block-floating-point floor, confirming the CUDA encoder ↔ numpy decoder round 
    decisions). Physics: channel noise dominates even bfp8's ~42 dB quantization floor by
    ≥12 dB at these signal SNRs, so the quantizer is invisible to modem and models alike.
    (bfp8's slightly *negative* chBER deltas are noise/dither, not improvement.)
+   The identical accuracy columns were verified, not assumed: re-running T-PRIME on matched
+   raw-vs-dequantized band pairs (16 bands, 20 dB) shows the softmax genuinely moves
+   (median max|Δp| ≈ 1e-4; worst case 0.0025 for bfp12, 0.023 for bfp8) with **zero argmax
+   flips** — the model consumed the codec-altered data and made the same decisions.
+   NOTE: this whole eval is decompress-then-ingest — the models classify the dequantized
+   reconstruction. Compressed-DOMAIN inference (mantissa-domain inputs, no dequantization)
+   is Phase 2 (#40) and requires retraining.
 2. **Ratios land exactly on theory and are content-independent** (fixed-rate codecs):
    2.00× / 2.65× / 3.97×.
 3. **Economics**: at 20 dB the same detections shrink 70.4 → 17.8 MB (bfp8). Stacked on
