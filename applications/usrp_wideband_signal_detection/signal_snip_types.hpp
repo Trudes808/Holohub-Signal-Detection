@@ -57,6 +57,19 @@ struct SignalSnippet {
 
   // Detected signals described by this snippet (>=1). Time-only intervals may carry several.
   std::vector<SnipAnnotation> annotations;
+
+  // --- Optional compressed payload (filled by the snippet_compression operator) ----------------
+  // When `codec` is empty the payload is `device_iq` (interleaved cf32) exactly as above. When a
+  // codec is set, the payload is `device_comp` (`comp_bytes` opaque bytes) and `device_iq` is
+  // released; `n_iq` still counts LOGICAL complex samples so every downstream duration/rate
+  // computation is unchanged. Codec strings: "sc16" (per-snippet peak scale, int16 I/Q,
+  // dequant x = m * comp_scale), "bfp8" / "bfp12" (block floating point: per-block int8 exponent
+  // + two's-complement mantissas over comp_block complex samples per block).
+  std::string codec;
+  uint64_t comp_bytes = 0;
+  std::shared_ptr<uint8_t> device_comp;  // pooled device buffer (aliases a DeviceBufferPool slab)
+  float comp_scale = 1.0f;               // sc16 only
+  int comp_block = 0;                    // bfp only: complex samples per exponent block
 };
 
 struct SnippetBatchMessage {

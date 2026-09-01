@@ -170,6 +170,7 @@ add_executable(usrp_wideband_signal_detection
   screenshot_sink.cpp
   signal_snip_core.cu
   signal_snipper.cu
+  snippet_compression.cu
   sigmf_file_sink.cpp
 )
 target_link_libraries(usrp_wideband_signal_detection
@@ -212,6 +213,7 @@ add_executable(run_offline_cuda_detector_eval
   run_offline_cuda_detector_eval.cpp
   signal_snip_core.cu
   signal_snipper.cu
+  snippet_compression.cu
   sigmf_file_sink.cpp
 )
 

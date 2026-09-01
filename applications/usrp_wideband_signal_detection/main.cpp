@@ -5,6 +5,7 @@
 #include "fft_runtime_config.hpp"
 #include "sigmf_file_sink.hpp"
 #include "signal_snipper.hpp"
+#include "snippet_compression.hpp"
 #include "spectrogram_visualization.hpp"
 #include "advanced_network/common.h"
 #include <algorithm>
@@ -605,7 +606,11 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     }
 
     std::vector<std::shared_ptr<holoscan::Operator>> signalSnipperOps;
+    std::vector<std::shared_ptr<holoscan::Operator>> snippetCompressionOps;
     std::vector<std::shared_ptr<holoscan::Operator>> sigmfFileSinkOps;
+    const bool enable_snippet_compression =
+        enable_signal_snipper &&
+        usrp_wideband::from_config_or<bool>(*this, "pipeline.enable_snippet_compression", false);
     if (enable_signal_snipper) {
       signalSnipperOps.reserve(static_cast<size_t>(pipeline_channels));
       sigmfFileSinkOps.reserve(static_cast<size_t>(pipeline_channels));
@@ -614,6 +619,11 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
             std::string("signalSnipperOpCh") + std::to_string(channel_index),
             from_config("signal_snipper"),
             holoscan::Arg("channel_filter") = channel_index));
+        if (enable_snippet_compression) {
+          snippetCompressionOps.push_back(make_operator<ops::SnippetCompressionOp>(
+              std::string("snippetCompressionOpCh") + std::to_string(channel_index),
+              from_config("snippet_compression")));
+        }
         sigmfFileSinkOps.push_back(make_operator<ops::SigmfFileSinkOp>(
             std::string("sigmfFileSinkOpCh") + std::to_string(channel_index),
             from_config("sigmf_file_sink")));
@@ -804,6 +814,9 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       for (auto& op : signalSnipperOps) {
         add_operator(op);
       }
+      for (auto& op : snippetCompressionOps) {
+        add_operator(op);
+      }
       for (auto& op : sigmfFileSinkOps) {
         add_operator(op);
       }
@@ -876,8 +889,16 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
           add_flow(finetunedDinoDetectorOps[static_cast<size_t>(channel_index)], snipperOp,
                    {{"mask_out", "mask_in"}});
         }
-        add_flow(snipperOp, sigmfFileSinkOps[static_cast<size_t>(channel_index)],
-                 {{"snippets_out", "in"}});
+        if (enable_snippet_compression) {
+          // Real-time compression stage on the data-saved path: snipper -> compressor -> sink.
+          auto& compOp = snippetCompressionOps[static_cast<size_t>(channel_index)];
+          add_flow(snipperOp, compOp, {{"snippets_out", "in"}});
+          add_flow(compOp, sigmfFileSinkOps[static_cast<size_t>(channel_index)],
+                   {{"out", "in"}});
+        } else {
+          add_flow(snipperOp, sigmfFileSinkOps[static_cast<size_t>(channel_index)],
+                   {{"snippets_out", "in"}});
+        }
       }
 
       if (enable_logger_branch && effective_log_from_spectrogram) {

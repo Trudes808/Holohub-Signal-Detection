@@ -82,6 +82,33 @@ void SigmfFileSinkOp::writer_loop() {
 
 snip::HostSnippet SigmfFileSinkOp::stage_to_host(const SignalSnippet& snippet) const {
   snip::HostSnippet host;
+  if (!snippet.codec.empty()) {
+    // Compressed payload: stage the byte buffer instead of cf32 IQ.
+    host.codec = snippet.codec;
+    host.n_iq_logical = snippet.n_iq;
+    host.comp_scale = snippet.comp_scale;
+    host.comp_block = snippet.comp_block;
+    host.payload.resize(snippet.comp_bytes);
+    if (snippet.comp_bytes > 0 && snippet.device_comp) {
+      const cudaError_t status = cudaMemcpy(host.payload.data(),
+                                            snippet.device_comp.get(),
+                                            snippet.comp_bytes,
+                                            cudaMemcpyDeviceToHost);
+      if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("sigmf_file_sink: cudaMemcpy (comp) failed: ") +
+                                 cudaGetErrorString(status));
+      }
+    }
+    host.sample_rate_hz = snippet.sample_rate_hz;
+    host.center_freq_hz = snippet.center_freq_hz;
+    host.orig_sample_start = snippet.orig_sample_start;
+    host.orig_sample_count = snippet.orig_sample_count;
+    host.orig_sample_rate_hz = snippet.orig_sample_rate_hz;
+    host.frame_number = snippet.frame_number;
+    host.channel = snippet.channel;
+    host.annotations = snippet.annotations;
+    return host;
+  }
   host.iq.resize(snippet.n_iq);
   if (snippet.n_iq > 0 && snippet.device_iq) {
     const cudaError_t status = cudaMemcpy(host.iq.data(),
@@ -140,7 +167,10 @@ void SigmfFileSinkOp::flush_pack() {
                                               rate_key(pending_.front().center_freq_hz)};
   for (const auto& snippet : pending_) {
     if (rate_key(snippet.sample_rate_hz) != first_key.first ||
-        rate_key(snippet.center_freq_hz) != first_key.second) {
+        rate_key(snippet.center_freq_hz) != first_key.second ||
+        !snippet.codec.empty()) {
+      // Compressed snippets always go through the container writer (the only one that understands
+      // byte payloads); uniform-rate cf32 packs keep the legacy layout.
       uniform = false;
       break;
     }
@@ -184,11 +214,14 @@ void SigmfFileSinkOp::write_host_batch(const std::vector<snip::HostSnippet>& sni
     return;
   }
 
-  // per_signal: write each snippet immediately.
+  // per_signal: write each snippet immediately. Compressed snippets route through the container
+  // writer (the only writer that understands byte payloads), one member per file.
   uint64_t seq = 0;
   for (const auto& host : snippets) {
     const std::string stem = stem_for(output_dir_.get(), filename_prefix_.get(), host, seq++);
-    const std::string dpath = snip::write_sigmf_recording(stem, host);
+    const std::string dpath = host.codec.empty()
+        ? snip::write_sigmf_recording(stem, host)
+        : snip::write_sigmf_container(stem, std::vector<snip::HostSnippet>{host});
     if (!write_iq_.get()) { std::error_code ec; std::filesystem::remove(dpath, ec); }
     ++files_written_;
   }

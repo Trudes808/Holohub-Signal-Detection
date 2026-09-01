@@ -19,6 +19,8 @@ pipeline:
   log_from_spectrogram: false
   # Cut detected signals out of the stream and write SigMF (requires enable_detector).
   enable_signal_snipper: true
+  # Real-time IQ compression between snipper and sink (see snippet_compression: block).
+  enable_snippet_compression: true
 
 scheduler:
   worker_thread_number: 4
@@ -225,6 +227,17 @@ coherent_power_signal_detector:
   timing_summary_enable: true
   timing_summary_every_n: 512
   timing_summary_window: 512
+
+# --- Snippet compression --------------------------------------------------------------------------
+# Real-time GPU compression on the data-saved path (snipper -> THIS -> sigmf sink). Codecs:
+#   none  = passthrough (zero cost)          sc16  = int16 I/Q, exactly 2.0x, ~96 dB quant SNR
+#   bfp12 = block floating point, ~2.65x     bfp8  = block floating point, ~3.97x
+# All are decode-grade at the demo SNR ladder (bfp8 is the first the 50 dB clean rung notices).
+# The DEMO CONTROLS "codec" value in control_json_path switches this LIVE (no app restart).
+snippet_compression:
+  codec: "none"
+  bfp_block: 64                       # complex samples per shared-exponent block (bfp codecs)
+  control_json_path: "/workspace/spectrograms/demo_control.json"
 
 # --- Signal snipper -----------------------------------------------------------------------------
 # Clusters the detector mask into per-signal boxes and cuts the corresponding IQ out of the stream.

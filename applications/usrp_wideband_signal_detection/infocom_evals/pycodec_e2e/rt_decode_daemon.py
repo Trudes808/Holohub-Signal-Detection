@@ -243,6 +243,9 @@ class Metrics:
         self.data_files = 0
         self.data_snips = 0
         self.stream_rate_hz = 245.76e6     # for the full-capture baseline
+        self.comp_codec = None             # snippet_compression codec (from pack annotations)
+        self.comp_logical = 0              # decompressed cf32 bytes represented
+        self.comp_stored = 0               # bytes actually stored
 
     def note_decode(self, f_hz: float, mod: str, crc_ok: bool):
         self.recent.append({"f_hz": f_hz, "mod": mod, "crc_ok": bool(crc_ok), "t": time.time()})
@@ -275,6 +278,14 @@ class Metrics:
         self.data_bytes += new_bytes
         self.data_files += new_files
         self.data_snips += new_snips
+
+    def note_compression(self, codec: str, logical_bytes: int, stored_bytes: int):
+        """Codec economics per processed annotation: logical (decompressed cf32)
+        vs stored bytes. cf32_le members of a compressed container count too
+        (ratio-1 contributions keep the aggregate honest)."""
+        self.comp_codec = codec
+        self.comp_logical += logical_bytes
+        self.comp_stored += stored_bytes
 
     def note_band_snr(self, truth, labels: dict, gate: str,
                       bits: int, errors: int, nframes: int, wexp: int = 0):
@@ -405,11 +416,49 @@ class Metrics:
         d["data_snips"] = self.data_snips
         d["full_capture_gb"] = round(
             (time.time() - self.started) * self.stream_rate_hz * 8.0 / 1e9, 2)
+        if self.comp_codec is not None and self.comp_stored > 0:
+            d["comp_codec"] = self.comp_codec
+            d["comp_ratio"] = round(self.comp_logical / self.comp_stored, 3)
+            d["comp_logical_gb"] = round(self.comp_logical / 1e9, 3)
+            d["comp_stored_gb"] = round(self.comp_stored / 1e9, 3)
         return d
 
 
 args_no_band_truth = False
 args_center_hz = 2.4e9   # channel tune: live snips tag ABSOLUTE RF centers
+
+
+def decode_snip_payload(codec: str, raw: np.ndarray, n_iq: int, a: dict) -> np.ndarray:
+    """Dequantize one compressed snippet payload (uint8 array) back to complex64.
+    Codecs mirror snippet_compression.cu: sc16 (per-snippet scale int16 I/Q),
+    bfp8/bfp12 (per-block int8 power-of-2 exponent + two's-complement mantissas)."""
+    if codec == "cf32_le":
+        return raw[: n_iq * 8].view(np.complex64).copy()
+    if codec == "sc16":
+        scale = float(a.get("wfgt:comp_scale", 1.0))
+        x = raw[: n_iq * 4].view("<i2").astype(np.float32) * scale
+        return (x[0::2] + 1j * x[1::2]).astype(np.complex64)
+    if codec in ("bfp8", "bfp12"):
+        B = int(a.get("wfgt:comp_block", 64))
+        block_bytes = 1 + (2 * B if codec == "bfp8" else 3 * B)
+        nblocks = raw.size // block_bytes
+        if nblocks == 0:
+            return np.empty(0, np.complex64)
+        m = raw[: nblocks * block_bytes].reshape(nblocks, block_bytes)
+        e = m[:, 0].view(np.int8).astype(np.float32)
+        if codec == "bfp8":
+            scal = m[:, 1:].view(np.int8).astype(np.float32)
+        else:
+            p = m[:, 1:].reshape(nblocks, B, 3).astype(np.uint16)
+            m0 = (p[..., 0] << 4) | (p[..., 1] >> 4)
+            m1 = ((p[..., 1] & 0xF) << 8) | p[..., 2]
+            pair = np.empty((nblocks, B, 2), np.int32)
+            pair[..., 0] = ((m0.astype(np.int32) ^ 0x800) - 0x800)  # sign-extend 12-bit
+            pair[..., 1] = ((m1.astype(np.int32) ^ 0x800) - 0x800)
+            scal = pair.reshape(nblocks, 2 * B).astype(np.float32)
+        flat = (scal * np.exp2(e)[:, None]).reshape(-1)[: 2 * n_iq]
+        return (flat[0::2] + 1j * flat[1::2]).astype(np.complex64)
+    return np.empty(0, np.complex64)  # unknown codec: skip rather than mis-decode
 
 
 class PackReader:
@@ -438,6 +487,21 @@ class PackReader:
         except OSError:
             return np.empty(0, dtype="<c8")
 
+    def read_compressed(self, a: dict) -> np.ndarray:
+        """Read one compressed-container chunk by its wfgt:comp_byte_* range and
+        dequantize to complex64 (see decode_snip_payload)."""
+        codec = a.get("wfgt:compression", "cf32_le")
+        off = int(a.get("wfgt:comp_byte_offset", 0))
+        nb = int(a.get("wfgt:comp_byte_count", 0))
+        n_iq = int(a.get("core:sample_count", 0))
+        try:
+            raw = np.fromfile(self.path, dtype=np.uint8, count=nb, offset=off)
+        except OSError:
+            return np.empty(0, np.complex64)
+        if raw.size < nb:
+            return np.empty(0, np.complex64)  # pack still flushing; caller skips
+        return decode_snip_payload(codec, raw, n_iq, a)
+
 
 def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
     snip_fs = float(a.get("wfgt:snippet_sample_rate",
@@ -445,7 +509,14 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
     metrics.stream_rate_hz = max(metrics.stream_rate_hz,
                                  float(a.get("wfgt:orig_sample_rate", 0.0)))
     start, count = int(a["core:sample_start"]), int(a["core:sample_count"])
-    iq = np.asarray(data[start:start + count], dtype=np.complex64)
+    if "wfgt:comp_byte_offset" in a and hasattr(data, "read_compressed"):
+        # Compressed container: chunks are byte-addressed; core:sample_* stay logical.
+        iq = data.read_compressed(a)
+        metrics.note_compression(a.get("wfgt:compression", "cf32_le"),
+                                 logical_bytes=count * 8,
+                                 stored_bytes=int(a.get("wfgt:comp_byte_count", 0)))
+    else:
+        iq = np.asarray(data[start:start + count], dtype=np.complex64)
     if iq.size < 4096:
         return None
     t0 = time.time()
@@ -722,8 +793,12 @@ def main():
             processed = done
             for a in anns[done:]:
                 # pack data still being flushed: retry the remainder next pass
-                end = int(a.get("core:sample_start", 0)) + int(a.get("core:sample_count", 0))
-                if end * 8 > data.size_bytes():
+                if "wfgt:comp_byte_offset" in a:
+                    end_bytes = int(a["wfgt:comp_byte_offset"]) + int(a.get("wfgt:comp_byte_count", 0))
+                else:
+                    end_bytes = (int(a.get("core:sample_start", 0)) +
+                                 int(a.get("core:sample_count", 0))) * 8
+                if end_bytes > data.size_bytes():
                     break
                 check_control()
                 scan_data_stats()

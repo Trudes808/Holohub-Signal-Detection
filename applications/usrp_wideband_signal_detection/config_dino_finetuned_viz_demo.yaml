@@ -19,6 +19,8 @@ pipeline:
   log_from_spectrogram: false
   # Cut detected signals out of the stream and write SigMF (requires enable_detector).
   enable_signal_snipper: true
+  # Real-time IQ compression between snipper and sink (see snippet_compression: block).
+  enable_snippet_compression: true
 
 scheduler:
   worker_thread_number: 4
@@ -225,6 +227,15 @@ coherent_power_signal_detector:
   timing_summary_enable: true
   timing_summary_every_n: 512
   timing_summary_window: 512
+
+# --- Snippet compression --------------------------------------------------------------------------
+# Real-time GPU compression on the data-saved path (snipper -> THIS -> sigmf sink). Codecs:
+#   none | sc16 (2.0x) | bfp12 (~2.65x) | bfp8 (~3.97x) -- see config_snipper_viz_demo.yaml.
+# The DEMO CONTROLS "codec" value in control_json_path switches this LIVE (no app restart).
+snippet_compression:
+  codec: "none"
+  bfp_block: 64
+  control_json_path: "/workspace/spectrograms/demo_control.json"
 
 # --- Fine-tuned DINOv3 segmenter (M2_dr, rate-invariant 20.48-245.76 MS/s) -----------------------
 # Taps raw IQ and runs its own dedicated nfft-point FFT (240 kHz/bin, 4.17 us/row at 245.76 MS/s)

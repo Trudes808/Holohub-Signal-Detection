@@ -530,6 +530,16 @@ struct MetaAnn {
   uint64_t frame_number = 0;
   double center_freq_hz = 0.0;
   double sample_rate_hz = 0.0;      // this snippet's own (decimated) rate
+
+  // Compressed-container fields (set only when the pack holds compressed payloads). The chunk's
+  // physical bytes live at [byte_offset, byte_offset+byte_count) in the .sigmf-data;
+  // core:sample_start/count above stay in LOGICAL (decompressed) complex samples so downstream
+  // duration/rate math is codec-agnostic.
+  std::string codec;                // "" = plain cf32 slice (legacy layout, sample-addressed)
+  uint64_t byte_offset = 0;
+  uint64_t byte_count = 0;
+  float comp_scale = 1.0f;          // sc16
+  int comp_block = 0;               // bfp
 };
 
 void append_annotation(std::ostringstream& meta, const MetaAnn& a, bool last) {
@@ -559,7 +569,17 @@ void append_annotation(std::ostringstream& meta, const MetaAnn& a, bool last) {
        << (decim > 1.001 ? "mix_to_baseband; lowpass to bandwidth*(1+oversample); decimate"
                          : "full-rate, no decimation (time_only, or box bandwidth ~= full span)")
        << "\",\n";
-  meta << "      \"wfgt:snippet_sample_rate\": " << a.sample_rate_hz << "\n";
+  meta << "      \"wfgt:snippet_sample_rate\": " << a.sample_rate_hz;
+  if (!a.codec.empty()) {
+    meta << ",\n";
+    meta << "      \"wfgt:compression\": \"" << json_escape(a.codec) << "\",\n";
+    meta << "      \"wfgt:comp_byte_offset\": " << a.byte_offset << ",\n";
+    meta << "      \"wfgt:comp_byte_count\": " << a.byte_count << ",\n";
+    meta << "      \"wfgt:comp_scale\": " << a.comp_scale << ",\n";
+    meta << "      \"wfgt:comp_block\": " << a.comp_block << "\n";
+  } else {
+    meta << "\n";
+  }
   meta << "    }" << (last ? "\n" : ",\n");
 }
 
@@ -568,14 +588,21 @@ std::string build_meta(double sample_rate_hz,
                        uint64_t orig_sample_start,
                        double orig_sample_rate_hz,
                        const std::vector<MetaAnn>& anns,
-                       bool container = false) {
+                       bool container = false,
+                       const std::string& datatype = "cf32_le") {
   std::ostringstream meta;
   // Default float formatting with high precision so large Hz values (e.g. 2.4 GHz +/- kHz edges)
   // are written exactly rather than rounded to ~6 significant digits.
   meta.precision(15);
   meta << "{\n";
   meta << "  \"global\": {\n";
-  meta << "    \"core:datatype\": \"cf32_le\",\n";
+  meta << "    \"core:datatype\": \"" << datatype << "\",\n";
+  if (datatype != "cf32_le") {
+    // Compressed container: the .sigmf-data is a byte stream; each annotation's wfgt:compression /
+    // wfgt:comp_byte_* fields describe its chunk. datatype u8 makes a legacy cf32 reader fail
+    // loudly instead of silently decoding garbage.
+    meta << "    \"wfgt:compressed_container\": true,\n";
+  }
   meta << "    \"core:sample_rate\": " << sample_rate_hz << ",\n";
   meta << "    \"core:version\": \"1.0.0\",\n";
   meta << "    \"core:num_channels\": 1,\n";
@@ -675,6 +702,65 @@ std::string write_sigmf_pack(const std::string& stem, const std::vector<HostSnip
 std::string write_sigmf_container(const std::string& stem, const std::vector<HostSnippet>& snippets) {
   const std::filesystem::path data_path(stem + ".sigmf-data");
   const std::filesystem::path meta_path(stem + ".sigmf-meta");
+
+  // Compressed variant: if ANY member carries a codec, the .sigmf-data becomes a byte stream of
+  // concatenated per-snippet payloads (compressed members verbatim; raw members as their cf32
+  // bytes, tagged codec "cf32_le"). core:sample_start/count stay in LOGICAL complex samples;
+  // wfgt:comp_byte_offset/count address the physical chunk.
+  const bool any_compressed = std::any_of(snippets.begin(), snippets.end(),
+                                          [](const HostSnippet& s) { return !s.codec.empty(); });
+  if (any_compressed) {
+    std::vector<uint8_t> bytes;
+    std::vector<MetaAnn> anns;
+    const double orig_rate = snippets.empty() ? 0.0 : snippets.front().orig_sample_rate_hz;
+    const double center = snippets.empty() ? 0.0 : snippets.front().center_freq_hz;
+    uint64_t logical_offset = 0;
+    for (const auto& snippet : snippets) {
+      const bool raw = snippet.codec.empty();
+      const uint8_t* src = raw ? reinterpret_cast<const uint8_t*>(snippet.iq.data())
+                               : snippet.payload.data();
+      const uint64_t nbytes = raw ? snippet.iq.size() * sizeof(SnipComplex)
+                                  : snippet.payload.size();
+      const uint64_t logical_count = raw ? static_cast<uint64_t>(snippet.iq.size())
+                                         : snippet.n_iq_logical;
+      const uint64_t byte_offset = bytes.size();
+      bytes.insert(bytes.end(), src, src + nbytes);
+      for (const auto& ann : snippet.annotations) {
+        MetaAnn m;
+        m.ann = ann;
+        m.file_sample_start = logical_offset;
+        m.file_sample_count = logical_count;
+        m.orig_sample_start = snippet.orig_sample_start;
+        m.orig_sample_count = snippet.orig_sample_count;
+        m.frame_number = snippet.frame_number;
+        m.center_freq_hz = snippet.center_freq_hz;
+        m.sample_rate_hz = snippet.sample_rate_hz;
+        m.codec = raw ? "cf32_le" : snippet.codec;
+        m.byte_offset = byte_offset;
+        m.byte_count = nbytes;
+        m.comp_scale = snippet.comp_scale;
+        m.comp_block = snippet.comp_block;
+        anns.push_back(std::move(m));
+      }
+      logical_offset += logical_count;
+    }
+    if (!data_path.parent_path().empty()) {
+      std::filesystem::create_directories(data_path.parent_path());
+    }
+    std::ofstream out(data_path, std::ios::binary);
+    if (!out.is_open()) {
+      throw std::runtime_error("failed to open compressed container for writing: " + data_path.string());
+    }
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!out.good()) {
+      throw std::runtime_error("failed to write compressed container: " + data_path.string());
+    }
+    const std::string meta = build_meta(orig_rate, center,
+                                        snippets.empty() ? 0 : snippets.front().orig_sample_start,
+                                        orig_rate, anns, /*container=*/true, /*datatype=*/"u8");
+    write_text_file(meta_path, meta);
+    return data_path.string();
+  }
 
   // One file holding ALL snippets concatenated end-to-end regardless of their (rate, center). Each
   // annotation self-describes its slice: core:sample_start/count locate the chunk in this file, and

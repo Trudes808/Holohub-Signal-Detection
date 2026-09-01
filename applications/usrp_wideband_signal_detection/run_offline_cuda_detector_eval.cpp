@@ -7,6 +7,7 @@
 #include "fft_runtime_config.hpp"
 #include "sigmf_file_sink.hpp"
 #include "signal_snipper.hpp"
+#include "snippet_compression.hpp"
 #include "spectrogram_visualization.hpp"
 
 #include <coherent_power_signal_detector.hpp>
@@ -2369,7 +2370,16 @@ class OfflineCudaDetectorEvalApp : public holoscan::Application {
           Arg("output_dir") = (overrides_.output_root / "snippets").string());
       add_flow(source, snipper, {{"out", "iq_in"}});
       add_flow(detector, snipper, {{"mask_out", "mask_in"}});
-      add_flow(snipper, snip_sink, {{"snippets_out", "in"}});
+      if (usrp_wideband::from_config_or<bool>(*this, "pipeline.enable_snippet_compression", false)) {
+        // Same compression stage as the live graph, so offline rate-distortion evals exercise the
+        // real compiled codec kernels (snipper -> compressor -> sink).
+        auto compressor = make_operator<holoscan::ops::SnippetCompressionOp>(
+            "snippetCompressionOpCh0", from_config("snippet_compression"));
+        add_flow(snipper, compressor, {{"snippets_out", "in"}});
+        add_flow(compressor, snip_sink, {{"out", "in"}});
+      } else {
+        add_flow(snipper, snip_sink, {{"snippets_out", "in"}});
+      }
     }
   }
 

@@ -133,7 +133,7 @@ SnippetIq copy_time_slice(const SnipComplex* frame_iq,
 
 // Copy of a snippet's IQ already staged on the host, plus its descriptors, for writing.
 struct HostSnippet {
-  std::vector<SnipComplex> iq;  // interleaved cf32 (I,Q) on host
+  std::vector<SnipComplex> iq;  // interleaved cf32 (I,Q) on host (empty when `codec` is set)
   double sample_rate_hz = 0.0;
   double center_freq_hz = 0.0;
   uint64_t orig_sample_start = 0;   // full-rate global sample index of the first payload sample
@@ -142,6 +142,15 @@ struct HostSnippet {
   uint64_t frame_number = 0;
   int channel = 0;
   std::vector<SnipAnnotation> annotations;
+
+  // Optional compressed payload (mirrors SignalSnippet's compression fields). When `codec` is
+  // non-empty, `payload` holds the compressed bytes, `iq` is empty, and `n_iq_logical` records the
+  // decompressed complex-sample count (what core:sample_count reports).
+  std::string codec;
+  std::vector<uint8_t> payload;
+  uint64_t n_iq_logical = 0;
+  float comp_scale = 1.0f;  // sc16 only
+  int comp_block = 0;       // bfp only
 };
 
 // Write one SigMF recording (.sigmf-data + .sigmf-meta) at `stem` (no extension). datatype cf32_le.
