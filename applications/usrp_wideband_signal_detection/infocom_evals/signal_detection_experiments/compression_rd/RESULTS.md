@@ -100,6 +100,47 @@ block-floating-point floor, confirming the CUDA encoder ↔ numpy decoder round 
    ≥40 dB (the 50 dB "clean" rung is where bfp8's floor first becomes visible), or more
    aggressive codecs.
 
+## 4b. ZFP knee sweep (2026-09-01): the knee found
+
+`zfp_knee_sweep.py`: the SAME detected snips (uncompressed offline runs) re-encoded with zfp
+fixed-rate (planar I/Q, zfpy — bitstream-deterministic, so identical to what the CUDA backend
+would produce) at 12/10/8/6/5/4/3 bits per scalar (2.67–10.7× vs cf32), across
+clean(50)/30/20/12 dB captures; daemon decode+classify over the reconstructions. 28 points:
+`zfp_knee_results.csv`, plot `zfp_knee.png`. (zfpy 1.0.1 crashes below rate 3 on aarch64.)
+
+Reconstruction SNR is content-independent (~6 dB/bit): rate 12→~50 dB, 10→~38, 8→~26,
+6→~14, 5→~8, 4→~2, 3→~−3 dB.
+
+**Finding 1 — the decode knee scales with signal SNR.** Last transparent ratio → first
+broken ratio (chBER vs its own uncompressed baseline):
+
+| capture | decode transparent through | knee (first damage) | collapse |
+|---|---|---|---|
+| clean (50 dB) | 5.33× (rate 6) | 6.4× (chBER → 1.0) | ≥6.4× |
+| 30 dB | 4.0× (rate 8) | 5.33× (6.8e-3 → 8.9e-2) | ≥6.4× |
+| 20 dB | 3.2× (rate 10) | 4.0× (6.7e-3 → 8.9e-2) | ≥6.4× |
+| 12 dB | 3.2× (rate 10) | 4.0× (0.116 → 0.365) | ≥10.7× |
+
+**Finding 2 — the classification knee sits FAR beyond the decode knee.** T-PRIME accuracy is
+unchanged through 5.33–6.4× at every rung where decode has already degraded or collapsed
+(e.g. 20 dB: accuracy identical at 6.4× where chBER is 0.31), and only breaks toward 8–10.7×
+(reconstruction ≤2 dB). Classify-only consumers can ride roughly **2× deeper compression**
+than decode-grade storage — the concrete justification for the planned two-lane split
+(decode-grade to disk, aggressive lane for ML ingest). Low-rate accuracy points are noisy
+(classifying near-garbage is prior-biased; small N) — read trends, not single cells.
+
+**Finding 3 — BFP beats zfp by ~16 dB at matched ratio on RF IQ.** bfp12 (2.65×) reconstructs
+at 66 dB vs zfp rate-12 (2.67×) at ~50 dB; bfp8 (3.97×) at ~42 dB vs zfp rate-8 (4.0×) at
+~26 dB. Consequence at 20 dB: bfp8 is transparent at 4.0× while zfp is already 13× worse in
+chBER at the same ratio. zfp's decorrelating transform assumes smooth fields; near-critically
+sampled IQ is noise-like, so plain block floating point is the better family per bit.
+
+**Decision guidance:** do NOT integrate zfp CUDA as a production codec — it served its
+purpose as the rate knob that located the knee. The production ladder should instead extend
+BFP downward (bfp6 ≈ 5.2×/~30 dB floor, bfp4 ≈ 7.5×/~18 dB) to walk the knee with the
+better-per-bit family, plus the nvCOMP entropy stage for free lossless gains. Predicted from
+the recon-SNR mapping: bfp6 transparent at 20–30 dB rungs, bfp4 classification-only.
+
 ## 5. Caveats
 
 - Accuracy columns are small-N (each capture is ~0.1 s ≈ 4 frames; e.g. 20 dB reads 0.56 while

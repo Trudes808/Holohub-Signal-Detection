@@ -458,6 +458,18 @@ def decode_snip_payload(codec: str, raw: np.ndarray, n_iq: int, a: dict) -> np.n
             scal = pair.reshape(nblocks, 2 * B).astype(np.float32)
         flat = (scal * np.exp2(e)[:, None]).reshape(-1)[: 2 * n_iq]
         return (flat[0::2] + 1j * flat[1::2]).astype(np.complex64)
+    if codec.startswith("zfp"):
+        # zfp fixed-rate, planar: [u32 len_I][zfpy stream I][zfpy stream Q]. Streams carry
+        # their own zfp headers (written by zfpy or a header-enabled C encoder).
+        try:
+            import zfpy
+        except ImportError:
+            return np.empty(0, np.complex64)
+        li = int.from_bytes(raw[:4].tobytes(), "little")
+        i = zfpy.decompress_numpy(raw[4:4 + li].tobytes())
+        q = zfpy.decompress_numpy(raw[4 + li:].tobytes())
+        n = min(n_iq, i.size, q.size)
+        return (i[:n] + 1j * q[:n]).astype(np.complex64)
     return np.empty(0, np.complex64)  # unknown codec: skip rather than mis-decode
 
 
