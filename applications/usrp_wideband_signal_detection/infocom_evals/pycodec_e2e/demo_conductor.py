@@ -52,6 +52,18 @@ CONFIG_BY_DETECTOR_LIVE = {
     # columns the rolloff cliff fires (dashboard A/B against the base variant).
     "cuda_dino_finetuned_sb": "config_live_v3_dino_ft_sb.yaml",
 }
+# Loopback replay of dense composites with the v3 dashboard (run_loopback_v3_demo.sh).
+# Same 4 detectors as live, but coherent_power's emit-occupancy guard is OFF (dense
+# composites legitimately exceed the live 0.35 cap; the guard is a live garbage-flood
+# defense and the loopback transport is clean). The DINO configs are reused verbatim
+# (no emit guard) and, at the composite's 245.76 MSps, DINO-FT runs at its trained
+# native geometry.
+CONFIG_BY_DETECTOR_LOOPBACK = {
+    "coherent_power": "config_loopback_v3_single_channel.yaml",
+    "cuda_dino": "config_loopback_v3_dino.yaml",
+    "cuda_dino_finetuned": "config_loopback_v3_dino_ft.yaml",
+    "cuda_dino_finetuned_sb": "config_loopback_v3_dino_ft_sb.yaml",
+}
 # Loopback replay runs at the composites' rate, which is what the DINO
 # coherence gate was calibrated against (2026-08-18) — use the calibrated
 # config there; per-frequency floors are span-specific so live air keeps
@@ -144,6 +156,11 @@ class Conductor:
         return r.returncode == 0
 
     def config_map(self):
+        # --loopback: v3 dashboard fed by loopback replay (external tcpreplay) -> the
+        # loopback config set (coherent guard off). Implies the --no-replay app-launch
+        # path (we drive the pcap, not the conductor).
+        if getattr(self.args, "loopback", False):
+            return CONFIG_BY_DETECTOR_LOOPBACK
         return CONFIG_BY_DETECTOR_LIVE if self.args.no_replay else CONFIG_BY_DETECTOR
 
     def set_detector(self, detector: str):
@@ -239,7 +256,13 @@ def main():
     ap.add_argument("--no-replay", action="store_true",
                     help="live-radio mode: honor detector switches but ignore SNR "
                          "selections (those drive the loopback replay pcaps)")
+    ap.add_argument("--loopback", action="store_true",
+                    help="v3 dashboard fed by EXTERNAL loopback replay (run_loopback_v3_demo.sh "
+                         "drives tcpreplay): use the loopback config set (coherent emit guard off) "
+                         "and the direct app-launch path. Implies --no-replay.")
     args = ap.parse_args()
+    if args.loopback:
+        args.no_replay = True  # we don't manage tcpreplay; the launcher does
     c = Conductor(args)
     try:
         c.watch()
