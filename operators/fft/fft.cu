@@ -57,7 +57,12 @@ __global__ void fftshift_rows_kernel(const complex* input,
 }  // namespace
 
 void FFT::setup(OperatorSpec& spec) {
-    spec.input<in_t>("in", holoscan::IOSpec::IOSize{16});
+    // Input queue depth sets the display latency: a wide batched FFT runs right at the batch period
+    // at full rate (245.76 MSps), so a deep queue fills once (startup/model-prime) and never drains,
+    // standing at depth x batch_period of latency (16 x ~21 ms ~= 320 ms). A shallow queue keeps the
+    // display near real-time; if a transient ever exceeds it a batch is dropped, which is now cosmetic
+    // (the shared chdr_batch_index keeps every emitted frame + its mask correctly aligned regardless).
+    spec.input<in_t>("in", holoscan::IOSpec::IOSize{4});
     spec.output<out_t>("out", holoscan::IOSpec::IOSize{16});
     spec.param(burst_size,
         "burst_size",
