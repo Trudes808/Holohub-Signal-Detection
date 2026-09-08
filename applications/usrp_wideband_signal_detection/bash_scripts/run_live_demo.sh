@@ -35,8 +35,11 @@ case "${MODE}" in
     # Dashboard v3: detector + classifier pipeline (no decode). Snipper +
     # compression feed the classify-only daemon; DEMO CONTROLS drive the
     # classifier checklist live and detector switches via the conductor.
+    # GAIN=10 (not the 30 bench default): the A/B showed the busy 2.4 GHz band
+    # needs the lower RX gain to keep the front end / dynamic floor sane.
     CONFIG_NAME=config_live_v3_single_channel.yaml
-    export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234}
+    export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234} \
+           GAIN=${GAIN:-10}
     V3_STACK=1
     ;;
   v3dual)
@@ -44,7 +47,7 @@ case "${MODE}" in
     # (983 MSps aggregate). Detector dropdown stays coherent-only in dual mode.
     CONFIG_NAME=config_live_v3_two_channel.yaml
     export CHANNELS=${CHANNELS:-"0 1"} FREQS=${FREQS:-"2400e6 1000e6"} \
-           DEST_PORTS=${DEST_PORTS:-"1234 1235"}
+           DEST_PORTS=${DEST_PORTS:-"1234 1235"} GAIN=${GAIN:-10}
     V3_STACK=1
     ;;
   *.yaml)
