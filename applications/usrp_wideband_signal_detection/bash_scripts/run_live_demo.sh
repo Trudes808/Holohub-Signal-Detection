@@ -112,6 +112,8 @@ if [[ "${V3_STACK:-0}" == "1" ]]; then
   echo "==> v3: control state + snippet scratch (before the app starts writing)"
   sudo mkdir -p /tmp/usrp_spectrograms && sudo chmod 1777 /tmp/usrp_spectrograms
   sudo rm -rf /tmp/usrp_spectrograms/snippets 2>/dev/null || true
+  # fs.protected_regular blocks root overwriting a user-owned sidecar in /tmp
+  sudo rm -f /tmp/usrp_stream_params.json
   printf '{"gate": "tprime", "snr": "clean", "detector": "coherent_power", "classifiers": "vtcnn2,resnet1d,tprime", "seq": 1}\n' \
     | sudo tee /tmp/usrp_spectrograms/demo_control.json > /dev/null
   sudo chmod 666 /tmp/usrp_spectrograms/demo_control.json

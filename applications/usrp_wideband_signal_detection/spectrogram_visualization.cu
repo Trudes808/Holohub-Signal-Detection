@@ -2168,6 +2168,9 @@ struct DecodeMetricsSnapshot {
   };
   std::vector<ClsResource> cls_resources;
   bool classify_only = false;
+  // cumulative output-label counts per model (classifier.models.<name>.preds):
+  // [PSK, QAM, FSK, OFDM, NOISE] in kClsLabels order
+  std::map<std::string, std::array<uint64_t, 5>> cls_preds;
   double snips_per_s = -1.0;          // detection->snip rate (EMA of deltas)
   // ---- app-side throughput/compute (app_metrics.json from the rate monitor)
   double app_msps = -1.0, app_gbps = -1.0;
@@ -2407,6 +2410,22 @@ void poll_decode_metrics() {
         json_find_double(item, "acc", m.acc);
         json_find_double(item, "avg_ms", m.avg_ms);
         next.cls_models.push_back(std::move(m));
+        // cumulative output-label counts: "preds": {"OFDM": 123, "NOISE": 4, ...}
+        const auto ppos = text.find("\"preds\"", mpos);
+        if (ppos != std::string::npos) {
+          const auto popen = text.find('{', ppos);
+          const auto pclose = popen == std::string::npos ? std::string::npos
+                                                         : text.find('}', popen);
+          if (pclose != std::string::npos) {
+            const std::string pbody = text.substr(popen, pclose - popen + 1);
+            static const char* const kClsLabels[5] = {"PSK", "QAM", "FSK", "OFDM", "NOISE"};
+            std::array<uint64_t, 5> counts{};
+            for (int li = 0; li < 5; ++li) {
+              json_find_u64(pbody, kClsLabels[li], counts[li]);
+            }
+            next.cls_preds[name] = counts;
+          }
+        }
       }
     }
   }
@@ -2583,6 +2602,15 @@ std::string& demo_control_path_storage() {
 void set_visualization_demo_control_path(const std::string& path) {
   std::lock_guard<std::mutex> lock(demo_control_mutex());
   demo_control_path_storage() = path;
+}
+
+std::atomic<bool>& demo_snr_enabled_storage() {
+  static std::atomic<bool> b{true};
+  return b;
+}
+
+void set_visualization_demo_snr_enabled(bool enabled) {
+  demo_snr_enabled_storage() = enabled;
 }
 
 bool json_find_string(const std::string& text, const std::string& key, std::string& out) {
@@ -2781,10 +2809,12 @@ void render_visualization_ui_overlay() {
       for (int i = 0; i < 3; ++i) {
         changed |= ImGui::Checkbox(kDemoGateLabels[i], &st.cls_on[i]);
       }
-      static const char* const kSnrCombo[] = {"Clean", "30 dB", "20 dB", "15 dB",
-                                              "12 dB", "9 dB", "6 dB", "0 dB",
-                                              "-5 dB", "-10 dB", "Staircase"};
-      changed |= ImGui::Combo("SNR", &st.snr, kSnrCombo, 11);
+      if (demo_snr_enabled_storage()) {  // replay-only knob (pcap switching)
+        static const char* const kSnrCombo[] = {"Clean", "30 dB", "20 dB", "15 dB",
+                                                "12 dB", "9 dB", "6 dB", "0 dB",
+                                                "-5 dB", "-10 dB", "Staircase"};
+        changed |= ImGui::Combo("SNR", &st.snr, kSnrCombo, 11);
+      }
       changed |= ImGui::Combo("Detector", &st.detector, kDemoDetectorLabels, 3);
       ImGui::PopItemWidth();
       if (changed) {
@@ -3245,7 +3275,10 @@ void render_visualization_ui_overlay() {
           while (msps_hist.size() > 64) msps_hist.pop_front();
         }
         last_age = dm.app_age_s;
-        const float chart_x0 = bx0 + 12.0f, chart_x1 = bx1 - 76.0f;
+        // sparkline keeps the LEFT half; the right half carries the
+        // cumulative output-label table
+        const float chart_x0 = bx0 + 12.0f;
+        const float chart_x1 = bx0 + (bx1 - bx0) * 0.46f;
         const float chart_y1 = fy1 - 4.0f;
         const float chart_h = chart_y1 - (fy0 + 26.0f);
         if (!msps_hist.empty() && chart_h > 6.0f) {
@@ -3258,7 +3291,45 @@ void render_visualization_ui_overlay() {
             draw_list->AddRectFilled(ImVec2(x, chart_y1 - frac * chart_h),
                                      ImVec2(x + bar_w - 1.0f, chart_y1), accent_blue);
           }
-          draw_list->AddText(ImVec2(chart_x1 + 8.0f, chart_y1 - 14.0f), panel_muted, "MSps");
+          draw_list->AddText(ImVec2(chart_x0 + 4.0f, chart_y1 - 14.0f), panel_muted, "MSps");
+        }
+      }
+      // CLASSIFIER OUTPUTS: cumulative label counts per model (what each
+      // enabled classifier has been calling the detections)
+      if (!dm.cls_preds.empty()) {
+        const float ox0 = bx0 + (bx1 - bx0) * 0.52f;
+        float oy = fy0 + 6.0f;
+        draw_list->AddText(ImVec2(ox0, oy), accent_blue, "CLASSIFIER OUTPUTS (cumulative)");
+        oy += 18.0f;
+        static const char* const kClsLabels[5] = {"PSK", "QAM", "FSK", "OFDM", "NOISE"};
+        static const char* const kModelOrder[3] = {"vtcnn2", "resnet1d", "tprime"};
+        static const char* const kModelShort[3] = {"VT-CNN2", "ResNet1D", "T-PRIME"};
+        const float col0 = ox0, colw = 82.0f;
+        // header row: model columns
+        for (int mi = 0; mi < 3; ++mi) {
+          if (dm.cls_preds.count(kModelOrder[mi])) {
+            draw_list->AddText(ImVec2(col0 + 62.0f + mi * colw, oy), panel_muted,
+                               kModelShort[mi]);
+          }
+        }
+        oy += 16.0f;
+        char cc[24];
+        for (int li = 0; li < 5; ++li) {
+          draw_list->AddText(ImVec2(col0, oy), li == 4 ? panel_muted : panel_text,
+                             kClsLabels[li]);
+          for (int mi = 0; mi < 3; ++mi) {
+            const auto it = dm.cls_preds.find(kModelOrder[mi]);
+            if (it == dm.cls_preds.end()) continue;
+            const uint64_t v = it->second[li];
+            if (v >= 100000) {
+              std::snprintf(cc, sizeof(cc), "%.0fk", v / 1000.0);
+            } else {
+              std::snprintf(cc, sizeof(cc), "%llu", static_cast<unsigned long long>(v));
+            }
+            draw_list->AddText(ImVec2(col0 + 62.0f + mi * colw, oy),
+                               v == 0 ? panel_muted : panel_text, cc);
+          }
+          oy += 16.0f;
         }
       }
 
@@ -3603,6 +3674,12 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
              "detector). rt_decode_daemon.py applies the gate live; demo_conductor.py switches "
              "the replay pcap and restarts the app on detector change. Empty hides the panel.",
              std::string(""));
+  spec.param(demo_controls_snr_,
+             "demo_controls_snr",
+             "Demo Controls SNR",
+             "Show the SNR dropdown in DEMO CONTROLS. Only meaningful for loopback replay "
+             "(pcap switching); live-radio configs set false.",
+             true);
   spec.param(center_frequency_hz_, "center_frequency_hz", "Center Frequency", "Center frequency for display in Hz.", 0.0);
   spec.param(span_hz_, "span_hz", "Span Hz", "Frequency span shown on calibrated plot axes in Hz.", 0.0);
   spec.param(fft_size_, "fft_size", "FFT Size", "FFT size shown in analyzer readouts.", 20480);
@@ -3663,6 +3740,7 @@ void SpectrogramToHolovizOp::initialize() {
   }
   if (!demo_control_json_.get().empty()) {
     set_visualization_demo_control_path(demo_control_json_.get());
+    set_visualization_demo_snr_enabled(demo_controls_snr_.get());
     HOLOSCAN_LOG_INFO("DEMO CONTROLS panel enabled: writing {}", demo_control_json_.get());
   }
   render_stop_ = false;

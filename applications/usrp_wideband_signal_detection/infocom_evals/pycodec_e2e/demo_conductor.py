@@ -46,8 +46,8 @@ CONFIG_BY_DETECTOR = {
 # rate-invariance envelope (expect degraded masks until a retrain).
 CONFIG_BY_DETECTOR_LIVE = {
     "coherent_power": "config_live_v3_single_channel.yaml",
-    "cuda_dino": "config_cuda_dino_performance_single_channel.yaml",
-    "cuda_dino_finetuned": "config_cuda_dino_finetuned_performance_single_channel.yaml",
+    "cuda_dino": "config_live_v3_dino.yaml",
+    "cuda_dino_finetuned": "config_live_v3_dino_ft.yaml",
 }
 # Loopback replay runs at the composites' rate, which is what the DINO
 # coherence gate was calibrated against (2026-08-18) — use the calibrated
@@ -108,9 +108,19 @@ class Conductor:
         self.snr = snr
 
     def _launch_app(self, cfg: str):
+        # Kill the old app, WAIT for its DPDK teardown, and clear the EAL
+        # runtime state — relaunching after a fixed 2 s hit "EAL: Cannot
+        # create lock on /var/run/dpdk/nwlrbbmqbh/config" (old process still
+        # holding the primary lock) and the new app died instantly, which
+        # read on the dashboard as "detector switch does nothing".
         self.run_or_print(["docker", "exec", CONTAINER, "bash", "-lc",
-                           "pkill -f '(^|/)usrp_wideband_signal_detection( |$)' || true"])
-        time.sleep(2 if not self.args.dry else 0)
+                           "pkill -f '(^|/)usrp_wideband_signal_detection( |$)' || true; "
+                           "for i in $(seq 1 30); do "
+                           "  pgrep -f '(^|/)usrp_wideband_signal_detection( |$)' >/dev/null || break; "
+                           "  sleep 1; done; "
+                           "rm -f /dev/hugepages/nwlrbbmqbh* 2>/dev/null; "
+                           "rm -rf /var/run/dpdk/nwlrbbmqbh 2>/dev/null || true"])
+        time.sleep(1 if not self.args.dry else 0)
         # mirror run_live_demo.sh's launch env: stream rate/center + XDG dir
         self.run_or_print(["docker", "exec", "-d",
                            "-e", f"DISPLAY={self.args.display}",
@@ -160,6 +170,11 @@ class Conductor:
                 print(f"[conductor] APP DIED after switching to {detector} ({cfg}) — "
                       f"rolling back to {prev_cfg or self.config_map()['coherent_power']}",
                       flush=True)
+                # preserve the dying app's log before the rollback launch
+                # overwrites it (post-mortems were impossible without this)
+                self.run_or_print(["docker", "exec", CONTAINER, "bash", "-lc",
+                                   "cp /workspace/spectrograms/demo_app.log "
+                                   f"/workspace/spectrograms/demo_app_died_{detector}.log || true"])
                 self.pps = 240000
                 if self.snr is not None:
                     snr, self.snr = self.snr, None
