@@ -70,6 +70,7 @@ class SignalSnipperOp : public holoscan::Operator {
   holoscan::Parameter<double> bandwidth_margin_hz_;
   holoscan::Parameter<int> min_box_pixels_;
   holoscan::Parameter<double> min_mask_bandwidth_hz_;  // pre-label mask run-length filter (0 = disabled)
+  holoscan::Parameter<double> max_mask_occupancy_;      // flood guard fraction (0 = disabled)
   holoscan::Parameter<double> min_bandwidth_hz_;   // post-merge min box bandwidth (0 = disabled)
   holoscan::Parameter<double> min_duration_s_;     // post-merge min box duration  (0 = disabled)
   holoscan::Parameter<int> merge_gap_rows_;
@@ -91,6 +92,7 @@ class SignalSnipperOp : public holoscan::Operator {
   cudaStream_t snip_stream_ = nullptr;
   std::vector<cudaEvent_t> event_pool_;  // reused round-robin, sized to ring depth
   uint64_t masks_processed_ = 0;
+  uint64_t flood_skips_ = 0;  // masks rejected by the occupancy flood guard
   uint64_t snippets_emitted_ = 0;
 };
 

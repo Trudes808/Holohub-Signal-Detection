@@ -40,6 +40,12 @@ void SignalSnipperOp::setup(holoscan::OperatorSpec& spec) {
   spec.param(min_box_pixels_, "min_box_pixels", "Min box pixels",
              "Discard connected components smaller than this many mask pixels (pre-merge speckle "
              "filter). 0 = disabled.", 256);
+  spec.param(max_mask_occupancy_, "max_mask_occupancy", "Max mask occupancy",
+             "Flood guard: skip any mask where more than this FRACTION of pixels is lit. A "
+             "detector never legitimately marks most of the band-time at once -- near-full masks "
+             "are detector faults (torn frames, floor collapse) and snipping them floods the sink "
+             "with ~full-rate IQ, stalling the pipeline into MORE torn frames. 0 disables.",
+             0.30);
   spec.param(min_mask_bandwidth_hz_, "min_mask_bandwidth_hz", "Min mask bandwidth Hz",
              "Pre-labeling mask filter: zero out lit runs narrower than this bandwidth along each "
              "mask row (auto-scaled to columns from the delivered sample rate). Removes persistent "
@@ -281,6 +287,25 @@ void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask, SnippetBatch
     std::copy_n(mask.pixels.begin(), mask_bytes, host_mask_.begin());
   } else {
     return;
+  }
+
+  // Flood guard: a mask covering most of the band-time is a detector fault, not signal.
+  const double max_occ = max_mask_occupancy_.get();
+  if (max_occ > 0.0 && mask_bytes > 0) {
+    const size_t lit = static_cast<size_t>(
+        std::count_if(host_mask_.begin(), host_mask_.begin() + mask_bytes,
+                      [](uint8_t v) { return v != 0; }));
+    if (static_cast<double>(lit) > max_occ * static_cast<double>(mask_bytes)) {
+      ++flood_skips_;
+      if ((flood_skips_ & 0x1F) == 1) {  // throttled: every 32nd
+        HOLOSCAN_LOG_WARN(
+            "signal_snipper: FLOOD GUARD skipped mask frame {} ({:.0f}% lit > {:.0f}% cap; "
+            "{} skips total) -- detector fault, not signal.",
+            mask.frame_number, 100.0 * lit / mask_bytes, 100.0 * max_occ, flood_skips_);
+      }
+      prune_ring();  // release this frame's buffered IQ
+      return;
+    }
   }
 
   // Pre-labeling mask filter: drop lit runs narrower than min_mask_bandwidth_hz along each row so

@@ -156,7 +156,8 @@ if [[ "${V3_STACK:-0}" == "1" ]]; then
   echo "==> v3: classify-only AMC daemon (THROUGHPUT + COMPUTE panels)"
   # stale metrics from a previous run must not paint the panels before the
   # daemon's first write
-  sudo rm -f /tmp/usrp_spectrograms/rt_metrics.json /tmp/usrp_spectrograms/daemon_live.log
+  sudo rm -f /tmp/usrp_spectrograms/rt_metrics.json /tmp/usrp_spectrograms/daemon_live.log \
+    /tmp/usrp_spectrograms/snip_stats.json
   (cd "${APP_DIR_HOST}/infocom_evals/pycodec_e2e" && \
    PYCODEC_ROOT="${V3_USER_HOME}/Documents/holoscan_waveform_generation" \
    exec "${VENV_PY}" rt_decode_daemon.py --snips /tmp/usrp_spectrograms/snippets \

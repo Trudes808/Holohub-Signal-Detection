@@ -719,6 +719,7 @@ def main():
 
     last_scan = [0.0]
     primed = [False]
+    sink_stats_prev = [0, 0, 0]   # bytes, snippets, packs from snip_stats.json
 
     def scan_data_stats():
         """Account every byte/file/snippet the sink writes, independent of
@@ -732,6 +733,27 @@ def main():
         # first scan only PRIMES the baselines: pre-existing packs (from an
         # earlier daemon run) must not lump into the current SNR bucket
         attribute = primed[0]
+        # v3: the sink publishes LOGICAL output accounting (snip_stats.json,
+        # written+budget-skipped packs both counted) — authoritative when
+        # present, since the on-disk packs are only a classification sample.
+        stats_path = os.path.join(os.path.dirname(args.snips.rstrip("/")),
+                                  "snip_stats.json")
+        if os.path.exists(stats_path):
+            try:
+                st = json.load(open(stats_path))
+                b, sn, pk = int(st.get("bytes", 0)), int(st.get("snippets", 0)), \
+                    int(st.get("packs", 0))
+            except (OSError, json.JSONDecodeError, ValueError):
+                return
+            pb, ps, pp = sink_stats_prev
+            if b < pb:      # sink restart: re-prime
+                sink_stats_prev[:] = [b, sn, pk]
+                return
+            if attribute and b > pb:
+                metrics.note_data(b - pb, new_files=pk - pp, new_snips=sn - ps)
+            sink_stats_prev[:] = [b, sn, pk]
+            primed[0] = True
+            return
         live = set()
         for dp in glob.glob(os.path.join(args.snips, "*.sigmf-data")):
             live.add(dp)
@@ -900,6 +922,23 @@ def main():
         if args.idle_exit and (time.time() - last_new) > args.idle_exit:
             print("idle timeout, exiting", flush=True)
             break
+        # Data accounting must tick even with no packs to classify: under the
+        # sink's write budget most output is counted (snip_stats.json) but
+        # never lands on disk, so per-annotation scans alone would freeze the
+        # dashboard's data metric at 0.
+        if not new_work:
+            scan_data_stats()
+            try:
+                tmp = metrics_path + ".tmp"
+                with open(tmp, "w") as f:
+                    d = metrics.as_dict()
+                    if clf is not None:
+                        d["resources"] = clf.resource_report()
+                        d["classify_only"] = args_classify_only
+                    json.dump(d, f, indent=1)
+                os.replace(tmp, metrics_path)
+            except OSError:
+                pass
         time.sleep(args.poll)
 
     m = metrics.as_dict()

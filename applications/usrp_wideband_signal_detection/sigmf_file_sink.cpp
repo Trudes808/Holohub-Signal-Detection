@@ -6,6 +6,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <fstream>
 #include <cmath>
 #include <filesystem>
 #include <map>
@@ -35,6 +37,16 @@ void SigmfFileSinkOp::setup(OperatorSpec& spec) {
              "If false, write only the .sigmf-meta and immediately delete the .sigmf-data. The snip "
              "footprint stays exactly measurable (sample_count/rate in the meta) without storing IQ.",
              true);
+  spec.param(write_budget_mb_s_, "write_budget_mb_s", "Write budget MB/s",
+             "Token-bucket budget for REAL disk writes. Packs beyond the budget are counted in the "
+             "virtual data-saved accounting (stats_json) but never written -- the on-disk snips are "
+             "a classification sample, not the product, and unbounded writes stall the pipeline on "
+             "GB10's shared memory bus. 0 = unlimited (legacy behavior).", 0.0);
+  spec.param(stats_json_, "stats_json", "Stats JSON",
+             "Path for cumulative LOGICAL output accounting {bytes, snippets, packs, written_*} "
+             "(atomic rename), covering both written and budget-skipped packs. The decode daemon "
+             "prefers this over directory scanning for the data-saved metric. Empty disables.",
+             std::string(""));
   spec.param(max_queued_batches_, "max_queued_batches", "Max queued batches",
              "Bound on batches awaiting the background writer; excess is dropped so the pipeline "
              "never blocks on disk. Each queued batch pins its device IQ until written, so this also "
@@ -44,6 +56,8 @@ void SigmfFileSinkOp::setup(OperatorSpec& spec) {
 void SigmfFileSinkOp::initialize() {
   holoscan::Operator::initialize();
   stopping_ = false;
+  cudaStreamCreateWithFlags(&stage_stream_, cudaStreamNonBlocking);
+  budget_last_ns_ = 0;
   writer_thread_ = std::thread([this] { writer_loop(); });
 }
 
@@ -90,10 +104,11 @@ snip::HostSnippet SigmfFileSinkOp::stage_to_host(const SignalSnippet& snippet) c
     host.comp_block = snippet.comp_block;
     host.payload.resize(snippet.comp_bytes);
     if (snippet.comp_bytes > 0 && snippet.device_comp) {
-      const cudaError_t status = cudaMemcpy(host.payload.data(),
-                                            snippet.device_comp.get(),
-                                            snippet.comp_bytes,
-                                            cudaMemcpyDeviceToHost);
+      const cudaError_t status = cudaMemcpyAsync(host.payload.data(),
+                                                 snippet.device_comp.get(),
+                                                 snippet.comp_bytes,
+                                                 cudaMemcpyDeviceToHost,
+                                                 stage_stream_);
       if (status != cudaSuccess) {
         throw std::runtime_error(std::string("sigmf_file_sink: cudaMemcpy (comp) failed: ") +
                                  cudaGetErrorString(status));
@@ -111,10 +126,11 @@ snip::HostSnippet SigmfFileSinkOp::stage_to_host(const SignalSnippet& snippet) c
   }
   host.iq.resize(snippet.n_iq);
   if (snippet.n_iq > 0 && snippet.device_iq) {
-    const cudaError_t status = cudaMemcpy(host.iq.data(),
-                                          snippet.device_iq.get(),
-                                          snippet.n_iq * sizeof(SnipComplex),
-                                          cudaMemcpyDeviceToHost);
+    const cudaError_t status = cudaMemcpyAsync(host.iq.data(),
+                                               snippet.device_iq.get(),
+                                               snippet.n_iq * sizeof(SnipComplex),
+                                               cudaMemcpyDeviceToHost,
+                                               stage_stream_);
     if (status != cudaSuccess) {
       throw std::runtime_error(std::string("sigmf_file_sink: cudaMemcpy failed: ") +
                                cudaGetErrorString(status));
@@ -157,6 +173,45 @@ void SigmfFileSinkOp::flush_pack() {
   std::ostringstream pack_name;
   pack_name << filename_prefix_.get() << "_pack" << pack_id;
   const std::string pack_stem = (std::filesystem::path(output_dir_.get()) / pack_name.str()).string();
+
+  // ---- Virtual output accounting + write budget (v3): every pack COUNTS toward the
+  // data-saved metric (compressed payload bytes where present, else cf32 bytes); only
+  // packs within the token-bucket budget are physically written -- the on-disk snips
+  // are a classification sample, not the demo's product.
+  uint64_t pack_bytes = 0;
+  for (const auto& sn : pending_) {
+    pack_bytes += sn.codec.empty() ? sn.iq.size() * sizeof(SnipComplex) : sn.payload.size();
+  }
+  stat_bytes_ += pack_bytes;
+  stat_snippets_ += pending_.size();
+  stat_packs_ += 1;
+  bool budget_ok = true;
+  const double budget = write_budget_mb_s_.get();
+  if (budget > 0.0) {
+    const uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (budget_last_ns_ != 0) {
+      budget_allowance_ = std::min(budget * 2.0e6,  // credit caps at ~2 s of budget
+                                   budget_allowance_ + (now_ns - budget_last_ns_) * 1e-9 * budget * 1e6);
+    }
+    budget_last_ns_ = now_ns;
+    // DEBT model: any pack writes while the balance is non-negative, then owes
+    // its bytes. A strict token bucket never fits a pack larger than the
+    // bucket, which starved the classifier of samples entirely.
+    budget_ok = budget_allowance_ >= 0.0;
+    if (budget_ok) { budget_allowance_ -= static_cast<double>(pack_bytes); }
+  }
+  if (budget_ok) {
+    stat_written_bytes_ += pack_bytes;
+    stat_written_packs_ += 1;
+  }
+  write_stats_json();
+  if (!budget_ok) {
+    pending_.clear();
+    frames_in_pack_ = 0;
+    have_last_pack_frame_ = false;
+    return;
+  }
 
   // Do all snippets share one (rate, center)? If so (typically time_only mode) write one standard
   // SigMF recording. Otherwise (typically frequency mode: every signal a distinct rate/center) write
@@ -288,6 +343,10 @@ void SigmfFileSinkOp::compute(InputContext& op_input, OutputContext&, ExecutionC
   for (const auto& snippet : batch.snippets) {
     host_batch.push_back(stage_to_host(snippet));
   }
+  // One sync for the whole batch: per-snippet cudaMemcpy issued hundreds of
+  // implicit synchronizations per pack, each stalling the operator graph on
+  // GB10's shared memory bus (the 'Fell behind' -> torn-frame chain).
+  cudaStreamSynchronize(stage_stream_);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     queue_.push_back(std::move(host_batch));
@@ -295,7 +354,30 @@ void SigmfFileSinkOp::compute(InputContext& op_input, OutputContext&, ExecutionC
   cv_.notify_one();
 }
 
+void SigmfFileSinkOp::write_stats_json() {
+  const std::string path = stats_json_.get();
+  if (path.empty()) { return; }
+  const std::string tmp = path + ".tmp";
+  std::ofstream out(tmp);
+  if (!out.is_open()) { return; }
+  out << "{\n"
+      << "  \"bytes\": " << stat_bytes_ << ",\n"
+      << "  \"snippets\": " << stat_snippets_ << ",\n"
+      << "  \"packs\": " << stat_packs_ << ",\n"
+      << "  \"written_bytes\": " << stat_written_bytes_ << ",\n"
+      << "  \"written_packs\": " << stat_written_packs_ << "\n"
+      << "}\n";
+  out.close();
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+}
+
 void SigmfFileSinkOp::stop() {
+  if (stage_stream_ != nullptr) {
+    cudaStreamSynchronize(stage_stream_);
+    cudaStreamDestroy(stage_stream_);
+    stage_stream_ = nullptr;
+  }
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stopping_ = true;

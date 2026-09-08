@@ -3343,7 +3343,7 @@ void render_visualization_ui_overlay() {
         const double reduction = dm.data_saved_gb > 1e-9
                                      ? dm.full_capture_gb / dm.data_saved_gb : 0.0;
         std::snprintf(totals, sizeof(totals),
-                      "stored %.2f GB vs %.0f GB full-rate = %.0fx less",
+                      "selected %.2f GB vs %.0f GB full-rate = %.0fx less",
                       dm.data_saved_gb, dm.full_capture_gb, reduction);
         draw_list->AddText(ImVec2(tx0 + 196.0f, fy0 + 6.0f), accent_green, totals);
       }

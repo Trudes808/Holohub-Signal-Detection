@@ -6,6 +6,8 @@
 #include "signal_snip_core.hpp"
 #include "signal_snip_types.hpp"
 
+#include <cuda_runtime.h>
+
 #include <holoscan/holoscan.hpp>
 
 #include <condition_variable>
@@ -54,6 +56,7 @@ class SigmfFileSinkOp : public holoscan::Operator {
   snip::HostSnippet stage_to_host(const SignalSnippet& snippet) const;  // compute thread (D2H)
   void write_host_batch(const std::vector<snip::HostSnippet>& snippets);  // writer thread (host->file)
   void flush_pack();  // writer thread only
+  void write_stats_json();  // writer thread only (atomic rename)
 
   holoscan::Parameter<std::string> mode_;
   holoscan::Parameter<int> pack_frames_;
@@ -61,6 +64,21 @@ class SigmfFileSinkOp : public holoscan::Operator {
   holoscan::Parameter<std::string> filename_prefix_;
   holoscan::Parameter<int> max_queued_batches_;
   holoscan::Parameter<bool> write_iq_;  // false => write only .sigmf-meta, delete .sigmf-data (footprint-only)
+  holoscan::Parameter<double> write_budget_mb_s_;   // real-write token bucket (0 = unlimited)
+  holoscan::Parameter<std::string> stats_json_;     // cumulative logical-output accounting sidecar
+
+  // Staging stream: batched async D2H copies, ONE sync per batch (per-snippet
+  // synchronous cudaMemcpy stalled the whole graph on GB10's shared memory bus).
+  cudaStream_t stage_stream_ = nullptr;
+
+  // Writer-thread accounting (logical vs physically written).
+  uint64_t stat_bytes_ = 0;
+  uint64_t stat_snippets_ = 0;
+  uint64_t stat_packs_ = 0;
+  uint64_t stat_written_bytes_ = 0;
+  uint64_t stat_written_packs_ = 0;
+  double budget_allowance_ = 0.0;
+  uint64_t budget_last_ns_ = 0;
 
   // Producer/consumer handoff to the background writer: HOST-staged batches (device already freed).
   std::thread writer_thread_;

@@ -295,6 +295,8 @@ snippet_compression:
   control_json_path: "/workspace/spectrograms/demo_control.json"
 
 signal_snipper:
+  # Flood guard: skip masks lighting >30% of band-time (detector fault, not signal)
+  max_mask_occupancy: 0.30
   # "time_only": keep the time regions containing any signal at full bandwidth/rate; annotate the
   #   detected freqs/bandwidths in each interval.
   # "frequency": additionally isolate each signal -- shift to 0 Hz, low-pass to its bandwidth, and
@@ -324,6 +326,11 @@ signal_snipper:
   sample_rate_hz: 0.0
 
 sigmf_file_sink:
+  # v3: snips on disk are a CLASSIFICATION SAMPLE, not the product. Real writes
+  # are budgeted; ALL output bytes (incl. budget-skipped packs) are counted in
+  # stats_json, which the daemon prefers for the data-saved metric.
+  write_budget_mb_s: 48.0
+  stats_json: "/workspace/spectrograms/snip_stats.json"
   # "per_signal": one SigMF recording per snippet, written as they arrive.
   # "pack": accumulate `pack_frames` frames, then flush; snippets are grouped by (rate, center) into
   #   concatenated recordings, tied by a .sigmf-collection when a pack spans multiple groups.
