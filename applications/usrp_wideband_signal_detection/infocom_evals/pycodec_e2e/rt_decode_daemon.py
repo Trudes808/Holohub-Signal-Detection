@@ -426,6 +426,7 @@ class Metrics:
 
 args_no_band_truth = False
 args_center_hz = 2.4e9   # channel tune: live snips tag ABSOLUTE RF centers
+args_classify_only = False  # dashboard v3: detector+classifier pipeline, no decode
 
 
 def decode_snip_payload(codec: str, raw: np.ndarray, n_iq: int, a: dict) -> np.ndarray:
@@ -551,9 +552,28 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
             truth_fam, truth_idx = (metrics.truth.lookup(orig_start, orig_count,
                                                          snip_center + center)
                                     if metrics.truth else (None, None))
+            if clf is not None and args_classify_only:
+                # Detector + classifier pipeline (dashboard v3): NO decode
+                # anywhere. Truth (when a plan/annotation provides it) still
+                # scores accuracy; all BER machinery is skipped.
+                res = clf.classify(ch)
+                if not res:
+                    continue
+                t = truth_fam
+                if t is None and not args_no_band_truth:
+                    f_band = snip_center + center
+                    if abs(f_band) > 1e9:
+                        f_band -= args_center_hz
+                    t = band_truth(f_band)[0] or "NOISE"
+                for name, r in res.items():
+                    metrics.note_cls(name, r.label, r.ms, t)
+                top = max(res.values(), key=lambda r: r.conf)
+                band_info.append(f"{center/1e6:+.1f}MHz[{top.label} {top.conf:.2f}]")
+                continue
             if clf is not None:
                 res = clf.classify(ch)
-                pred = res[clf.gate].label
+                pred = res[clf.gate].label if clf.gate in res else \
+                    max(res.values(), key=lambda r: r.conf).label
                 got, how = decode_band_routed(ch, chfs, bw, pred)
                 # truth priority: TX annotations (offline) > fixed frequency
                 # plan (staircase-family replay, loop-invariant) >
@@ -618,6 +638,9 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
     dt_ms = (time.time() - t0) * 1e3
 
     metrics.snips += 1
+    if args_classify_only:
+        return (f"snip frame#{a.get('wfgt:frame_number', '?')} "
+                f"{count/snip_fs*1e3:6.2f} ms  cls[{' '.join(band_info) or '-'}]  [{dt_ms:.0f} ms]")
     if not frames:
         return (f"snip frame#{a.get('wfgt:frame_number', '?')} "
                 f"{count/snip_fs*1e3:6.2f} ms  no frames (bands {' '.join(band_info) or '-'})  [{dt_ms:.0f} ms]")
@@ -649,6 +672,9 @@ def main():
                     help="where to write rt_metrics.json (default: inside --snips); "
                          "the HoloViz LIVE DECODE panel watches this path")
     ap.add_argument("--no-amc", action="store_true", help="disable the classifier stage")
+    ap.add_argument("--classify-only", action="store_true",
+                    help="dashboard v3 pipeline: detector + classifier, NO decode/BER "
+                         "anywhere (throughput/compute demo mode)")
     ap.add_argument("--amc-weights", default=None)
     ap.add_argument("--amc-device", default=None, help="cuda|cpu (default: auto)")
     ap.add_argument("--gate", default="tprime", choices=["tprime", "resnet1d", "vtcnn2"],
@@ -675,6 +701,8 @@ def main():
 
     global args_no_band_truth, args_center_hz
     args_no_band_truth = args.no_band_truth
+    global args_classify_only
+    args_classify_only = args.classify_only
     args_center_hz = args.center_hz
     truth = TruthScorer(args.truth_meta, args.truth_lib) if args.truth_meta else None
     if truth:
@@ -763,6 +791,12 @@ def main():
                 metrics.snr_bucket = snr
                 print(f"[{time.strftime('%H:%M:%S')}] === DEMO CONTROL: snr bucket -> {snr} ===",
                       flush=True)
+            wanted = ctl.get("classifiers")
+            if isinstance(wanted, str) and wanted:
+                names = [n.strip() for n in wanted.split(",") if n.strip()]
+                if clf.set_enabled(names):
+                    print(f"[{time.strftime('%H:%M:%S')}] === DEMO CONTROL: classifiers -> "
+                          f"{sorted(clf.models)} ===", flush=True)
             gate = ctl.get("gate")
             if gate in clf.models and gate != clf.gate:
                 clf.gate = gate
@@ -772,7 +806,11 @@ def main():
                 try:  # reflect the '>' marker immediately, before new snips
                     tmp = metrics_path + ".tmp"
                     with open(tmp, "w") as f:
-                        json.dump(metrics.as_dict(), f, indent=1)
+                        d = metrics.as_dict()
+                        if clf is not None:
+                            d["resources"] = clf.resource_report()
+                            d["classify_only"] = args_classify_only
+                        json.dump(d, f, indent=1)
                     os.replace(tmp, metrics_path)
                 except OSError:
                     pass
@@ -822,7 +860,11 @@ def main():
                 try:
                     tmp = metrics_path + ".tmp"
                     with open(tmp, "w") as f:
-                        json.dump(metrics.as_dict(), f, indent=1)
+                        d = metrics.as_dict()
+                        if clf is not None:
+                            d["resources"] = clf.resource_report()
+                            d["classify_only"] = args_classify_only
+                        json.dump(d, f, indent=1)
                     os.replace(tmp, metrics_path)
                 except OSError:
                     pass

@@ -8,9 +8,12 @@
 #include "snippet_compression.hpp"
 #include "spectrogram_visualization.hpp"
 #include "advanced_network/common.h"
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <atomic>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -242,6 +245,59 @@ class LogOp: public holoscan::Operator {
     holoscan::Operator::stop();
   }
 
+  // Dashboard v3: publish the throughput/compute numbers this monitor already
+  // gathers to a small JSON (atomic rename) the HoloViz HUD polls — same
+  // pattern as the decode daemon's rt_metrics.json. GPU memory comes from
+  // cudaMemGetInfo (meaningful on GB10's unified pool).
+  void publish_app_metrics(uint16_t channel_num, double samples_per_second,
+                           double bits_per_second) {
+    const char* dir = std::getenv("USRP_APP_METRICS_DIR");
+    const std::string base = (dir != nullptr && dir[0] != '\0')
+        ? std::string(dir) : std::string("/workspace/spectrograms");
+    const std::string path = base + "/app_metrics.json";
+    const std::string tmp = path + ".tmp";
+    // GB10 unified memory: cudaMemGetInfo's "free" excludes reclaimable page
+    // cache, which reads as a nearly-full bar. MemAvailable is the honest
+    // number for "how much could allocations actually get".
+    size_t mem_free = 0, mem_total = 0;
+    {
+      std::ifstream mi("/proc/meminfo");
+      std::string key;
+      uint64_t kb = 0;
+      std::string unit;
+      while (mi >> key >> kb >> unit) {
+        if (key == "MemTotal:") mem_total = kb * 1024ull;
+        if (key == "MemAvailable:") mem_free = kb * 1024ull;
+      }
+    }
+    if (mem_total == 0) { cudaMemGetInfo(&mem_free, &mem_total); }
+    double mean_util = 0.0;
+    unsigned int min_util = 0, max_util = 0;
+    if (gpu_util_samples_[channel_num] > 0) {
+      mean_util = gpu_util_sum_[channel_num] / static_cast<double>(gpu_util_samples_[channel_num]);
+      min_util = gpu_util_min_[channel_num] == std::numeric_limits<unsigned int>::max()
+          ? 0U : gpu_util_min_[channel_num];
+      max_util = gpu_util_max_[channel_num];
+    }
+    std::ofstream out(tmp);
+    if (!out.is_open()) { return; }
+    out << "{\n"
+        << "  \"channel\": " << channel_num << ",\n"
+        << "  \"msps\": " << samples_per_second / 1e6 << ",\n"
+        << "  \"gbps\": " << bits_per_second / 1e9 << ",\n"
+        << "  \"pps\": " << samples_per_second / 1024.0 << ",\n"
+        << "  \"gpu_util_mean\": " << mean_util << ",\n"
+        << "  \"gpu_util_min\": " << min_util << ",\n"
+        << "  \"gpu_util_max\": " << max_util << ",\n"
+        << "  \"gpu_mem_used_gb\": " << static_cast<double>(mem_total - mem_free) / 1e9 << ",\n"
+        << "  \"gpu_mem_total_gb\": " << static_cast<double>(mem_total) / 1e9 << ",\n"
+        << "  \"ts\": " << std::chrono::duration<double>(
+               std::chrono::system_clock::now().time_since_epoch()).count() << "\n"
+        << "}\n";
+    out.close();
+    std::rename(tmp.c_str(), path.c_str());
+  }
+
   void compute(holoscan::InputContext& op_input,
                holoscan::OutputContext&,
                holoscan::ExecutionContext&) override {
@@ -267,6 +323,7 @@ class LogOp: public holoscan::Operator {
     if (total_samples_[channel_num] > 0 && seconds >= log_interval_) {
       const double samples_per_second = static_cast<double>(total_samples_[channel_num]) / seconds;
       const double bits_per_second = static_cast<double>(total_samples_[channel_num]) * sizeof(int16_t) * 2 * 8 / seconds;
+      publish_app_metrics(channel_num, samples_per_second, bits_per_second);
       if (gpu_util_samples_[channel_num] > 0) {
         const double mean_gpu_util = gpu_util_sum_[channel_num] / static_cast<double>(gpu_util_samples_[channel_num]);
         const unsigned int min_gpu_util = gpu_util_min_[channel_num] == std::numeric_limits<unsigned int>::max() ? 0U : gpu_util_min_[channel_num];

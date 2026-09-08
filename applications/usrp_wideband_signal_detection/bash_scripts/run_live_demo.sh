@@ -31,6 +31,14 @@ case "${MODE}" in
     CONFIG_NAME=config_coherent_power_perf_dynamic_single_channel.yaml
     export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234}
     ;;
+  v3)
+    # Dashboard v3: detector + classifier pipeline (no decode). Snipper +
+    # compression feed the classify-only daemon; DEMO CONTROLS drive the
+    # classifier checklist live and detector switches via the conductor.
+    CONFIG_NAME=config_live_v3_single_channel.yaml
+    export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234}
+    V3_STACK=1
+    ;;
   *.yaml)
     CONFIG_NAME=${MODE}
     ;;
@@ -80,12 +88,18 @@ stop_app() {
 
 RADIO_PID=""
 TAIL_PID=""
+DAEMON_PID=""
+CONDUCTOR_PID=""
+JANITOR_PID=""
 cleanup() {
   trap - INT TERM EXIT
   echo
   echo "==> Shutting down the demo"
   [ -n "${RADIO_PID}" ] && kill "${RADIO_PID}" 2>/dev/null || true
   [ -n "${TAIL_PID}" ] && kill "${TAIL_PID}" 2>/dev/null || true
+  [ -n "${DAEMON_PID}" ] && kill "${DAEMON_PID}" 2>/dev/null || true
+  [ -n "${CONDUCTOR_PID}" ] && kill "${CONDUCTOR_PID}" 2>/dev/null || true
+  [ -n "${JANITOR_PID}" ] && kill "${JANITOR_PID}" 2>/dev/null || true
   stop_app
   echo "==> Demo stopped."
 }
@@ -93,6 +107,15 @@ trap cleanup INT TERM EXIT
 
 echo "==> Stopping any previous app instance"
 stop_app
+
+if [[ "${V3_STACK:-0}" == "1" ]]; then
+  echo "==> v3: control state + snippet scratch (before the app starts writing)"
+  sudo mkdir -p /tmp/usrp_spectrograms && sudo chmod 1777 /tmp/usrp_spectrograms
+  sudo rm -rf /tmp/usrp_spectrograms/snippets 2>/dev/null || true
+  printf '{"gate": "tprime", "snr": "clean", "detector": "coherent_power", "classifiers": "vtcnn2,resnet1d,tprime", "seq": 1}\n' \
+    | sudo tee /tmp/usrp_spectrograms/demo_control.json > /dev/null
+  sudo chmod 666 /tmp/usrp_spectrograms/demo_control.json
+fi
 
 echo "==> Launching the app (config: ${CONFIG_NAME})"
 sudo docker exec -d \
@@ -122,6 +145,37 @@ done
 # Mirror the app log into this terminal alongside the radio output.
 sudo docker exec "${CONTAINER_NAME}" tail -f "${APP_LOG}" &
 TAIL_PID=$!
+
+if [[ "${V3_STACK:-0}" == "1" ]]; then
+  APP_DIR_HOST=$(cd "${SCRIPT_DIR}/.." && pwd -P)
+  # under sudo, HOME=/root — resolve the desktop user's home for the ML venv
+  V3_USER_HOME=$(getent passwd "${SUDO_USER:-${USER}}" | cut -d: -f6)
+  VENV_PY="${VENV_PY:-${V3_USER_HOME}/Documents/holoscan_waveform_generation/.venv-ml/bin/python}"
+  echo "==> v3: classify-only AMC daemon (THROUGHPUT + COMPUTE panels)"
+  # stale metrics from a previous run must not paint the panels before the
+  # daemon's first write
+  sudo rm -f /tmp/usrp_spectrograms/rt_metrics.json /tmp/usrp_spectrograms/daemon_live.log
+  (cd "${APP_DIR_HOST}/infocom_evals/pycodec_e2e" && \
+   PYCODEC_ROOT="${V3_USER_HOME}/Documents/holoscan_waveform_generation" \
+   exec "${VENV_PY}" rt_decode_daemon.py --snips /tmp/usrp_spectrograms/snippets \
+     --classify-only --no-band-truth \
+     --metrics-out /tmp/usrp_spectrograms/rt_metrics.json \
+     > /tmp/usrp_spectrograms/daemon_live.log 2>&1) &
+  DAEMON_PID=$!
+
+  echo "==> v3: conductor (detector switches from DEMO CONTROLS; no replay)"
+  (cd "${APP_DIR_HOST}/infocom_evals/pycodec_e2e" && \
+   exec sudo python3 demo_conductor.py --no-replay --display "${DISPLAY:-:1}" \
+     --rate-hz "${USRP_SAMPLE_RATE_HZ}" \
+     > /tmp/usrp_spectrograms/conductor.log 2>&1) &
+  CONDUCTOR_PID=$!
+
+  echo "==> v3: snippet janitor (keep 5 min)"
+  (sudo bash -c 'while true; do
+     find /tmp/usrp_spectrograms/snippets -name "snip_pack*" -mmin +5 -delete 2>/dev/null
+     sleep 30; done' > /dev/null 2>&1) &
+  JANITOR_PID=$!
+fi
 
 echo "==> Starting the over-the-air radio stream (Ctrl-C stops everything)"
 "${SCRIPT_DIR}/start_radio_stream.sh" &

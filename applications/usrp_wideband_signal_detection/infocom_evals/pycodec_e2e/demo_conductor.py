@@ -40,6 +40,15 @@ CONFIG_BY_DETECTOR = {
     # so replay stays at the full 240 kpps (fresh mask every ~340 ms).
     "cuda_dino_finetuned": "config_dino_finetuned_viz_demo.yaml",
 }
+# Live radio (--no-replay): coherent_power uses the v3 live config (dynamic
+# floor + snipper + compression). NOTE the DINO-FT M2_dr checkpoint was trained
+# for 20.48-245.76 MS/s; at the live 491.52 MS/s it runs outside its
+# rate-invariance envelope (expect degraded masks until a retrain).
+CONFIG_BY_DETECTOR_LIVE = {
+    "coherent_power": "config_live_v3_single_channel.yaml",
+    "cuda_dino": "config_cuda_dino_performance_single_channel.yaml",
+    "cuda_dino_finetuned": "config_cuda_dino_finetuned_performance_single_channel.yaml",
+}
 # Loopback replay runs at the composites' rate, which is what the DINO
 # coherence gate was calibrated against (2026-08-18) — use the calibrated
 # config there; per-frequency floors are span-specific so live air keeps
@@ -121,8 +130,11 @@ class Conductor:
                            check=False)
         return r.returncode == 0
 
+    def config_map(self):
+        return CONFIG_BY_DETECTOR_LIVE if self.args.no_replay else CONFIG_BY_DETECTOR
+
     def set_detector(self, detector: str):
-        cfg = CONFIG_BY_DETECTOR.get(detector)
+        cfg = self.config_map().get(detector)
         if cfg is None:
             print(f"[conductor] unknown detector '{detector}', ignoring", flush=True)
             return
@@ -146,14 +158,14 @@ class Conductor:
             time.sleep(10)
             if not self._app_alive():
                 print(f"[conductor] APP DIED after switching to {detector} ({cfg}) — "
-                      f"rolling back to {prev_cfg or CONFIG_BY_DETECTOR['coherent_power']}",
+                      f"rolling back to {prev_cfg or self.config_map()['coherent_power']}",
                       flush=True)
                 self.pps = 240000
                 if self.snr is not None:
                     snr, self.snr = self.snr, None
                     self.set_snr(snr)
-                self._launch_app(prev_cfg or CONFIG_BY_DETECTOR["coherent_power"])
-                self.current_cfg = prev_cfg or CONFIG_BY_DETECTOR["coherent_power"]
+                self._launch_app(prev_cfg or self.config_map()["coherent_power"])
+                self.current_cfg = prev_cfg or self.config_map()["coherent_power"]
                 return
         self.detector = detector
 
@@ -171,8 +183,8 @@ class Conductor:
             if self.detector is not None and now - alive_check > 5.0:
                 alive_check = now
                 if not self._app_alive():
-                    cfg = self.current_cfg or CONFIG_BY_DETECTOR.get(
-                        self.detector, CONFIG_BY_DETECTOR["coherent_power"])
+                    cfg = self.current_cfg or self.config_map().get(
+                        self.detector, self.config_map()["coherent_power"])
                     print(f"[conductor] app not running — reviving with {cfg}", flush=True)
                     self._launch_app(cfg)
                     self.current_cfg = cfg

@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -2155,6 +2156,24 @@ struct DecodeMetricsSnapshot {
   double data_saved_gb = -1.0;                   // total snippet bytes stored
   double full_capture_gb = -1.0;                 // full-rate cf32 baseline
   uint64_t data_snips = 0;
+  // ---- v3 pipeline (detector + classifier, no decode): per-model compute cost
+  struct ClsResource {
+    std::string name;
+    uint64_t params = 0;
+    double gpu_mb = -1.0;             // torch allocator delta at load
+    double gflops_per_window = -1.0;  // profiled forward cost
+    double ms_avg = -1.0;             // rolling latency per band
+    uint64_t windows = 0;             // cumulative windows classified
+    double windows_per_s = -1.0;      // EMA of deltas
+  };
+  std::vector<ClsResource> cls_resources;
+  bool classify_only = false;
+  double snips_per_s = -1.0;          // detection->snip rate (EMA of deltas)
+  // ---- app-side throughput/compute (app_metrics.json from the rate monitor)
+  double app_msps = -1.0, app_gbps = -1.0;
+  double app_gpu_util = -1.0, app_gpu_util_max = -1.0;
+  double app_mem_used_gb = -1.0, app_mem_total_gb = -1.0;
+  double app_age_s = 1e9;             // seconds since app_metrics.json changed
 };
 
 std::mutex& decode_metrics_mutex() {
@@ -2391,6 +2410,43 @@ void poll_decode_metrics() {
       }
     }
   }
+  // ---- v3: per-model compute resources + classify-only flag -------------
+  next.classify_only = text.find("\"classify_only\": true") != std::string::npos;
+  const auto res_pos = text.find("\"resources\"");
+  if (res_pos != std::string::npos) {
+    static std::map<std::string, std::pair<uint64_t, double>> win_track;  // name -> (prev, ema)
+    static std::chrono::steady_clock::time_point win_last =
+        std::chrono::steady_clock::now();
+    const double wdt = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - win_last).count();
+    win_last = std::chrono::steady_clock::now();
+    for (const char* name : {"vtcnn2", "resnet1d", "tprime"}) {
+      const auto mpos = text.find(std::string("\"") + name + "\"", res_pos);
+      if (mpos == std::string::npos) continue;
+      const auto open = text.find('{', mpos);
+      const auto close = open == std::string::npos ? std::string::npos
+                                                   : text.find('}', open);
+      if (close == std::string::npos) continue;
+      const std::string item = text.substr(open, close - open + 1);
+      DecodeMetricsSnapshot::ClsResource r;
+      r.name = name;
+      json_find_u64(item, "params", r.params);
+      json_find_double(item, "gpu_mb", r.gpu_mb);
+      json_find_double(item, "gflops_per_window", r.gflops_per_window);
+      json_find_double(item, "ms_avg", r.ms_avg);
+      json_find_u64(item, "windows", r.windows);
+      auto& track = win_track[name];
+      if (r.windows >= track.first && wdt > 0.05) {
+        const double wps = static_cast<double>(r.windows - track.first) / wdt;
+        track.second = track.second <= 0.0 ? wps : 0.7 * track.second + 0.3 * wps;
+      } else if (r.windows < track.first) {
+        track.second = -1.0;  // daemon restart / model reload
+      }
+      track.first = r.windows;
+      r.windows_per_s = track.second;
+      next.cls_resources.push_back(std::move(r));
+    }
+  }
   if (next.bits > prev_bits) {
     const double inst = static_cast<double>(next.errors - std::min(next.errors, prev_errors)) /
                         static_cast<double>(next.bits - prev_bits);
@@ -2409,11 +2465,14 @@ void poll_decode_metrics() {
     have_change = false;
     ema_fps = ema_hit = -1.0;
   }
+  static double ema_sps = -1.0;
   if (have_change) {
     const double dt = std::chrono::duration<double>(now_tp - last_change).count();
     if (dt > 0.05) {
       const double fps = static_cast<double>(next.frames - prev_frames) / dt;
       ema_fps = ema_fps < 0.0 ? fps : 0.7 * ema_fps + 0.3 * fps;
+      const double sps = static_cast<double>(snips - prev_snips) / dt;
+      ema_sps = ema_sps < 0.0 ? sps : 0.7 * ema_sps + 0.3 * sps;
       if (snips > prev_snips) {
         const double hit = 100.0 * static_cast<double>(snips_hit - prev_snips_hit) /
                            static_cast<double>(snips - prev_snips);
@@ -2427,19 +2486,63 @@ void poll_decode_metrics() {
   last_change = now_tp;
   have_change = true;
   next.frames_per_s = ema_fps;
+  next.snips_per_s = ema_sps;
   next.snips_decoded_pct = ema_hit;
   next.secs_since_update = 0.0;
   decode_metrics_last_parse() = now_tp;
-  next.valid = next.frames > 0 || next.bits > 0;
+  next.valid = next.frames > 0 || next.bits > 0 || snips > 0;
   s = std::move(next);
+}
+
+// app_metrics.json (rate monitor, same directory as rt_metrics.json):
+// throughput + GPU utilization/memory for the v3 THROUGHPUT & COMPUTE panel.
+void poll_app_metrics(DecodeMetricsSnapshot& snap) {
+  std::string base;
+  {
+    std::lock_guard<std::mutex> lock(decode_metrics_mutex());
+    base = decode_metrics_path_storage();
+  }
+  if (base.empty()) return;
+  const auto slash = base.find_last_of('/');
+  const std::string path =
+      (slash == std::string::npos ? std::string(".") : base.substr(0, slash)) +
+      "/app_metrics.json";
+  static std::string cache_text;
+  static std::filesystem::file_time_type last_mtime {};
+  static std::chrono::steady_clock::time_point last_change_tp =
+      std::chrono::steady_clock::now();
+  std::error_code ec;
+  const auto mtime = std::filesystem::last_write_time(path, ec);
+  if (!ec && mtime != last_mtime) {
+    last_mtime = mtime;
+    last_change_tp = std::chrono::steady_clock::now();
+    std::ifstream in(path);
+    if (in.is_open()) {
+      cache_text.assign((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+    }
+  }
+  if (cache_text.empty()) return;
+  json_find_double(cache_text, "msps", snap.app_msps);
+  json_find_double(cache_text, "gbps", snap.app_gbps);
+  json_find_double(cache_text, "gpu_util_mean", snap.app_gpu_util);
+  json_find_double(cache_text, "gpu_util_max", snap.app_gpu_util_max);
+  json_find_double(cache_text, "gpu_mem_used_gb", snap.app_mem_used_gb);
+  json_find_double(cache_text, "gpu_mem_total_gb", snap.app_mem_total_gb);
+  snap.app_age_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - last_change_tp).count();
 }
 
 DecodeMetricsSnapshot decode_metrics_snapshot() {
   poll_decode_metrics();
-  std::lock_guard<std::mutex> lock(decode_metrics_mutex());
-  DecodeMetricsSnapshot copy = decode_metrics_storage();
-  copy.secs_since_update = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - decode_metrics_last_parse()).count();
+  DecodeMetricsSnapshot copy;
+  {
+    std::lock_guard<std::mutex> lock(decode_metrics_mutex());
+    copy = decode_metrics_storage();
+    copy.secs_since_update = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - decode_metrics_last_parse()).count();
+  }
+  poll_app_metrics(copy);  // takes the same mutex internally: call unlocked
   return copy;
 }
 
@@ -2451,6 +2554,7 @@ struct DemoControlState {
   int gate = 2;       // index into kDemoGateNames (default tprime)
   int snr = 0;        // index into kDemoSnrNames (default clean composite)
   int detector = 0;   // index into kDemoDetectorNames
+  bool cls_on[3] = {true, true, true};  // classifier CHECKLIST (kDemoGateNames order)
   uint64_t seq = 0;
   bool loaded = false;
 };
@@ -2514,6 +2618,11 @@ void demo_control_load_once(DemoControlState& st, const std::string& path) {
   if (json_find_string(text, "detector", v)) {
     st.detector = demo_option_index(kDemoDetectorNames, v, st.detector);
   }
+  if (json_find_string(text, "classifiers", v)) {
+    for (int i = 0; i < 3; ++i) {
+      st.cls_on[i] = v.find(kDemoGateNames[i]) != std::string::npos;
+    }
+  }
   json_find_u64(text, "seq", st.seq);
 }
 
@@ -2522,9 +2631,17 @@ void demo_control_write(const DemoControlState& st, const std::string& path) {
   {
     std::ofstream out(tmp);
     if (!out.is_open()) return;
+    std::string cls_list;
+    for (int i = 0; i < 3; ++i) {
+      if (st.cls_on[i]) {
+        if (!cls_list.empty()) cls_list += ",";
+        cls_list += kDemoGateNames[i];
+      }
+    }
     out << "{\n \"gate\": \"" << kDemoGateNames[st.gate] << "\",\n"
         << " \"snr\": \"" << kDemoSnrNames[st.snr] << "\",\n"
         << " \"detector\": \"" << kDemoDetectorNames[st.detector] << "\",\n"
+        << " \"classifiers\": \"" << cls_list << "\",\n"
         << " \"seq\": " << st.seq << "\n}\n";
   }
   std::error_code ec;
@@ -2651,12 +2768,19 @@ void render_visualization_ui_overlay() {
                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
                        ImGuiWindowFlags_NoSavedSettings);
-      ImGui::SetWindowFontScale(1.2f);
-      ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 3.0f));
-      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 5.0f));
+      // v3 checklist made this panel taller: tighter type/spacing so it stays
+      // inside the banner instead of occluding the CH-0 heading below.
+      ImGui::SetWindowFontScale(1.05f);
+      ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, 2.0f));
+      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 3.0f));
       ImGui::PushItemWidth(170.0f);
       bool changed = false;
-      changed |= ImGui::Combo("Gate", &st.gate, kDemoGateLabels, 3);
+      // Classifier CHECKLIST (v3): enable any subset; the daemon hot-loads /
+      // unloads models and the COMPUTE panel shows each one's cost.
+      ImGui::TextUnformatted("Classifiers");
+      for (int i = 0; i < 3; ++i) {
+        changed |= ImGui::Checkbox(kDemoGateLabels[i], &st.cls_on[i]);
+      }
       static const char* const kSnrCombo[] = {"Clean", "30 dB", "20 dB", "15 dB",
                                               "12 dB", "9 dB", "6 dB", "0 dB",
                                               "-5 dB", "-10 dB", "Staircase"};
@@ -2712,7 +2836,111 @@ void render_visualization_ui_overlay() {
   // ---- LIVE DECODE panel (pycodec real-time decode metrics) ----
   {
     const auto dm = decode_metrics_snapshot();
-    if (dm.valid) {
+    if (dm.classify_only) {
+      // ---- v3 pipeline sidebar: THROUGHPUT + COMPUTE (no decode/BER) ----
+      const float x0 = sidebar_min.x + 16.0f;
+      const float x1 = rect_max(state.sidebar_rect).x - 16.0f;
+      char line[112];
+      draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.25f,
+                         ImVec2(x0, sidebar_text_y), accent_blue, "PIPELINE THROUGHPUT");
+      sidebar_text_y += 24.0f;
+      const bool app_fresh = dm.app_age_s < 15.0 && dm.app_msps > 0.0;
+      if (app_fresh) {
+        std::snprintf(line, sizeof(line), "%.1f MSps", dm.app_msps);
+        draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.6f,
+                           ImVec2(x0, sidebar_text_y), accent_green, line);
+        std::snprintf(line, sizeof(line), "%.2f Gbps", dm.app_gbps);
+        draw_list->AddText(ImVec2(x0 + 158.0f, sidebar_text_y + 6.0f), panel_text, line);
+      } else {
+        draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.6f,
+                           ImVec2(x0, sidebar_text_y), panel_muted, "ingest --");
+      }
+      sidebar_text_y += 28.0f;
+      if (dm.app_gpu_util >= 0.0 && app_fresh) {
+        std::snprintf(line, sizeof(line), "GPU %.0f%% (peak %.0f%%)",
+                      dm.app_gpu_util, dm.app_gpu_util_max);
+        const ImU32 uc = dm.app_gpu_util < 70.0 ? accent_green
+                         : (dm.app_gpu_util < 90.0 ? IM_COL32(255, 212, 89, 255)
+                                                    : accent_orange);
+        draw_list->AddText(ImVec2(x0, sidebar_text_y), uc, line);
+        sidebar_text_y += 18.0f;
+      }
+      if (dm.app_mem_total_gb > 0.0 && app_fresh) {
+        std::snprintf(line, sizeof(line), "mem %.1f / %.0f GB",
+                      dm.app_mem_used_gb, dm.app_mem_total_gb);
+        draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_text, line);
+        // memory bar
+        const float mb_y = sidebar_text_y + 17.0f;
+        const float frac = std::min(1.0f, static_cast<float>(dm.app_mem_used_gb /
+                                                             dm.app_mem_total_gb));
+        draw_list->AddRectFilled(ImVec2(x0, mb_y), ImVec2(x1, mb_y + 6.0f),
+                                 IM_COL32(17, 24, 34, 255), 3.0f);
+        draw_list->AddRectFilled(ImVec2(x0, mb_y), ImVec2(x0 + frac * (x1 - x0), mb_y + 6.0f),
+                                 frac < 0.7f ? accent_blue : accent_orange, 3.0f);
+        sidebar_text_y = mb_y + 14.0f;
+      }
+      // GPU-util sparkline (history sampled at render time from app metrics)
+      {
+        static std::deque<float> util_hist;
+        static double last_sample_age = 1e9;
+        if (app_fresh && dm.app_age_s < last_sample_age) {
+          util_hist.push_back(static_cast<float>(dm.app_gpu_util));
+          while (util_hist.size() > 64) util_hist.pop_front();
+        }
+        last_sample_age = dm.app_age_s;
+        if (!util_hist.empty()) {
+          const float spark_h = 26.0f;
+          const float base_y = sidebar_text_y + spark_h;
+          draw_list->AddRectFilled(ImVec2(x0, sidebar_text_y), ImVec2(x1, base_y),
+                                   IM_COL32(17, 24, 34, 255), 3.0f);
+          const int n = static_cast<int>(util_hist.size());
+          const float bar_w = (x1 - x0) / 64.0f;
+          for (int i = 0; i < n; ++i) {
+            const float frac = std::min(1.0f, util_hist[i] / 100.0f);
+            const float bx = x1 - (n - i) * bar_w;
+            draw_list->AddRectFilled(
+                ImVec2(bx, base_y - 2.0f - frac * (spark_h - 4.0f)),
+                ImVec2(bx + bar_w - 1.0f, base_y - 2.0f),
+                frac < 0.7f ? accent_green : accent_orange);
+          }
+          draw_list->AddText(ImVec2(x0 + 4.0f, sidebar_text_y + 2.0f), panel_muted, "gpu util");
+          sidebar_text_y = base_y + 8.0f;
+        }
+      }
+      const bool stale = dm.secs_since_update > 4.0;
+      std::snprintf(line, sizeof(line), "%.1f detections/s   %llu snips total",
+                    (stale || dm.snips_per_s < 0.0) ? 0.0 : dm.snips_per_s,
+                    static_cast<unsigned long long>(dm.data_snips));
+      draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_text, line);
+      sidebar_text_y += 20.0f;
+      // Compact per-model cost rows (full table in the footer). Skip when the
+      // sidebar is out of vertical room -- overflowing text lands on the
+      // footer's compute table.
+      const float sidebar_bottom = rect_max(state.sidebar_rect).y - 16.0f;
+      if (!dm.cls_resources.empty() &&
+          sidebar_text_y + 26.0f + 17.0f * dm.cls_resources.size() < sidebar_bottom) {
+        sidebar_text_y += 4.0f;
+        draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.25f,
+                           ImVec2(x0, sidebar_text_y), accent_blue, "CLASSIFIERS");
+        std::snprintf(line, sizeof(line), "%zu enabled", dm.cls_resources.size());
+        draw_list->AddText(ImVec2(x0 + 130.0f, sidebar_text_y + 3.0f), panel_muted, line);
+        sidebar_text_y += 22.0f;
+        for (const auto& r : dm.cls_resources) {
+          const char* disp = r.name == "vtcnn2" ? "VT-CNN2"
+                             : (r.name == "resnet1d" ? "ResNet1D" : "T-PRIME");
+          draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_text, disp);
+          if (r.ms_avg >= 0.0) {
+            std::snprintf(line, sizeof(line), "%.1f ms", r.ms_avg);
+            draw_list->AddText(ImVec2(x0 + 92.0f, sidebar_text_y), panel_muted, line);
+          }
+          if (r.gpu_mb >= 0.0) {
+            std::snprintf(line, sizeof(line), "%.0f MB", r.gpu_mb);
+            draw_list->AddText(ImVec2(x0 + 158.0f, sidebar_text_y), panel_muted, line);
+          }
+          sidebar_text_y += 17.0f;
+        }
+      }
+    } else if (dm.valid) {
       const float x0 = sidebar_min.x + 16.0f;
       const float x1 = rect_max(state.sidebar_rect).x - 16.0f;
       draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.25f,
@@ -2995,7 +3223,118 @@ void render_visualization_ui_overlay() {
     // popup renders there and must not collide with the metric panels.
     const float split_x = display_size.x * 0.565f;
 
-    if (dm.valid) {
+    if (dm.classify_only) {
+      // ---- v3 footer: ingest history (left) + CLASSIFIER COMPUTE table (right) ----
+      const float bx0 = 16.0f, bx1 = display_size.x * 0.435f;
+      draw_list->AddRectFilled(ImVec2(bx0, fy0), ImVec2(bx1, fy1), IM_COL32(13, 18, 27, 235), 6.0f);
+      draw_list->AddRect(ImVec2(bx0, fy0), ImVec2(bx1, fy1), panel_border, 6.0f, 0, 1.0f);
+      char hdr[112];
+      if (dm.app_msps > 0.0 && dm.app_age_s < 15.0) {
+        std::snprintf(hdr, sizeof(hdr), "INGEST %.1f MSps  %.2f Gbps   GPU %.0f%%",
+                      dm.app_msps, dm.app_gbps, std::max(0.0, dm.app_gpu_util));
+      } else {
+        std::snprintf(hdr, sizeof(hdr), "INGEST --  (app metrics stale)");
+      }
+      draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.3f,
+                         ImVec2(bx0 + 12.0f, fy0 + 4.0f), accent_green, hdr);
+      {
+        static std::deque<float> msps_hist;
+        static double last_age = 1e9;
+        if (dm.app_msps > 0.0 && dm.app_age_s < last_age) {
+          msps_hist.push_back(static_cast<float>(dm.app_msps));
+          while (msps_hist.size() > 64) msps_hist.pop_front();
+        }
+        last_age = dm.app_age_s;
+        const float chart_x0 = bx0 + 12.0f, chart_x1 = bx1 - 76.0f;
+        const float chart_y1 = fy1 - 4.0f;
+        const float chart_h = chart_y1 - (fy0 + 26.0f);
+        if (!msps_hist.empty() && chart_h > 6.0f) {
+          const float vmax = std::max(1.0f, *std::max_element(msps_hist.begin(), msps_hist.end()));
+          const int n = static_cast<int>(msps_hist.size());
+          const float bar_w = (chart_x1 - chart_x0) / 64.0f;
+          for (int i = 0; i < n; ++i) {
+            const float frac = msps_hist[i] / vmax;
+            const float x = chart_x1 - (n - i) * bar_w;
+            draw_list->AddRectFilled(ImVec2(x, chart_y1 - frac * chart_h),
+                                     ImVec2(x + bar_w - 1.0f, chart_y1), accent_blue);
+          }
+          draw_list->AddText(ImVec2(chart_x1 + 8.0f, chart_y1 - 14.0f), panel_muted, "MSps");
+        }
+      }
+
+      // CLASSIFIER COMPUTE table (right): the per-configuration cost story.
+      const float tx0 = split_x, tx1 = display_size.x - 16.0f;
+      draw_list->AddRectFilled(ImVec2(tx0, fy0), ImVec2(tx1, fy1), IM_COL32(13, 18, 27, 235), 6.0f);
+      draw_list->AddRect(ImVec2(tx0, fy0), ImVec2(tx1, fy1), panel_border, 6.0f, 0, 1.0f);
+      draw_list->AddText(ImVec2(tx0 + 12.0f, fy0 + 4.0f), accent_blue, "CLASSIFIER COMPUTE");
+      if (dm.data_saved_gb >= 0.0 && dm.full_capture_gb > 0.0) {
+        char totals[128];
+        const double reduction = dm.data_saved_gb > 1e-9
+                                     ? dm.full_capture_gb / dm.data_saved_gb : 0.0;
+        std::snprintf(totals, sizeof(totals),
+                      "stored %.2f GB vs %.0f GB full-rate = %.0fx less",
+                      dm.data_saved_gb, dm.full_capture_gb, reduction);
+        draw_list->AddText(ImVec2(tx0 + 196.0f, fy0 + 6.0f), accent_green, totals);
+      }
+      const float kParX = tx0 + 128.0f, kMemX = tx0 + 236.0f, kMsX = tx0 + 344.0f;
+      const float kWpsX = tx0 + 452.0f, kFlX = tx0 + 584.0f;
+      float ty = fy0 + 26.0f;
+      draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_muted, "model");
+      draw_list->AddText(ImVec2(kParX, ty), panel_muted, "params");
+      draw_list->AddText(ImVec2(kMemX, ty), panel_muted, "GPU mem");
+      draw_list->AddText(ImVec2(kMsX, ty), panel_muted, "ms/band");
+      draw_list->AddText(ImVec2(kWpsX, ty), panel_muted, "windows/s");
+      draw_list->AddText(ImVec2(kFlX, ty), panel_muted, "GFLOP/s");
+      ty += 18.0f;
+      if (dm.cls_resources.empty()) {
+        draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_muted,
+                           "(no classifiers enabled -- tick them in DEMO CONTROLS)");
+      }
+      char cell[48];
+      double tot_mem = 0.0, tot_flops = 0.0;
+      for (const auto& r : dm.cls_resources) {
+        if (ty > fy1 - 30.0f) break;
+        const char* disp = r.name == "vtcnn2" ? "VT-CNN2"
+                           : (r.name == "resnet1d" ? "ResNet1D" : "T-PRIME");
+        draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_text, disp);
+        std::snprintf(cell, sizeof(cell), "%.2f M", r.params / 1e6);
+        draw_list->AddText(ImVec2(kParX, ty), panel_text, cell);
+        if (r.gpu_mb >= 0.0) {
+          std::snprintf(cell, sizeof(cell), "%.0f MB", r.gpu_mb);
+          tot_mem += r.gpu_mb;
+        } else {
+          std::snprintf(cell, sizeof(cell), "--");
+        }
+        draw_list->AddText(ImVec2(kMemX, ty), panel_text, cell);
+        if (r.ms_avg >= 0.0) {
+          std::snprintf(cell, sizeof(cell), "%.1f", r.ms_avg);
+        } else {
+          std::snprintf(cell, sizeof(cell), "--");
+        }
+        draw_list->AddText(ImVec2(kMsX, ty), panel_text, cell);
+        const bool rate_ok = r.windows_per_s >= 0.0 && dm.secs_since_update < 6.0;
+        std::snprintf(cell, sizeof(cell), rate_ok ? "%.1f" : "--",
+                      rate_ok ? r.windows_per_s : 0.0);
+        draw_list->AddText(ImVec2(kWpsX, ty), panel_text, cell);
+        if (rate_ok && r.gflops_per_window > 0.0) {
+          const double gfs = r.gflops_per_window * r.windows_per_s;
+          tot_flops += gfs;
+          std::snprintf(cell, sizeof(cell), "%.1f", gfs);
+          draw_list->AddText(ImVec2(kFlX, ty), accent_blue, cell);
+        } else {
+          draw_list->AddText(ImVec2(kFlX, ty), panel_muted, "--");
+        }
+        ty += 18.0f;
+      }
+      if (!dm.cls_resources.empty() && ty <= fy1 - 14.0f) {
+        std::snprintf(cell, sizeof(cell), "total");
+        draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_muted, cell);
+        std::snprintf(cell, sizeof(cell), "%.0f MB", tot_mem);
+        draw_list->AddText(ImVec2(kMemX, ty), accent_green, cell);
+        std::snprintf(cell, sizeof(cell), "%.1f", tot_flops);
+        draw_list->AddText(ImVec2(kFlX, ty), accent_green, cell);
+      }
+    } else if (dm.valid) {
       // BER strip (left): log-scaled instantaneous-BER bars over the recent window.
       const float bx0 = 16.0f, bx1 = display_size.x * 0.435f;
       draw_list->AddRectFilled(ImVec2(bx0, fy0), ImVec2(bx1, fy1), IM_COL32(13, 18, 27, 235), 6.0f);
