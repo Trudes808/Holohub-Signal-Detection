@@ -252,13 +252,24 @@ finetuned_dino_detector:
   threshold: 0.95
   model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m2_dr_bf16.ts"
   torch_dtype: "fp32"               # vestigial: bf16 compute is baked into the traced .ts
-  # GB10 real-time budget: ~10.4 ms/tile x 20 tiles per 21.3 ms frame -> stride 16 keeps the
-  # model at ~60% GPU duty at the full 240 kpps replay (one fresh mask every ~340 ms).
-  emit_stride: 16
+  # LIVE @ 491.52 MSps: with downsample mode the frame cost is ~2 tiles (rate-adaptive), so a
+  # low stride is affordable and the ROI history reads as a continuous ribbon (viz holds the last
+  # mask up to 48 frames) instead of chunk-by-chunk. Native mode (below) is 20+ tiles/frame and
+  # forced the coarse stride-16 blocks.
+  emit_stride: 4
   channel_filter: -1
-  real_time_downsample: false       # native dedicated-FFT path is the validated one
-  downsample_fft_size: 10240
-  flatten_noise_floor: false        # model trained on raw (unflattened) captures - keep off
+  # Native nfft-FFT at 491.52 MSps = 480 kHz/bin, DOUBLE M2_dr's trained 240 kHz/bin -> every
+  # signal reads half-width at the wrong scale. Downsample mode FFTs wide (auto-sized to the actual
+  # rate) then resizes the freq axis to nfft inside torch, so the model sees its trained per-pixel
+  # geometry REGARDLESS of the live rate -- the fix for the wrong-scale / mis-placed detections.
+  real_time_downsample: true
+  downsample_fft_size: 0            # 0 = auto-size from the live rate (keeps ~2-tile cost at any rate)
+  # The X410 analog anti-alias filter rolls off toward the band edges; the fixed db_vmin/vmax clip
+  # maps that tilt into the model's active range and it fires on the edges (activity where the raw
+  # spectrogram shows none). Flattening the per-frequency floor removes it. (Off for the shipped
+  # loopback config since that trained on unflattened captures; at the off-distribution live rate the
+  # edge artifact dominates, so flatten on.)
+  flatten_noise_floor: true
 
 # --- Signal snipper -----------------------------------------------------------------------------
 # Clusters the detector mask into per-signal boxes and cuts the corresponding IQ out of the stream.
