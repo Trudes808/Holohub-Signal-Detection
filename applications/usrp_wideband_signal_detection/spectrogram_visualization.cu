@@ -2581,8 +2581,10 @@ static const char* const kDemoGateNames[] = {"vtcnn2", "resnet1d", "tprime"};
 static const char* const kDemoGateLabels[] = {"VT-CNN2", "ResNet1D", "T-PRIME"};
 static const char* const kDemoSnrNames[] = {"clean", "30", "20", "15", "12", "9", "6",
                                             "0", "-5", "-10", "staircase"};
-static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino", "cuda_dino_finetuned"};
-static const char* const kDemoDetectorLabels[] = {"CoherentPower", "CUDA-DINO", "DINO-FT (M2_dr)"};
+static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino", "cuda_dino_finetuned",
+                                                 "cuda_dino_finetuned_sb"};
+static const char* const kDemoDetectorLabels[] = {"CoherentPower", "CUDA-DINO", "DINO-FT (M2_dr)",
+                                                  "DINO-FT (SB ignore)"};
 
 std::mutex& demo_control_mutex() {
   static std::mutex m;
@@ -2815,7 +2817,7 @@ void render_visualization_ui_overlay() {
                                                 "-5 dB", "-10 dB", "Staircase"};
         changed |= ImGui::Combo("SNR", &st.snr, kSnrCombo, 11);
       }
-      changed |= ImGui::Combo("Detector", &st.detector, kDemoDetectorLabels, 3);
+      changed |= ImGui::Combo("Detector", &st.detector, kDemoDetectorLabels, 4);
       ImGui::PopItemWidth();
       if (changed) {
         st.seq += 1;

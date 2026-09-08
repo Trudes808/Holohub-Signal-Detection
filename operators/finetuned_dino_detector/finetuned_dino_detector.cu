@@ -304,6 +304,14 @@ void FinetunedDinoDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(flatten_signal_cap_db_, "flatten_signal_cap_db", "Flatten signal cap",
              "Cap a bin's influence on its own floor estimate at reference+this (dB) so strong "
              "signals don't inflate the floor; 0 disables the capped second pass.", 6.0);
+  spec.param(ignore_sideband_percent_, "ignore_sideband_percent", "Ignore sideband percent",
+             "Zero the emitted mask's outermost columns on EACH band edge, as a percent of the mask "
+             "width. The X410 anti-alias rolloff cliff at the extreme bins survives the floor flatten "
+             "and fires the model there; this trims those columns after inference. Takes precedence "
+             "over ignore_sideband_hz. 0 = off (same semantics as the coherent detector's).", 0.0);
+  spec.param(ignore_sideband_hz_, "ignore_sideband_hz", "Ignore sideband Hz",
+             "Alternative per-side trim as a frequency span (Hz), converted with the live rate. Used "
+             "only when ignore_sideband_percent == 0. 0 = off.", 0.0);
 }
 
 void FinetunedDinoDetector::initialize() {
@@ -585,6 +593,29 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
   throw_if_cuda_error(cudaStreamSynchronize(stream), "stream sync before emit");
     mask_width = nfft;
   }  // end native path
+
+  // Band-edge sideband ignore (both paths): zero the outer mask columns per side. percent wins over
+  // hz (converted with the live rate); capped at half the width. Runs after inference so the model
+  // input is untouched -- only the emitted detections are trimmed.
+  {
+    const double pct = ignore_sideband_percent_.get();
+    const double hz = ignore_sideband_hz_.get();
+    int ignore_cols = 0;
+    if (pct > 0.0) {
+      ignore_cols = static_cast<int>(std::floor(static_cast<double>(mask_width) * pct / 100.0));
+    } else if (hz > 0.0 && rate_hz > 0.0) {
+      ignore_cols = static_cast<int>(std::ceil(hz / (rate_hz / static_cast<double>(mask_width))));
+    }
+    ignore_cols = std::min(ignore_cols, mask_width / 2);
+    if (ignore_cols > 0) {
+      throw_if_cuda_error(cudaMemset2DAsync(emit_mask, mask_width, 0, ignore_cols, rows, stream),
+                          "sideband memset left");
+      throw_if_cuda_error(cudaMemset2DAsync(emit_mask + (mask_width - ignore_cols), mask_width, 0,
+                                            ignore_cols, rows, stream),
+                          "sideband memset right");
+      throw_if_cuda_error(cudaStreamSynchronize(stream), "sideband sync");
+    }
+  }
 
   holoscan::ops::DetectorMaskMessage mask_msg;
   mask_msg.width = mask_width;

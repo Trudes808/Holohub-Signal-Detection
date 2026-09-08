@@ -48,6 +48,9 @@ CONFIG_BY_DETECTOR_LIVE = {
     "coherent_power": "config_live_v3_single_channel.yaml",
     "cuda_dino": "config_live_v3_dino.yaml",
     "cuda_dino_finetuned": "config_live_v3_dino_ft.yaml",
+    # Same detector + ignore_sideband_percent 3.0: trims the band-edge mask
+    # columns the rolloff cliff fires (dashboard A/B against the base variant).
+    "cuda_dino_finetuned_sb": "config_live_v3_dino_ft_sb.yaml",
 }
 # Loopback replay runs at the composites' rate, which is what the DINO
 # coherence gate was calibrated against (2026-08-18) — use the calibrated

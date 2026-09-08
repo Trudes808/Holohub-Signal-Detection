@@ -102,6 +102,8 @@ class FinetunedDinoDetector : public holoscan::Operator {
   holoscan::Parameter<double>      flatten_smooth_frac_;     // gaussian sigma as a FRACTION of fft_size (bandwidth-invariant)
   holoscan::Parameter<double>      flatten_max_boost_db_;    // max additive lift per bin (dB; hardware-scale, scale-free)
   holoscan::Parameter<double>      flatten_signal_cap_db_;   // cap signal influence on the floor estimate (dB; 0=off)
+  holoscan::Parameter<double>      ignore_sideband_percent_; // zero mask cols on EACH band edge (% of width; 0=off; wins over hz)
+  holoscan::Parameter<double>      ignore_sideband_hz_;      // alternative per-side span in Hz (used when percent==0)
 
   uint64_t compute_count_ = 0;
   bool startup_log_emitted_ = false;

@@ -76,10 +76,17 @@ Findings:
    real traffic — guard-on live config is validated against real occupancy.
 5. **Known residual: RT band-edge columns.** 17.5 % of the outer 3 % margins lit
    (intermittent full-height edge bands; visible in frame 19). The flatten
-   doesn't fully tame the rolloff cliff at the outermost bins. Candidate fix:
-   a DINO-side sideband ignore, mirroring the coherent detector's
-   `ignore_sideband_percent`/`ignore_sideband_hz` params (zero mask columns in
-   the outer ~3 %) — not yet implemented.
+   doesn't fully tame the rolloff cliff at the outermost bins.
+   **FIXED (same day):** the finetuned_dino_detector now supports
+   `ignore_sideband_percent`/`ignore_sideband_hz` (coherent-detector semantics;
+   post-inference mask-column trim, off by default). Re-running this capture
+   with `ignore_sideband_percent: 3.0`: edge occupancy **17.50 % → 0.00 %**,
+   in-band mask **bit-identical** (0.0000 % pixel disagreement vs the untrimmed
+   run). Live it ships as a separate selectable Detector dropdown entry
+   "DINO-FT (SB ignore)" (`cuda_dino_finetuned_sb` →
+   `config_live_v3_dino_ft_sb.yaml`) so with/without can be A/B'd on air; the
+   base DINO-FT entry is unchanged. Smoke-tested live at 491.5 MSps (GPU 67 %,
+   clean edges in the ROI panel).
 
 Regenerate: `python3 render_ota_masks.py [frames...]` (mask/tensor artifacts under
 `/tmp/usrp_spectrograms/offline_eval/*/x410_ota_2g4_gain10_20260908/`).

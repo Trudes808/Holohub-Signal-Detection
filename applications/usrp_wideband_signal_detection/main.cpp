@@ -768,11 +768,16 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       const std::string visualization_recess_period = std::to_string(visualization_refresh_hz) + "hz";
         const auto visualization_channel_filter =
           from_config("visualization.renderer.channel_filter").as<int>();
-      const std::string detector_label =
+      std::string detector_label =
           (!enable_detector || detector_type == "cuda_dino")
               ? std::string("Dinov3")
               : (detector_type == "cuda_dino_finetuned" ? std::string("Dinov3 FT")
                                                         : std::string("Coherent Power"));
+      // Config override: detector VARIANTS share a detector_type (e.g. DINO-FT with vs without the
+      // sideband ignore), so the derived label can't tell them apart in the dashboard header.
+      const auto detector_label_override =
+          usrp_wideband::from_config_or<std::string>(*this, "visualization.detector_label", "");
+      if (!detector_label_override.empty()) detector_label = detector_label_override;
       spectrogramVisualizerOp = make_operator<ops::SpectrogramToHolovizOp>(
         "spectrogramVisualizerOp",
         Arg("shutdown_scheduling_term") = visualization_shutdown_term,
