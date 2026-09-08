@@ -1,0 +1,7 @@
+detector,frames,gt_regions,regions_detected,region_det_rate,mean_region_coverage,pixel_precision,pixel_recall,pixel_iou,fp_area_fraction
+coherent_power_guarded,573,4595,2597,0.5652,0.5655,0.3714,0.4398,0.1711,0.0554
+coherent_power_noguard,573,4595,4274,0.9301,0.9281,0.4120,0.9308,0.3937,0.2571
+cuda_dino,286,4056,3996,0.9852,0.9628,0.3250,0.7999,0.2620,0.2701
+dino_ft_native,286,4056,3299,0.8134,0.7557,0.9527,0.9261,0.8878,0.0031
+dino_ft_rt_live,286,4056,3791,0.9347,0.8363,0.8834,0.9201,0.8226,0.0068
+dino_ft_rt_noflatten,286,4056,3792,0.9349,0.8365,0.8820,0.9278,0.8290,0.0073
