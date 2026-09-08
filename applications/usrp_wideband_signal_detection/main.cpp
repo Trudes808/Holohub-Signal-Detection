@@ -251,6 +251,19 @@ class LogOp: public holoscan::Operator {
   // cudaMemGetInfo (meaningful on GB10's unified pool).
   void publish_app_metrics(uint16_t channel_num, double samples_per_second,
                            double bits_per_second) {
+    // Dual channel: each channel's log tick updates its slot; the published
+    // msps/gbps are the AGGREGATE so the HUD shows total pipeline throughput.
+    if (last_msps_.size() <= channel_num) {
+      last_msps_.resize(channel_num + 1, 0.0);
+      last_gbps_.resize(channel_num + 1, 0.0);
+    }
+    last_msps_[channel_num] = samples_per_second / 1e6;
+    last_gbps_[channel_num] = bits_per_second / 1e9;
+    double msps_total = 0.0, gbps_total = 0.0;
+    for (size_t i = 0; i < last_msps_.size(); ++i) {
+      msps_total += last_msps_[i];
+      gbps_total += last_gbps_[i];
+    }
     const char* dir = std::getenv("USRP_APP_METRICS_DIR");
     const std::string base = (dir != nullptr && dir[0] != '\0')
         ? std::string(dir) : std::string("/workspace/spectrograms");
@@ -283,9 +296,10 @@ class LogOp: public holoscan::Operator {
     if (!out.is_open()) { return; }
     out << "{\n"
         << "  \"channel\": " << channel_num << ",\n"
-        << "  \"msps\": " << samples_per_second / 1e6 << ",\n"
-        << "  \"gbps\": " << bits_per_second / 1e9 << ",\n"
-        << "  \"pps\": " << samples_per_second / 1024.0 << ",\n"
+        << "  \"channels\": " << last_msps_.size() << ",\n"
+        << "  \"msps\": " << msps_total << ",\n"
+        << "  \"gbps\": " << gbps_total << ",\n"
+        << "  \"pps\": " << msps_total * 1e6 / 1024.0 << ",\n"
         << "  \"gpu_util_mean\": " << mean_util << ",\n"
         << "  \"gpu_util_min\": " << min_util << ",\n"
         << "  \"gpu_util_max\": " << max_util << ",\n"
@@ -395,6 +409,8 @@ class LogOp: public holoscan::Operator {
   std::vector<unsigned int> gpu_util_max_;
   std::vector<std::chrono::steady_clock::time_point> gpu_sample_start_;
   std::vector<std::chrono::steady_clock::time_point> last_gpu_sample_;
+  std::vector<double> last_msps_;
+  std::vector<double> last_gbps_;
 
 #ifdef USRP_WIDEBAND_HAS_NVML
   std::optional<nvmlDevice_t> nvml_device_;
@@ -681,9 +697,26 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
               std::string("snippetCompressionOpCh") + std::to_string(channel_index),
               from_config("snippet_compression")));
         }
+        // Per-channel sink identity: with >1 channel the sinks would otherwise
+        // collide on pack filenames (both count their own pack ids from 0) and
+        // fight over the stats sidecar.
+        std::string sink_prefix = usrp_wideband::from_config_or<std::string>(
+            *this, "sigmf_file_sink.filename_prefix", "snip");
+        std::string sink_stats = usrp_wideband::from_config_or<std::string>(
+            *this, "sigmf_file_sink.stats_json", "");
+        if (pipeline_channels > 1) {
+          sink_prefix += "_ch" + std::to_string(channel_index);
+          if (!sink_stats.empty()) {
+            const auto dot = sink_stats.rfind(".json");
+            sink_stats = (dot == std::string::npos ? sink_stats : sink_stats.substr(0, dot)) +
+                         "_ch" + std::to_string(channel_index) + ".json";
+          }
+        }
         sigmfFileSinkOps.push_back(make_operator<ops::SigmfFileSinkOp>(
             std::string("sigmfFileSinkOpCh") + std::to_string(channel_index),
-            from_config("sigmf_file_sink")));
+            from_config("sigmf_file_sink"),
+            holoscan::Arg("filename_prefix") = sink_prefix,
+            holoscan::Arg("stats_json") = sink_stats));
       }
     }
 

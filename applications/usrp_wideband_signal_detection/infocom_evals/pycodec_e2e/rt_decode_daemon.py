@@ -736,13 +736,16 @@ def main():
         # v3: the sink publishes LOGICAL output accounting (snip_stats.json,
         # written+budget-skipped packs both counted) — authoritative when
         # present, since the on-disk packs are only a classification sample.
-        stats_path = os.path.join(os.path.dirname(args.snips.rstrip("/")),
-                                  "snip_stats.json")
-        if os.path.exists(stats_path):
+        stats_files = sorted(glob.glob(os.path.join(
+            os.path.dirname(args.snips.rstrip("/")), "snip_stats*.json")))
+        if stats_files:  # dual channel: one sidecar per sink, summed here
+            b = sn = pk = 0
             try:
-                st = json.load(open(stats_path))
-                b, sn, pk = int(st.get("bytes", 0)), int(st.get("snippets", 0)), \
-                    int(st.get("packs", 0))
+                for sp in stats_files:
+                    st = json.load(open(sp))
+                    b += int(st.get("bytes", 0))
+                    sn += int(st.get("snippets", 0))
+                    pk += int(st.get("packs", 0))
             except (OSError, json.JSONDecodeError, ValueError):
                 return
             pb, ps, pp = sink_stats_prev
@@ -913,6 +916,12 @@ def main():
             try:
                 tmp = metrics_path + ".tmp"
                 with open(tmp, "w") as f:
+                    # same merge as every other writer: a dump missing
+                    # classify_only made the HUD flash the legacy PN9/BER
+                    # panels until the next per-snippet write
+                    if clf is not None:
+                        m["resources"] = clf.resource_report()
+                        m["classify_only"] = args_classify_only
                     json.dump(m, f, indent=1)
                 os.replace(tmp, metrics_path)  # atomic: the HoloViz panel polls this file
             except OSError:

@@ -39,6 +39,14 @@ case "${MODE}" in
     export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234}
     V3_STACK=1
     ;;
+  v3dual)
+    # v3 pipeline on BOTH channels: ch0 @ 2.4 GHz, ch1 @ 1 GHz, 491.52 MSps each
+    # (983 MSps aggregate). Detector dropdown stays coherent-only in dual mode.
+    CONFIG_NAME=config_live_v3_two_channel.yaml
+    export CHANNELS=${CHANNELS:-"0 1"} FREQS=${FREQS:-"2400e6 1000e6"} \
+           DEST_PORTS=${DEST_PORTS:-"1234 1235"}
+    V3_STACK=1
+    ;;
   *.yaml)
     CONFIG_NAME=${MODE}
     ;;
@@ -157,7 +165,7 @@ if [[ "${V3_STACK:-0}" == "1" ]]; then
   # stale metrics from a previous run must not paint the panels before the
   # daemon's first write
   sudo rm -f /tmp/usrp_spectrograms/rt_metrics.json /tmp/usrp_spectrograms/daemon_live.log \
-    /tmp/usrp_spectrograms/snip_stats.json
+    /tmp/usrp_spectrograms/snip_stats*.json
   (cd "${APP_DIR_HOST}/infocom_evals/pycodec_e2e" && \
    PYCODEC_ROOT="${V3_USER_HOME}/Documents/holoscan_waveform_generation" \
    exec "${VENV_PY}" rt_decode_daemon.py --snips /tmp/usrp_spectrograms/snippets \

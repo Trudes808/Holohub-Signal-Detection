@@ -798,6 +798,7 @@ __global__ void coherent_power_dynamic_floor_update_kernel(const float* correcte
                                                            int cols,
                                                            int ignore_bins_per_side,
                                                            float std_k,
+                                                           float max_drop_db,
                                                            float* ring,
                                                            int window_slots,
                                                            int cur_slot,
@@ -845,7 +846,15 @@ __global__ void coherent_power_dynamic_floor_update_kernel(const float* correcte
     }
     const float mean = partial_sum[0] / static_cast<float>(n);
     const float var = fmaxf(partial_sq[0] / static_cast<float>(n) - mean * mean, 0.0f);
-    const float stat = mean + std_k * sqrtf(var);
+    float stat = mean + std_k * sqrtf(var);
+    // Slew limit: one garbage frame (data-path fault injecting white full-scale
+    // "samples"... or any transient) must not collapse the windowed-min floor,
+    // which otherwise stays poisoned for a full window (= the blind episodes).
+    // A real noise floor never drops max_drop_db in a single frame; warmup
+    // still descends from the high init bar at max_drop_db per frame.
+    if (max_drop_db > 0.0f) {
+      stat = fmaxf(stat, floor_db[row] - max_drop_db);
+    }
 
     const size_t base = static_cast<size_t>(row) * static_cast<size_t>(window_slots);
     // Overwrite the slot on its first frame (retiring the window it previously held), otherwise fold
@@ -1521,6 +1530,8 @@ void CoherentPowerSignalDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(per_freq_threshold_offset_db_, "per_freq_threshold_offset_db", "Per-frequency threshold offset", "dB above the calibrated per-row floor required to fire the per-frequency fill.", 2.0);
   spec.param(per_freq_threshold_mode_, "per_freq_threshold_mode", "Per-frequency threshold mode", "Source of the per-frequency floor when the fill is enabled: 'calibrated' (load the .npy at per_freq_threshold_path), 'dynamic' (learn a monotone running-min floor live from the stream), or 'static'/empty (disable the per-frequency fill).", std::string(""));
   spec.param(dynamic_floor_init_db_, "dynamic_floor_init_db", "Dynamic floor init", "Initial high per-bin floor (dB) for dynamic mode; each bin only ever descends from here. Reset to this on startup and on a center-frequency change.", 40.0);
+  spec.param(dynamic_floor_max_drop_db_, "dynamic_floor_max_drop_db", "Dynamic floor max drop dB", "Slew limit on the per-frame floor statistic: it may descend at most this many dB per frame below the published floor, so one corrupted/transient frame cannot collapse the windowed-min floor and blind the detector for a whole window. 0 disables.", 3.0);
+  spec.param(max_emit_occupancy_, "max_emit_occupancy", "Max emit occupancy", "Emit-side fault gate: if the final mask lights more than this FRACTION of pixels, emit an EMPTY mask instead (with a throttled warning). A detector never legitimately marks most of the band-time; full masks are faults and their downstream processing (5MB copies, viz reduction, snip labeling) is what stalls the pipeline. 0 disables.", 0.35);
   spec.param(dynamic_floor_std_k_, "dynamic_floor_std_k", "Dynamic floor std multiplier", "The per-frame per-row statistic folded into the running min is mean + k*std of corrected_db; k approximates the noise high-quantile the offline calibration uses. Combine with per_freq_threshold_offset_db for the final firing margin.", 2.0);
   spec.param(dynamic_floor_warmup_frames_, "dynamic_floor_warmup_frames", "Dynamic floor warmup", "Frames to accumulate into the running min before the dynamic floor is allowed to feed the fill kernel (0 = use it immediately; the high init bar already keeps early frames conservative).", 0);
   spec.param(dynamic_floor_window_slots_, "dynamic_floor_window_slots", "Dynamic floor window slots", "Number of sub-window minima kept per bin. The published floor is the min across all slots; stale lows age out after all slots rotate, bounding creep. Effective window = window_slots * slot_frames frames.", 8);
@@ -2459,6 +2470,7 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
           src_cols,
           ignore_bins_per_side,
           static_cast<float>(dynamic_floor_std_k_.get()),
+          static_cast<float>(dynamic_floor_max_drop_db_.get()),
           buffers.dynamic_floor_ring_device,
           window_slots,
           cur_slot,
@@ -3377,9 +3389,33 @@ void CoherentPowerSignalDetector::compute(holoscan::InputContext& op_input,
         }
         fast_summary.always_on_stripe_count = always_on_stripe_count;
       }
+      // Emit-side occupancy fault: a mask lighting most of the band-time is a
+      // detector/data-path fault, never signal. Emit it EMPTY so the fault
+      // costs nothing downstream (mask D2H, viz reduction, snip labeling were
+      // the load that stalled the ingest into 'Fell behind').
+      unsigned int effective_nonzero = emitted_nonzero_count;
+      {
+        const double occ_cap = max_emit_occupancy_.get();
+        const double total_px = static_cast<double>(dst_cols) * static_cast<double>(dst_rows);
+        if (occ_cap > 0.0 && static_cast<double>(emitted_nonzero_count) > occ_cap * total_px) {
+          if (cudaMemset(mask_buffer.get(), 0, emitted_mask_bytes) != cudaSuccess) {
+            throw std::runtime_error("failed to blank occupancy-fault mask");
+          }
+          effective_nonzero = 0;
+          ++emit_occupancy_faults_;
+          if ((emit_occupancy_faults_ & 0x1F) == 1) {
+            HOLOSCAN_LOG_WARN(
+                "coherent_power: OCCUPANCY FAULT ch={} frame={} mask {:.0f}% lit > {:.0f}% cap "
+                "({} faults total) -- emitting empty mask.",
+                channel_number, frame_number,
+                100.0 * emitted_nonzero_count / total_px, 100.0 * occ_cap,
+                emit_occupancy_faults_);
+          }
+        }
+      }
       holoscan::ops::DetectorMaskMessage mask_msg;
       mask_msg.device_pixels = std::move(mask_buffer);
-      coherent_emitted_mask_nonzero_pixels = emitted_nonzero_count;
+      coherent_emitted_mask_nonzero_pixels = effective_nonzero;
       coherent_emitted_mask_metrics_meaningful = true;
       mask_msg.width = dst_cols;
       mask_msg.height = dst_rows;

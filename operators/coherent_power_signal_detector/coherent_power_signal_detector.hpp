@@ -128,6 +128,9 @@ class CoherentPowerSignalDetector : public holoscan::Operator {
   holoscan::Parameter<std::string> per_freq_threshold_mode_;
   holoscan::Parameter<double> dynamic_floor_init_db_;
   holoscan::Parameter<double> dynamic_floor_std_k_;
+  holoscan::Parameter<double> dynamic_floor_max_drop_db_;  // per-frame floor descent slew limit (dB)
+  holoscan::Parameter<double> max_emit_occupancy_;         // emit-side full-band fault gate (fraction)
+  uint64_t emit_occupancy_faults_ = 0;
   holoscan::Parameter<int> dynamic_floor_warmup_frames_;
   holoscan::Parameter<int> dynamic_floor_window_slots_;
   holoscan::Parameter<int> dynamic_floor_slot_frames_;
