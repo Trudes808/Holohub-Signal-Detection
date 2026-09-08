@@ -356,9 +356,19 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
   // Offline drain / partial-batch frames: skip without emitting (matches cuda_dino_detector).
   if (meta && meta->get<bool>("offline_source_drain_frame", false)) return;
 
-  // Arrival-order frame number: the tapped IQ has no FFT counter, but the CHDR arrival index equals
-  // signal_snipper's own IQ counter, so a per-channel arrival count keeps masks aligned to its ring.
-  const uint64_t frame_number = ++frame_count_[ch];
+  // Frame identity: prefer the CHDR converter's shared batch index (stamped on every emitted batch).
+  // Keying the emitted mask to that same index -- the value the FFT stamps as fft_emitted_frame_number
+  // and the snipper keys its IQ ring by -- makes the viz place masks correctly and the snipper find the
+  // matching IQ, WITHOUT depending on the FFT operator and this IQ tap staying in lockstep (they drift
+  // when the FFT lags/drops under load: its counter falls behind the true arrival index while this tap,
+  // reading IQ directly, does not). Fall back to a local arrival counter offline (file replay has no
+  // CHDR stamp), preserving the validated offline behavior. The local counter is advanced either way so
+  // emit_stride cadence is identical across both paths.
+  const uint64_t local_frame_number = ++frame_count_[ch];
+  const uint64_t frame_number =
+      (meta && meta->has_key("chdr_batch_index"))
+          ? meta->get<uint64_t>("chdr_batch_index", local_frame_number)
+          : local_frame_number;
   if (emit_stride_.get() > 1 && (frame_number % emit_stride_.get()) != 0) return;
 
   const int nfft = nfft_.get();          // model input width (fixed by the checkpoint)

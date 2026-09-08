@@ -219,6 +219,14 @@ void FFT::compute(InputContext& op_input, OutputContext& op_output, ExecutionCon
     if (channel_num < output_frame_count.size()) {
         frame_number = ++output_frame_count[channel_num];
     }
+    // Prefer the CHDR converter's shared batch index when present: it is the true arrival index and
+    // does not drift if this operator ever lags/drops inputs, so every downstream consumer keyed off
+    // fft_emitted_frame_number (viz display, coherent detector) stays aligned with the IQ-tapped
+    // detectors that read the same stamp. Falls back to the local counter offline (file replay has no
+    // CHDR stamp), preserving the validated offline behavior.
+    if (meta->has_key("chdr_batch_index")) {
+        frame_number = meta->get<uint64_t>("chdr_batch_index", frame_number);
+    }
     if (configured_emit_stride > 1 &&
         (frame_number % static_cast<uint64_t>(configured_emit_stride)) != 0) {
         return;

@@ -107,8 +107,16 @@ void SignalSnipperOp::ingest_iq(holoscan::InputContext& op_input) {
       continue;
     }
 
-    ++iq_arrival_counter_;  // matches the FFT's per-input counter == mask.frame_number
-    const uint64_t frame_number = iq_arrival_counter_;
+    // Key the IQ ring by the CHDR converter's shared batch index when present, so it matches the
+    // mask.frame_number the detectors now stamp from the same source (robust to FFT lag/drops). The
+    // local arrival counter is the offline fallback (file replay has no CHDR stamp); advance it either
+    // way so ring bookkeeping is identical across both paths.
+    ++iq_arrival_counter_;
+    auto iq_meta = metadata();
+    const uint64_t frame_number =
+        (iq_meta && iq_meta->has_key("chdr_batch_index"))
+            ? iq_meta->get<uint64_t>("chdr_batch_index", iq_arrival_counter_)
+            : iq_arrival_counter_;
 
     RingEntry entry;
     entry.frame_number = frame_number;

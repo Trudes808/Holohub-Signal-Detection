@@ -737,6 +737,12 @@ bool ChdrConverterOpRx::free_bufs_and_emit_arrays(
   meta->set("channel_number", channel->channel_num);
   meta->set("chdr_emit_ts_ns", steady_time_ns());
   meta->set("chdr_soft_resync_epoch", channel->panic_resets);
+  // Monotonic per-channel batch index (1-based) stamped on EVERY emitted batch. This is the single
+  // source of truth for frame identity across the fan-out: the FFT, coherent, snipper, and DINO
+  // detectors all key off it so an IQ-tapped detector's masks and the FFT-derived display frames
+  // stay aligned even when the FFT operator lags/drops under load (its own per-input counter then
+  // diverges from the true arrival index; this shared stamp does not). +1 == "count including this".
+  meta->set("chdr_batch_index", static_cast<uint64_t>(channel->completed_batches_emitted + 1));
   if (channel->channel_num < center_frequency_by_channel_.size() &&
       center_frequency_by_channel_[channel->channel_num].has_value()) {
     meta->set("rx_center_frequency_hz", center_frequency_by_channel_[channel->channel_num].value());
