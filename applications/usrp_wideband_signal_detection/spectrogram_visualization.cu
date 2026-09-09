@@ -2588,6 +2588,12 @@ static const char* const kDemoSnrNames[] = {"clean", "30", "20", "15", "12", "9"
 static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino_finetuned"};
 static const char* const kDemoDetectorLabels[] = {"CoherentPower", "DINO-FT (M2_dr)"};
 
+// Demo 2026-09-09: HIDE the ingest-throughput readouts (sidebar MSps/Gbps, footer INGEST line, the
+// MSps history bar chart). The number reflects samples actually ingested, which sheds below the
+// 983 MSps radio rate under dual load and reads as a distraction. GPU util + memory stay. Set true
+// to restore.
+static constexpr bool kShowThroughput = false;
+
 std::mutex& demo_control_mutex() {
   static std::mutex m;
   return m;
@@ -2883,21 +2889,24 @@ void render_visualization_ui_overlay() {
       const float x0 = sidebar_min.x + 16.0f;
       const float x1 = rect_max(state.sidebar_rect).x - 16.0f;
       char line[112];
-      draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.25f,
-                         ImVec2(x0, sidebar_text_y), accent_blue, "PIPELINE THROUGHPUT");
-      sidebar_text_y += 24.0f;
       const bool app_fresh = dm.app_age_s < 15.0 && dm.app_msps > 0.0;
-      if (app_fresh) {
-        std::snprintf(line, sizeof(line), "%.1f MSps", dm.app_msps);
-        draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.6f,
-                           ImVec2(x0, sidebar_text_y), accent_green, line);
-        std::snprintf(line, sizeof(line), "%.2f Gbps", dm.app_gbps);
-        draw_list->AddText(ImVec2(x0 + 158.0f, sidebar_text_y + 6.0f), panel_text, line);
-      } else {
-        draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.6f,
-                           ImVec2(x0, sidebar_text_y), panel_muted, "ingest --");
+      draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.25f,
+                         ImVec2(x0, sidebar_text_y), accent_blue,
+                         kShowThroughput ? "PIPELINE THROUGHPUT" : "PIPELINE");
+      sidebar_text_y += 24.0f;
+      if (kShowThroughput) {
+        if (app_fresh) {
+          std::snprintf(line, sizeof(line), "%.1f MSps", dm.app_msps);
+          draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.6f,
+                             ImVec2(x0, sidebar_text_y), accent_green, line);
+          std::snprintf(line, sizeof(line), "%.2f Gbps", dm.app_gbps);
+          draw_list->AddText(ImVec2(x0 + 158.0f, sidebar_text_y + 6.0f), panel_text, line);
+        } else {
+          draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.6f,
+                             ImVec2(x0, sidebar_text_y), panel_muted, "ingest --");
+        }
+        sidebar_text_y += 28.0f;
       }
-      sidebar_text_y += 28.0f;
       if (dm.app_gpu_util >= 0.0 && app_fresh) {
         std::snprintf(line, sizeof(line), "GPU %.0f%% (peak %.0f%%)",
                       dm.app_gpu_util, dm.app_gpu_util_max);
@@ -3276,10 +3285,15 @@ void render_visualization_ui_overlay() {
       draw_list->AddRect(ImVec2(bx0, fy0), ImVec2(bx1, fy1), panel_border, 6.0f, 0, 1.0f);
       char hdr[112];
       if (dm.app_msps > 0.0 && dm.app_age_s < 15.0) {
-        std::snprintf(hdr, sizeof(hdr), "INGEST %.1f MSps  %.2f Gbps   GPU %.0f%%",
-                      dm.app_msps, dm.app_gbps, std::max(0.0, dm.app_gpu_util));
+        if (kShowThroughput) {
+          std::snprintf(hdr, sizeof(hdr), "INGEST %.1f MSps  %.2f Gbps   GPU %.0f%%",
+                        dm.app_msps, dm.app_gbps, std::max(0.0, dm.app_gpu_util));
+        } else {
+          std::snprintf(hdr, sizeof(hdr), "PIPELINE   GPU %.0f%%", std::max(0.0, dm.app_gpu_util));
+        }
       } else {
-        std::snprintf(hdr, sizeof(hdr), "INGEST --  (app metrics stale)");
+        std::snprintf(hdr, sizeof(hdr), kShowThroughput ? "INGEST --  (app metrics stale)"
+                                                        : "PIPELINE --");
       }
       draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.3f,
                          ImVec2(bx0 + 12.0f, fy0 + 4.0f), accent_green, hdr);
@@ -3297,7 +3311,7 @@ void render_visualization_ui_overlay() {
         const float chart_x1 = bx0 + (bx1 - bx0) * 0.46f;
         const float chart_y1 = fy1 - 4.0f;
         const float chart_h = chart_y1 - (fy0 + 26.0f);
-        if (!msps_hist.empty() && chart_h > 6.0f) {
+        if (kShowThroughput && !msps_hist.empty() && chart_h > 6.0f) {
           const float vmax = std::max(1.0f, *std::max_element(msps_hist.begin(), msps_hist.end()));
           const int n = static_cast<int>(msps_hist.size());
           const float bar_w = (chart_x1 - chart_x0) / 64.0f;
