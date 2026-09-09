@@ -2832,6 +2832,11 @@ void render_visualization_ui_overlay() {
   draw_list->AddText(ImVec2(sidebar_min.x + 16.0f, sidebar_min.y + 16.0f), panel_text, "Channel Info");
 
   float sidebar_text_y = sidebar_min.y + 42.0f;
+  // Multi-channel: the geometry rows (span/bins/ratios/FFT/history) are identical across channels
+  // (one rate, one config), so print the full block ONCE and only the per-channel deltas (center
+  // frequency) after it. Repeating the full block per channel overflowed the sidebar box in dual
+  // mode and the THROUGHPUT section below drew on top of the neighboring panels.
+  bool shared_block_printed = false;
   for (const auto& channel : state.channels) {
     if (!channel.active) {
       continue;
@@ -2847,16 +2852,19 @@ void render_visualization_ui_overlay() {
     };
 
     draw_kv("Center", format_frequency_label(channel.center_frequency_hz));
-    draw_kv("Span", format_frequency_label(channel.span_hz));
-    draw_kv("Det Bin", format_frequency_label(channel.resolution_hz));
-    draw_kv("Disp Px", format_frequency_label(channel.display_frequency_bin_hz));
-    draw_kv("Time Bin", format_time_bin_label(channel.seconds_per_time_bin));
-        draw_kv("Processing Ratio", format_displayed_frame_ratio_label(channel.displayed_frame_ratio,
-                channel.displayed_frame_stride));
-    draw_kv("Vis Ratio", format_fft_row_visualization_ratio_label(channel.displayed_fft_rows_per_frame,
-                                     channel.fft_rows_per_frame));
-    draw_kv("FFT", std::to_string(channel.fft_size));
-        draw_kv("History", std::to_string(channel.history_rows) + " frames");
+    if (!shared_block_printed) {
+      draw_kv("Span", format_frequency_label(channel.span_hz));
+      draw_kv("Det Bin", format_frequency_label(channel.resolution_hz));
+      draw_kv("Disp Px", format_frequency_label(channel.display_frequency_bin_hz));
+      draw_kv("Time Bin", format_time_bin_label(channel.seconds_per_time_bin));
+      draw_kv("Processing Ratio", format_displayed_frame_ratio_label(channel.displayed_frame_ratio,
+              channel.displayed_frame_stride));
+      draw_kv("Vis Ratio", format_fft_row_visualization_ratio_label(channel.displayed_fft_rows_per_frame,
+                                       channel.fft_rows_per_frame));
+      draw_kv("FFT", std::to_string(channel.fft_size));
+      draw_kv("History", std::to_string(channel.history_rows) + " frames");
+      shared_block_printed = true;
+    }
 
     draw_list->AddLine(ImVec2(sidebar_min.x + 16.0f, sidebar_text_y),
                        ImVec2(rect_max(state.sidebar_rect).x - 16.0f, sidebar_text_y),
@@ -2911,6 +2919,9 @@ void render_visualization_ui_overlay() {
                                  frac < 0.7f ? accent_blue : accent_orange, 3.0f);
         sidebar_text_y = mb_y + 14.0f;
       }
+      // Everything below is skipped when the sidebar is out of vertical room (dual mode packs two
+      // channel blocks above) -- overflowing draws land on the neighboring footer panels.
+      const float sidebar_bottom = rect_max(state.sidebar_rect).y - 16.0f;
       // GPU-util sparkline (history sampled at render time from app metrics)
       {
         static std::deque<float> util_hist;
@@ -2920,7 +2931,7 @@ void render_visualization_ui_overlay() {
           while (util_hist.size() > 64) util_hist.pop_front();
         }
         last_sample_age = dm.app_age_s;
-        if (!util_hist.empty()) {
+        if (!util_hist.empty() && sidebar_text_y + 34.0f < sidebar_bottom) {
           const float spark_h = 26.0f;
           const float base_y = sidebar_text_y + spark_h;
           draw_list->AddRectFilled(ImVec2(x0, sidebar_text_y), ImVec2(x1, base_y),
@@ -2940,15 +2951,16 @@ void render_visualization_ui_overlay() {
         }
       }
       const bool stale = dm.secs_since_update > 4.0;
-      std::snprintf(line, sizeof(line), "%.1f detections/s   %llu snips total",
-                    (stale || dm.snips_per_s < 0.0) ? 0.0 : dm.snips_per_s,
-                    static_cast<unsigned long long>(dm.data_snips));
-      draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_text, line);
-      sidebar_text_y += 20.0f;
+      if (sidebar_text_y + 18.0f < sidebar_bottom) {
+        std::snprintf(line, sizeof(line), "%.1f detections/s   %llu snips total",
+                      (stale || dm.snips_per_s < 0.0) ? 0.0 : dm.snips_per_s,
+                      static_cast<unsigned long long>(dm.data_snips));
+        draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_text, line);
+        sidebar_text_y += 20.0f;
+      }
       // Compact per-model cost rows (full table in the footer). Skip when the
       // sidebar is out of vertical room -- overflowing text lands on the
       // footer's compute table.
-      const float sidebar_bottom = rect_max(state.sidebar_rect).y - 16.0f;
       if (!dm.cls_resources.empty() &&
           sidebar_text_y + 26.0f + 17.0f * dm.cls_resources.size() < sidebar_bottom) {
         sidebar_text_y += 4.0f;
