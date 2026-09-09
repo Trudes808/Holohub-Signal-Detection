@@ -47,8 +47,9 @@ case "${MODE}" in
     # (983 MSps aggregate). Detector dropdown stays coherent-only in dual mode.
     CONFIG_NAME=config_live_v3_two_channel.yaml
     export CHANNELS=${CHANNELS:-"0 1"} FREQS=${FREQS:-"2400e6 1000e6"} \
-           DEST_PORTS=${DEST_PORTS:-"1234 1235"} GAIN=${GAIN:-10}
+           DEST_PORTS=${DEST_PORTS:-"1234 1235"} GAIN=${GAIN:-15}
     V3_STACK=1
+    V3_DUAL=1
     ;;
   *.yaml)
     CONFIG_NAME=${MODE}
@@ -142,23 +143,8 @@ sudo docker exec -d \
   cd '${BUILD_APP_DIR}'
   exec ./usrp_wideband_signal_detection '${CONFIG_NAME}' > '${APP_LOG}' 2>&1"
 
-echo "==> Waiting for DPDK to arm (RX flows)"
-for i in $(seq 1 60); do
-  if sudo docker exec "${CONTAINER_NAME}" bash -lc "grep -q 'Adding RX flow' '${APP_LOG}' 2>/dev/null"; then
-    break
-  fi
-  if ! sudo docker exec "${CONTAINER_NAME}" bash -lc 'ps -eo comm | grep -q "^usrp_wideband"'; then
-    echo "App exited during startup — last log lines:" >&2
-    sudo docker exec "${CONTAINER_NAME}" bash -lc "tail -25 '${APP_LOG}'" >&2 || true
-    exit 1
-  fi
-  sleep 1
-done
-
-# Mirror the app log into this terminal alongside the radio output.
-sudo docker exec "${CONTAINER_NAME}" tail -f "${APP_LOG}" &
-TAIL_PID=$!
-
+# v3 stack starts BEFORE the DPDK arm wait: the daemon's torch import (~20-30 s) and the
+# conductor spin-up overlap the app arming + radio init instead of serializing after them.
 if [[ "${V3_STACK:-0}" == "1" ]]; then
   APP_DIR_HOST=$(cd "${SCRIPT_DIR}/.." && pwd -P)
   # under sudo, HOME=/root — resolve the desktop user's home for the ML venv
@@ -179,7 +165,7 @@ if [[ "${V3_STACK:-0}" == "1" ]]; then
 
   echo "==> v3: conductor (detector switches from DEMO CONTROLS; no replay)"
   (cd "${APP_DIR_HOST}/infocom_evals/pycodec_e2e" && \
-   exec sudo python3 demo_conductor.py --no-replay --display "${DISPLAY:-:1}" \
+   exec sudo python3 demo_conductor.py --no-replay ${V3_DUAL:+--dual} --display "${DISPLAY:-:1}" \
      --rate-hz "${USRP_SAMPLE_RATE_HZ}" \
      > /tmp/usrp_spectrograms/conductor.log 2>&1) &
   CONDUCTOR_PID=$!
@@ -190,6 +176,24 @@ if [[ "${V3_STACK:-0}" == "1" ]]; then
      sleep 30; done' > /dev/null 2>&1) &
   JANITOR_PID=$!
 fi
+
+echo "==> Waiting for DPDK to arm (RX flows)"
+for i in $(seq 1 60); do
+  if sudo docker exec "${CONTAINER_NAME}" bash -lc "grep -q 'Adding RX flow' '${APP_LOG}' 2>/dev/null"; then
+    break
+  fi
+  if ! sudo docker exec "${CONTAINER_NAME}" bash -lc 'ps -eo comm | grep -q "^usrp_wideband"'; then
+    echo "App exited during startup — last log lines:" >&2
+    sudo docker exec "${CONTAINER_NAME}" bash -lc "tail -25 '${APP_LOG}'" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+# Mirror the app log into this terminal alongside the radio output.
+sudo docker exec "${CONTAINER_NAME}" tail -f "${APP_LOG}" &
+TAIL_PID=$!
+
 
 echo "==> Starting the over-the-air radio stream (Ctrl-C stops everything)"
 "${SCRIPT_DIR}/start_radio_stream.sh" &

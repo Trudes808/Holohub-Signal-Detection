@@ -41,15 +41,15 @@ CONFIG_BY_DETECTOR = {
     "cuda_dino_finetuned": "config_dino_finetuned_viz_demo.yaml",
 }
 # Live radio (--no-replay): coherent_power uses the v3 live config (dynamic
-# floor + snipper + compression). NOTE the DINO-FT M2_dr checkpoint was trained
-# for 20.48-245.76 MS/s; at the live 491.52 MS/s it runs outside its
-# rate-invariance envelope (expect degraded masks until a retrain).
+# floor + snipper + compression). DINO-FT runs the rate-adaptive downsample
+# path with circular edge inference (border-bias fix), so 491.52 MSps live is
+# fully supported.
 CONFIG_BY_DETECTOR_LIVE = {
     "coherent_power": "config_live_v3_single_channel.yaml",
     "cuda_dino": "config_live_v3_dino.yaml",
     "cuda_dino_finetuned": "config_live_v3_dino_ft.yaml",
-    # Same detector + ignore_sideband_percent 3.0: trims the band-edge mask
-    # columns the rolloff cliff fires (dashboard A/B against the base variant).
+    # Legacy A/B variant (mask-edge trim). Superseded by circular edge inference
+    # in the operator, kept selectable for comparison.
     "cuda_dino_finetuned_sb": "config_live_v3_dino_ft_sb.yaml",
 }
 # Loopback replay of dense composites with the v3 dashboard (run_loopback_v3_demo.sh).
@@ -58,6 +58,15 @@ CONFIG_BY_DETECTOR_LIVE = {
 # defense and the loopback transport is clean). The DINO configs are reused verbatim
 # (no emit guard) and, at the composite's 245.76 MSps, DINO-FT runs at its trained
 # native geometry.
+# Dual-channel live (run_live_demo.sh v3dual + --dual): both channels at 491.52 MSps. cuda_dino is
+# absent on purpose (the zero-shot ViT cannot sustain two channels); selecting it is ignored with a
+# log line. The SB entry maps to the same dual DINO config: circular edge inference (in-operator)
+# already removes the border artifact, so a separate trimmed variant adds nothing in dual mode.
+CONFIG_BY_DETECTOR_LIVE_DUAL = {
+    "coherent_power": "config_live_v3_two_channel.yaml",
+    "cuda_dino_finetuned": "config_live_v3_dino_ft_two_channel.yaml",
+    "cuda_dino_finetuned_sb": "config_live_v3_dino_ft_two_channel.yaml",
+}
 CONFIG_BY_DETECTOR_LOOPBACK = {
     "coherent_power": "config_loopback_v3_single_channel.yaml",
     "cuda_dino": "config_loopback_v3_dino.yaml",
@@ -136,11 +145,13 @@ class Conductor:
                            "rm -f /dev/hugepages/nwlrbbmqbh* 2>/dev/null; "
                            "rm -rf /var/run/dpdk/nwlrbbmqbh 2>/dev/null || true"])
         time.sleep(1 if not self.args.dry else 0)
-        # mirror run_live_demo.sh's launch env: stream rate/center + XDG dir
-        self.run_or_print(["docker", "exec", "-d",
-                           "-e", f"DISPLAY={self.args.display}",
-                           "-e", f"USRP_SAMPLE_RATE_HZ={self.args.rate_hz:.0f}",
-                           "-e", f"USRP_CENTER_FREQ_HZ={self.args.center_hz:.0f}",
+        # mirror run_live_demo.sh's launch env: stream rate/center + XDG dir. In dual mode the
+        # per-channel centers come from the config; a single center env would mislabel ch1.
+        env_args = ["-e", f"DISPLAY={self.args.display}",
+                    "-e", f"USRP_SAMPLE_RATE_HZ={self.args.rate_hz:.0f}"]
+        if not getattr(self.args, "dual", False):
+            env_args += ["-e", f"USRP_CENTER_FREQ_HZ={self.args.center_hz:.0f}"]
+        self.run_or_print(["docker", "exec", "-d", *env_args,
                            CONTAINER, "bash", "-lc",
                            "mkdir -p /tmp/xdg-runtime-root && chmod 700 /tmp/xdg-runtime-root && "
                            "export XDG_RUNTIME_DIR=/tmp/xdg-runtime-root && "
@@ -161,6 +172,8 @@ class Conductor:
         # path (we drive the pcap, not the conductor).
         if getattr(self.args, "loopback", False):
             return CONFIG_BY_DETECTOR_LOOPBACK
+        if getattr(self.args, "dual", False):
+            return CONFIG_BY_DETECTOR_LIVE_DUAL
         return CONFIG_BY_DETECTOR_LIVE if self.args.no_replay else CONFIG_BY_DETECTOR
 
     def set_detector(self, detector: str):
@@ -256,6 +269,9 @@ def main():
     ap.add_argument("--no-replay", action="store_true",
                     help="live-radio mode: honor detector switches but ignore SNR "
                          "selections (those drive the loopback replay pcaps)")
+    ap.add_argument("--dual", action="store_true",
+                    help="dual-channel live mode: detector switches use the two-channel v3 configs "
+                         "(implies --no-replay)")
     ap.add_argument("--loopback", action="store_true",
                     help="v3 dashboard fed by EXTERNAL loopback replay (run_loopback_v3_demo.sh "
                          "drives tcpreplay): use the loopback config set (coherent emit guard off) "
@@ -263,6 +279,8 @@ def main():
     args = ap.parse_args()
     if args.loopback:
         args.no_replay = True  # we don't manage tcpreplay; the launcher does
+    if args.dual:
+        args.no_replay = True
     c = Conductor(args)
     try:
         c.watch()

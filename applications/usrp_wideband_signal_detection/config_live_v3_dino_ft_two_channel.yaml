@@ -1,3 +1,8 @@
+# Live dual-channel v3 with the DINO-FT (M2_dr) detector on BOTH channels: ch0 @ 2.4 GHz,
+# ch1 @ 1 GHz, 491.52 MSps each. Same dual wiring as config_live_v3_two_channel.yaml; the
+# detector runs the rate-adaptive downsample path with circular edge inference (border-bias
+# fix) per channel. Launched by the conductor when the dual demo's Detector dropdown selects
+# DINO-FT (run_live_demo.sh v3dual + demo_conductor.py --dual).
 # SPDX-FileCopyrightText: 2026 National Instruments Corporation
 # SPDX-License-Identifier: Apache-2.0
 ---
@@ -8,7 +13,7 @@ pipeline:
   enable_detector: true
   enable_signal_snipper: true
   enable_snippet_compression: true
-  detector_type: "coherent_power"
+  detector_type: "cuda_dino_finetuned"
   log_from_spectrogram: false
 
 scheduler:
@@ -150,6 +155,7 @@ logger:
   log_interval: 5
 
 visualization:
+  detector_label: "Dinov3 FT (dual)"
   enable: true
   renderer:
     num_channels: 2
@@ -279,3 +285,36 @@ sigmf_file_sink:
   pack_frames: 16
   output_dir: "/workspace/spectrograms/snippets"
   filename_prefix: "snip"
+
+finetuned_dino_detector:
+  num_channels: 2
+  tile_rows: 256
+  nfft: 1024
+  fft_window: "hann"
+  db_vmin: -47.6526985168457
+  db_vmax: 20.45633316040039
+  threshold: 0.95
+  model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m2_dr_bf16.ts"
+  torch_dtype: "fp32"               # vestigial: bf16 compute is baked into the traced .ts
+  # LIVE @ 491.52 MSps: with downsample mode the frame cost is ~2 tiles (rate-adaptive), so a
+  # low stride is affordable and the ROI history reads as a continuous ribbon (viz holds the last
+  # mask up to 48 frames) instead of chunk-by-chunk. Native mode (below) is 20+ tiles/frame and
+  # forced the coarse stride-16 blocks.
+  # DUAL: measured live 2026-09-08 — under dual contention each emitted frame costs ~110 ms
+  # (vs 46 ms solo), so stride 8 put DINO alone at >100% GPU and ingest fell to 65%. Stride 16
+  # (one mask per ~340 ms per channel) budgets DINO at ~40% GPU next to 2x FFT/viz/snips.
+  emit_stride: 16
+  channel_filter: -1
+  # Native nfft-FFT at 491.52 MSps = 480 kHz/bin, DOUBLE M2_dr's trained 240 kHz/bin -> every
+  # signal reads half-width at the wrong scale. Downsample mode FFTs wide (auto-sized to the actual
+  # rate) then resizes the freq axis to nfft inside torch, so the model sees its trained per-pixel
+  # geometry REGARDLESS of the live rate -- the fix for the wrong-scale / mis-placed detections.
+  real_time_downsample: true
+  downsample_fft_size: 0            # 0 = auto-size from the live rate (keeps ~2-tile cost at any rate)
+  # The X410 analog anti-alias filter rolls off toward the band edges; the fixed db_vmin/vmax clip
+  # maps that tilt into the model's active range and it fires on the edges (activity where the raw
+  # spectrogram shows none). Flattening the per-frequency floor removes it. (Off for the shipped
+  # loopback config since that trained on unflattened captures; at the off-distribution live rate the
+  # edge artifact dominates, so flatten on.)
+  flatten_noise_floor: true
+

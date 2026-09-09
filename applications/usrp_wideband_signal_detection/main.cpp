@@ -17,8 +17,10 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <pthread.h>
+#include <tuple>
 #include <sched.h>
 #include <sstream>
 #include <thread>
@@ -181,6 +183,157 @@ void reserve_adv_network_cores_for_process_threads(const holoscan::advanced_netw
 
 }  // namespace
 
+// Background app-metrics publisher. LogOp::compute() sits ON THE DATA PATH (it receives every CHDR
+// batch), so it must never block on NVML or file I/O: an NVML utilization query costs 1-10 ms on
+// GB10 and the app_metrics.json write lands on a Docker bind mount — both were running inline on a
+// shared Holoscan worker thread and, in dual-channel mode (2 LogOp instances, 983 MSps aggregate),
+// visibly stalled the graph. One process-wide thread now owns NVML sampling (250 ms cadence, one
+// query for the one GPU instead of per-channel) and the JSON write (1 s cadence, atomic rename);
+// LogOp just posts its per-channel rates. Side fix: the JSON now aggregates across ALL LogOp
+// instances instead of only the channels one instance happened to see.
+class AppMetricsPublisher {
+ public:
+  static AppMetricsPublisher& instance() {
+    static AppMetricsPublisher publisher;
+    return publisher;
+  }
+
+  void update_channel(uint16_t channel_num, double msps, double gbps) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (rates_.size() <= channel_num) { rates_.resize(channel_num + 1, {0.0, 0.0}); }
+    rates_[channel_num] = {msps, gbps};
+  }
+
+  // Mean/max GPU util over the last completed publish window (for LogOp's console line).
+  // Returns {mean, max, valid}.
+  std::tuple<double, unsigned int, bool> util_window() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {last_window_mean_, last_window_max_, last_window_valid_};
+  }
+
+  AppMetricsPublisher(const AppMetricsPublisher&) = delete;
+  AppMetricsPublisher& operator=(const AppMetricsPublisher&) = delete;
+
+ private:
+  AppMetricsPublisher() {
+#ifdef USRP_WIDEBAND_HAS_NVML
+    if (nvmlInit_v2() == NVML_SUCCESS) {
+      unsigned int count = 0;
+      nvmlDevice_t handle = nullptr;
+      if (nvmlDeviceGetCount_v2(&count) == NVML_SUCCESS && count > 0 &&
+          nvmlDeviceGetHandleByIndex_v2(0, &handle) == NVML_SUCCESS) {
+        nvml_device_ = handle;
+      } else {
+        nvmlShutdown();
+      }
+    }
+#endif
+    thread_ = std::thread([this] { run(); });
+  }
+
+  ~AppMetricsPublisher() {
+    stop_.store(true);
+    if (thread_.joinable()) { thread_.join(); }
+#ifdef USRP_WIDEBAND_HAS_NVML
+    if (nvml_device_.has_value()) { nvmlShutdown(); }
+#endif
+  }
+
+  void run() {
+    double util_sum = 0.0;
+    unsigned int util_min = std::numeric_limits<unsigned int>::max(), util_max = 0;
+    uint64_t util_samples = 0;
+    int tick = 0;
+    while (!stop_.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      ++tick;
+#ifdef USRP_WIDEBAND_HAS_NVML
+      if (nvml_device_.has_value()) {
+        nvmlUtilization_t utilization {};
+        if (nvmlDeviceGetUtilizationRates(*nvml_device_, &utilization) == NVML_SUCCESS) {
+          util_sum += static_cast<double>(utilization.gpu);
+          util_min = std::min(util_min, utilization.gpu);
+          util_max = std::max(util_max, utilization.gpu);
+          ++util_samples;
+        }
+      }
+#endif
+      if (tick % 4 != 0) { continue; }  // publish at 1 s cadence
+      double msps_total = 0.0, gbps_total = 0.0;
+      size_t channels = 0;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        channels = rates_.size();
+        for (const auto& [msps, gbps] : rates_) { msps_total += msps; gbps_total += gbps; }
+        if (util_samples > 0) {
+          last_window_mean_ = util_sum / static_cast<double>(util_samples);
+          last_window_max_ = util_max;
+          last_window_valid_ = true;
+        }
+      }
+      if (channels == 0) {  // nothing reported yet; keep the util window rolling
+        util_sum = 0.0; util_samples = 0;
+        util_min = std::numeric_limits<unsigned int>::max(); util_max = 0;
+        continue;
+      }
+      // GB10 unified memory: cudaMemGetInfo's "free" excludes reclaimable page cache, which reads
+      // as a nearly-full bar. MemAvailable is the honest number.
+      size_t mem_free = 0, mem_total = 0;
+      {
+        std::ifstream mi("/proc/meminfo");
+        std::string key, unit;
+        uint64_t kb = 0;
+        while (mi >> key >> kb >> unit) {
+          if (key == "MemTotal:") mem_total = kb * 1024ull;
+          if (key == "MemAvailable:") mem_free = kb * 1024ull;
+        }
+      }
+      if (mem_total == 0) { cudaMemGetInfo(&mem_free, &mem_total); }
+      const char* dir = std::getenv("USRP_APP_METRICS_DIR");
+      const std::string base = (dir != nullptr && dir[0] != '\0')
+          ? std::string(dir) : std::string("/workspace/spectrograms");
+      const std::string path = base + "/app_metrics.json";
+      const std::string tmp = path + ".tmp";
+      const double mean_util = util_samples > 0
+          ? util_sum / static_cast<double>(util_samples) : 0.0;
+      const unsigned int min_util =
+          util_min == std::numeric_limits<unsigned int>::max() ? 0U : util_min;
+      std::ofstream out(tmp);
+      if (out.is_open()) {
+        out << "{\n"
+            << "  \"channel\": 0,\n"
+            << "  \"channels\": " << channels << ",\n"
+            << "  \"msps\": " << msps_total << ",\n"
+            << "  \"gbps\": " << gbps_total << ",\n"
+            << "  \"pps\": " << msps_total * 1e6 / 1024.0 << ",\n"
+            << "  \"gpu_util_mean\": " << mean_util << ",\n"
+            << "  \"gpu_util_min\": " << min_util << ",\n"
+            << "  \"gpu_util_max\": " << util_max << ",\n"
+            << "  \"gpu_mem_used_gb\": " << static_cast<double>(mem_total - mem_free) / 1e9 << ",\n"
+            << "  \"gpu_mem_total_gb\": " << static_cast<double>(mem_total) / 1e9 << ",\n"
+            << "  \"ts\": " << std::chrono::duration<double>(
+                   std::chrono::system_clock::now().time_since_epoch()).count() << "\n"
+            << "}\n";
+        out.close();
+        std::rename(tmp.c_str(), path.c_str());
+      }
+      util_sum = 0.0; util_samples = 0;
+      util_min = std::numeric_limits<unsigned int>::max(); util_max = 0;
+    }
+  }
+
+  std::mutex mutex_;
+  std::vector<std::pair<double, double>> rates_;  // per-channel {msps, gbps}
+  double last_window_mean_ = 0.0;
+  unsigned int last_window_max_ = 0;
+  bool last_window_valid_ = false;
+  std::atomic<bool> stop_ {false};
+  std::thread thread_;
+#ifdef USRP_WIDEBAND_HAS_NVML
+  std::optional<nvmlDevice_t> nvml_device_;
+#endif
+};
+
 class LogOp: public holoscan::Operator {
  public:
   HOLOSCAN_OPERATOR_FORWARD_ARGS(LogOp)
@@ -211,105 +364,9 @@ class LogOp: public holoscan::Operator {
     total_samples_.resize(num_channels_, 0);
     start_.resize(num_channels_, std::chrono::steady_clock::now());
     elapsed_.resize(num_channels_, std::chrono::steady_clock::duration::zero());
-    gpu_util_sum_.resize(num_channels_, 0.0);
-    gpu_util_samples_.resize(num_channels_, 0);
-    gpu_util_min_.resize(num_channels_, std::numeric_limits<unsigned int>::max());
-    gpu_util_max_.resize(num_channels_, 0);
-    gpu_sample_start_.resize(num_channels_, std::chrono::steady_clock::time_point {});
-    last_gpu_sample_.resize(num_channels_, std::chrono::steady_clock::time_point {});
-
-#ifdef USRP_WIDEBAND_HAS_NVML
-    const auto init_result = nvmlInit_v2();
-    if (init_result == NVML_SUCCESS) {
-      nvml_device_count_ = 0;
-      if (nvmlDeviceGetCount_v2(&nvml_device_count_) == NVML_SUCCESS && nvml_device_count_ > 0) {
-        nvmlDevice_t handle = nullptr;
-        if (nvmlDeviceGetHandleByIndex_v2(0, &handle) == NVML_SUCCESS) {
-          nvml_device_ = handle;
-        }
-      }
-      if (!nvml_device_.has_value()) {
-        nvmlShutdown();
-      }
-    }
-#endif
-  }
-
-  void stop() override {
-#ifdef USRP_WIDEBAND_HAS_NVML
-    if (nvml_device_.has_value()) {
-      nvmlShutdown();
-      nvml_device_.reset();
-    }
-#endif
-    holoscan::Operator::stop();
-  }
-
-  // Dashboard v3: publish the throughput/compute numbers this monitor already
-  // gathers to a small JSON (atomic rename) the HoloViz HUD polls — same
-  // pattern as the decode daemon's rt_metrics.json. GPU memory comes from
-  // cudaMemGetInfo (meaningful on GB10's unified pool).
-  void publish_app_metrics(uint16_t channel_num, double samples_per_second,
-                           double bits_per_second) {
-    // Dual channel: each channel's log tick updates its slot; the published
-    // msps/gbps are the AGGREGATE so the HUD shows total pipeline throughput.
-    if (last_msps_.size() <= channel_num) {
-      last_msps_.resize(channel_num + 1, 0.0);
-      last_gbps_.resize(channel_num + 1, 0.0);
-    }
-    last_msps_[channel_num] = samples_per_second / 1e6;
-    last_gbps_[channel_num] = bits_per_second / 1e9;
-    double msps_total = 0.0, gbps_total = 0.0;
-    for (size_t i = 0; i < last_msps_.size(); ++i) {
-      msps_total += last_msps_[i];
-      gbps_total += last_gbps_[i];
-    }
-    const char* dir = std::getenv("USRP_APP_METRICS_DIR");
-    const std::string base = (dir != nullptr && dir[0] != '\0')
-        ? std::string(dir) : std::string("/workspace/spectrograms");
-    const std::string path = base + "/app_metrics.json";
-    const std::string tmp = path + ".tmp";
-    // GB10 unified memory: cudaMemGetInfo's "free" excludes reclaimable page
-    // cache, which reads as a nearly-full bar. MemAvailable is the honest
-    // number for "how much could allocations actually get".
-    size_t mem_free = 0, mem_total = 0;
-    {
-      std::ifstream mi("/proc/meminfo");
-      std::string key;
-      uint64_t kb = 0;
-      std::string unit;
-      while (mi >> key >> kb >> unit) {
-        if (key == "MemTotal:") mem_total = kb * 1024ull;
-        if (key == "MemAvailable:") mem_free = kb * 1024ull;
-      }
-    }
-    if (mem_total == 0) { cudaMemGetInfo(&mem_free, &mem_total); }
-    double mean_util = 0.0;
-    unsigned int min_util = 0, max_util = 0;
-    if (gpu_util_samples_[channel_num] > 0) {
-      mean_util = gpu_util_sum_[channel_num] / static_cast<double>(gpu_util_samples_[channel_num]);
-      min_util = gpu_util_min_[channel_num] == std::numeric_limits<unsigned int>::max()
-          ? 0U : gpu_util_min_[channel_num];
-      max_util = gpu_util_max_[channel_num];
-    }
-    std::ofstream out(tmp);
-    if (!out.is_open()) { return; }
-    out << "{\n"
-        << "  \"channel\": " << channel_num << ",\n"
-        << "  \"channels\": " << last_msps_.size() << ",\n"
-        << "  \"msps\": " << msps_total << ",\n"
-        << "  \"gbps\": " << gbps_total << ",\n"
-        << "  \"pps\": " << msps_total * 1e6 / 1024.0 << ",\n"
-        << "  \"gpu_util_mean\": " << mean_util << ",\n"
-        << "  \"gpu_util_min\": " << min_util << ",\n"
-        << "  \"gpu_util_max\": " << max_util << ",\n"
-        << "  \"gpu_mem_used_gb\": " << static_cast<double>(mem_total - mem_free) / 1e9 << ",\n"
-        << "  \"gpu_mem_total_gb\": " << static_cast<double>(mem_total) / 1e9 << ",\n"
-        << "  \"ts\": " << std::chrono::duration<double>(
-               std::chrono::system_clock::now().time_since_epoch()).count() << "\n"
-        << "}\n";
-    out.close();
-    std::rename(tmp.c_str(), path.c_str());
+    // NVML + metrics-file work lives in AppMetricsPublisher's background thread; construct it
+    // here (outside the data path) so its NVML init doesn't land on the first compute() tick.
+    AppMetricsPublisher::instance();
   }
 
   void compute(holoscan::InputContext& op_input,
@@ -331,91 +388,35 @@ class LogOp: public holoscan::Operator {
     total_samples_[channel_num] += num_samples;
     elapsed_[channel_num] += interval;
 
-    maybe_sample_gpu_util(channel_num, now);
-
     auto seconds = std::chrono::duration<double>(elapsed_[channel_num]).count();
     if (total_samples_[channel_num] > 0 && seconds >= log_interval_) {
       const double samples_per_second = static_cast<double>(total_samples_[channel_num]) / seconds;
       const double bits_per_second = static_cast<double>(total_samples_[channel_num]) * sizeof(int16_t) * 2 * 8 / seconds;
-      publish_app_metrics(channel_num, samples_per_second, bits_per_second);
-      if (gpu_util_samples_[channel_num] > 0) {
-        const double mean_gpu_util = gpu_util_sum_[channel_num] / static_cast<double>(gpu_util_samples_[channel_num]);
-        const unsigned int min_gpu_util = gpu_util_min_[channel_num] == std::numeric_limits<unsigned int>::max() ? 0U : gpu_util_min_[channel_num];
-        HOLOSCAN_LOG_INFO("Processed {} samples from channel {} at {:.2f} MSps ({:.2f} Gbps) gpu_util_pct(mean={:.2f},min={},max={})",
-                          total_samples_[channel_num],
-                          channel_num,
-                          samples_per_second / 1e6,
-                          bits_per_second / 1e9,
-                          mean_gpu_util,
-                          min_gpu_util,
-                          gpu_util_max_[channel_num]);
+      // Post rates to the background publisher (lock-brief); NVML + JSON I/O happen on ITS thread,
+      // never on this data-path worker.
+      AppMetricsPublisher::instance().update_channel(channel_num, samples_per_second / 1e6,
+                                                     bits_per_second / 1e9);
+      const auto [util_mean, util_max, util_valid] = AppMetricsPublisher::instance().util_window();
+      if (util_valid) {
+        HOLOSCAN_LOG_INFO("Processed {} samples from channel {} at {:.2f} MSps ({:.2f} Gbps) gpu_util_pct(mean={:.2f},max={})",
+                          total_samples_[channel_num], channel_num,
+                          samples_per_second / 1e6, bits_per_second / 1e9, util_mean, util_max);
       } else {
         HOLOSCAN_LOG_INFO("Processed {} samples from channel {} at {:.2f} MSps ({:.2f} Gbps)",
-                          total_samples_[channel_num],
-                          channel_num,
-                          samples_per_second / 1e6,
-                          bits_per_second / 1e9);
+                          total_samples_[channel_num], channel_num,
+                          samples_per_second / 1e6, bits_per_second / 1e9);
       }
       total_samples_[channel_num] = 0;
       elapsed_[channel_num] = std::chrono::steady_clock::duration::zero();
-      gpu_util_sum_[channel_num] = 0.0;
-      gpu_util_samples_[channel_num] = 0;
-      gpu_util_min_[channel_num] = std::numeric_limits<unsigned int>::max();
-      gpu_util_max_[channel_num] = 0;
-      gpu_sample_start_[channel_num] = std::chrono::steady_clock::time_point {};
     }
   }
 
  private:
-  void maybe_sample_gpu_util(uint16_t channel_num, const std::chrono::steady_clock::time_point& now) {
-    if (channel_num >= gpu_util_sum_.size()) {
-      return;
-    }
-#ifdef USRP_WIDEBAND_HAS_NVML
-    if (!nvml_device_.has_value()) {
-      return;
-    }
-    constexpr auto kGpuSamplePeriod = std::chrono::milliseconds(250);
-    if (last_gpu_sample_[channel_num] != std::chrono::steady_clock::time_point {} &&
-        now - last_gpu_sample_[channel_num] < kGpuSamplePeriod) {
-      return;
-    }
-    nvmlUtilization_t utilization {};
-    if (nvmlDeviceGetUtilizationRates(*nvml_device_, &utilization) != NVML_SUCCESS) {
-      return;
-    }
-    last_gpu_sample_[channel_num] = now;
-    if (gpu_sample_start_[channel_num] == std::chrono::steady_clock::time_point {}) {
-      gpu_sample_start_[channel_num] = now;
-    }
-    gpu_util_sum_[channel_num] += static_cast<double>(utilization.gpu);
-    gpu_util_samples_[channel_num] += 1;
-    gpu_util_min_[channel_num] = std::min(gpu_util_min_[channel_num], utilization.gpu);
-    gpu_util_max_[channel_num] = std::max(gpu_util_max_[channel_num], utilization.gpu);
-#else
-    static_cast<void>(channel_num);
-    static_cast<void>(now);
-#endif
-  }
-
   holoscan::Parameter<int> num_channels_;
   holoscan::Parameter<int> log_interval_;
   std::vector<int64_t> total_samples_;
   std::vector<std::chrono::steady_clock::time_point> start_;
   std::vector<std::chrono::steady_clock::duration> elapsed_;
-  std::vector<double> gpu_util_sum_;
-  std::vector<uint64_t> gpu_util_samples_;
-  std::vector<unsigned int> gpu_util_min_;
-  std::vector<unsigned int> gpu_util_max_;
-  std::vector<std::chrono::steady_clock::time_point> gpu_sample_start_;
-  std::vector<std::chrono::steady_clock::time_point> last_gpu_sample_;
-  std::vector<double> last_msps_;
-  std::vector<double> last_gbps_;
-
-#ifdef USRP_WIDEBAND_HAS_NVML
-  std::optional<nvmlDevice_t> nvml_device_;
-  unsigned int nvml_device_count_ = 0;
-#endif
 };
 
 class DropOp: public holoscan::Operator {
