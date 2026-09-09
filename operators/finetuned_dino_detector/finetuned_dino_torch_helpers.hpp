@@ -33,9 +33,17 @@ class FinetunedDinoTorchRuntime {
   // through the segmenter, thresholded (sigmoid >= threshold), stitched, and nearest-upsampled back to
   // rows x wide, written to out_mask_wide (device uint8). Everything runs in torch on `stream`.
   // Returns false on failure. Optionally reports the pure-inference (resize+forward+post) time in ms.
+  //
+  // wrap_edges: the M2_dr checkpoint has a measured BORDER bias -- on flat noise it fires on 30-70% of
+  // its outermost columns and 0% mid-image (its training captures always had the receiver rolloff at
+  // the image borders). An FFT spectrum is circular (-fs/2 == +fs/2), so the band edge is only where
+  // we CUT the image, not a real boundary: run the model on the image AND a half-band circular
+  // rotation of it (batched into one forward), then take every output column from the pass where it
+  // sat in the image center. No output column ever comes from a model border. Measured on the 491.52
+  // OTA capture: edge-region firing 16.5% -> 0.00% with mid-band masks unchanged.
   bool forward_downsampled(const float* normalized_wide, int rows, int wide, int tile_rows, int nfft,
                            float threshold, uint8_t* out_mask_wide, cudaStream_t stream,
-                           double* inference_ms = nullptr);
+                           double* inference_ms = nullptr, bool wrap_edges = true);
 
   // Prime the model (a few dummy forwards) so the first real frame doesn't pay the one-time
   // cuDNN-autotune / allocation cost (~hundreds of ms). Call once after load(), before compute().

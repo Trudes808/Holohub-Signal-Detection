@@ -304,6 +304,13 @@ void FinetunedDinoDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(flatten_signal_cap_db_, "flatten_signal_cap_db", "Flatten signal cap",
              "Cap a bin's influence on its own floor estimate at reference+this (dB) so strong "
              "signals don't inflate the floor; 0 disables the capped second pass.", 6.0);
+  spec.param(circular_edge_inference_, "circular_edge_inference", "Circular edge inference",
+             "Downsample path: also run the model on a half-band circular rotation of the input "
+             "(batched into the same forward) and take the mask's outer quarters from that pass, so "
+             "no output column comes from the model's borders. Fixes the checkpoint's measured "
+             "border bias (fires on flat noise at its image edges) without trimming detections; the "
+             "DFT spectrum is periodic so the rotation is spectrally contiguous. Costs ~2x tiles per "
+             "emitted frame.", true);
   spec.param(ignore_sideband_percent_, "ignore_sideband_percent", "Ignore sideband percent",
              "Zero the emitted mask's outermost columns on EACH band edge, as a percent of the mask "
              "width. The X410 anti-alias rolloff cliff at the extreme bins survives the floor flatten "
@@ -326,7 +333,9 @@ void FinetunedDinoDetector::initialize() {
     // Prime the model so the first real frame doesn't pay the ~hundreds-of-ms cuDNN-autotune cost
     // (which would otherwise spike backpressure at live startup). Tiles are tile_rows x nfft; batch 2
     // covers the downsample path (512 rows) and primes the same per-tile kernels the native path uses.
-    runtime_->warmup(tile_rows_.get(), nfft_.get(), 2);
+    // Downsample-path forward is ~2 tiles, x2 when circular edge inference batches the rotated
+    // copy -- prime the larger batch so the first live frame doesn't autotune.
+    runtime_->warmup(tile_rows_.get(), nfft_.get(), 4);
   }
 }
 
@@ -544,7 +553,8 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
     double inference_ms = 0.0;
     const bool ok = runtime_->forward_downsampled(buf.normalized_device, rows, fft_size, tile_rows,
                                                   nfft, static_cast<float>(threshold_.get()),
-                                                  emit_mask, stream, &inference_ms);
+                                                  emit_mask, stream, &inference_ms,
+                                                  circular_edge_inference_.get());
     if (!ok) { cudaFree(emit_mask); return; }
     ++inference_samples_;
     inference_ms_ewma_ += (inference_ms - inference_ms_ewma_) / static_cast<double>(inference_samples_);

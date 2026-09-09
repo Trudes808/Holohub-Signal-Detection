@@ -63,7 +63,7 @@ bool FinetunedDinoTorchRuntime::load(const std::string& model_script_path,
 bool FinetunedDinoTorchRuntime::forward_downsampled(const float* normalized_wide, int rows, int wide,
                                                     int tile_rows, int nfft, float threshold,
                                                     uint8_t* out_mask_wide, cudaStream_t stream,
-                                                    double* inference_ms) {
+                                                    double* inference_ms, bool wrap_edges) {
 #if defined(HOLOHUB_HAS_TORCH)
   if (!impl_->is_loaded) return false;
   namespace F = torch::nn::functional;
@@ -96,10 +96,33 @@ bool FinetunedDinoTorchRuntime::forward_downsampled(const float* normalized_wide
       resized = torch::constant_pad_nd(resized, {0, 0, 0, padded - rows}, 0);
     }
     auto tiles = resized.contiguous().view({batch, tile_rows, nfft}).unsqueeze(1);  // [B,1,tile_rows,nfft]
-    torch::jit::IValue model_in = (impl_->dtype == torch::kHalf) ? tiles.to(torch::kHalf) : tiles;
+
+    // Circular edge inference (see header): batch a half-band-rotated copy into the SAME forward so
+    // the border-biased model never supplies the mask's outer columns. The DFT spectrum is periodic,
+    // so the rotation is spectrally contiguous -- no synthetic seam is introduced.
+    torch::Tensor tiles_all = tiles;
+    if (wrap_edges) {
+      auto rolled = torch::roll(resized, {nfft / 2}, {3});
+      auto tiles2 = rolled.contiguous().view({batch, tile_rows, nfft}).unsqueeze(1);
+      tiles_all = torch::cat({tiles, tiles2}, 0);  // [2B,1,tile_rows,nfft]
+    }
+    torch::jit::IValue model_in = (impl_->dtype == torch::kHalf) ? tiles_all.to(torch::kHalf) : tiles_all;
 
     auto logits = impl_->module.forward({model_in}).toTensor().to(torch::kFloat32);
-    auto mask_tiles = (torch::sigmoid(logits) >= threshold).to(torch::kFloat32);  // [B,1,tile_rows,nfft]
+    auto mask_tiles = (torch::sigmoid(logits) >= threshold).to(torch::kFloat32);  // [B or 2B,1,tile_rows,nfft]
+    if (wrap_edges) {
+      using torch::indexing::Slice;
+      auto m1 = mask_tiles.narrow(0, 0, batch);
+      auto m2 = torch::roll(mask_tiles.narrow(0, batch, batch), {-nfft / 2}, {3});  // back to true columns
+      // Outer quarters come from the rotated pass (those columns sat mid-image there); the rotated
+      // pass's own borders land mid-band and are discarded. Every output column is center-sourced.
+      const int quarter = nfft / 4;
+      m1.index_put_({Slice(), Slice(), Slice(), Slice(0, quarter)},
+                    m2.index({Slice(), Slice(), Slice(), Slice(0, quarter)}));
+      m1.index_put_({Slice(), Slice(), Slice(), Slice(nfft - quarter, nfft)},
+                    m2.index({Slice(), Slice(), Slice(), Slice(nfft - quarter, nfft)}));
+      mask_tiles = m1;
+    }
 
     // stitch tiles back to [1,1,padded,nfft], crop to rows, nearest-upsample freq nfft->wide
     auto stitched = mask_tiles.squeeze(1).contiguous().view({1, 1, padded, nfft});
