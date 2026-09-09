@@ -99,6 +99,7 @@ class ChdrConverterOpRx : public Operator {
     int cur_idx = 0;
     tensor_t<complex, 3> rf_data;
     std::array<void **, num_concurrent> h_dev_ptrs;
+    std::array<uint16_t *, num_concurrent> h_valid_samples = {};  // per-packet valid sample counts (short packets)
     std::array<cudaStream_t, num_concurrent> streams;
     std::array<cudaEvent_t, num_concurrent> events;
     RxMsg cur_msg{};
@@ -109,6 +110,7 @@ class ChdrConverterOpRx : public Operator {
     uint64_t aggr_pkts_recv = 0;
     uint64_t completed_batches_queued = 0;
     uint64_t completed_batches_emitted = 0;
+    uint64_t bad_payload_pkts = 0;  // payload-size mismatches (foreign/truncated packets read as IQ)
     uint64_t backlog_events = 0;
     uint64_t rx_bursts_received = 0;
     uint64_t empty_rx_polls = 0;

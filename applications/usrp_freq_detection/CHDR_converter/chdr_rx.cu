@@ -36,6 +36,7 @@ using namespace std::complex_literals;
 // CUDA kernel to process an individual CHDR packet
 __global__ void place_packet_data_kernel(complex* out,
                                          const void* const* const __restrict__ in,
+                                         const uint16_t* __restrict__ valid_samples,
                                          const int cur_idx,
                                          const int num_complex_samples_per_packet,
                                          const int packets_in_batch
@@ -78,16 +79,26 @@ __global__ void place_packet_data_kernel(complex* out,
                 + (num_complex_samples_per_packet * blockDim.x * blockIdx.x)
                 + (num_complex_samples_per_packet * threadIdx.x);
 
-  // Copy data while performing an endian flip and casting to complex float
-  for (size_t i = 0; i < num_complex_samples_per_packet; ++i) {
+  // Copy ONLY the samples the NIC reported for this packet; zero the remainder of the slot.
+  // Short packets (radio burst/overflow boundaries ship 4032 B instead of 4096 B) previously made
+  // this kernel read past the valid payload into adjacent mbuf memory -- full-scale garbage that
+  // rendered as the intermittent full-width bright bar. Never interpret unreported bytes as IQ.
+  const int n_valid = valid_samples != nullptr
+      ? min(static_cast<int>(valid_samples[packet_index]), num_complex_samples_per_packet)
+      : num_complex_samples_per_packet;
+  for (int i = 0; i < n_valid; ++i) {
     // Casting includes conversion from network order on little-endian systems
     out[offset + i] = complex(static_cast<float>(samples[i * 2]) * scalar,
                       static_cast<float>(samples[(i * 2) + 1]) * scalar);
+  }
+  for (int i = n_valid; i < num_complex_samples_per_packet; ++i) {
+    out[offset + i] = complex(0.0f, 0.0f);
   }
 }
 
 void place_packet_data(complex* out,
                        const void* const* const in,
+                       const uint16_t* valid_samples,
                        const uint16_t cur_idx,
                        const int num_ffts_per_batch,
                        const int num_packets_per_fft,
@@ -111,6 +122,7 @@ void place_packet_data(complex* out,
       num_packets_per_fft * sizeof(int), stream>>>(
           out,
           in,
+          valid_samples,
           cur_idx,
           num_complex_samples_per_packet,
           packets_in_batch);
@@ -465,11 +477,15 @@ void ChdrConverterOpRx::initialize() {
     // Allocate memory and create CUDA streams for each concurrent batch
     for (int n = 0; n < num_simul_batches_.get(); n++) {
       cudaMallocHost((void**)&new_channel->h_dev_ptrs[n], sizeof(void*) * num_packets_per_batch);
+      cudaMallocHost((void**)&new_channel->h_valid_samples[n], sizeof(uint16_t) * num_packets_per_batch);
+      std::fill_n(new_channel->h_valid_samples[n], num_packets_per_batch,
+                  static_cast<uint16_t>(num_complex_samples_per_packet_.get()));
 
       cudaStreamCreateWithFlags(&new_channel->streams[n], cudaStreamNonBlocking);
       cudaEventCreate(&new_channel->events[n]);
       // Warmup
       place_packet_data(nullptr,
+                        nullptr,
                         nullptr,
                         0,
                         num_ffts_per_batch_.get(),
@@ -668,6 +684,7 @@ void ChdrConverterOpRx::queue_completed_batch(
 
   place_packet_data(channel->rf_data.Data(),
                     channel->h_dev_ptrs[completed_batch_idx],
+                    channel->h_valid_samples[completed_batch_idx],
                     completed_batch_idx,
                     num_ffts_per_batch_.get(),
                     num_packets_per_fft_.get(),
@@ -822,6 +839,10 @@ void ChdrConverterOpRx::release_channel_resources() {
       if (channel->h_dev_ptrs[stream_index] != nullptr) {
         cudaFreeHost(channel->h_dev_ptrs[stream_index]);
         channel->h_dev_ptrs[stream_index] = nullptr;
+      }
+      if (channel->h_valid_samples[stream_index] != nullptr) {
+        cudaFreeHost(channel->h_valid_samples[stream_index]);
+        channel->h_valid_samples[stream_index] = nullptr;
       }
     }
   }
@@ -1033,13 +1054,30 @@ void ChdrConverterOpRx::process_channel_data(
     channel->cur_msg.msg[channel->cur_msg.num_batches++] = burst;
 
     uint64_t ttl_bytes_in_cur_chunk = 0;
+    // Diagnostic: a data packet's payload segment must be exactly num_complex_samples_per_packet
+    // int16 IQ pairs. Anything else (radio status frames, truncated packets) would be interpreted
+    // as full-scale garbage samples by the gather kernel -- the suspected "bright bar" source.
+    const uint64_t expected_payload_bytes =
+        static_cast<uint64_t>(num_complex_samples_per_packet_.get()) * 2 * sizeof(int16_t);
     for (int p = 0; p < packets_to_copy; p++) {
       const int burst_packet_idx = packet_offset + p;
       channel->h_dev_ptrs[channel->cur_idx][channel->aggr_pkts_recv + p]
           = get_segment_packet_ptr(burst, 2, burst_packet_idx);
+      const uint64_t payload_len = get_segment_packet_length(burst, 2, burst_packet_idx);
+      channel->h_valid_samples[channel->cur_idx][channel->aggr_pkts_recv + p] =
+          static_cast<uint16_t>(std::min<uint64_t>(payload_len / (2 * sizeof(int16_t)),
+                                                   num_complex_samples_per_packet_.get()));
+      if (payload_len != expected_payload_bytes) {
+        channel->bad_payload_pkts++;
+        if (channel->bad_payload_pkts <= 5 || (channel->bad_payload_pkts % 100000) == 0) {
+          HOLOSCAN_LOG_WARN("CHDR ch={} packet with payload {} B (expected {}), count={}",
+                            channel->channel_num, payload_len, expected_payload_bytes,
+                            channel->bad_payload_pkts);
+        }
+      }
       ttl_bytes_in_cur_chunk += get_segment_packet_length(burst, 0, burst_packet_idx)
           + get_segment_packet_length(burst, 1, burst_packet_idx)
-          + get_segment_packet_length(burst, 2, burst_packet_idx);
+          + payload_len;
     }
 
     channel->ttl_bytes_recv += ttl_bytes_in_cur_chunk;
