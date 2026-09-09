@@ -817,11 +817,15 @@ def main():
                 print(f"[{time.strftime('%H:%M:%S')}] === DEMO CONTROL: snr bucket -> {snr} ===",
                       flush=True)
             wanted = ctl.get("classifiers")
-            if isinstance(wanted, str) and wanted:
+            # An EMPTY string is a real directive (all checkboxes unchecked -> unload every
+            # model, freeing its GPU compute/memory); only a missing field means "no opinion".
+            # The old `and wanted` guard silently ignored the all-unchecked case, so the
+            # models kept running and unchecking never recovered GPU headroom.
+            if isinstance(wanted, str):
                 names = [n.strip() for n in wanted.split(",") if n.strip()]
                 if clf.set_enabled(names):
                     print(f"[{time.strftime('%H:%M:%S')}] === DEMO CONTROL: classifiers -> "
-                          f"{sorted(clf.models)} ===", flush=True)
+                          f"{sorted(clf.models) or ['(none)']} ===", flush=True)
             gate = ctl.get("gate")
             if gate in clf.models and gate != clf.gate:
                 clf.gate = gate
