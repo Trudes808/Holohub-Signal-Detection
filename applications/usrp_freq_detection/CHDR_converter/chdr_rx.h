@@ -52,7 +52,11 @@ class ChdrConverterOpRx : public Operator {
   void stop() override;
 
  private:
-  static constexpr int num_concurrent  = 4;   // Number of concurrent batches processing
+  // 8 (was 4): sizes the per-channel slot ring (rf_data batches, streams, events, h_dev_ptrs).
+  // Emitted tensors are VIEWS into this ring and cur_idx wraps without downstream feedback, so the
+  // ring must outlast the longest downstream holder chain (dual: FFT queue 4 + in-flight consumers)
+  // or a slot gets re-filled mid-read -- the intermittent full-width bright "torn frame" bar.
+  static constexpr int num_concurrent  = 8;   // Number of concurrent batches processing
   static constexpr int MAX_ANO_BATCHES = 20;  // Batches from ANO for one app batch
 
   Parameter<uint16_t> num_complex_samples_per_packet_;

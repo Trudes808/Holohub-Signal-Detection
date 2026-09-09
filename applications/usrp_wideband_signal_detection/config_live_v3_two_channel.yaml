@@ -12,7 +12,9 @@ pipeline:
   log_from_spectrogram: false
 
 scheduler:
-  worker_thread_number: 8   # dual-channel graph (2x converter/fft/spectrogram/detector + viz) starves at 4 workers
+  worker_thread_number: 12   # dual v3 graph is ~17 operators incl. long-blocking sink/snip computes; at 8 workers the
+  # visualizer got scheduled ~1x/1.5s (measured 22-row scroll jumps = chunky stutter). GB10 has 20
+  # cores; DPDK reserves 3(master)/5/7, so 12 workers still leaves kernel headroom.
   stop_on_deadlock: true
   stop_on_deadlock_timeout: 500
 
@@ -109,7 +111,12 @@ chdr_converter:
   num_complex_samples_per_packet: 1024
   num_packets_per_fft: 20
   num_ffts_per_batch: 512   # frame size (21.3 ms of RF per batch). Since the Tier A+B GPU work (2026-08-15), dual full rate is LOSSLESS at this setting with per-frame detection. Historical: 256 sheds via out_q backpressure -> RX mempool exhaustion -> NIC drops + error spam; avoid. Must equal fft.num_bursts.
-  num_simul_batches: 4   # hard max: chdr_rx supports 4 in-flight batch slots (app aborts on more)
+  # 8 (was 4): the converter emits VIEWS into this slot ring and cur_idx wraps without knowing when
+  # downstream finished reading — under dual backlog (FFT queue alone holds 4 batches) a slot gets
+  # re-filled mid-read and the FFT of a changing buffer renders as a full-width bright bar (the
+  # intermittent "yellow bar"). 8 slots outlast the worst-case holder chain (fft q4 + in-flight).
+  # Cost: rf_data ring 336->672 MB per channel in unified memory.
+  num_simul_batches: 8   # hard max: chdr_rx supports 4 in-flight batch slots (app aborts on more)
   num_channels: 2
   log_packets: false
   log_data: false
@@ -162,7 +169,13 @@ visualization:
     rows_per_frame: 8   # waterfall scroll cadence (display-only, no pipeline cost) — match the single-channel feel; was 2, which made dual look ~4x slower than it is
     mask_frame_offset: 0
     allow_backpressure_valve: true
-    render_every_n_frames: 1   # no display decimation: at the current operating point (batch 512, emit_stride 2) rendering every frame costs nothing measurable — coverage/latency identical to render=3
+    # SCROLL SMOOTHNESS (2026-09-09): render_every_n_frames must stay 1 — history scrolls on EVERY
+    # processed frame while composition happens every Nth, so stride N makes the waterfall jump
+    # N*rows_per_frame rows per visible update (chunky). For dual smoothness, pace composition with
+    # refresh_hz at a rate the ~90%-loaded GPU can hold UNIFORMLY instead: steady 24 fps reads
+    # smoother than an irregular 15-30.
+    render_every_n_frames: 1
+    refresh_hz: 24
     timing_summary_enable: true
     timing_summary_every_n: 128
     decode_metrics_json: "/workspace/spectrograms/rt_metrics.json"   # LIVE DECODE sidebar panel (written by rt_decode_daemon.py --metrics-out)
