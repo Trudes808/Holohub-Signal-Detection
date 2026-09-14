@@ -231,6 +231,22 @@ HTML = r"""<title>DINO-FT Ingest A/B</title>
     still survives, i.e. the documented residual a frequency-span discriminator would catch.</figcaption>
   </figure>
 
+  <h2><span class="n">08</span>Weak signals: lowering the threshold is not the fix</h2>
+  <p>A natural idea for the missed faint signals is to lower the 0.95 decision threshold. Tested offline
+  (same capture, no drops) at 0.70 vs 0.95 &mdash; <b class="lb">red = detected at 0.95</b>,
+  <b style="color:#22d3ee">cyan = what 0.70 adds</b>. Occupancy rises 0.293% &rarr; 0.382% (&times;1.30), but
+  the recovered pixels are mostly the wrong things.</p>
+  <figure>
+    <img alt="threshold 0.95 vs 0.70 comparison" src="__THRCOMPARE__">
+    <figcaption>Top frame: the cyan gain is a <b>spurious full-width row line</b> plus noise, not a signal.
+    Other frames: cyan mostly <b>grows skirts around already-detected strong signals</b>. Crucially, the
+    genuinely faint signals (e.g. the streaks on the far right edge) stay <b>unmasked even at 0.70</b>. So a
+    global threshold drop adds false positives faster than it recovers real weak signals &mdash; the small
+    signals are lost in the 491.52 downsample front-end (bilinear resize diluting narrow signals; flatten
+    swallowing weak edge signals), not at the threshold. Real fixes: max-pool the freq resize, freq-tile to
+    native 240 kHz/bin, level/flatten tuning, or a domain-match fine-tune.</figcaption>
+  </figure>
+
   <div class="foot">
     capture x410_ota_2g4_gain10_20260908 · 491.52 MSps · 2.4 GHz · 1 s OTA (ci16)<br>
     offline __OFFN__ frames · loopback __LBN__ frames · masks 512×20480 · emit_stride 4 · threshold 0.95<br>
@@ -263,6 +279,8 @@ repl = {
                    base64.b64encode((RESG / "occupancy_raster.png").read_bytes()).decode(),
     "__RTOVERLAY__": "data:image/png;base64," +
                      base64.b64encode((RESG / "rt_mask_overlays.png").read_bytes()).decode(),
+    "__THRCOMPARE__": "data:image/png;base64," +
+                      base64.b64encode((RESG / "threshold_compare.png").read_bytes()).decode(),
 }
 for k, v in repl.items():
     HTML = HTML.replace(k, v)
