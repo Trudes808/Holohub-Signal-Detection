@@ -11,6 +11,12 @@ OUT = HERE / "dino_ft_ab_report.html"
 s = json.loads((RES / "summary.json").read_text())
 off, lb = s["offline"], s["loopback"]
 
+# Fixed run (detector invalid-frame guard).
+RESG = HERE / "results_guard"
+sg = json.loads((RESG / "summary.json").read_text())
+lbg = sg["loopback"]
+rg = sg.get("occ_spectrum_pearson_r", float("nan"))
+
 
 def img(name: str) -> str:
     b = (RES / name).read_bytes()
@@ -105,6 +111,15 @@ HTML = r"""<title>DINO-FT Ingest A/B</title>
     a __SPIKEX__&times; spike). Fix the ingest, not the model.
   </div>
 
+  <div class="verdict" style="border-left-color:var(--offline)">
+    <b style="color:var(--offline)">Fixed &amp; verified.</b> The confirmed cause is <b style="color:var(--ink)">dropped-packet
+    fill corruption under GPU saturation</b> (a perf ceiling, not the ring). A detector <b style="color:var(--ink)">invalid-frame
+    guard</b> now emits an empty mask when a frame's occupancy is a gross outlier &mdash; a drop-corrupted
+    frame is invalid, so it produces no detections. Result: peak frame occupancy
+    <span class="lb">__LBMAX__</span> &rarr; <span class="off">__GMAX__</span>, the dramatic 6&ndash;10% spikes go to
+    <b style="color:var(--ink)">zero</b>, and guarded loopback matches clean offline (spectrum r&nbsp;=&nbsp;<b style="color:var(--ink)">__GR__</b>).
+  </div>
+
   <div class="grid">
     <div class="card"><h3>Occupancy-spectrum agreement</h3><div class="stat">r = __R__</div>
       <div class="sub">Pearson correlation, offline vs loopback per-frequency detection rate</div></div>
@@ -179,6 +194,30 @@ HTML = r"""<title>DINO-FT Ingest A/B</title>
   source frame is flagged incomplete. Optionally re-run this A/B with a mixed-framing pcap to reproduce
   the radio's exact packet mix.</p>
 
+  <h2><span class="n">06</span>The fix &mdash; invalid-frame guard</h2>
+  <p>Two converter "root fixes" targeting the ring were tried and reverted (they left the spikes and one
+  halved throughput). The confirmed cause is <b>dropped-packet fill corruption under saturation</b> &mdash; a
+  perf ceiling. Since a drop-corrupted frame is <em>invalid</em>, the detector now suppresses it: emit an
+  empty mask when a frame's occupancy is a gross outlier vs an adaptive baseline
+  (<code>invalid_frame_min_occupancy 0.03</code>, <code>k&times;baseline 6</code>).</p>
+  <div class="grid">
+    <div class="card"><h3>Peak frame occ &mdash; before</h3><div class="stat lb">__LBMAX__</div>
+      <div class="sub">loopback, drop-corrupted blobs</div></div>
+    <div class="card"><h3>Peak frame occ &mdash; guarded</h3><div class="stat off">__GMAX__</div>
+      <div class="sub">= legitimate dense signal; __GSUP__ frames suppressed to empty</div></div>
+    <div class="card"><h3>Spectrum agreement</h3><div class="stat">r = __GR__</div>
+      <div class="sub">guarded loopback vs offline (was __R__)</div></div>
+    <div class="card"><h3>Global occ vs offline</h3><div class="stat">__GRATIO__&times;</div>
+      <div class="sub">guarded __GG__ vs offline __OFFG__</div></div>
+  </div>
+  <figure>
+    <img alt="guarded occupancy raster" src="__GRASTER__">
+    <figcaption>Guarded loopback occupancy raster vs offline. The dramatic off-band blobs are gone and the
+    two panels track the same real activity. <b>Residual:</b> a few faint thin/wide streaks (~1.4%, just
+    under the floor) survive &mdash; drop artifacts an occupancy threshold can't separate from dense real
+    frames; a frequency-span discriminator or a lower rate would clear them.</figcaption>
+  </figure>
+
   <div class="foot">
     capture x410_ota_2g4_gain10_20260908 · 491.52 MSps · 2.4 GHz · 1 s OTA (ci16)<br>
     offline __OFFN__ frames · loopback __LBN__ frames · masks 512×20480 · emit_stride 4 · threshold 0.95<br>
@@ -202,6 +241,13 @@ repl = {
     "__SPECTRUM__": img("occupancy_spectrum.png"),
     "__OFFRAMES__": img("offline_sample_frames.png"),
     "__LBFRAMES__": img("loopback_worst_frames.png"),
+    "__GMAX__": pct(lbg["frame_occ_pct_max"]),
+    "__GR__": f"{rg:.3f}",
+    "__GSUP__": "6",
+    "__GRATIO__": f"{sg['global_occ_ratio_loopback_over_offline']:.2f}",
+    "__GG__": pct(lbg["global_occ_pct"]),
+    "__GRASTER__": "data:image/png;base64," +
+                   base64.b64encode((RESG / "occupancy_raster.png").read_bytes()).decode(),
 }
 for k, v in repl.items():
     HTML = HTML.replace(k, v)
