@@ -18,6 +18,8 @@
 
 #include <cuda_runtime.h>
 #include <matx.h>
+#include <thrust/count.h>
+#include <thrust/execution_policy.h>
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +41,11 @@ inline void throw_if_cuda_error(cudaError_t err, const char* what) {
                              cudaGetErrorString(err));
   }
 }
+
+// Predicate for the invalid-frame guard's occupancy count (thrust::count_if over the emitted mask).
+struct ft_dino_is_nonzero {
+  __host__ __device__ bool operator()(uint8_t v) const { return v != 0; }
+};
 
 // Port of resolve_fft_runtime_config (fft_runtime_config.hpp): the deployed dynamic FFT size for a
 // sample rate (power-of-two span snap around a 500 MHz / 20480-bin reference, quantized to 1024-sample
@@ -326,12 +333,26 @@ void FinetunedDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "cost).", std::string(""));
   spec.param(debug_mask_dump_max_frames_, "debug_mask_dump_max_frames", "Debug mask dump max frames",
              "Total masks to write before the dump goes quiet. 0 = unlimited.", 0);
+  spec.param(invalid_frame_guard_, "invalid_frame_guard", "Invalid-frame guard",
+             "Suppress (emit empty mask) a frame whose occupancy is a gross outlier vs an adaptive "
+             "baseline -- drop-corrupted frames under ingest saturation otherwise fire a spurious "
+             "off-band blob. true = on (default).", true);
+  spec.param(invalid_frame_min_occupancy_, "invalid_frame_min_occupancy", "Invalid-frame min occupancy",
+             "Absolute occupancy floor (fraction 0-1): a mask denser than this is suppressed regardless "
+             "of baseline. Set above the densest LEGITIMATE frame for the scene (OTA ~0.014; raise for "
+             "dense composites).", 0.03);
+  spec.param(invalid_frame_occupancy_k_, "invalid_frame_occupancy_k", "Invalid-frame occupancy k",
+             "Also suppress when occupancy exceeds k * the adaptive baseline (catches outliers on denser "
+             "scenes where the absolute floor is too high).", 6.0);
+  spec.param(invalid_frame_baseline_alpha_, "invalid_frame_baseline_alpha", "Invalid-frame baseline alpha",
+             "EWMA rate for the per-channel accepted-frame occupancy baseline (0-1).", 0.05);
 }
 
 void FinetunedDinoDetector::initialize() {
   holoscan::Operator::initialize();
   const int channels = channel_filter_.get() >= 0 ? 1 : std::max(1, num_channels_.get());
   frame_count_.assign(channels, 0);
+  occ_baseline_.assign(channels, -1.0);   // <0 => not yet initialized (invalid-frame guard)
   channel_buffers_.assign(channels, ChannelBuffers{});
   runtime_ = std::make_shared<FinetunedDinoTorchRuntime>();
   if (!runtime_->load(model_script_path_.get(), torch_dtype_.get())) {
@@ -649,6 +670,45 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
                                             ignore_cols, rows, stream),
                           "sideband memset right");
       throw_if_cuda_error(cudaStreamSynchronize(stream), "sideband sync");
+    }
+  }
+
+  // INVALID-FRAME GUARD. Under real-time ingest saturation the pipeline drops packets, corrupting the
+  // frame fill and making the segmenter fire a large spurious off-band blob (root cause confirmed in the
+  // offline-vs-loopback A/B: offline is drop-free and never spikes; loopback spikes to 6-10% occupancy on
+  // ~1-2% of frames while real activity stays <=~1.4%). A drop-corrupted frame is invalid, so the correct
+  // output is NO detections, not a false blob: suppress (zero) the mask when its occupancy is a gross
+  // outlier vs an adaptive per-channel baseline. The absolute floor catches spikes before the baseline
+  // warms up / on sparse scenes; the k*baseline term protects genuinely dense scenes from being clipped.
+  // Baseline updates only on ACCEPTED frames so a spike can't inflate it. Never fires offline (occ there
+  // stays far below the floor). Cost: one GPU reduction + sync per processed frame.
+  if (invalid_frame_guard_.get() && rows > 0 && mask_width > 0) {
+    // Occupancy = fraction of set mask pixels. thrust::count_if runs on the op stream (ordered after the
+    // stitch/sideband writes above) and returns the count to host (synchronizing), so no separate sync.
+    const size_t guard_px = static_cast<size_t>(rows) * static_cast<size_t>(mask_width);
+    const long long nz = thrust::count_if(thrust::cuda::par.on(stream), emit_mask, emit_mask + guard_px,
+                                          ft_dino_is_nonzero{});
+    const double occ = static_cast<double>(nz) / static_cast<double>(guard_px);
+    double& base = occ_baseline_[ch];
+    const double thresh = std::max(
+        invalid_frame_min_occupancy_.get(),
+        base >= 0.0 ? invalid_frame_occupancy_k_.get() * base : invalid_frame_min_occupancy_.get());
+    if (occ > thresh) {
+      throw_if_cuda_error(
+          cudaMemsetAsync(emit_mask, 0, static_cast<size_t>(rows) * static_cast<size_t>(mask_width), stream),
+          "invalid-frame guard zero");
+      throw_if_cuda_error(cudaStreamSynchronize(stream), "invalid-frame guard zero sync");
+      if ((invalid_frames_suppressed_++ % 8) == 0) {
+        std::fprintf(stderr, "[finetuned_dino_detector] invalid-frame guard: suppressed ch%d frame %llu "
+                     "occ=%.2f%% > thresh=%.2f%% (baseline=%.3f%%); total suppressed=%llu\n",
+                     static_cast<int>(channel_number), static_cast<unsigned long long>(frame_number),
+                     100.0 * occ, 100.0 * thresh, base >= 0.0 ? 100.0 * base : -1.0,
+                     static_cast<unsigned long long>(invalid_frames_suppressed_));
+      }
+    } else {
+      base = (base < 0.0) ? occ
+                          : (1.0 - invalid_frame_baseline_alpha_.get()) * base
+                                + invalid_frame_baseline_alpha_.get() * occ;
     }
   }
 

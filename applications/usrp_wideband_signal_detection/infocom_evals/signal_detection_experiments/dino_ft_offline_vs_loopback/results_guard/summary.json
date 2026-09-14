@@ -1,0 +1,37 @@
+{
+  "offline": {
+    "label": "offline",
+    "n_frames": 46,
+    "mask_rows": 512,
+    "mask_cols": 20480,
+    "global_occ_pct": 0.29349534407905914,
+    "frame_occ_pct_min": 0.0,
+    "frame_occ_pct_max": 1.34735107421875,
+    "edge_occ_pct": 0.0,
+    "interior_occ_pct": 0.3913271254387455,
+    "edge_to_interior_ratio": 0.0,
+    "full_width_bar_row_pct": 0.0,
+    "n_signal_cols": 71,
+    "continuity_on_fraction": 0.5321494182486223,
+    "continuity_mean_transitions": 25.12676056338028
+  },
+  "loopback": {
+    "label": "loopback",
+    "n_frames": 250,
+    "mask_rows": 512,
+    "mask_cols": 20480,
+    "global_occ_pct": 0.2916847229003906,
+    "frame_occ_pct_min": 0.0,
+    "frame_occ_pct_max": 1.55487060546875,
+    "edge_occ_pct": 0.020416259765625,
+    "interior_occ_pct": 0.3821075439453125,
+    "edge_to_interior_ratio": 0.053430663929909195,
+    "full_width_bar_row_pct": 0.0,
+    "n_signal_cols": 60,
+    "continuity_on_fraction": 0.5454,
+    "continuity_mean_transitions": 116.46666666666667
+  },
+  "occ_spectrum_pearson_r": 0.9959941421757091,
+  "occ_spectrum_mae_pct": 0.03352561618970788,
+  "global_occ_ratio_loopback_over_offline": 0.9938308350875208
+}

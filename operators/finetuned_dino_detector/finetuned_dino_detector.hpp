@@ -114,6 +114,15 @@ class FinetunedDinoDetector : public holoscan::Operator {
   holoscan::Parameter<std::string> debug_mask_dump_dir_;         // container path; "" = off
   holoscan::Parameter<int>         debug_mask_dump_max_frames_;  // total frames to write; 0 = unlimited
 
+  // Invalid-frame guard: suppress (emit an empty mask for) a frame whose occupancy is a gross outlier
+  // vs an adaptive per-channel baseline. Drop-corrupted frames under real-time ingest saturation
+  // otherwise make the segmenter fire a large spurious off-band blob (root cause confirmed in the
+  // offline-vs-loopback A/B). Default ON; never triggers offline (clean frames stay well under the floor).
+  holoscan::Parameter<bool>   invalid_frame_guard_;
+  holoscan::Parameter<double> invalid_frame_min_occupancy_;   // absolute occupancy floor (fraction 0-1)
+  holoscan::Parameter<double> invalid_frame_occupancy_k_;     // also suppress if occ > k * baseline
+  holoscan::Parameter<double> invalid_frame_baseline_alpha_;  // EWMA rate for the accepted-frame baseline
+
   uint64_t compute_count_ = 0;
   bool startup_log_emitted_ = false;
   bool flatten_log_emitted_ = false;
@@ -121,6 +130,8 @@ class FinetunedDinoDetector : public holoscan::Operator {
   double inference_ms_ewma_ = 0.0;   // rolling mean of downsample inference time (ms)
   uint64_t inference_samples_ = 0;
   std::vector<uint64_t> frame_count_;
+  std::vector<double>   occ_baseline_;             // per-channel EWMA occupancy of accepted frames (guard)
+  uint64_t              invalid_frames_suppressed_ = 0;
   std::vector<ChannelBuffers> channel_buffers_;
   std::shared_ptr<FinetunedDinoTorchRuntime> runtime_;
 

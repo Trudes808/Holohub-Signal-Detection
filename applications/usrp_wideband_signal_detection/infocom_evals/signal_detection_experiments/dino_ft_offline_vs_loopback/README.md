@@ -45,9 +45,46 @@ Capture: `~/Documents/captures/x410_ota_2g4_gain10_20260908.sigmf-{data,meta}` (
 - This is with CLEAN uniform 1024-sample packets. The real radio streams mixed 1024/1008 native-DDC
   framing (~44-50% short packets), which drives MORE such corruptions -> live-on-radio is worse.
 
-**Conclusion.** Do not touch the model or its downsample geometry. Chase the intermittent ingest-frame
-corruption in `chdr_converter` (short-packet gather / slot-ring recycling / drop-on-incomplete-frame),
-and consider a detector-side guard that suppresses a mask when its frame is flagged incomplete.
+**Conclusion.** Do not touch the model or its downsample geometry.
+
+## Root cause (confirmed 2026-09-14) + fix
+
+Two "root fix" attempts in the CHDR converter were tried and REVERTED because they targeted the wrong
+mechanism (the header's "torn frame = slot recycled mid-read" comment):
+- **Detector copy-at-`compute()`** — copies data already recycled by dequeue time (deep input-queue lag);
+  no effect, and the extra sync worsened lag.
+- **Converter copy-at-queue (owned snapshot per batch)** — spikes UNCHANGED, and the extra 84 MB/batch
+  copy on the ingest-critical path HALVED throughput (0.40 -> 0.20 Mpps) -> more drops.
+
+By elimination (offline=no packets=clean; loopback=packets=spikes; owned-snapshot=still spikes) the real
+cause is **dropped-packet fill corruption under GPU saturation**: at 491.52 MSps with viz+snipper+detector
+the GB10 saturates (log: 131 "might get dropped", 311 "Fell behind", ~200-400k of 480k pps ingested), so
+some batches are assembled from discontinuous/stale IQ -> a broadband transient -> a spurious off-band
+blob. This is a PERF CEILING, not a converter logic bug; "lossless ingest at 491.52 full-load" is not
+achievable by a code change.
+
+**Fix (shipped): detector invalid-frame guard.** `finetuned_dino_detector` now suppresses (emits an empty
+mask for) a frame whose occupancy is a gross outlier vs an adaptive per-channel baseline
+(`invalid_frame_guard`=on, `invalid_frame_min_occupancy`=0.03, `invalid_frame_occupancy_k`=6). A
+drop-corrupted frame is invalid, so the correct output is no detections. Verified on the same A/B:
+
+| metric | offline | loopback pre-fix | loopback + guard |
+|---|---|---|---|
+| global occupancy | 0.293% | 0.314% | 0.292% |
+| **max frame occupancy** | 1.35% | 6.98% | **1.55%** |
+| occupancy-spectrum Pearson r | — | 0.992 | **0.996** |
+| dramatic spikes (6-10%) | 0 | 4/250 | **0** (6 suppressed to empty) |
+
+Guarded loopback is statistically indistinguishable from clean offline. Never fires offline (occ stays
+far below the floor); tune `invalid_frame_min_occupancy` up for denser scenes (dense composites).
+
+**Residual.** The guard clears the dramatic blobs but NOT subtle torn frames (thin-in-time /
+wide-in-frequency streaks at ~1.4% whole-frame occupancy, just under the floor) — visible as faint brief
+horizontal marks in the loopback raster (`results_guard/occupancy_raster.png`) but absent offline. An
+occupancy threshold can't separate them from legitimate dense frames; a frequency-SPAN discriminator
+(suppress frames whose detections span an anomalously wide band in few time rows) would catch them. Left
+as a follow-up. The deeper cure is reducing drops (lighten the pipeline / lower rate) since the cause is
+the saturation perf ceiling.
 
 ## Files
 - `compare_offline_vs_loopback.py` — the analysis (aggregate metrics + plots).
