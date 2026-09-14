@@ -270,6 +270,11 @@ finetuned_dino_detector:
   # loopback config since that trained on unflattened captures; at the off-distribution live rate the
   # edge artifact dominates, so flatten on.)
   flatten_noise_floor: true
+  # Per-frame adaptive normalization: anchor [0,1] to the per-frame noise floor so a narrow live scene
+  # fills the range like training and moderate signals are not compressed into noise (recovers them, cuts FP).
+  adaptive_normalization: true
+  adaptive_span_db: 34.0
+  adaptive_floor_frac: 0.12
 
 # --- Signal snipper -----------------------------------------------------------------------------
 # Clusters the detector mask into per-signal boxes and cuts the corresponding IQ out of the stream.

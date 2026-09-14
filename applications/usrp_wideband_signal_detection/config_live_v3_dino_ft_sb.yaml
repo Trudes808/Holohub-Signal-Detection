@@ -276,6 +276,11 @@ finetuned_dino_detector:
   # loopback config since that trained on unflattened captures; at the off-distribution live rate the
   # edge artifact dominates, so flatten on.)
   flatten_noise_floor: true
+  # Per-frame adaptive normalization: anchor [0,1] to the per-frame noise floor so a narrow live scene
+  # fills the range like training and moderate signals are not compressed into noise (recovers them, cuts FP).
+  adaptive_normalization: true
+  adaptive_span_db: 34.0
+  adaptive_floor_frac: 0.12
   # OTA-measured (detector_mask_sanity_ota): the anti-alias rolloff cliff at the outermost bins
   # survives the flatten and fires the model (17.5% of the outer 3% margins lit vs 0.32% in-band).
   # Zero the outer 3% of mask columns per side after inference. 0 disables (= base config).
