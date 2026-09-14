@@ -1,0 +1,52 @@
+[
+  {
+    "tag": "clean",
+    "snr": 99,
+    "frames": 35,
+    "regions": 320,
+    "pixel_recall": 0.0,
+    "pixel_precision": NaN,
+    "pixel_iou": 0.0,
+    "region_detrate": 0.0
+  },
+  {
+    "tag": "snr20",
+    "snr": 20,
+    "frames": 35,
+    "regions": 320,
+    "pixel_recall": 15.96277102507683,
+    "pixel_precision": NaN,
+    "pixel_iou": 15.294907749213655,
+    "region_detrate": 26.5625
+  },
+  {
+    "tag": "snr12",
+    "snr": 12,
+    "frames": 35,
+    "regions": 320,
+    "pixel_recall": 15.166139362728352,
+    "pixel_precision": NaN,
+    "pixel_iou": 14.393943422682906,
+    "region_detrate": 26.875
+  },
+  {
+    "tag": "snr6",
+    "snr": 6,
+    "frames": 35,
+    "regions": 320,
+    "pixel_recall": 12.936251349105445,
+    "pixel_precision": NaN,
+    "pixel_iou": 12.163067444706474,
+    "region_detrate": 22.1875
+  },
+  {
+    "tag": "snr0",
+    "snr": 0,
+    "frames": 35,
+    "regions": 320,
+    "pixel_recall": 9.121006571048778,
+    "pixel_precision": NaN,
+    "pixel_iou": 8.39231440345357,
+    "region_detrate": 12.5
+  }
+]
