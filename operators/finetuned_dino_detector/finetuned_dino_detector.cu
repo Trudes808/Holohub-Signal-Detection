@@ -312,6 +312,16 @@ void FinetunedDinoDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(flatten_signal_cap_db_, "flatten_signal_cap_db", "Flatten signal cap",
              "Cap a bin's influence on its own floor estimate at reference+this (dB) so strong "
              "signals don't inflate the floor; 0 disables the capped second pass.", 6.0);
+  spec.param(adaptive_normalization_, "adaptive_normalization", "Adaptive normalization",
+             "Flatten path only: anchor the [0,1] clip to the per-frame data-derived floor (flatten "
+             "reference) with adaptive_span_db instead of the fixed db_vmin/db_vmax window, so a narrow "
+             "live scene fills [0,1] like training and moderate signals aren't compressed into the noise. "
+             "false = validated fixed clip (default).", false);
+  spec.param(adaptive_span_db_, "adaptive_span_db", "Adaptive span dB",
+             "dB above the floor spread across [adaptive_floor_frac, 1] when adaptive_normalization is on. "
+             "Smaller = more contrast/recall but more noise FP.", 34.0);
+  spec.param(adaptive_floor_frac_, "adaptive_floor_frac", "Adaptive floor frac",
+             "Where the per-frame noise floor lands in [0,1] under adaptive normalization.", 0.12);
   spec.param(circular_edge_inference_, "circular_edge_inference", "Circular edge inference",
              "Downsample path: also run the model on a half-band circular rotation of the input "
              "(batched into the same forward) and take the mask's outer quarters from that pass, so "
@@ -554,9 +564,26 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
     ft_frontend_correction_kernel<<<spec_blocks, threads, 0, stream>>>(
         buf.db_device, rows, fft_size, buf.col_smooth_device, buf.frontend_reference_device,
         static_cast<float>(flatten_max_boost_db_.get()));
+    // Clip vmin/span: fixed calibrated window, OR per-frame adaptive anchored to the data-derived floor.
+    float clip_vmin = static_cast<float>(db_vmin_.get() + level_offset_db);  // gain already subtracted above
+    float clip_inv_span = inv_span;
+    if (adaptive_normalization_.get()) {
+      float ref_db = 0.0f;
+      throw_if_cuda_error(cudaMemcpyAsync(&ref_db, buf.frontend_reference_device, sizeof(float),
+                                          cudaMemcpyDeviceToHost, stream), "adaptive ref D2H");
+      throw_if_cuda_error(cudaStreamSynchronize(stream), "adaptive ref sync");
+      const double span = std::max(1.0, adaptive_span_db_.get());
+      clip_vmin = static_cast<float>(static_cast<double>(ref_db) - adaptive_floor_frac_.get() * span);
+      clip_inv_span = static_cast<float>(1.0 / span);
+      if (!adaptive_log_emitted_) {
+        std::fprintf(stderr, "[finetuned_dino_detector] adaptive normalization ON: per-frame floor=%.2f dB "
+                     "span=%.1f dB floor_frac=%.2f -> clip_vmin=%.2f\n", ref_db, span,
+                     adaptive_floor_frac_.get(), clip_vmin);
+        adaptive_log_emitted_ = true;
+      }
+    }
     ft_clip_normalize_kernel<<<spec_blocks, threads, 0, stream>>>(
-        buf.db_device, buf.normalized_device, spec_total,
-        static_cast<float>(db_vmin_.get() + level_offset_db), inv_span);  // gain already subtracted in power_to_db
+        buf.db_device, buf.normalized_device, spec_total, clip_vmin, clip_inv_span);
     throw_if_cuda_error(cudaGetLastError(), "flatten frontend kernels");
     if (!flatten_log_emitted_) {
       std::fprintf(stderr, "[finetuned_dino_detector] per-freq floor flatten ON (q=%.0f frac=%.4f "

@@ -105,6 +105,14 @@ class FinetunedDinoDetector : public holoscan::Operator {
   holoscan::Parameter<double>      flatten_smooth_frac_;     // gaussian sigma as a FRACTION of fft_size (bandwidth-invariant)
   holoscan::Parameter<double>      flatten_max_boost_db_;    // max additive lift per bin (dB; hardware-scale, scale-free)
   holoscan::Parameter<double>      flatten_signal_cap_db_;   // cap signal influence on the floor estimate (dB; 0=off)
+  // Per-frame adaptive normalization: instead of the fixed db_vmin/db_vmax clip (a 68 dB window calibrated
+  // on the 0-60 dB training sweep, which crushes a ~25 dB live scene into the middle of [0,1] and hides
+  // moderate signals), anchor the [0,1] mapping to the per-frame data-derived floor (the flatten
+  // reference) with a fixed span, so the scene fills [0,1] like training regardless of gain/rate. Only
+  // active in the flatten path (deployment uses flatten). Default OFF (keeps the validated fixed clip).
+  holoscan::Parameter<bool>        adaptive_normalization_;  // on = anchor to per-frame floor + adaptive_span_db
+  holoscan::Parameter<double>      adaptive_span_db_;        // dB above the floor spread across [floor_frac, 1]
+  holoscan::Parameter<double>      adaptive_floor_frac_;     // where the noise floor lands in [0,1]
   holoscan::Parameter<bool>        circular_edge_inference_; // downsample path: dual-pass circular-rotation stitch (border-bias fix)
   holoscan::Parameter<double>      ignore_sideband_percent_; // zero mask cols on EACH band edge (% of width; 0=off; wins over hz)
   holoscan::Parameter<double>      ignore_sideband_hz_;      // alternative per-side span in Hz (used when percent==0)
@@ -128,6 +136,7 @@ class FinetunedDinoDetector : public holoscan::Operator {
   bool startup_log_emitted_ = false;
   bool flatten_log_emitted_ = false;
   bool level_log_emitted_ = false;
+  bool adaptive_log_emitted_ = false;
   double inference_ms_ewma_ = 0.0;   // rolling mean of downsample inference time (ms)
   uint64_t inference_samples_ = 0;
   std::vector<uint64_t> frame_count_;

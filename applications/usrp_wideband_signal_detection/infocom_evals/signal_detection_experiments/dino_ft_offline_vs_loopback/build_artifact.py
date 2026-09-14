@@ -247,6 +247,21 @@ HTML = r"""<title>DINO-FT Ingest A/B</title>
     native 240 kHz/bin, level/flatten tuning, or a domain-match fine-tune.</figcaption>
   </figure>
 
+  <h2><span class="n">09</span>The real cause: the model input is contrast-compressed</h2>
+  <p>What the <em>display</em> shows (a −20…+15 dB window) is not what the model receives. The model
+  normalizes with a <b>fixed 68 dB clip</b> (<code>db_vmin −47.65 … db_vmax +20.46</code>) calibrated on the
+  training captures (which swept 0–60 dB attenuation). This live scene only spans ~25 dB, so it lands in the
+  middle third of <code>[0,1]</code>: noise ≈0.32, moderate signals ≈0.40–0.45, strongest peak only 0.69.</p>
+  <figure>
+    <img alt="model input as-is vs contrast-stretched" src="__MODELINPUT__">
+    <figcaption><b>Top — the model input as-is</b> (<code>[0,1]</code>): a flat blue wash; only the one strong
+    signal (red mask) stands out. <b>Bottom — the same data contrast-stretched</b>: it's full of real
+    yellow/green narrowband signals the model input <b>contains but did not mask</b>. The signals aren't faint
+    in the data — they're faint <em>to the model</em>, because the fixed clip crushes the scene's dynamic range.
+    So the miss is a <b>normalization</b> problem, not the threshold and not truly-weak signals. Fix direction:
+    re-level / per-frame-adaptive normalization so the scene fills <code>[0,1]</code> the way training did.</figcaption>
+  </figure>
+
   <div class="foot">
     capture x410_ota_2g4_gain10_20260908 · 491.52 MSps · 2.4 GHz · 1 s OTA (ci16)<br>
     offline __OFFN__ frames · loopback __LBN__ frames · masks 512×20480 · emit_stride 4 · threshold 0.95<br>
@@ -281,6 +296,8 @@ repl = {
                      base64.b64encode((RESG / "rt_mask_overlays.png").read_bytes()).decode(),
     "__THRCOMPARE__": "data:image/png;base64," +
                       base64.b64encode((RESG / "threshold_compare.png").read_bytes()).decode(),
+    "__MODELINPUT__": "data:image/png;base64," +
+                      base64.b64encode((RESG / "missed_signals_zoom540.png").read_bytes()).decode(),
 }
 for k, v in repl.items():
     HTML = HTML.replace(k, v)
