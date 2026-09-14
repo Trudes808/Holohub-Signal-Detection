@@ -29,8 +29,10 @@ SENDER_IFACE="${SENDER_IFACE:-enp1s0f1np1}"
 DEMO_DISPLAY="${DEMO_DISPLAY:-${DISPLAY:-:1}}"
 # The composites are 245.76 MSps -- which is ALSO the DINO-FT (M2_dr) trained
 # rate, so DINO-FT runs at its native trained geometry here (looks its best).
-RATE_HZ=245760000
-CENTER_HZ=2400000000
+# RATE_HZ is env-overridable so the offline-vs-loopback A/B can push a 491.52 MSps
+# capture at the LIVE radio rate (set RATE_HZ=491520000 PPS=480000 with a 491.52 pcap).
+RATE_HZ="${RATE_HZ:-245760000}"
+CENTER_HZ="${CENTER_HZ:-2400000000}"
 PPS="${PPS:-240000}"
 COMPOSITES="/home/genesys-dgx1/Documents/holoscan_waveform_generation/composition/composites"
 PCAP="${PCAP:-snr_clean_burst.pcap}"

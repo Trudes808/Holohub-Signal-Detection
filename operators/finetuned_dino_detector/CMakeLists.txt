@@ -67,8 +67,10 @@ endif()
 add_library(finetuned_dino_detector
   finetuned_dino_detector.cu
   finetuned_dino_torch_helpers.cpp
+  finetuned_dino_mask_dump.cpp
   finetuned_dino_detector.hpp
   finetuned_dino_torch_helpers.hpp
+  finetuned_dino_mask_dump.hpp
 )
 add_library(holoscan::ops::finetuned_dino_detector ALIAS finetuned_dino_detector)
 target_include_directories(finetuned_dino_detector INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})

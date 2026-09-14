@@ -13,6 +13,7 @@
 //   img  = clamp((db - db_vmin) / (db_vmax - db_vmin), 0, 1)
 #include "finetuned_dino_detector.hpp"
 #include "finetuned_dino_torch_helpers.hpp"
+#include "finetuned_dino_mask_dump.hpp"
 #include "../../applications/usrp_wideband_signal_detection/spectrogram_visualization.hpp"
 
 #include <cuda_runtime.h>
@@ -319,6 +320,12 @@ void FinetunedDinoDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(ignore_sideband_hz_, "ignore_sideband_hz", "Ignore sideband Hz",
              "Alternative per-side trim as a frequency span (Hz), converted with the live rate. Used "
              "only when ignore_sideband_percent == 0. 0 = off.", 0.0);
+  spec.param(debug_mask_dump_dir_, "debug_mask_dump_dir", "Debug mask dump dir",
+             "VALIDATION ONLY: write each emitted mask as a .npy (+ manifest CSV) to this dir on a "
+             "background thread, for the offline-vs-loopback A/B. \"\" = off (default; zero hot-path "
+             "cost).", std::string(""));
+  spec.param(debug_mask_dump_max_frames_, "debug_mask_dump_max_frames", "Debug mask dump max frames",
+             "Total masks to write before the dump goes quiet. 0 = unlimited.", 0);
 }
 
 void FinetunedDinoDetector::initialize() {
@@ -337,9 +344,17 @@ void FinetunedDinoDetector::initialize() {
     // copy -- prime the larger batch so the first live frame doesn't autotune.
     runtime_->warmup(tile_rows_.get(), nfft_.get(), 4);
   }
+
+  // Validation mask dump (inert unless a dir is configured). make_shared here (complete type) so
+  // the deleter is type-erased for the header-only forward declaration in the app TUs.
+  mask_dump_ = std::make_shared<MaskDumpWriter>();
+  mask_dump_->configure(debug_mask_dump_dir_.get(), debug_mask_dump_max_frames_.get());
 }
 
-void FinetunedDinoDetector::stop() { release_channel_buffers(); }
+void FinetunedDinoDetector::stop() {
+  if (mask_dump_) mask_dump_->flush_and_stop();
+  release_channel_buffers();
+}
 
 void FinetunedDinoDetector::release_channel_buffers() {
   for (auto& b : channel_buffers_) {
@@ -635,6 +650,19 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
                           "sideband memset right");
       throw_if_cuda_error(cudaStreamSynchronize(stream), "sideband sync");
     }
+  }
+
+  // VALIDATION ONLY: copy the finalized device mask to host and hand it to the background writer,
+  // so a real-time loopback run can be diffed against the deterministic offline eval. The D2H +
+  // sync run only when the dump is configured and under budget -- zero cost on the normal path.
+  if (mask_dump_ && mask_dump_->wants_more()) {
+    const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(mask_width);
+    if (dump_host_buf_.size() < n) dump_host_buf_.resize(n);
+    throw_if_cuda_error(cudaMemcpyAsync(dump_host_buf_.data(), emit_mask, n * sizeof(uint8_t),
+                                        cudaMemcpyDeviceToHost, stream), "mask dump D2H");
+    throw_if_cuda_error(cudaStreamSynchronize(stream), "mask dump sync");
+    mask_dump_->submit(static_cast<int>(channel_number), frame_number, rows, mask_width,
+                       dump_host_buf_.data());
   }
 
   holoscan::ops::DetectorMaskMessage mask_msg;

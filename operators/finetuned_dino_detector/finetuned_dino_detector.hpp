@@ -18,6 +18,9 @@ namespace holoscan::ops {
 // headers never reach nvcc -- same split cuda_dino_detector uses).
 class FinetunedDinoTorchRuntime;
 
+// Off-data-path per-frame mask dumper (validation only; defined in finetuned_dino_mask_dump.cpp).
+class MaskDumpWriter;
+
 // Native detector operator for the fine-tuned DINOv3 segmenter (DinoSegmenter): backbone + trained
 // SegHead. Emits holoscan::ops::DetectorMaskMessage on "mask_out" so signal_snipper can snip it.
 //
@@ -106,6 +109,11 @@ class FinetunedDinoDetector : public holoscan::Operator {
   holoscan::Parameter<double>      ignore_sideband_percent_; // zero mask cols on EACH band edge (% of width; 0=off; wins over hz)
   holoscan::Parameter<double>      ignore_sideband_hz_;      // alternative per-side span in Hz (used when percent==0)
 
+  // VALIDATION ONLY: dump each emitted mask to disk on a background thread (offline-vs-loopback
+  // A/B). Empty dir = disabled (default) = zero hot-path cost. See finetuned_dino_mask_dump.hpp.
+  holoscan::Parameter<std::string> debug_mask_dump_dir_;         // container path; "" = off
+  holoscan::Parameter<int>         debug_mask_dump_max_frames_;  // total frames to write; 0 = unlimited
+
   uint64_t compute_count_ = 0;
   bool startup_log_emitted_ = false;
   bool flatten_log_emitted_ = false;
@@ -115,6 +123,13 @@ class FinetunedDinoDetector : public holoscan::Operator {
   std::vector<uint64_t> frame_count_;
   std::vector<ChannelBuffers> channel_buffers_;
   std::shared_ptr<FinetunedDinoTorchRuntime> runtime_;
+
+  // Validation mask dump (inert unless debug_mask_dump_dir_ is set); host staging buffer for the D2H.
+  // shared_ptr (not unique_ptr) so the forward-declared type stays incomplete in main.cpp /
+  // run_offline_cuda_detector_eval.cpp, which instantiate the operator's inline constructor -- same
+  // reason runtime_ above is a shared_ptr (the deleter is type-erased at make_shared in the .cu).
+  std::shared_ptr<MaskDumpWriter> mask_dump_;
+  std::vector<uint8_t> dump_host_buf_;
 
   void release_channel_buffers();
 };
