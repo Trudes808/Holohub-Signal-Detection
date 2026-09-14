@@ -83,9 +83,19 @@ robust-norm) at the 491.52 geometry, across dense+sparse scenes and varied per-s
    491.52 training is fine for a fixed-rate deployment.
 
 ## Roadmap (start here after compaction)
-1. **Robust normalization** in `finetuned_dino_detector` (part A above) + offline-validate it no longer
-   collapses on clean/dense/0dB (reuse `dino_ft_snr_benchmark/`). Config knobs already exist:
-   `adaptive_normalization/adaptive_span_db/adaptive_floor_frac` — add a robust floor + fallback.
+1. **[DONE 2026-09-14] Robust normalization** in `finetuned_dino_detector` — implemented + offline-validated.
+   New knobs: `adaptive_robust_floor` (default true), `adaptive_low_pct` (20), `adaptive_high_pct` (95),
+   `adaptive_min_range_db` (8), `adaptive_floor_below_calib_db` (25). Path: histogram the flattened dB
+   image (2 new kernels `ft_db_histogram_kernel`/`ft_hist_percentiles_kernel`), take the p20 floor, anchor
+   the fixed span to it; fall back to the fixed calibrated clip when (p95-p20) < min_range (dense/mostly-
+   signal) or the floor is > floor_below_calib below the fixed vmin (noiseless). Validation:
+   `infocom_evals/signal_detection_experiments/dino_ft_robust_norm/` (gen_configs.py + run_validation.sh +
+   analyze.py + README + results/). FINDING: robust never collapses (no scene >50% sat or >90% dead; std
+   0.14-0.35 everywhere), FIXES adaptive's clean/dense over-saturation (7% vs 45% sat). Residual: at
+   snr0 robust keeps signals clearly visible (higher std than fixed) but the CURRENT fixed-clip-trained
+   checkpoint doesn't fire on robust's brightness -> a model-DISTRIBUTION mismatch, exactly what step 2
+   (train ON robust norm) fixes. SAFETY: the 5 shipped demo configs are pinned `adaptive_robust_floor:
+   false` (legacy q-blend) until a checkpoint fine-tuned on robust norm exists; flip to true with it.
 2. **491.52 data+GT pipeline**: edit geometry FS; generate DENSE + SPARSE composites, per-signal SNR
    sweep (near/far), GT via annotations; run through the deployment front-end (+ robust norm) -> training
    tiles + a held-out clean benchmark (replaces the confounded dense-only one).

@@ -178,6 +178,60 @@ __global__ void ft_clip_normalize_kernel(const float* __restrict__ db, float* __
   out[idx] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
+// Fixed-bin dB histogram config for the robust-floor percentile estimate (covers any realistic
+// gain-corrected dB range at 0.5 dB resolution; out-of-range pixels clamp to the end bins).
+constexpr int   ft_hist_bins   = 320;
+constexpr float ft_hist_min_db = -110.0f;
+constexpr float ft_hist_max_db = 50.0f;
+
+// Histogram of the (flattened, gain-corrected) dB image. Per-block shared histogram merged to a global
+// one to bound global-atomic contention. Grid-stride over all pixels; launch shared = nbins * 4 bytes.
+__global__ void ft_db_histogram_kernel(const float* __restrict__ db, long total, int nbins,
+                                       float hist_min, float inv_bin_w, unsigned int* __restrict__ hist) {
+  extern __shared__ unsigned int sh[];
+  for (int i = threadIdx.x; i < nbins; i += blockDim.x) sh[i] = 0u;
+  __syncthreads();
+  const long stride = (long)blockDim.x * gridDim.x;
+  for (long idx = blockIdx.x * (long)blockDim.x + threadIdx.x; idx < total; idx += stride) {
+    int b = (int)((db[idx] - hist_min) * inv_bin_w);
+    b = b < 0 ? 0 : (b >= nbins ? nbins - 1 : b);
+    atomicAdd(&sh[b], 1u);
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < nbins; i += blockDim.x)
+    if (sh[i]) atomicAdd(&hist[i], sh[i]);
+}
+
+// From the histogram CDF, the dB values at low_pct and high_pct (linear interpolation within the bin).
+// stats[0] = floor (low pct), stats[1] = high pct. Single thread (nbins is small, one serial scan).
+__global__ void ft_hist_percentiles_kernel(const unsigned int* __restrict__ hist, int nbins,
+                                           float hist_min, float bin_w, float low_pct, float high_pct,
+                                           float* __restrict__ stats) {
+  if (threadIdx.x != 0) return;
+  long total = 0;
+  for (int i = 0; i < nbins; ++i) total += hist[i];
+  if (total <= 0) { stats[0] = hist_min; stats[1] = hist_min; return; }
+  const double lo_target = 0.01 * (double)low_pct * (double)total;
+  const double hi_target = 0.01 * (double)high_pct * (double)total;
+  long cum = 0;
+  float lo_db = hist_min, hi_db = hist_min + nbins * bin_w;
+  bool lo_done = false, hi_done = false;
+  for (int i = 0; i < nbins; ++i) {
+    const long c = hist[i];
+    if (!lo_done && (double)(cum + c) >= lo_target) {
+      const double frac = (lo_target - (double)cum) / fmax((double)c, 1.0);
+      lo_db = hist_min + ((float)i + (float)frac) * bin_w; lo_done = true;
+    }
+    if (!hi_done && (double)(cum + c) >= hi_target) {
+      const double frac = (hi_target - (double)cum) / fmax((double)c, 1.0);
+      hi_db = hist_min + ((float)i + (float)frac) * bin_w; hi_done = true;
+    }
+    cum += c;
+    if (lo_done && hi_done) break;
+  }
+  stats[0] = lo_db; stats[1] = hi_db;
+}
+
 // sigmoid(logit) >= threshold -> uint8 {0,1}
 __global__ void sigmoid_threshold_kernel(const float* __restrict__ logits,
                                          uint8_t* __restrict__ mask,
@@ -197,6 +251,8 @@ void FinetunedDinoDetector::ChannelBuffers::release() {
   cudaFree(col_stat_device);
   cudaFree(col_smooth_device);
   cudaFree(frontend_reference_device);
+  cudaFree(db_hist_device);
+  cudaFree(robust_stats_device);
   cudaFree(tile_batch_device);
   cudaFree(logits_device);
   cudaFree(tile_mask_device);
@@ -207,6 +263,8 @@ void FinetunedDinoDetector::ChannelBuffers::release() {
   col_stat_device = nullptr;
   col_smooth_device = nullptr;
   frontend_reference_device = nullptr;
+  db_hist_device = nullptr;
+  robust_stats_device = nullptr;
   tile_batch_device = nullptr;
   logits_device = nullptr;
   tile_mask_device = nullptr;
@@ -228,6 +286,8 @@ void FinetunedDinoDetector::ChannelBuffers::ensure(size_t new_rows, size_t new_n
   cudaFree(col_stat_device);
   cudaFree(col_smooth_device);
   cudaFree(frontend_reference_device);
+  cudaFree(db_hist_device);
+  cudaFree(robust_stats_device);
   cudaFree(tile_batch_device);
   cudaFree(logits_device);
   cudaFree(tile_mask_device);
@@ -244,6 +304,8 @@ void FinetunedDinoDetector::ChannelBuffers::ensure(size_t new_rows, size_t new_n
   throw_if_cuda_error(cudaMalloc(&col_stat_device, new_nfft * sizeof(float)), "malloc col_stat");
   throw_if_cuda_error(cudaMalloc(&col_smooth_device, new_nfft * sizeof(float)), "malloc col_smooth");
   throw_if_cuda_error(cudaMalloc(&frontend_reference_device, sizeof(float)), "malloc frontend_reference");
+  throw_if_cuda_error(cudaMalloc(&db_hist_device, ft_hist_bins * sizeof(unsigned int)), "malloc db_hist");
+  throw_if_cuda_error(cudaMalloc(&robust_stats_device, 2 * sizeof(float)), "malloc robust_stats");
   throw_if_cuda_error(cudaMalloc(&tile_batch_device, tile_elems * sizeof(float)), "malloc tiles");
   throw_if_cuda_error(cudaMalloc(&logits_device, tile_elems * sizeof(float)), "malloc logits");
   throw_if_cuda_error(cudaMalloc(&tile_mask_device, tile_elems * sizeof(uint8_t)), "malloc tile_mask");
@@ -322,6 +384,21 @@ void FinetunedDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "Smaller = more contrast/recall but more noise FP.", 34.0);
   spec.param(adaptive_floor_frac_, "adaptive_floor_frac", "Adaptive floor frac",
              "Where the per-frame noise floor lands in [0,1] under adaptive normalization.", 0.12);
+  spec.param(adaptive_robust_floor_, "adaptive_robust_floor", "Adaptive robust floor",
+             "Adaptive path: estimate the floor as a LOW percentile of the whole dB image (robust to "
+             "occupancy) instead of the q-blend flatten reference, and fall back to the fixed calibrated "
+             "clip when the frame has no usable dynamic range (dense/mostly-signal) or an implausibly low "
+             "floor (noiseless). This is the density/distance-robust path. true = default.", true);
+  spec.param(adaptive_low_pct_, "adaptive_low_pct", "Adaptive low percentile",
+             "Noise-floor percentile of the dB image (0-100) for the robust floor.", 20.0);
+  spec.param(adaptive_high_pct_, "adaptive_high_pct", "Adaptive high percentile",
+             "High percentile of the dB image (0-100); (high-low) gauges the frame's dynamic range.", 95.0);
+  spec.param(adaptive_min_range_db_, "adaptive_min_range_db", "Adaptive min range dB",
+             "Fall back to the fixed clip when (high_pct - low_pct) < this (dB): the frame is "
+             "mostly-signal/flat with no usable floor-to-signal spread.", 8.0);
+  spec.param(adaptive_floor_below_calib_db_, "adaptive_floor_below_calib_db", "Adaptive floor-below-calib dB",
+             "Fall back to the fixed clip when the robust floor is more than this many dB BELOW the fixed "
+             "calibrated vmin: an implausibly low floor (noiseless/degenerate frame).", 25.0);
   spec.param(circular_edge_inference_, "circular_edge_inference", "Circular edge inference",
              "Downsample path: also run the model on a half-band circular rotation of the input "
              "(batched into the same forward) and take the mask's outer quarters from that pass, so "
@@ -568,18 +645,59 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
     float clip_vmin = static_cast<float>(db_vmin_.get() + level_offset_db);  // gain already subtracted above
     float clip_inv_span = inv_span;
     if (adaptive_normalization_.get()) {
-      float ref_db = 0.0f;
-      throw_if_cuda_error(cudaMemcpyAsync(&ref_db, buf.frontend_reference_device, sizeof(float),
-                                          cudaMemcpyDeviceToHost, stream), "adaptive ref D2H");
-      throw_if_cuda_error(cudaStreamSynchronize(stream), "adaptive ref sync");
       const double span = std::max(1.0, adaptive_span_db_.get());
-      clip_vmin = static_cast<float>(static_cast<double>(ref_db) - adaptive_floor_frac_.get() * span);
-      clip_inv_span = static_cast<float>(1.0 / span);
-      if (!adaptive_log_emitted_) {
-        std::fprintf(stderr, "[finetuned_dino_detector] adaptive normalization ON: per-frame floor=%.2f dB "
-                     "span=%.1f dB floor_frac=%.2f -> clip_vmin=%.2f\n", ref_db, span,
-                     adaptive_floor_frac_.get(), clip_vmin);
-        adaptive_log_emitted_ = true;
+      const float fixed_vmin = clip_vmin;  // the calibrated fallback (already set above)
+      if (adaptive_robust_floor_.get()) {
+        // Robust floor: a LOW percentile of the whole (flattened) dB image survives any occupancy, and a
+        // small floor-to-signal spread OR an implausibly low floor triggers a fallback to the fixed clip
+        // (dense/mostly-signal or noiseless frames, where a per-frame anchor collapses). See
+        // notes/dino_ft_finetune_plan.md (robustness across field distance/density).
+        constexpr int kBins = ft_hist_bins;
+        const float bin_w = (ft_hist_max_db - ft_hist_min_db) / static_cast<float>(kBins);
+        throw_if_cuda_error(cudaMemsetAsync(buf.db_hist_device, 0, kBins * sizeof(unsigned int), stream),
+                            "robust hist memset");
+        const int hist_blocks = std::min(spec_blocks, 512);
+        ft_db_histogram_kernel<<<hist_blocks, threads, kBins * sizeof(unsigned int), stream>>>(
+            buf.db_device, spec_total, kBins, ft_hist_min_db, 1.0f / bin_w, buf.db_hist_device);
+        ft_hist_percentiles_kernel<<<1, 32, 0, stream>>>(
+            buf.db_hist_device, kBins, ft_hist_min_db, bin_w,
+            static_cast<float>(adaptive_low_pct_.get()), static_cast<float>(adaptive_high_pct_.get()),
+            buf.robust_stats_device);
+        throw_if_cuda_error(cudaGetLastError(), "robust hist kernels");
+        float stats[2] = {0.0f, 0.0f};
+        throw_if_cuda_error(cudaMemcpyAsync(stats, buf.robust_stats_device, 2 * sizeof(float),
+                                            cudaMemcpyDeviceToHost, stream), "robust stats D2H");
+        throw_if_cuda_error(cudaStreamSynchronize(stream), "robust stats sync");
+        const float floor_db = stats[0];
+        const float drange = stats[1] - stats[0];
+        const bool too_flat = drange < static_cast<float>(adaptive_min_range_db_.get());
+        const bool floor_implausible =
+            floor_db < fixed_vmin - static_cast<float>(adaptive_floor_below_calib_db_.get());
+        const bool use_robust = !too_flat && !floor_implausible;
+        if (use_robust) {
+          clip_vmin = static_cast<float>(static_cast<double>(floor_db) - adaptive_floor_frac_.get() * span);
+          clip_inv_span = static_cast<float>(1.0 / span);
+        }  // else keep the fixed calibrated clip_vmin/clip_inv_span
+        if (!robust_log_emitted_) {
+          std::fprintf(stderr, "[finetuned_dino_detector] robust normalization ON: floor(p%.0f)=%.2f dB "
+                       "high(p%.0f)=%.2f dB range=%.2f dB -> %s (fixed_vmin=%.2f, clip_vmin=%.2f, span=%.1f)\n",
+                       adaptive_low_pct_.get(), floor_db, adaptive_high_pct_.get(), stats[1], drange,
+                       use_robust ? "ROBUST" : "FALLBACK-FIXED", fixed_vmin, clip_vmin, span);
+          robust_log_emitted_ = true;
+        }
+      } else {
+        float ref_db = 0.0f;
+        throw_if_cuda_error(cudaMemcpyAsync(&ref_db, buf.frontend_reference_device, sizeof(float),
+                                            cudaMemcpyDeviceToHost, stream), "adaptive ref D2H");
+        throw_if_cuda_error(cudaStreamSynchronize(stream), "adaptive ref sync");
+        clip_vmin = static_cast<float>(static_cast<double>(ref_db) - adaptive_floor_frac_.get() * span);
+        clip_inv_span = static_cast<float>(1.0 / span);
+        if (!adaptive_log_emitted_) {
+          std::fprintf(stderr, "[finetuned_dino_detector] adaptive normalization ON: per-frame floor=%.2f dB "
+                       "span=%.1f dB floor_frac=%.2f -> clip_vmin=%.2f\n", ref_db, span,
+                       adaptive_floor_frac_.get(), clip_vmin);
+          adaptive_log_emitted_ = true;
+        }
       }
     }
     ft_clip_normalize_kernel<<<spec_blocks, threads, 0, stream>>>(

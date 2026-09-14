@@ -57,6 +57,8 @@ class FinetunedDinoDetector : public holoscan::Operator {
     float*   col_stat_device    = nullptr;   // nfft  per-frequency floor estimate (dB)
     float*   col_smooth_device  = nullptr;   // nfft  smoothed per-frequency floor (dB)
     float*   frontend_reference_device = nullptr;  // scalar reference floor level (dB)
+    unsigned int* db_hist_device = nullptr;  // fixed-bin histogram of the dB image (robust normalization)
+    float*   robust_stats_device = nullptr;  // [low_pct_db, high_pct_db] from the histogram CDF
     float*   tile_batch_device  = nullptr;   // B x 1 x tile_rows x nfft (model input)
     float*   logits_device      = nullptr;   // B x 1 x tile_rows x nfft (model output)
     uint8_t* tile_mask_device   = nullptr;   // B x tile_rows x nfft (thresholded)
@@ -113,6 +115,16 @@ class FinetunedDinoDetector : public holoscan::Operator {
   holoscan::Parameter<bool>        adaptive_normalization_;  // on = anchor to per-frame floor + adaptive_span_db
   holoscan::Parameter<double>      adaptive_span_db_;        // dB above the floor spread across [floor_frac, 1]
   holoscan::Parameter<double>      adaptive_floor_frac_;     // where the noise floor lands in [0,1]
+  // Robust floor estimator for adaptive normalization: instead of anchoring to the q-blend flatten
+  // reference (which is biased toward signal and collapses on mostly-signal or noiseless frames), take a
+  // LOW percentile of the whole dB image as the floor and FALL BACK to the fixed calibrated clip when
+  // the frame has no usable dynamic-range spread (dense/mostly-signal) or an implausibly low floor
+  // (noiseless). This is the density/distance-robust path (see notes/dino_ft_finetune_plan.md).
+  holoscan::Parameter<bool>        adaptive_robust_floor_;   // on = histogram low-percentile floor + fallback
+  holoscan::Parameter<double>      adaptive_low_pct_;        // floor percentile of the dB image (0-100)
+  holoscan::Parameter<double>      adaptive_high_pct_;       // high percentile (for the dynamic-range gauge)
+  holoscan::Parameter<double>      adaptive_min_range_db_;   // fall back to fixed if (high-low) < this (dB)
+  holoscan::Parameter<double>      adaptive_floor_below_calib_db_;  // fall back if floor < fixed_vmin - this
   holoscan::Parameter<bool>        circular_edge_inference_; // downsample path: dual-pass circular-rotation stitch (border-bias fix)
   holoscan::Parameter<double>      ignore_sideband_percent_; // zero mask cols on EACH band edge (% of width; 0=off; wins over hz)
   holoscan::Parameter<double>      ignore_sideband_hz_;      // alternative per-side span in Hz (used when percent==0)
@@ -137,6 +149,7 @@ class FinetunedDinoDetector : public holoscan::Operator {
   bool flatten_log_emitted_ = false;
   bool level_log_emitted_ = false;
   bool adaptive_log_emitted_ = false;
+  bool robust_log_emitted_ = false;
   double inference_ms_ewma_ = 0.0;   // rolling mean of downsample inference time (ms)
   uint64_t inference_samples_ = 0;
   std::vector<uint64_t> frame_count_;

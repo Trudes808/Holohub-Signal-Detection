@@ -275,11 +275,15 @@ finetuned_dino_detector:
   adaptive_normalization: true
   adaptive_span_db: 34.0
   adaptive_floor_frac: 0.12
-  # Pinned to the legacy q-blend floor for the CURRENT (fixed-clip-trained) checkpoint: the robust
-  # low-percentile floor changes the input brightness distribution, and the shipped model under-detects
-  # at low SNR under it (offline validation: dino_ft_robust_norm/). Flip to true only with a checkpoint
-  # fine-tuned ON robust normalization (see notes/dino_ft_finetune_plan.md, roadmap step 2+).
   adaptive_robust_floor: false
+  adaptive_low_pct: 20.0
+  adaptive_high_pct: 95.0
+  adaptive_min_range_db: 8.0
+  adaptive_floor_below_calib_db: 25.0
+  # --- robust-normalization validation: dump the [0,1] model input + mask for a few frames ---
+  debug_mask_dump_dir: "/workspace/spectrograms/robust_val/adapt"
+  debug_mask_dump_max_frames: 16
+  debug_spectrogram_dump: true
 
 # --- Signal snipper -----------------------------------------------------------------------------
 # Clusters the detector mask into per-signal boxes and cuts the corresponding IQ out of the stream.
