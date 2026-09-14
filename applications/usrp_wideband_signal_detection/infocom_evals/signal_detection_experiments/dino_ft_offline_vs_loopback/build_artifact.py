@@ -218,6 +218,19 @@ HTML = r"""<title>DINO-FT Ingest A/B</title>
     frames; a frequency-span discriminator or a lower rate would clear them.</figcaption>
   </figure>
 
+  <h2><span class="n">07</span>Real-time masks on the actual spectrogram</h2>
+  <p>The clinching view: the <b>real-time (loopback) DINO-FT mask</b> overlaid on the <b>exact input
+  spectrogram the model saw</b> that frame (the operator dumps its normalized input alongside the mask;
+  captured guard-OFF so a corrupted frame is shown intact). Red = detection.</p>
+  <figure>
+    <img alt="RT DINO-FT masks overlaid on the spectrogram" src="__RTOVERLAY__">
+    <figcaption>Top two frames (9.0%, 7.0%): a large red blob sits over a <b>pure-noise</b> region &mdash; the
+    real signals are near bin ~1150 &mdash; a textbook drop-corrupted frame; the <b>invalid-frame guard
+    suppresses these</b>. Middle-lower frames: masks land tightly on the <b>real</b> signals (clean, kept).
+    Frame 276 (2.63%) is an honest borderline &mdash; a partial spurious blob just under the 3% floor that
+    still survives, i.e. the documented residual a frequency-span discriminator would catch.</figcaption>
+  </figure>
+
   <div class="foot">
     capture x410_ota_2g4_gain10_20260908 · 491.52 MSps · 2.4 GHz · 1 s OTA (ci16)<br>
     offline __OFFN__ frames · loopback __LBN__ frames · masks 512×20480 · emit_stride 4 · threshold 0.95<br>
@@ -248,6 +261,8 @@ repl = {
     "__GG__": pct(lbg["global_occ_pct"]),
     "__GRASTER__": "data:image/png;base64," +
                    base64.b64encode((RESG / "occupancy_raster.png").read_bytes()).decode(),
+    "__RTOVERLAY__": "data:image/png;base64," +
+                     base64.b64encode((RESG / "rt_mask_overlays.png").read_bytes()).decode(),
 }
 for k, v in repl.items():
     HTML = HTML.replace(k, v)

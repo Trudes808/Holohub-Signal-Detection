@@ -248,6 +248,9 @@ finetuned_dino_detector:
   # thread. Host path: /tmp/usrp_spectrograms/loopback_eval/dino_ft_rt/mask_arrays/.
   debug_mask_dump_dir: "/workspace/spectrograms/loopback_eval/dino_ft_rt/mask_arrays"
   debug_mask_dump_max_frames: 250
+  # invalid_frame_guard defaults ON (this is the guard-on A/B that matches results_guard/summary.json).
+  # To regenerate the RT mask-on-spectrogram overlay panel (render_rt_overlays.py), flip these two and
+  # set max_frames ~150:  debug_spectrogram_dump: true   +   invalid_frame_guard: false
 
 # --- Signal snipper -----------------------------------------------------------------------------
 signal_snipper:

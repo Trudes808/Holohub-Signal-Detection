@@ -113,6 +113,7 @@ class FinetunedDinoDetector : public holoscan::Operator {
   // A/B). Empty dir = disabled (default) = zero hot-path cost. See finetuned_dino_mask_dump.hpp.
   holoscan::Parameter<std::string> debug_mask_dump_dir_;         // container path; "" = off
   holoscan::Parameter<int>         debug_mask_dump_max_frames_;  // total frames to write; 0 = unlimited
+  holoscan::Parameter<bool>        debug_spectrogram_dump_;      // also dump the RT input spectrogram per frame
 
   // Invalid-frame guard: suppress (emit an empty mask for) a frame whose occupancy is a gross outlier
   // vs an adaptive per-channel baseline. Drop-corrupted frames under real-time ingest saturation
@@ -141,6 +142,7 @@ class FinetunedDinoDetector : public holoscan::Operator {
   // reason runtime_ above is a shared_ptr (the deleter is type-erased at make_shared in the .cu).
   std::shared_ptr<MaskDumpWriter> mask_dump_;
   std::vector<uint8_t> dump_host_buf_;
+  std::vector<float>   dump_spec_host_buf_;   // host staging for the optional RT-spectrogram dump
 
   void release_channel_buffers();
 };

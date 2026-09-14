@@ -47,6 +47,29 @@ void write_npy_u8(const std::string& path, const uint8_t* data, size_t rows, siz
   f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(rows * cols));
 }
 
+// Same, for a 2-D float32 array (dtype '<f4') -- the RT input spectrogram, for mask-on-spectrogram overlays.
+void write_npy_f32(const std::string& path, const float* data, size_t rows, size_t cols) {
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    std::fprintf(stderr, "[mask_dump] failed to open %s for write\n", path.c_str());
+    return;
+  }
+  std::string hdr = "{'descr': '<f4', 'fortran_order': False, 'shape': (" +
+                    std::to_string(rows) + ", " + std::to_string(cols) + "), }";
+  const size_t total = 10 + hdr.size() + 1;
+  const size_t pad = (64 - (total % 64)) % 64;
+  hdr.append(pad, ' ');
+  hdr.push_back('\n');
+  const uint16_t hlen = static_cast<uint16_t>(hdr.size());
+  const char magic[6] = {'\x93', 'N', 'U', 'M', 'P', 'Y'};
+  const char ver[2] = {1, 0};
+  f.write(magic, 6);
+  f.write(ver, 2);
+  f.write(reinterpret_cast<const char*>(&hlen), sizeof(hlen));
+  f.write(hdr.data(), static_cast<std::streamsize>(hdr.size()));
+  f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(rows * cols * sizeof(float)));
+}
+
 }  // namespace
 
 struct Job {
@@ -55,6 +78,7 @@ struct Job {
   int rows = 0;
   int cols = 0;
   std::vector<uint8_t> data;
+  std::vector<float> spec;   // optional rows*cols float32 input spectrogram (empty = not dumped)
 };
 
 struct MaskDumpWriter::Impl {
@@ -92,9 +116,15 @@ struct MaskDumpWriter::Impl {
       std::snprintf(fname, sizeof(fname), "mask_ch%d_%06d.npy", job.channel, seq);
       write_npy_u8(dir + "/" + fname, job.data.data(),
                    static_cast<size_t>(job.rows), static_cast<size_t>(job.cols));
+      char sname[128] = "";
+      if (!job.spec.empty()) {
+        std::snprintf(sname, sizeof(sname), "spec_ch%d_%06d.npy", job.channel, seq);
+        write_npy_f32(dir + "/" + sname, job.spec.data(),
+                      static_cast<size_t>(job.rows), static_cast<size_t>(job.cols));
+      }
       if (manifest.is_open()) {
         manifest << seq << ',' << job.channel << ',' << job.frame << ',' << job.rows << ','
-                 << job.cols << ',' << fname << '\n';
+                 << job.cols << ',' << fname << ',' << sname << '\n';
         manifest.flush();
       }
       written.fetch_add(1);
@@ -127,7 +157,7 @@ void MaskDumpWriter::configure(const std::string& dir, int max_frames) {
 
   impl_->manifest.open(dir + "/mask_dump_manifest.csv", std::ios::out | std::ios::trunc);
   if (impl_->manifest.is_open()) {
-    impl_->manifest << "seq,channel,frame_number,rows,cols,mask_npy\n";
+    impl_->manifest << "seq,channel,frame_number,rows,cols,mask_npy,spec_npy\n";
     impl_->manifest.flush();
     impl_->manifest_header_written = true;
   }
@@ -144,7 +174,7 @@ bool MaskDumpWriter::wants_more() const {
 }
 
 void MaskDumpWriter::submit(int channel, uint64_t frame_number, int rows, int cols,
-                            const uint8_t* host_mask) {
+                            const uint8_t* host_mask, const float* host_spec) {
   if (!enabled_ || !impl_ || host_mask == nullptr || rows <= 0 || cols <= 0) return;
   if (impl_->max_frames > 0 && impl_->submitted.load() >= impl_->max_frames) return;
 
@@ -154,6 +184,9 @@ void MaskDumpWriter::submit(int channel, uint64_t frame_number, int rows, int co
   job.rows = rows;
   job.cols = cols;
   job.data.assign(host_mask, host_mask + static_cast<size_t>(rows) * cols);
+  if (host_spec != nullptr) {
+    job.spec.assign(host_spec, host_spec + static_cast<size_t>(rows) * cols);
+  }
 
   {
     std::lock_guard<std::mutex> lk(impl_->mtx);

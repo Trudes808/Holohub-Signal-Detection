@@ -333,6 +333,9 @@ void FinetunedDinoDetector::setup(holoscan::OperatorSpec& spec) {
              "cost).", std::string(""));
   spec.param(debug_mask_dump_max_frames_, "debug_mask_dump_max_frames", "Debug mask dump max frames",
              "Total masks to write before the dump goes quiet. 0 = unlimited.", 0);
+  spec.param(debug_spectrogram_dump_, "debug_spectrogram_dump", "Debug spectrogram dump",
+             "When mask dump is on, also write the RT input spectrogram (float32, same grid) per frame "
+             "for mask-on-spectrogram overlays. false = masks only (default).", false);
   spec.param(invalid_frame_guard_, "invalid_frame_guard", "Invalid-frame guard",
              "Suppress (emit empty mask) a frame whose occupancy is a gross outlier vs an adaptive "
              "baseline -- drop-corrupted frames under ingest saturation otherwise fire a spurious "
@@ -720,9 +723,19 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
     if (dump_host_buf_.size() < n) dump_host_buf_.resize(n);
     throw_if_cuda_error(cudaMemcpyAsync(dump_host_buf_.data(), emit_mask, n * sizeof(uint8_t),
                                         cudaMemcpyDeviceToHost, stream), "mask dump D2H");
+    // Optionally also grab the RT input spectrogram (normalized [0,1] image the model saw; same
+    // rows x mask_width grid as the mask) so the dumped mask can be overlaid on the actual spectrogram.
+    const float* spec_host = nullptr;
+    if (debug_spectrogram_dump_.get() && buf.normalized_device != nullptr) {
+      if (dump_spec_host_buf_.size() < n) dump_spec_host_buf_.resize(n);
+      throw_if_cuda_error(cudaMemcpyAsync(dump_spec_host_buf_.data(), buf.normalized_device,
+                                          n * sizeof(float), cudaMemcpyDeviceToHost, stream),
+                          "spec dump D2H");
+      spec_host = dump_spec_host_buf_.data();
+    }
     throw_if_cuda_error(cudaStreamSynchronize(stream), "mask dump sync");
     mask_dump_->submit(static_cast<int>(channel_number), frame_number, rows, mask_width,
-                       dump_host_buf_.data());
+                       dump_host_buf_.data(), spec_host);
   }
 
   holoscan::ops::DetectorMaskMessage mask_msg;

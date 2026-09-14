@@ -40,8 +40,10 @@ class MaskDumpWriter {
 
   // Enqueue a COPY of host_mask (rows*cols uint8, C-order). Non-blocking: if the writer has
   // fallen behind and the queue is full, the frame is dropped and counted (logged at stop) so
-  // the data path is never stalled.
-  void submit(int channel, uint64_t frame_number, int rows, int cols, const uint8_t* host_mask);
+  // the data path is never stalled. If host_spec != nullptr, ALSO dumps the rows*cols float32
+  // input spectrogram (the [0,1] image the model saw) as spec_*.npy for mask-on-spectrogram overlays.
+  void submit(int channel, uint64_t frame_number, int rows, int cols, const uint8_t* host_mask,
+              const float* host_spec = nullptr);
 
   // Drain the queue, join the writer, close the manifest, and log a one-line summary.
   void flush_and_stop();
