@@ -732,16 +732,12 @@ uint8_t max_ring_canvas_value(const std::vector<uint8_t>& ring,
 }
 
 RgbColor mask_overlay_color(float normalized_value) {
-  const float t = std::clamp(std::sqrt(std::max(0.0f, normalized_value)), 0.0f, 1.0f);
-  const auto blend_channel = [t](uint8_t low, uint8_t high) {
-    return static_cast<uint8_t>(std::lround((1.0f - t) * static_cast<float>(low) +
-                                            t * static_cast<float>(high)));
-  };
-  return {
-      blend_channel(72, 255),
-      blend_channel(208, 246),
-      blend_channel(255, 168),
-  };
+  // Constant high-contrast lime-green so a detection is visible on BOTH the dark-blue noise floor AND
+  // bright high-power signals. The previous value->pale-yellow blend matched the color of bright/yellow
+  // signal pixels, so the mask washed out exactly on the loudest signals (looked "missing"); confidence
+  // is already encoded via alpha (scaled_alpha in overlay_mask), so hue does not need to carry it.
+  (void)normalized_value;
+  return {60, 255, 90};
 }
 
 void overlay_mask(std::vector<uint8_t>& canvas,
@@ -762,7 +758,7 @@ void overlay_mask(std::vector<uint8_t>& canvas,
         continue;
       }
       const float normalized_value = static_cast<float>(value) / 255.0f;
-      const float scaled_alpha = overlay_alpha * (0.18f + 0.82f * std::sqrt(normalized_value));
+      const float scaled_alpha = overlay_alpha * (0.35f + 0.65f * std::sqrt(normalized_value));
       blend_pixel(canvas,
                   canvas_width,
                   canvas_height,
@@ -864,7 +860,7 @@ void overlay_mask_ring(std::vector<uint8_t>& canvas,
       if (value > 0) {
         const float normalized_value = static_cast<float>(value) / 255.0f;
         const float boosted_visibility = std::pow(normalized_value, 0.65f);
-        const float scaled_alpha = overlay_alpha * (0.16f + 0.84f * boosted_visibility);
+        const float scaled_alpha = overlay_alpha * (0.35f + 0.65f * boosted_visibility);
         blend_pixel(canvas,
                     canvas_width,
                     canvas_height,
