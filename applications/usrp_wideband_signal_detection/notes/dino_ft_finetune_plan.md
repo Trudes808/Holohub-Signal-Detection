@@ -175,3 +175,18 @@ robust-norm) at the 491.52 geometry, across dense+sparse scenes and varied per-s
 - Offline eval: `python3 run_cuda_dino_offline_file.py <sigmf-data> --detector cuda_dino_finetuned
   --config <cfg> --output-root <dir>` (saves mask_arrays + gt_masks; eval via `mask_eval_metrics`/`eval_detector_masks.py`).
 - Loopback pcaps on THIS host need dst-MAC 4c:bb:47:2c:45:13 (see [[loopback-dstmac-spark]]).
+
+## RT dashboard "misses the loud signal / odd placements" — ROOT CAUSE = viz overlay color (2026-09-14)
+Thoroughly investigated (radio + loopback + 2x loopback + offline). The DINO-FT M3 masks are CORRECT:
+detect the loud burst 96-100% of frames, cover it MORE than coherent (20% vs 1% px), match offline<->
+loopback (occ 0.67/0.70%), keep up (inference 52ms < 85ms stride-4 budget, CHDR partial_drops=0, no
+frame gaps), and the overlay is frame-synced (a temporary MASKSYNC probe showed curmatch=true, lag=0,
+dims match on every frame, even under 2x oversaturation). So it is NOT a sync/drift/dropped-frame or
+detector problem. ROOT CAUSE was purely rendering: `mask_overlay_color` blended to pale-yellow at high
+mask values, matching bright/yellow high-power signal pixels -> the overlay washed out on the loudest
+signals while staying visible on dark noise ("missing the loud signal, detections in odd places").
+Reproduced offline by replaying the exact overlay_mask alpha blend (results/faithful_overlay.png,
+overlay_color_options.png). FIX (commit 01f08d3b): constant high-contrast lime-green mask color +
+low-value alpha floor 0.18->0.35 (both overlay + ring paths). Verify on the dashboard: the loud burst
+should now be clearly green-masked. NOTE: could not reproduce any radio-specific frame drift; if the
+radio still shows misregistration under heavier load, re-add the MASKSYNC probe and read curmatch/lag.
