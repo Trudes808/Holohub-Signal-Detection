@@ -245,7 +245,7 @@ snippet_compression:
 # --- Fine-tuned DINOv3 segmenter (M2_dr, rate-invariant 20.48-245.76 MS/s) -----------------------
 # Taps raw IQ and runs its own dedicated nfft-point FFT (240 kHz/bin, 4.17 us/row at 245.76 MS/s)
 # to reproduce the training physics exactly. Geometry contract MUST match the checkpoint's
-# exported *.meta.json (dino_fine_tuning/weights/finetuned_dino_m2_dr_bf16.meta.json).
+# exported *.meta.json (dino_fine_tuning/weights/finetuned_dino_m3_491_bf16.meta.json).
 finetuned_dino_detector:
   num_channels: 1
   tile_rows: 256
@@ -253,8 +253,8 @@ finetuned_dino_detector:
   fft_window: "hann"
   db_vmin: -47.6526985168457
   db_vmax: 20.45633316040039
-  threshold: 0.95
-  model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m2_dr_bf16.ts"
+  threshold: 0.6
+  model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m3_491_bf16.ts"
   torch_dtype: "fp32"               # vestigial: bf16 compute is baked into the traced .ts
   # LIVE @ 491.52 MSps: with downsample mode the frame cost is ~2 tiles (rate-adaptive), so a
   # low stride is affordable and the ROI history reads as a continuous ribbon (viz holds the last
@@ -279,11 +279,11 @@ finetuned_dino_detector:
   adaptive_normalization: true
   adaptive_span_db: 34.0
   adaptive_floor_frac: 0.12
-  # Pinned to the legacy q-blend floor for the CURRENT (fixed-clip-trained) checkpoint: the robust
-  # low-percentile floor changes the input brightness distribution, and the shipped model under-detects
-  # at low SNR under it (offline validation: dino_ft_robust_norm/). Flip to true only with a checkpoint
-  # fine-tuned ON robust normalization (see notes/dino_ft_finetune_plan.md, roadmap step 2+).
-  adaptive_robust_floor: false
+  # Robust floor ON: M3_491 is fine-tuned ON this exact robust normalization at the 491.52 deployment
+  # geometry (dense+sparse, per-signal SNR). Offline validation (dino_ft_robust_norm/): held-out region
+  # detection 83-100% across SNR; container A/B vs M2_dr on the sparse scene 43%->86%. Robust params
+  # stay at operator defaults (low_pct 20, high_pct 95, min_range 8, floor_below_calib 25) = training.
+  adaptive_robust_floor: true
 
 # --- Signal snipper -----------------------------------------------------------------------------
 # Clusters the detector mask into per-signal boxes and cuts the corresponding IQ out of the stream.

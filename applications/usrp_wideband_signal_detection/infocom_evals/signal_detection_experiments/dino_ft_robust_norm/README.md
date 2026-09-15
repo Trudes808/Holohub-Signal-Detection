@@ -48,8 +48,53 @@ Model input `[0,1]` — std / % saturated (≥0.99) / % dead (≤0.02) / mask oc
    checkpoint — trained for fixed-clip brightness — reads robust's brightness as noise and doesn't fire.
    Fixed happens to map snr0 into the model's trained band, so it fires. This is exactly why the plan
    couples robust normalization with **training the model ON it** (roadmap step 2).
-3. **Deployment coupling (safety).** Because robust under-detects at low SNR with the current model, the
-   5 shipped DINO-FT demo configs are pinned `adaptive_robust_floor: false` (legacy q-blend) until a
-   checkpoint fine-tuned on robust normalization exists. Flip to `true` alongside that checkpoint.
+3. **Deployment coupling (safety).** Because robust under-detects at low SNR with the *fixed-clip-trained*
+   model, the demo configs were first pinned `adaptive_robust_floor: false` (legacy q-blend) until a
+   checkpoint fine-tuned on robust normalization existed. **That checkpoint now exists (M3_491, below), so
+   the configs are flipped to `true`.** (The pin was the correct interim state before the retrain.)
 
 Dumps under `/tmp/usrp_spectrograms/robust_val/` are ephemeral; regenerate with `run_validation.sh`.
+
+---
+
+# M3_491: domain-match fine-tune on robust normalization (roadmap steps 2-5)
+
+The robust normalization (above) changes the model-input distribution, so the fixed-clip-trained M2_dr
+under-detected under it at low SNR. Fix per the locked plan: **retrain the segmenter ON the robust
+front-end at the 491.52 deployment geometry**, across dense+sparse scenes and per-signal SNR.
+
+**Pipeline** (`dino_fine_tuning/src/`, run in `.venv-ml` with `PYTHONPATH=~/Documents/dinov3:src`):
+- `frontend.py` — torch replica of the deployed downsample front-end (wide FFT 20480 @491.52 -> flatten ->
+  robust p20 norm -> bilinear resize freq->1024 -> tile 256). **Validated corr 1.0000 / MAE 0.0002 vs the
+  CUDA operator** on the real 491.52 capture. Robust norm is scale-invariant, so cf32 composites transfer
+  to the sc16 radio.
+- `gen_491.py` — places real MATLAB library waveforms (9 classes, resampled 2x->491.52) on a 491.52 canvas
+  with controllable density (dense/sparse) + per-signal SNR (near/far) + AWGN floor; emits SigMF+GT.
+- `build_dataset_rt.py` — streams composites through the front-end into `data/dataset_491/`
+  (train 2265 / val 277 / test 201 tiles) + `heldout_sigmf/` (6 composites for the operator A/B).
+- `train.py --mode ft_lastN` from the base DINOv3 backbone -> **M3_491**: 18 epochs, val IoU 0.748->0.9555,
+  F1 0.977, P 0.975, R 0.980.
+- `export_dinov3_finetuned_torchscript.py` -> `weights/finetuned_dino_m3_491_bf16.ts` (thr 0.6, bf16;
+  eager-vs-traced IoU 1.0; loads+runs in the container torch 2.10).
+
+**Held-out per-SNR** (`results/m3_heldout/heldout_snr.png`, `eval_heldout.py`) @thr 0.6: region detection
+**83-100% across every SNR bucket down to -3..3 dB**, dense and sparse. Threshold F1 is flat ~0.96 over
+0.4-0.9 (robust to the decision threshold).
+
+**Container A/B** — M3 vs M2_dr through the REAL operator on held-out composites (`compare_ab.py`,
+`results/ab_summary.json`), pixel recall / region detection / IoU:
+
+| model | scene | pix recall | region det | IoU |
+|-------|-------|-----------|-----------|-----|
+| M2_dr | dense  | 53% | 51% | 52% |
+| M2_dr | sparse | 35% | 43% | 20% |
+| **M3_491** | dense  | **79%** | **72%** | **72%** |
+| **M3_491** | sparse | **86%** | **86%** | **51%** |
+
+The sparse scene (the live failure mode) goes 43%->86% region detection in the deployment operator path.
+The 5 DINO-FT demo configs now point at M3 with `adaptive_robust_floor: true`, threshold 0.6.
+
+**Still to do**: a live radio run (config_live_v3_dino_ft.yaml) to confirm on-air.
+
+Regenerate: `gen_configs.py`/`run_validation.sh`/`analyze.py` (robust norm) and, for the retrain,
+`build_dataset_rt.py` -> `train.py` -> `export_...py` -> `eval_heldout.py` + `compare_ab.py`.

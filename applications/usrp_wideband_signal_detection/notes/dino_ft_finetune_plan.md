@@ -96,14 +96,52 @@ robust-norm) at the 491.52 geometry, across dense+sparse scenes and varied per-s
    checkpoint doesn't fire on robust's brightness -> a model-DISTRIBUTION mismatch, exactly what step 2
    (train ON robust norm) fixes. SAFETY: the 5 shipped demo configs are pinned `adaptive_robust_floor:
    false` (legacy q-blend) until a checkpoint fine-tuned on robust norm exists; flip to true with it.
-2. **491.52 data+GT pipeline**: edit geometry FS; generate DENSE + SPARSE composites, per-signal SNR
-   sweep (near/far), GT via annotations; run through the deployment front-end (+ robust norm) -> training
-   tiles + a held-out clean benchmark (replaces the confounded dense-only one).
-3. **build_dataset.py** on that data (repoint paths); **train.py --mode ft_lastN** from base in `.venv-ml`.
-4. **export_dinov3_finetuned_torchscript.py** -> new `.ts` + `.meta.json`; point the demo configs'
-   `model_script_path/tile_rows/nfft/db_vmin/db_vmax/threshold` at the new sidecar.
-5. **Validate**: held-out benchmark (recall/precision/IoU per SNR, sparse+dense), the offline-vs-loopback
-   A/B harness (`dino_ft_offline_vs_loopback/`), and a live run.
+2. **[DONE] 491.52 data+GT pipeline** — gen_491.py (real library waveforms placed on a 491.52 canvas,
+   dense+sparse, per-signal SNR) + build_dataset_rt.py (stream through frontend.py -> tiles+GT). Dataset
+   `dino_fine_tuning/data/dataset_491/`: train 2265 / val 277 / test 201 tiles + heldout_sigmf/ (6 comps).
+3. **[DONE] train.py --mode ft_lastN from base** (M3_491): 18 epochs, val IoU 0.748 -> **0.9555**, F1 0.977,
+   P 0.975, R 0.980. `dino_fine_tuning/checkpoints/M3_491/best.pt`.
+4. **[DONE] export** -> `dino_fine_tuning/weights/finetuned_dino_m3_491_bf16.ts` (+ .meta.json), thr 0.6,
+   491.52 geometry, bf16 (eager-vs-traced IoU 1.0). Loads+runs in the container (torch 2.10). The 5 DINO-FT
+   demo configs now point at it with `adaptive_robust_floor: true`, threshold 0.6.
+5. **[DONE offline / live PENDING] Validate**: held-out per-SNR region detection **83-100% across SNR**
+   (dense+sparse) @thr 0.6; container A/B vs M2_dr (real operator): dense region-det 51%->72%, **sparse
+   43%->86%**, sparse recall 35%->86%. Results in `dino_ft_robust_norm/` (heldout_snr.png, ab_summary.json,
+   compare_ab.py, config_m3_eval.yaml/config_m2_eval.yaml). STILL TO DO: a **live radio run** with
+   config_live_v3_dino_ft.yaml (M3 + robust) to confirm on-air; push (held per user).
+
+## Step 2 build decisions (2026-09-14, user: full autonomous build)
+- **Front-end replica VALIDATED**: `dino_fine_tuning/src/frontend.py` reproduces the deployed downsample
+  front-end (wide FFT auto=20480@491.52 -> dB - gain13.01 -> flatten -> robust p20 norm -> bilinear
+  resize freq->1024 -> tile 256). vs the CUDA operator on the real 491.52 capture: **corr 1.0000, MAE
+  0.0002**. Robust norm is scale-invariant (int16 capture vs cf32 composites both anchor to the per-frame
+  floor) -> training on cf32 composites transfers to the sc16 radio. Training is FAST/CHEAP on GB10
+  (ft_lastN 30.3M trainable, ~0.07s/step batch2, 1.5GB) -> compute is not the constraint.
+- **Data source**: real MATLAB library `~/Documents/holoscan_waveform_generation/generated_waveforms_24576/`
+  (9 classes BPSK/QPSK/16QAM/OFDM/802_11ax/5G_Downlink/Bluetooth/Broadband_FM/Narrowband_FM, all
+  outputSampleRateHz=245.76e6, designedOccupiedBandwidthHz in the .json). Placer resamples each 2x->491.52,
+  freq-shifts anywhere in +/-~230 MHz, scales to a per-signal SNR (near/far), adds complex AWGN floor.
+- **Two densities**: DENSE (many overlapping signals filling the band) + SPARSE (few signals, big
+  time/freq gaps -> matches the failed live scene). Per-signal SNR sweep covers field distance.
+- **Pipeline**: `gen_491.py` (in-memory composite + SigMF annotations) -> `build_dataset_rt.py` streams
+  each composite frame through frontend.py -> uint8 tiles + GT masks (rasterized on the wide-time-row grid,
+  samples_per_row=fft_size) into memmapped train/val/test. A few composites also written to SigMF for the
+  held-out benchmark (offline eval).
+
+## Step 2 pipeline files (all in dino_fine_tuning/, .venv-ml + PYTHONPATH=~/Documents/dinov3:src)
+- `src/frontend.py` — deployment front-end replica (VALIDATED corr 1.0) + `rasterize_gt` (wide-time-row GT).
+- `src/gen_491.py` — 491.52 composite generator (real library waveforms, dense/sparse, per-signal SNR).
+- `src/build_dataset_rt.py` — streams composites through frontend -> frames_{split}.npy/masks_{split}.npy +
+  frames.csv (RFSegDataset format) into data/dataset_491/; also writes heldout_sigmf/ (test composites).
+- `configs/train_491.yaml` — train config (weights_path repointed to ~/Documents/dinov3/weights).
+- TRAIN: `PYTHONPATH=~/Documents/dinov3:src .venv-ml/bin/python src/train.py --config configs/train_491.yaml
+  --dataset data/dataset_491 --mode ft_lastN --name M3_491 --out checkpoints/M3_491`
+- EXPORT: `applications/.../export_dinov3_finetuned_torchscript.py --ckpt checkpoints/M3_491/best.pt
+  --train-yaml dino_fine_tuning/configs/train_491.yaml --dinov3-repo ~/Documents/dinov3
+  --sample-rate-hz 491.52e6 --autocast bf16 --output <new>.ts` -> then flip the demo configs'
+  `adaptive_robust_floor: true` + point model_script_path at the new .ts.
+- DEPLOY NORM (must match training): adaptive_normalization true + adaptive_robust_floor TRUE, span 34,
+  floor_frac 0.12, low_pct 20, high_pct 95, min_range 8, floor_below_calib 25 (= FrontEndCfg defaults).
 
 ## Artifact / results locations
 - A/B + weak-signal + fixes report: `dino_ft_offline_vs_loopback/` (build_artifact.py, results/, results_guard/).

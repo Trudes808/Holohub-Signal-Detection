@@ -1,11 +1,5 @@
 # Loopback-demo variant of config_signal_snipper_single_channel.yaml with the
-# LOOPBACK VARIANT (run_loopback_v3_demo.sh): the live garbage-flood guards are relaxed
-# because dense composites legitimately light a large fraction of the band and the
-# loopback transport is clean. Do NOT use on live OTA.
 # visualizer ENABLED: dashboard + detector + snipper + sigmf sink in one app.
-# VARIANT: DINO-FT with band-edge sideband ignore (outer 3% of mask columns per side zeroed
-# after inference). Base config_live_v3_dino_ft.yaml = same detector WITHOUT the trim, so the
-# dashboard Detector dropdown can A/B the residual edge-column artifact live.
 # Used by the replay demo (notes/no_radio_loopback_demo.md) and the demo
 # conductor. On GB10 at 245.76 MSps replay the combined load holds up.
 # SPDX-FileCopyrightText: 2026 National Instruments Corporation
@@ -137,9 +131,6 @@ logger:
   log_interval: 5
 
 visualization:
-  detector_label: "Dinov3 FT SB (loopback)"
-  # Header label override: both DINO-FT variants share detector_type, so the derived
-  # label can't tell them apart.
   # Off for the snip-focused capture profile: on the RTX 4000 Ada the visualizer + FFT + detector +
   # snipper together cannot sustain 245 MSps. Set true to see the live spectrum (expect reduced
   # throughput / dropped packets on a modest GPU). The snipper/sink do not depend on it.
@@ -250,7 +241,7 @@ snippet_compression:
 # --- Fine-tuned DINOv3 segmenter (M2_dr, rate-invariant 20.48-245.76 MS/s) -----------------------
 # Taps raw IQ and runs its own dedicated nfft-point FFT (240 kHz/bin, 4.17 us/row at 245.76 MS/s)
 # to reproduce the training physics exactly. Geometry contract MUST match the checkpoint's
-# exported *.meta.json (dino_fine_tuning/weights/finetuned_dino_m3_491_bf16.meta.json).
+# exported *.meta.json (dino_fine_tuning/weights/finetuned_dino_m2_dr_bf16.meta.json).
 finetuned_dino_detector:
   num_channels: 1
   tile_rows: 256
@@ -284,21 +275,13 @@ finetuned_dino_detector:
   adaptive_normalization: true
   adaptive_span_db: 34.0
   adaptive_floor_frac: 0.12
-  # Robust floor ON: M3_491 is fine-tuned ON this exact robust normalization at the 491.52 deployment
-  # geometry (dense+sparse, per-signal SNR). Offline validation (dino_ft_robust_norm/): held-out region
-  # detection 83-100% across SNR; container A/B vs M2_dr on the sparse scene 43%->86%. Robust params
-  # stay at operator defaults (low_pct 20, high_pct 95, min_range 8, floor_below_calib 25) = training.
   adaptive_robust_floor: true
-  # OTA-measured (detector_mask_sanity_ota): the anti-alias rolloff cliff at the outermost bins
-  # survives the flatten and fires the model (17.5% of the outer 3% margins lit vs 0.32% in-band).
-  # Zero the outer 3% of mask columns per side after inference. 0 disables (= base config).
-  ignore_sideband_percent: 3.0
 
 # --- Signal snipper -----------------------------------------------------------------------------
 # Clusters the detector mask into per-signal boxes and cuts the corresponding IQ out of the stream.
 signal_snipper:
   # Flood guard: skip masks lighting >30% of band-time (detector fault, not signal)
-  max_mask_occupancy: 0.90   # loopback: dense composites, block only near-full-band faults
+  max_mask_occupancy: 0.30
   # "time_only": keep the time regions containing any signal at full bandwidth/rate; annotate the
   #   detected freqs/bandwidths in each interval.
   # "frequency": additionally isolate each signal -- shift to 0 Hz, low-pass to its bandwidth, and
