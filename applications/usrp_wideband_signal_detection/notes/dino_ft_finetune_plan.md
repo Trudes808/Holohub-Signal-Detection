@@ -147,6 +147,9 @@ robust-norm) at the 491.52 geometry, across dense+sparse scenes and varied per-s
 - A/B + weak-signal + fixes report: `dino_ft_offline_vs_loopback/` (build_artifact.py, results/, results_guard/).
   Live report artifact URL: https://claude.ai/code/artifact/091622b6-a4e8-43d7-b9c0-56c200f2e267
   Weak-signal deep-dive artifact: https://claude.ai/code/artifact/d97d1c0a-87a8-416e-85ab-bdbd2062f8a3
+- **Retrain report artifact (M3_491): https://claude.ai/code/artifact/48ace403-604c-460b-9e9e-f74c1ff1a61b**
+- Robust-norm + retrain experiment: `dino_ft_robust_norm/` (README, results/, gen_configs/run_validation/
+  analyze/gen_491/build_dataset_rt/eval_heldout/compare_ab/render_live_ab/build_report).
 - SNR benchmark: `dino_ft_snr_benchmark/` (make_snr_variants.py, snr_eval.py, results/, config_noadapt.yaml).
   Variants + eval outputs under `/tmp/usrp_spectrograms/snr_bench/` and `/tmp/usrp_spectrograms/offline_eval/snr_dino*/` (EPHEMERAL /tmp).
 - Live dump: `/tmp/usrp_spectrograms/live_eval/dino_ft/` (EPHEMERAL).
