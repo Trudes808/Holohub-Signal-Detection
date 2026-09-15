@@ -110,6 +110,17 @@ robust-norm) at the 491.52 geometry, across dense+sparse scenes and varied per-s
    compare_ab.py, config_m3_eval.yaml/config_m2_eval.yaml). STILL TO DO: a **live radio run** with
    config_live_v3_dino_ft.yaml (M3 + robust) to confirm on-air; push (held per user).
 
+## DINO-FT config inventory (which model each uses, 2026-09-14)
+- **M3_491 (491.52 downsample+flatten+robust, thr 0.6):** the LIVE + LOOPBACK configs the demo actually
+  runs — config_live_v3_dino_ft{,_sb,_two_channel}.yaml, config_loopback_v3_dino_ft{,_sb}.yaml. The v3/
+  v3dual dashboard's DINO-FT detector switch (demo_conductor CONFIG_BY_DETECTOR_LIVE / _LIVE_DUAL /
+  _LOOPBACK) loads these -> M3.
+- **M2_dr (245.76 native, fixed clip, thr 0.95) — INTENTIONALLY KEPT:** config_dino_finetuned_viz_demo.yaml
+  (the no-radio 245.76 replay/viz demo, demo_conductor CONFIG_BY_DETECTOR replay map). M2_dr is the
+  rate-matched model at 245.76 native (240 kHz/bin = its training geometry); M3 is a 491.52 model and
+  would run off-distribution there. Do NOT "consistency-fix" this to M3 without also moving the replay to
+  491.52 (user decision 2026-09-14).
+
 ## Step 2 build decisions (2026-09-14, user: full autonomous build)
 - **Front-end replica VALIDATED**: `dino_fine_tuning/src/frontend.py` reproduces the deployed downsample
   front-end (wide FFT auto=20480@491.52 -> dB - gain13.01 -> flatten -> robust p20 norm -> bilinear
