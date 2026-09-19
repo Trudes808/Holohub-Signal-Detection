@@ -229,3 +229,13 @@ The ~12 non-identical frames/loop are IoU >= 0.979 (1-2 px bf16 boundary jitter,
 Config: config_loopback_eval_dino_ft_rt.yaml updated M2_dr -> M3_491 so loopback masks are directly
 comparable to the offline M3 masks (detector block now tracks config_live_v3_dino_ft.yaml; stride stays
 4 for the full-rate A/B, use a stride-1 temp copy + slowed replay for the 1:1 mask validation).
+
+### Opus adversarial re-verification (2026-09-19) — VERDICT: SUPPORTED
+Independent recompute (own script, symmetric IoU, strict j%46, offset sweep): aligned loops all
+0.99822 mean / 34/46 bit-exact / min 0.97922 / 100% >= 0.95; old-capture loops 2-3 collapse 0.020/0.032.
+Strongest evidence: online-vs-online ACROSS loops = IoU 1.00000 exact (bit-exact deterministic RT), so the
+0.998 vs OFFLINE is purely bf16 jitter between the two backend paths, not misregistration. Adversarial
+checks all pass: masks distinct per frame (adjacent differ 47k-283k px), real signal (offline occ mean
+0.67%, range 0.13-2.17%), offset-0 is the UNIQUE IoU maximum (not best-match inflation), both-empty->1.0
+never triggered. Caveat: mask-level 1:1 validated for ch0 only (ch1 pcap frame-alignment confirmed, but no
+ch1 loopback masks were dumped to compare). Precise framing: online-vs-offline 0.998; online-vs-online 1.0.
