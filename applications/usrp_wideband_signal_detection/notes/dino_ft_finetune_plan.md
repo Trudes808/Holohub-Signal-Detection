@@ -258,3 +258,21 @@ classifier daemon publishes markers -> current demo behavior unchanged.
 - TO DEMO/TEST: run a config with the classifier daemon enabled so rt_metrics.json gets recent_decodes
   (the DINO-FT demo configs do NOT enable it), then flip the toggle. Live color render NOT yet verified
   end-to-end (needs the classifier pipeline up); compiles + links + Opus-reviewed.
+
+## Class-color overlay — VALIDATED LIVE + daemon fix (2026-09-19)
+Made the "Color Mask by Class" overlay actually light up (commit 035d5a60):
+- rt_decode_daemon.py --classify-only now emits a per-signal freq-tagged class marker (note_decode with
+  the predicted label) so rt_metrics.json recent_decodes populates (was aggregate-only -> empty markers ->
+  no colors, and empty panel triangles too).
+- Added renderer.class_colors_enable config Parameter (both viz operator classes) to start colors on for a
+  headless run (default false = button-driven; shipped configs unchanged).
+Live loopback validation (aligned 491.52 pcap, classify-only AMC daemon VT-CNN2/ResNet1D/T-PRIME, gate
+T-PRIME; screenshots via gnome-screenshot on DISPLAY=:1; driver capture_overlay.sh):
+- DINO-FT M3 + classifier: masks class-colored, OFDM blue dominant at 2.4 GHz (WiFi-like), 0 lime;
+  recent_decodes 16 (OFDM 5, PSK 1, NOISE 10); overlay px OFDM 1157 / FSK 47 / QAM 32 / PSK 12 / lime 0.
+- DINO-FT M3 classifier OFF: overlay falls back to uniform lime (no markers).
+- coherent_power + classifier: same coloring on noisier coherent masks -> detector-agnostic.
+Real-time at full radio rate (tcpreplay 480k pps = 491.52 MSps), GPU ~82%, CHDR partial_drops=0 in all
+three. Artifact RSdrKitPhtsFgSsyX5K3Ca; repo infocom_evals/signal_detection_experiments/dino_ft_class_overlay/.
+LIMITATION unchanged: markers are frequency-only -> tint spans the full column height (+/-4% span band),
+not the true signal ROI (Route B = per-signal class id through snipper->viz, follow-up).
