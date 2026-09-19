@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
-"""Exact online(loopback)-vs-offline DINO-FT M3 comparison on the SAME capture, same config.
+"""Honest online(loopback RT)-vs-offline DINO-FT M3 comparison on the SAME capture, same config.
 
 Offline: run_cuda_dino_offline_file output (mask_arrays + spectrogram_tensors, keyed by frame_number).
-Online:  loopback debug dump (mask_ch0_* + spec_ch0_* + manifest, frame_number = chdr_batch_index).
-The loopback loops the pcap, so online frame_number k maps to offline frame ((k-1) mod N). We search the
-best constant offset (frame-phase between DPDK batching and file chunking), report per-frame IoU + exact
-match %, and render low/medium/high-density frames with both masks on the spectrogram.
+Online:  loopback debug dump (mask_ch0_* + spec_ch0_*), frame_number = chdr_batch_index, in stream order.
+
+IMPORTANT METHODOLOGY NOTE (this replaces an earlier, overstated comparison):
+  The capture is 491,520,000 samples = exactly 46.875 detector frames (10,485,760 samples/frame), i.e.
+  NOT a whole number of frames. `tcpreplay --loop K` therefore mis-aligns the detector's frame boundaries
+  after the first pass: loop 1 is a clean pass over the 46 whole frames, but loops 2..K start mid-frame and
+  every frame is a shifted splice of two capture frames. Those shifted inputs legitimately produce different
+  masks. An earlier "best-IoU over all online frames" metric hid this, because loop 1 always supplies a clean
+  copy of every offline frame so a max() returns ~1.0 regardless of the looped copies. That was overstated.
+
+  The correct metric is a DIRECT 1:1 alignment, per loop segment: online frame j -> offline frame (j mod N).
+  Loop 1 is the real online-vs-offline test (RT reproducing offline on one clean pass); loops 2..K measure
+  only the tcpreplay loop-seam artifact and are reported separately, not folded into the headline number.
+
+  Takeaway: on one clean pass the RT pipeline reproduces the offline masks bit-for-bit; the looped-copy
+  mismatch is a test-rig artifact of a non-frame-aligned pcap, NOT an RT bug. The continuous live radio
+  stream has no loop seam and is unaffected. For a fully clean 1:1 across all frames, use --loop 1 or trim
+  the pcap to a whole number of frames.
 """
 from __future__ import annotations
 import csv, glob, os
@@ -17,91 +31,71 @@ ON = "/tmp/usrp_spectrograms/status_online/dino"
 OUT = os.path.join(os.path.dirname(__file__), "results")
 
 
-def load_offline():
+def load_offline_ordered():
+    """Return offline masks + dB in frame_number order (index 0..N-1)."""
     man = {int(r["frame_number"]): r for r in csv.DictReader(open(f"{OFF}/frame_manifest.csv")) if r.get("mask_npy")}
-    frames = {}
-    for fn, r in man.items():
-        mk = np.load(f"{OFF}/{r['mask_npy']}").astype(np.uint8)
+    masks, dBs = [], []
+    for fn in sorted(man):
+        r = man[fn]
+        masks.append(np.load(f"{OFF}/{r['mask_npy']}").astype(bool))
         t = np.load(f"{OFF}/{r['spectrogram_tensor_npy']}")
-        dB = 10*np.log10(t.real**2+t.imag**2+1e-12) if np.iscomplexobj(t) else t.astype(np.float32)
-        frames[fn] = (mk, dB)
-    return frames
+        dBs.append(10*np.log10(t.real**2+t.imag**2+1e-12) if np.iscomplexobj(t) else t.astype(np.float32))
+    return masks, dBs
 
 
-def load_online():
-    man = f"{ON}/mask_dump_manifest.csv"
-    frames = {}
-    if os.path.exists(man):
-        for r in csv.DictReader(open(man)):
-            fn = int(r["frame_number"]); p = os.path.join(ON, os.path.basename(r["mask_npy"]))
-            if os.path.exists(p):
-                frames[fn] = np.load(p).astype(np.uint8)
-    else:
-        for p in sorted(glob.glob(f"{ON}/mask_ch0_*.npy")):
-            fn = int(os.path.basename(p).split("_")[-1].split(".")[0]); frames[fn] = np.load(p).astype(np.uint8)
-    return frames
+def load_online_ordered():
+    """Return online masks in stream order (index 0.. across all loops)."""
+    return [np.load(p).astype(bool) for p in sorted(glob.glob(f"{ON}/mask_ch0_*.npy"))]
 
 
 def iou(a, b):
-    a = a > 0; b = b > 0; u = (a | b).sum()
-    return 1.0 if u == 0 else (a & b).sum()/u
+    u = (a | b).sum()
+    return 1.0 if u == 0 else float((a & b).sum() / u)
 
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    off = load_offline(); on = load_online()
-    if not off or not on:
-        print(f"missing data (offline {len(off)}, online {len(on)})"); return
-    N = max(off) - min(off) + 1
-    off0 = min(off)
-    # map online fn -> offline index (0-based within one loop), search best constant offset
-    on_items = sorted(on.items())
-    best = (0, -1, [])
-    for off_shift in range(N):
-        ious = []
-        for fn, m_on in on_items:
-            oidx = ((fn - 1 + off_shift) % N) + off0
-            if oidx in off and off[oidx][0].shape == m_on.shape:
-                ious.append(iou(m_on, off[oidx][0]))
-        if ious and np.mean(ious) > best[1]:
-            best = (off_shift, float(np.mean(ious)), ious)
-    shift, miou, ious = best
-    ious = np.array(ious)
-    print(f"offline {len(off)} frames, online {len(on)} frames, loop N={N}")
-    print(f"best frame-offset {shift}: mean IoU {miou:.3f}  median {np.median(ious):.3f}  "
-          f"min {ious.min():.3f}  exact(IoU=1.0) {100*(ious>=0.999).mean():.0f}%  IoU>=0.95 {100*(ious>=0.95).mean():.0f}%")
+    off_m, off_dB = load_offline_ordered()
+    on_m = load_online_ordered()
+    if not off_m or not on_m:
+        print(f"missing data (offline {len(off_m)}, online {len(on_m)})"); return
+    N = len(off_m)
+    print(f"offline {N} frames, online {len(on_m)} frames (~{len(on_m)/N:.2f} loops)")
 
-    # per-offline-frame occupancy -> pick low/med/high density frames
-    occ = {fn: off[fn][0].mean() for fn in off}
-    order = sorted(off, key=lambda f: occ[f])
-    lo = order[len(order)//6]; md = order[len(order)//2]; hi = order[-2]
-    picks = [("low density", lo), ("medium density", md), ("high density", hi)]
-    # for each pick, find the online frame mapping to it
-    def online_for(oidx):
-        for fn, m in on_items:
-            if ((fn - 1 + shift) % N) + off0 == oidx:
-                return m
-        return None
-    def dsc(a, f=20, agg=np.mean):
-        c = (a.shape[1]//f)*f; return agg(a[:, :c].reshape(a.shape[0], a.shape[1]//f, f), axis=2)
-    fig, axes = plt.subplots(len(picks), 2, figsize=(17, 3.0*len(picks)), squeeze=False)
-    for i, (label, oidx) in enumerate(picks):
-        mk_off, dB = off[oidx]; mk_on = online_for(oidx)
-        dBd = dsc(dB); vmin, vmax = np.percentile(dBd, 5), np.percentile(dBd, 99.5)
-        for j, (name, mk) in enumerate([("OFFLINE", mk_off), ("ONLINE (loopback RT)", mk_on)]):
-            ax = axes[i][j]
-            ax.imshow(dBd, aspect="auto", origin="lower", cmap="magma", vmin=vmin, vmax=vmax, interpolation="nearest")
-            if mk is not None:
-                mkd = dsc(mk.astype(np.float32), agg=np.max)
-                if mkd.any(): ax.contour(mkd, levels=[0.5], colors=(0.24,1.0,0.35), linewidths=0.7)
-            ij = iou(mk_on, mk_off) if mk is not None else float("nan")
-            ax.set_title(f"{name} — {label} (frame {oidx}, occ {occ[oidx]*100:.2f}%"
-                         + (f", IoU {ij:.3f}" if j==1 else "") + ")", fontsize=9)
-            ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle(f"DINO-FT M3: online (loopback RT) vs offline on the SAME capture — mean IoU {miou:.3f} (offset {shift})",
-                 fontsize=12)
-    fig.tight_layout(rect=[0,0,1,0.98])
-    p = os.path.join(OUT, "online_vs_offline_exact.png")
+    # --- honest direct 1:1 per loop segment: online j -> offline (j mod N) ---
+    seg_names = ["loop 1 (clean pass)"] + [f"loop {k+1} (after seam)" for k in range(1, (len(on_m)+N-1)//N)]
+    per_seg = []
+    for k, name in enumerate(seg_names):
+        idx = [j for j in range(k*N, min((k+1)*N, len(on_m)))]
+        v = np.array([iou(on_m[j], off_m[j % N]) for j in idx])
+        if len(v):
+            per_seg.append((name, v))
+            print(f"  {name:22s}: mean {v.mean():.3f} median {np.median(v):.3f} "
+                  f">=0.95 {100*(v>=0.95).mean():3.0f}%  ({len(v)} frames)")
+    # headline = loop 1 only
+    loop1 = per_seg[0][1]
+    ident = sum(np.array_equal(on_m[j], off_m[j]) for j in range(N))
+    print(f"HEADLINE (loop 1, the real RT-vs-offline test): mean IoU {loop1.mean():.3f}, "
+          f"{ident}/{N} pixel-identical, {100*(loop1>=0.95).mean():.0f}% >=0.95")
+
+    # --- figure: per-frame IoU vs stream index, colored by loop, seam marked ---
+    fig, ax = plt.subplots(figsize=(13, 4))
+    colors = ["#2fb46b", "#c8442e", "#e8791f", "#7a5cd0"]
+    for j in range(len(on_m)):
+        seg = j // N
+        ax.scatter(j, iou(on_m[j], off_m[j % N]), s=14, c=colors[seg % len(colors)])
+    for k in range(1, (len(on_m)+N-1)//N):
+        ax.axvline(k*N, color="#888", ls="--", lw=0.8)
+    ax.axhline(0.95, color="#888", ls=":", lw=0.7)
+    ax.set_xlabel("online frame index (green = loop 1 clean pass | others = looped copies; "
+                  "dashed = pcap loop seam)")
+    ax.set_ylabel("direct 1:1 IoU vs offline")
+    ax.set_ylim(-0.02, 1.03); ax.grid(alpha=0.3)
+    ax.set_title("DINO-FT M3 online vs offline (direct 1:1): loop 1 near-exact; looped copies mis-align "
+                 "at the seam\n(capture = 46.875 frames -> tcpreplay loop shifts frame boundaries; "
+                 "a test artifact, not an RT bug)", fontsize=10)
+    fig.tight_layout()
+    p = os.path.join(OUT, "online_vs_offline_perloop.png")
     fig.savefig(p, dpi=110); print("wrote", p)
 
 

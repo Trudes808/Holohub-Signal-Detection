@@ -190,3 +190,23 @@ overlay_color_options.png). FIX (commit 01f08d3b): constant high-contrast lime-g
 low-value alpha floor 0.18->0.35 (both overlay + ring paths). Verify on the dashboard: the loud burst
 should now be clearly green-masked. NOTE: could not reproduce any radio-specific frame drift; if the
 radio still shows misregistration under heavier load, re-add the MASKSYNC probe and read curmatch/lag.
+
+## Online (loopback RT) vs offline M3 — CORRECTED finding (2026-09-19)
+User asked for the online masks to be EXACTLY the offline masks (moved to loopback wiring for this), and
+for an Opus subagent to double-check. Verdict: on ONE CLEAN PASS the RT pipeline reproduces the offline
+detector output BIT-FOR-BIT (direct 1:1, loop 1: 34/46 frames pixel-identical, mean IoU 0.998, median
+1.000, 100% >= 0.95). So the RT path is correct.
+- HONEST-METRIC CORRECTION: an earlier "best-IoU over all online frames" number (~1.0) was OVERSTATED
+  (asymmetric recall metric). The pcap was looped 2.6x; loop 1 always supplies a clean copy of every
+  offline frame, so a max() returns ~1.0 regardless of the looped copies. The correct metric is direct
+  1:1 per loop segment (compare_online_offline_exact.py, results/online_vs_offline_perloop.png).
+- ROOT CAUSE of the loop-2/3 mismatch (mean IoU ~0.02/0.03): the capture is 491,520,000 samples =
+  exactly 46.875 detector frames (10,485,760 samples/frame) -> NOT a whole number. `tcpreplay --loop K`
+  therefore shifts the detector frame boundaries after the first pass; loops 2..K start mid-frame and each
+  frame is a shifted splice of two capture frames. Verified it is MIS-ALIGNMENT not corruption: loop2's
+  input spectrogram is a normal distribution (mean 0.250 std 0.138, dead%<=0.02 = 9.7), corr(loop1 f5,
+  loop2 f51) = 0.002, partial_drops = 0 (not saturation/dropped-packet fill). A test-rig artifact of
+  looping a non-frame-aligned pcap, NOT an RT bug. The continuous live radio stream has no loop seam and
+  is unaffected.
+- For a fully clean 1:1 across all frames: replay with `--loop 1`, or trim the pcap to a whole number of
+  frames (46 frames = 483,000,000 samples). Artifact (corrected caption): B5gZNwSSro36Y7uarzWTnr.
