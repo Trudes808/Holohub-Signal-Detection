@@ -295,6 +295,11 @@ std::atomic<bool>& global_full_ui_enabled() {
   return enabled;
 }
 
+std::atomic<bool>& global_class_colors_enabled() {
+  static std::atomic<bool> enabled{false};
+  return enabled;
+}
+
 std::mutex& visualization_ui_state_mutex() {
   static std::mutex mutex;
   return mutex;
@@ -740,6 +745,41 @@ RgbColor mask_overlay_color(float normalized_value) {
   return {60, 255, 90};
 }
 
+// ---- Per-class overlay colors ("Color Mask by Class" toggle) --------------------------------------
+// When the classifier is running, the live decode daemon (rt_metrics.json) tags each decoded signal
+// with a modulation class. This table maps each class label to an overlay hue so the detection mask is
+// colored by class instead of the single lime. Ordered to match kClsLabels {PSK, QAM, FSK, OFDM,
+// NOISE}; this is the single source of truth for class hues -- adding a future class is ONE entry here
+// (plus the classifier emitting that label). Any label not listed (incl. undecoded regions) falls back
+// to the default lime overlay color, so plain detections still show.
+struct ClassColorEntry {
+  const char* label;
+  RgbColor color;
+};
+
+const std::vector<ClassColorEntry>& class_color_table() {
+  static const std::vector<ClassColorEntry> table = {
+      {"PSK", {90, 220, 110}},     // green
+      {"QAM", {200, 110, 255}},    // purple
+      {"FSK", {255, 176, 64}},     // amber
+      {"OFDM", {72, 148, 255}},    // blue
+      {"NOISE", {150, 150, 150}},  // gray
+  };
+  return table;
+}
+
+RgbColor class_overlay_color(const std::string& label) {
+  for (const auto& entry : class_color_table()) {
+    if (label == entry.label) {
+      return entry.color;
+    }
+  }
+  return mask_overlay_color(0.0f);  // default lime for unknown / undecoded classes
+}
+
+// A mask column is colored by the nearest live decode marker within this fraction of the display span.
+constexpr double kClassColorFreqTolFrac = 0.04;
+
 void overlay_mask(std::vector<uint8_t>& canvas,
                   int canvas_width,
                   int canvas_height,
@@ -835,7 +875,8 @@ void overlay_mask_ring(std::vector<uint8_t>& canvas,
                        int capacity_rows,
                        int valid_rows,
                        int write_row,
-                       float overlay_alpha) {
+                       float overlay_alpha,
+                       const RgbColor* col_class_colors = nullptr) {
   if (ring.empty() || src_width <= 0 || capacity_rows <= 0) {
     return;
   }
@@ -861,12 +902,14 @@ void overlay_mask_ring(std::vector<uint8_t>& canvas,
         const float normalized_value = static_cast<float>(value) / 255.0f;
         const float boosted_visibility = std::pow(normalized_value, 0.65f);
         const float scaled_alpha = overlay_alpha * (0.35f + 0.65f * boosted_visibility);
+        const RgbColor mask_color =
+            col_class_colors ? col_class_colors[src_col] : mask_overlay_color(normalized_value);
         blend_pixel(canvas,
                     canvas_width,
                     canvas_height,
                     dst_x + col,
                     dst_y + row,
-                    mask_overlay_color(normalized_value),
+                    mask_color,
                     scaled_alpha);
       }
     }
@@ -2089,6 +2132,14 @@ bool visualization_overlay_enabled() {
   return global_overlay_enabled().load(std::memory_order_relaxed);
 }
 
+void set_visualization_class_colors_enabled(bool enabled) {
+  global_class_colors_enabled().store(enabled, std::memory_order_relaxed);
+}
+
+bool visualization_class_colors_enabled() {
+  return global_class_colors_enabled().load(std::memory_order_relaxed);
+}
+
 void set_visualization_full_ui_enabled(bool enabled) {
   global_full_ui_enabled().store(enabled, std::memory_order_relaxed);
 }
@@ -2775,6 +2826,23 @@ void render_visualization_ui_overlay() {
   bool overlay_enabled = visualization_overlay_enabled();
   if (ImGui::Checkbox("Overlay Detection Mask", &overlay_enabled)) {
     set_visualization_overlay_enabled(overlay_enabled);
+  }
+  bool class_colors = visualization_class_colors_enabled();
+  if (ImGui::Checkbox("Color Mask by Class", &class_colors)) {
+    set_visualization_class_colors_enabled(class_colors);
+  }
+  if (class_colors) {
+    // Inline legend so viewers can read the class hues at a glance.
+    bool first = true;
+    for (const auto& entry : class_color_table()) {
+      if (!first) {
+        ImGui::SameLine();
+      }
+      first = false;
+      ImGui::TextColored(ImVec4(entry.color.r / 255.0f, entry.color.g / 255.0f,
+                                entry.color.b / 255.0f, 1.0f),
+                         "%s", entry.label);
+    }
   }
   ImGui::PopStyleVar(2);
   ImGui::End();
@@ -5238,6 +5306,38 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                   blue_limit,
                                   red_limit);
     if (overlay_enabled) {
+      // "Color Mask by Class": tint each mask column by the class of the nearest live decode marker
+      // (rt_metrics.json), matched on frequency. Columns with no nearby decode keep the default lime,
+      // so plain detections still show. No-op unless the classifier daemon is publishing markers.
+      std::vector<RgbColor> class_col_colors;
+      const RgbColor* class_col_ptr = nullptr;
+      if (visualization_class_colors_enabled() && span_hz > 0.0 && history_width > 0) {
+        const auto dm = decode_metrics_snapshot();
+        if (!dm.recent.empty()) {
+          const double center = channel.info.center_frequency_hz;
+          const double lo = center - span_hz * 0.5;
+          const double tol = span_hz * kClassColorFreqTolFrac;
+          class_col_colors.assign(static_cast<size_t>(history_width), mask_overlay_color(0.0f));
+          for (int c = 0; c < history_width; ++c) {
+            const double f =
+                lo + (static_cast<double>(c) + 0.5) / static_cast<double>(history_width) * span_hz;
+            double best = tol;
+            const std::string* best_mod = nullptr;
+            for (const auto& mk : dm.recent) {
+              const double f_abs = std::abs(mk.f_hz) < 1e9 ? center + mk.f_hz : mk.f_hz;
+              const double d = std::abs(f_abs - f);
+              if (d < best) {
+                best = d;
+                best_mod = &mk.mod;
+              }
+            }
+            if (best_mod) {
+              class_col_colors[static_cast<size_t>(c)] = class_overlay_color(*best_mod);
+            }
+          }
+          class_col_ptr = class_col_colors.data();
+        }
+      }
       overlay_mask_ring(canvas,
                         output_width,
                         output_height,
@@ -5250,7 +5350,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                         history_rows,
                         channel.history_valid_rows,
                         channel.history_write_row,
-                        overlay_alpha);
+                        overlay_alpha,
+                        class_col_ptr);
     }
 
     fill_rect(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {14, 18, 28});
