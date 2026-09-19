@@ -239,3 +239,22 @@ checks all pass: masks distinct per frame (adjacent differ 47k-283k px), real si
 0.67%, range 0.13-2.17%), offset-0 is the UNIQUE IoU maximum (not best-match inflation), both-empty->1.0
 never triggered. Caveat: mask-level 1:1 validated for ch0 only (ch1 pcap frame-alignment confirmed, but no
 ch1 loopback masks were dumped to compare). Precise framing: online-vs-offline 0.998; online-vs-online 1.0.
+
+## Class-color mask overlay — NEW feature (2026-09-19)
+Dashboard toggle "Color Mask by Class" (spectrogram_visualization.cu): colors the detection-mask
+overlay by the classifier's predicted modulation class instead of the single lime. Commits 9f9dd494 +
+a646d024 (Opus-reviewed: SHIP WITH FIXES, all applied). Viz-only, off by default, no-op unless the
+classifier daemon publishes markers -> current demo behavior unchanged.
+- Class->color LUT: PSK=green, QAM=purple, FSK=amber, OFDM=blue (single source of truth; add a future
+  class = one entry). NOISE/undecoded fall through to lime. Inline legend under the toggle.
+- Mechanism (Route A): compose_visualization_rgb fetches decode markers once via
+  decode_metrics_snapshot() (rt_metrics.json recent_decodes = {f_hz, mod, crc_ok}); per channel it
+  builds a per-column color array by matching each column's frequency to the nearest in-band marker
+  within +/-4% of the display span, and passes it to overlay_mask_ring (new optional param).
+- LIMITATION: markers are frequency-only (no time bounds), so a class tint spans the full column height
+  and a +/-4%-span band, not the true signal ROI. For time-accurate per-signal coloring, Route B threads
+  a real per-signal class id through snipper->viz message->mask ring (~6 files + an in-process classifier
+  op) -- see the data-flow map in this session.
+- TO DEMO/TEST: run a config with the classifier daemon enabled so rt_metrics.json gets recent_decodes
+  (the DINO-FT demo configs do NOT enable it), then flip the toggle. Live color render NOT yet verified
+  end-to-end (needs the classifier pipeline up); compiles + links + Opus-reviewed.
