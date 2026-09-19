@@ -170,6 +170,7 @@ class SpectrogramToHolovizOp : public Operator {
   Parameter<float> red_limit_;
   Parameter<float> overlay_alpha_;
   Parameter<bool> overlay_enable_;
+  Parameter<bool> class_colors_enable_;
   Parameter<std::string> detector_label_;
   Parameter<std::string> demo_title_;
   Parameter<std::string> decode_metrics_json_;
@@ -309,6 +310,7 @@ class OfflinePgmReplayOp : public Operator {
   Parameter<float> red_limit_;
   Parameter<float> overlay_alpha_;
   Parameter<bool> overlay_enable_;
+  Parameter<bool> class_colors_enable_;
   Parameter<std::string> detector_label_;
   Parameter<double> center_frequency_hz_;
   Parameter<double> span_hz_;

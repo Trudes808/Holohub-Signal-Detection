@@ -568,6 +568,10 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                 for name, r in res.items():
                     metrics.note_cls(name, r.label, r.ms, t)
                 top = max(res.values(), key=lambda r: r.conf)
+                # Per-signal class marker for the viz (recent_decodes): a frequency-tagged predicted
+                # class so the "Color Mask by Class" overlay can tint the mask, and the detection-panel
+                # triangle can label the band. classify-only has no CRC, so mark it ok=True (classified).
+                metrics.note_decode(snip_center + center, top.label, True)
                 band_info.append(f"{center/1e6:+.1f}MHz[{top.label} {top.conf:.2f}]")
                 continue
             if clf is not None:

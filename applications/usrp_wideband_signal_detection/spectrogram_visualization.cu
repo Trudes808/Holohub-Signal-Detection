@@ -3739,6 +3739,11 @@ void SpectrogramToHolovizOp::setup(OperatorSpec& spec) {
              "Overlay Enable",
              "Enable or disable the detection overlay layer in the composed visualization.",
              false);
+  spec.param(class_colors_enable_,
+             "class_colors_enable",
+             "Class Colors Enable",
+             "Start with the detection mask colored by classifier class (needs the classifier daemon).",
+             false);
   spec.param(detector_label_,
              "detector_label",
              "Detector Label",
@@ -3828,6 +3833,7 @@ void SpectrogramToHolovizOp::initialize() {
     shutdown_term->enable_tick();
   }
   initialize_visualization_overlay_state(overlay_enable_.get());
+  set_visualization_class_colors_enabled(class_colors_enable_.get());
   if (!decode_metrics_json_.get().empty()) {
     set_visualization_decode_metrics_path(decode_metrics_json_.get());
     HOLOSCAN_LOG_INFO("LIVE DECODE panel enabled: watching {}", decode_metrics_json_.get());
@@ -4490,6 +4496,11 @@ void OfflinePgmReplayOp::setup(OperatorSpec& spec) {
              "Overlay Enable",
              "Enable or disable the detection overlay layer in the composed visualization.",
              false);
+  spec.param(class_colors_enable_,
+             "class_colors_enable",
+             "Class Colors Enable",
+             "Start with the detection mask colored by classifier class (needs the classifier daemon).",
+             false);
   spec.param(detector_label_,
              "detector_label",
              "Detector Label",
@@ -4506,6 +4517,7 @@ void OfflinePgmReplayOp::initialize() {
   Operator::initialize();
 
   initialize_visualization_overlay_state(overlay_enable_.get());
+  set_visualization_class_colors_enabled(class_colors_enable_.get());
 
   frames_ = list_pgm_frames(directory_.get(), channel_filter_.get());
   if (frames_.empty()) {
