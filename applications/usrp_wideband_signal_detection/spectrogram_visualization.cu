@@ -747,11 +747,12 @@ RgbColor mask_overlay_color(float normalized_value) {
 
 // ---- Per-class overlay colors ("Color Mask by Class" toggle) --------------------------------------
 // When the classifier is running, the live decode daemon (rt_metrics.json) tags each decoded signal
-// with a modulation class. This table maps each class label to an overlay hue so the detection mask is
-// colored by class instead of the single lime. Ordered to match kClsLabels {PSK, QAM, FSK, OFDM,
-// NOISE}; this is the single source of truth for class hues -- adding a future class is ONE entry here
-// (plus the classifier emitting that label). Any label not listed (incl. undecoded regions) falls back
-// to the default lime overlay color, so plain detections still show.
+// with a modulation class. This table maps each SIGNAL class label to an overlay hue so the detection
+// mask is colored by class instead of the single lime. It is the single source of truth for class hues
+// -- adding a future class is ONE entry here (plus the classifier emitting that label). Any label not
+// listed falls back to the default lime overlay color: that intentionally covers undecoded regions AND
+// the classifier's "NOISE" verdict, so a lit-but-not-a-signal detection reads as a plain lime detection
+// rather than a distinct hue. (Add a NOISE entry here if you want noise called out separately.)
 struct ClassColorEntry {
   const char* label;
   RgbColor color;
@@ -759,11 +760,10 @@ struct ClassColorEntry {
 
 const std::vector<ClassColorEntry>& class_color_table() {
   static const std::vector<ClassColorEntry> table = {
-      {"PSK", {90, 220, 110}},     // green
-      {"QAM", {200, 110, 255}},    // purple
-      {"FSK", {255, 176, 64}},     // amber
-      {"OFDM", {72, 148, 255}},    // blue
-      {"NOISE", {150, 150, 150}},  // gray
+      {"PSK", {90, 220, 110}},   // green
+      {"QAM", {200, 110, 255}},  // purple
+      {"FSK", {255, 176, 64}},   // amber
+      {"OFDM", {72, 148, 255}},  // blue
   };
   return table;
 }
@@ -5172,6 +5172,14 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   }
   ui_state.detector_label = active_detector_label;
 
+  // Live decode markers for the "Color Mask by Class" overlay: fetched ONCE per compose (they are
+  // channel-independent) so the per-channel loop below doesn't repeat the snapshot deep-copy + json
+  // rescan on the render thread.
+  const bool class_colors_enabled = visualization_class_colors_enabled();
+  DecodeMetricsSnapshot class_color_dm;
+  if (class_colors_enabled) {
+    class_color_dm = decode_metrics_snapshot();
+  }
   for (int channel_index = 0; channel_index < active_channels; ++channel_index) {
     const auto& channel = has_active_channels
         ? *active_channel_states[static_cast<size_t>(channel_index)]
@@ -5311,32 +5319,34 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
       // so plain detections still show. No-op unless the classifier daemon is publishing markers.
       std::vector<RgbColor> class_col_colors;
       const RgbColor* class_col_ptr = nullptr;
-      if (visualization_class_colors_enabled() && span_hz > 0.0 && history_width > 0) {
-        const auto dm = decode_metrics_snapshot();
-        if (!dm.recent.empty()) {
-          const double center = channel.info.center_frequency_hz;
-          const double lo = center - span_hz * 0.5;
-          const double tol = span_hz * kClassColorFreqTolFrac;
-          class_col_colors.assign(static_cast<size_t>(history_width), mask_overlay_color(0.0f));
-          for (int c = 0; c < history_width; ++c) {
-            const double f =
-                lo + (static_cast<double>(c) + 0.5) / static_cast<double>(history_width) * span_hz;
-            double best = tol;
-            const std::string* best_mod = nullptr;
-            for (const auto& mk : dm.recent) {
-              const double f_abs = std::abs(mk.f_hz) < 1e9 ? center + mk.f_hz : mk.f_hz;
-              const double d = std::abs(f_abs - f);
-              if (d < best) {
-                best = d;
-                best_mod = &mk.mod;
-              }
+      if (class_colors_enabled && !class_color_dm.recent.empty() && span_hz > 0.0 &&
+          history_width > 0) {
+        const double center = channel.info.center_frequency_hz;
+        const double lo = center - span_hz * 0.5;
+        const double hi = lo + span_hz;
+        const double tol = span_hz * kClassColorFreqTolFrac;
+        class_col_colors.assign(static_cast<size_t>(history_width), mask_overlay_color(0.0f));
+        for (int c = 0; c < history_width; ++c) {
+          const double f =
+              lo + (static_cast<double>(c) + 0.5) / static_cast<double>(history_width) * span_hz;
+          double best = tol;
+          const std::string* best_mod = nullptr;
+          for (const auto& mk : class_color_dm.recent) {
+            const double f_abs = std::abs(mk.f_hz) < 1e9 ? center + mk.f_hz : mk.f_hz;
+            if (f_abs < lo || f_abs > hi) {
+              continue;  // off-screen marker: don't bleed its class onto edge columns
             }
-            if (best_mod) {
-              class_col_colors[static_cast<size_t>(c)] = class_overlay_color(*best_mod);
+            const double d = std::abs(f_abs - f);
+            if (d < best) {
+              best = d;
+              best_mod = &mk.mod;
             }
           }
-          class_col_ptr = class_col_colors.data();
+          if (best_mod) {
+            class_col_colors[static_cast<size_t>(c)] = class_overlay_color(*best_mod);
+          }
         }
+        class_col_ptr = class_col_colors.data();
       }
       overlay_mask_ring(canvas,
                         output_width,
