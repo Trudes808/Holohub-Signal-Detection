@@ -226,9 +226,10 @@ snippet_compression:
   bfp_block: 64
   control_json_path: "/workspace/spectrograms/demo_control.json"
 
-# --- Fine-tuned DINOv3 segmenter (M2_dr) -- BLOCK IDENTICAL TO config_live_v3_dino_ft.yaml -------
+# --- Fine-tuned DINOv3 segmenter (M3_491) -- DETECTOR BLOCK TRACKS config_live_v3_dino_ft.yaml ---
 # EXCEPT the two debug_mask_dump_* keys below. This identity is the whole A/B: same detector, only
-# the ingest differs between offline (file) and loopback (DPDK/CHDR).
+# the ingest differs between offline (file) and loopback (DPDK/CHDR). Kept on M3_491 (the shipped
+# live/loopback model) so the loopback masks are directly comparable to the offline M3 masks.
 finetuned_dino_detector:
   num_channels: 1
   tile_rows: 256
@@ -236,14 +237,20 @@ finetuned_dino_detector:
   fft_window: "hann"
   db_vmin: -47.6526985168457
   db_vmax: 20.45633316040039
-  threshold: 0.95
-  model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m2_dr_bf16.ts"
+  threshold: 0.6
+  model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m3_491_bf16.ts"
   torch_dtype: "fp32"               # vestigial: bf16 compute is baked into the traced .ts
   emit_stride: 4
   channel_filter: -1
   real_time_downsample: true
   downsample_fft_size: 0            # 0 = auto-size from the live rate (keeps ~2-tile cost at any rate)
   flatten_noise_floor: true
+  # M3_491 is fine-tuned ON this robust normalization at the 491.52 deployment geometry; keep these
+  # identical to config_live_v3_dino_ft.yaml so offline and loopback see the same detector.
+  adaptive_normalization: true
+  adaptive_span_db: 34.0
+  adaptive_floor_frac: 0.12
+  adaptive_robust_floor: true
   # VALIDATION ONLY: dump every emitted mask (.npy uint8 + mask_dump_manifest.csv) on a background
   # thread. Host path: /tmp/usrp_spectrograms/loopback_eval/dino_ft_rt/mask_arrays/.
   debug_mask_dump_dir: "/workspace/spectrograms/loopback_eval/dino_ft_rt/mask_arrays"

@@ -210,3 +210,22 @@ detector output BIT-FOR-BIT (direct 1:1, loop 1: 34/46 frames pixel-identical, m
   is unaffected.
 - For a fully clean 1:1 across all frames: replay with `--loop 1`, or trim the pcap to a whole number of
   frames (46 frames = 483,000,000 samples). Artifact (corrected caption): B5gZNwSSro36Y7uarzWTnr.
+
+## Frame-aligned canonical test capture — BUILT + VALIDATED (2026-09-19)
+Generator: `bash_scripts/make_frame_aligned_capture.sh` (FRAMES=46 default). Trims the raw OTA
+capture (480000 pkts = 46.875 frames) to a whole number of frames so tcpreplay loops start on a
+frame boundary. Outputs (in composites/, ~1.99 GB each, not committed):
+  x410_ota_2g4_gain10_20260908_46f.spark.pcap   (ch0, dst port 1234, 471040 pkts)
+  x410_ota_ch1_p1235_46f.spark.pcap             (ch1, dst port 1235, portmap of ch0)
+Alignment property: 471040 % 10240 == 0 (46.0 frames); original 480000 % 10240 == 8960 (seam).
+
+VALIDATION (RT, M3, stride1, --loop 3 @ PPS 160000, detector debug_mask_dump; 138 masks, drops=0):
+direct 1:1 vs offline M3 masks, EVERY loop identical:
+  loop 1: mean IoU 0.9982, 34/46 pixel-identical, 100% >= 0.95
+  loop 2: mean IoU 0.9982, 34/46 pixel-identical, 100% >= 0.95   (was 0.020 with the 46.875f pcap)
+  loop 3: mean IoU 0.9982, 34/46 pixel-identical, 100% >= 0.95   (was 0.032 with the 46.875f pcap)
+Before/after mean over all frames: 0.398 -> 0.998. Figure: results/aligned_capture_before_after.png.
+The ~12 non-identical frames/loop are IoU >= 0.979 (1-2 px bf16 boundary jitter, identical loop-to-loop).
+Config: config_loopback_eval_dino_ft_rt.yaml updated M2_dr -> M3_491 so loopback masks are directly
+comparable to the offline M3 masks (detector block now tracks config_live_v3_dino_ft.yaml; stride stays
+4 for the full-rate A/B, use a stride-1 temp copy + slowed replay for the 1:1 mask validation).
