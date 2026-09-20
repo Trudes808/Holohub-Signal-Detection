@@ -15,6 +15,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -3901,6 +3902,15 @@ void SpectrogramToHolovizOp::initialize() {
   }
   initialize_visualization_overlay_state(overlay_enable_.get());
   set_visualization_class_colors_enabled(class_colors_enable_.get());
+  // Env overrides (the v4/v4dual demo presets set these): force the overlay + class colors ON
+  // regardless of the config default, and survive the conductor's detector-switch app restarts
+  // (demo_conductor.py forwards these -e vars on each relaunch).
+  if (const char* e = std::getenv("USRP_OVERLAY"); e && std::atoi(e) != 0) {
+    set_visualization_overlay_enabled(true);
+  }
+  if (const char* e = std::getenv("USRP_CLASS_COLORS"); e && std::atoi(e) != 0) {
+    set_visualization_class_colors_enabled(true);
+  }
   if (!decode_metrics_json_.get().empty()) {
     set_visualization_decode_metrics_path(decode_metrics_json_.get());
     HOLOSCAN_LOG_INFO("LIVE DECODE panel enabled: watching {}", decode_metrics_json_.get());
@@ -4586,6 +4596,15 @@ void OfflinePgmReplayOp::initialize() {
 
   initialize_visualization_overlay_state(overlay_enable_.get());
   set_visualization_class_colors_enabled(class_colors_enable_.get());
+  // Env overrides (the v4/v4dual demo presets set these): force the overlay + class colors ON
+  // regardless of the config default, and survive the conductor's detector-switch app restarts
+  // (demo_conductor.py forwards these -e vars on each relaunch).
+  if (const char* e = std::getenv("USRP_OVERLAY"); e && std::atoi(e) != 0) {
+    set_visualization_overlay_enabled(true);
+  }
+  if (const char* e = std::getenv("USRP_CLASS_COLORS"); e && std::atoi(e) != 0) {
+    set_visualization_class_colors_enabled(true);
+  }
 
   frames_ = list_pgm_frames(directory_.get(), channel_filter_.get());
   if (frames_.empty()) {

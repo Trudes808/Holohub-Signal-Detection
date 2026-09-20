@@ -51,11 +51,28 @@ case "${MODE}" in
     V3_STACK=1
     V3_DUAL=1
     ;;
+  v4)
+    # Identical to v3, but the detection overlay + per-signal "Color Mask by Class" start ON
+    # (USRP_OVERLAY/USRP_CLASS_COLORS env, honored by the viz and forwarded across detector-switch
+    # restarts). The classifier daemon (V3_STACK) drives the colors; still toggleable in the GUI.
+    CONFIG_NAME=config_live_v3_single_channel.yaml
+    export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234} \
+           GAIN=${GAIN:-10} USRP_OVERLAY=1 USRP_CLASS_COLORS=1
+    V3_STACK=1
+    ;;
+  v4dual)
+    # v3dual + overlay/class-colors ON at startup (see v4).
+    CONFIG_NAME=config_live_v3_two_channel.yaml
+    export CHANNELS=${CHANNELS:-"0 1"} FREQS=${FREQS:-"2400e6 1000e6"} \
+           DEST_PORTS=${DEST_PORTS:-"1234 1235"} GAIN=${GAIN:-15} USRP_OVERLAY=1 USRP_CLASS_COLORS=1
+    V3_STACK=1
+    V3_DUAL=1
+    ;;
   *.yaml)
     CONFIG_NAME=${MODE}
     ;;
   *)
-    echo "Usage: sudo $0 [single|dual|<config.yaml>]" >&2
+    echo "Usage: sudo $0 [single|dual|v3|v3dual|v4|v4dual|<config.yaml>]" >&2
     exit 1
     ;;
 esac
@@ -136,6 +153,8 @@ sudo docker exec -d \
   -e DISPLAY="${DISPLAY:-}" \
   -e USRP_SAMPLE_RATE_HZ="${USRP_SAMPLE_RATE_HZ}" \
   -e USRP_CENTER_FREQ_HZ="${USRP_CENTER_FREQ_HZ:-}" \
+  -e USRP_OVERLAY="${USRP_OVERLAY:-}" \
+  -e USRP_CLASS_COLORS="${USRP_CLASS_COLORS:-}" \
   "${CONTAINER_NAME}" bash -lc "
   cp '${SOURCE_APP_DIR}/${CONFIG_NAME}' '${BUILD_APP_DIR}/' 2>/dev/null || true
   mkdir -p /tmp/xdg-runtime-root && chmod 700 /tmp/xdg-runtime-root
