@@ -4,8 +4,11 @@ The "Color Mask by Class" dashboard toggle colors the detection-mask overlay by 
 predicted modulation class. Validated live on the network loopback (aligned 491.52 MSps capture,
 classify-only AMC daemon: VT-CNN2 + ResNet1D + T-PRIME, gate T-PRIME).
 
+Coloring is PER-SIGNAL REGION, separated in TIME and FREQUENCY: the daemon exports each decode's band
+[f_lo,f_hi]; the viz colors a pixel by the decode whose band contains it, and FREEZES the class into a
+parallel history ring at capture time so old waterfall rows keep their class (no whole-column recolor).
 Palette (5 distinct hues, legible on the blue waterfall): PSK green, QAM magenta, FSK orange, OFDM cyan,
-NOISE red; detected-but-unclassified columns show a neutral gray (no lime-vs-green clash, no blue-on-blue).
+NOISE red; detected-but-unclassified pixels show a neutral gray. Commits: 477f52a1 (region+time), 53c96560 (palette).
 
 Driver: `capture_overlay.sh` (env CONFIG_NAME / DAEMON / LABEL). Artifact: RSdrKitPhtsFgSsyX5K3Ca.
 
