@@ -736,6 +736,34 @@ uint8_t max_ring_canvas_value(const std::vector<uint8_t>& ring,
   return max_value;
 }
 
+// Like max_ring_canvas_value, but also returns the class-id from a PARALLEL ring at the row where the
+// mask value is greatest -- so per-pixel class coloring follows the lit pixel (and each row keeps the
+// class it was frozen with at capture time). *out_max receives the max mask value.
+uint8_t sample_class_at_max_ring(const std::vector<uint8_t>& mask_ring,
+                                 const std::vector<uint8_t>& class_ring,
+                                 int src_width,
+                                 int capacity_rows,
+                                 int leading_blank_rows,
+                                 int oldest_row,
+                                 int row_begin,
+                                 int row_end,
+                                 int src_col,
+                                 uint8_t* out_max) {
+  uint8_t max_value = 0;
+  uint8_t cls = 0;
+  for (int r = std::max(0, row_begin); r < std::min(capacity_rows, row_end); ++r) {
+    const uint8_t v = sample_ring_canvas_value(mask_ring, src_width, capacity_rows, leading_blank_rows,
+                                               oldest_row, r, src_col);
+    if (v >= max_value) {
+      max_value = v;
+      cls = sample_ring_canvas_value(class_ring, src_width, capacity_rows, leading_blank_rows, oldest_row,
+                                     r, src_col);
+    }
+  }
+  if (out_max) *out_max = max_value;
+  return cls;
+}
+
 RgbColor mask_overlay_color(float normalized_value) {
   // Constant high-contrast lime-green so a detection is visible on BOTH the dark-blue noise floor AND
   // bright high-power signals. The previous value->pale-yellow blend matched the color of bright/yellow
@@ -781,6 +809,25 @@ RgbColor class_overlay_color(const std::string& label) {
     }
   }
   return kUnclassifiedOverlayColor;  // unknown label -> neutral, not lime
+}
+
+// 0-based index of a class label in class_color_table, or -1 if absent. The class-id frozen into the
+// history_class_id ring is (this index + 1); 0 means unclassified (neutral).
+int class_table_index(const std::string& label) {
+  const auto& table = class_color_table();
+  for (size_t i = 0; i < table.size(); ++i) {
+    if (label == table[i].label) return static_cast<int>(i);
+  }
+  return -1;
+}
+
+// Color LUT indexed by ring class-id: [0] = unclassified (neutral), [k>=1] = class_color_table[k-1].color.
+std::vector<RgbColor> class_id_color_lut() {
+  std::vector<RgbColor> lut;
+  lut.reserve(class_color_table().size() + 1);
+  lut.push_back(kUnclassifiedOverlayColor);
+  for (const auto& entry : class_color_table()) lut.push_back(entry.color);
+  return lut;
 }
 
 // A mask column is colored by the nearest live decode marker within this fraction of the display span.
@@ -882,10 +929,14 @@ void overlay_mask_ring(std::vector<uint8_t>& canvas,
                        int valid_rows,
                        int write_row,
                        float overlay_alpha,
-                       const RgbColor* col_class_colors = nullptr) {
+                       const std::vector<uint8_t>* class_ring = nullptr,
+                       const std::vector<RgbColor>* class_lut = nullptr) {
   if (ring.empty() || src_width <= 0 || capacity_rows <= 0) {
     return;
   }
+  // Class coloring is active only when a per-pixel class ring of matching size and a color LUT are given.
+  const bool use_class = class_ring && class_lut && !class_lut->empty() &&
+                         class_ring->size() == ring.size();
   const int oldest_row = valid_rows == capacity_rows ? write_row : 0;
   const int leading_blank_rows = capacity_rows - valid_rows;
   for (int row = 0; row < dst_height; ++row) {
@@ -896,20 +947,22 @@ void overlay_mask_ring(std::vector<uint8_t>& canvas,
                                               std::max(1, dst_height)));
     for (int col = 0; col < dst_width; ++col) {
       const int src_col = std::min(src_width - 1, (col * src_width) / std::max(1, dst_width));
-      const uint8_t value = max_ring_canvas_value(ring,
-                                                  src_width,
-                                                  capacity_rows,
-                                                  leading_blank_rows,
-                                                  oldest_row,
-                                                  row_begin,
-                                                  row_end,
-                                                  src_col);
+      uint8_t value = 0;
+      uint8_t cls = 0;
+      if (use_class) {
+        cls = sample_class_at_max_ring(ring, *class_ring, src_width, capacity_rows, leading_blank_rows,
+                                       oldest_row, row_begin, row_end, src_col, &value);
+      } else {
+        value = max_ring_canvas_value(ring, src_width, capacity_rows, leading_blank_rows, oldest_row,
+                                      row_begin, row_end, src_col);
+      }
       if (value > 0) {
         const float normalized_value = static_cast<float>(value) / 255.0f;
         const float boosted_visibility = std::pow(normalized_value, 0.65f);
         const float scaled_alpha = overlay_alpha * (0.35f + 0.65f * boosted_visibility);
         const RgbColor mask_color =
-            col_class_colors ? col_class_colors[src_col] : mask_overlay_color(normalized_value);
+            use_class ? (*class_lut)[std::min<size_t>(cls, class_lut->size() - 1)]
+                      : mask_overlay_color(normalized_value);
         blend_pixel(canvas,
                     canvas_width,
                     canvas_height,
@@ -2161,6 +2214,8 @@ bool visualization_full_ui_enabled() {
 // derived from the deltas of the cumulative bit/error counters.
 struct DecodeMarker {
   double f_hz = 0.0;      // absolute Hz, OR baseband offset when |f| < 1 GHz
+  double f_lo_hz = 0.0;   // signal band edges (same |f|<1GHz convention); f_hi <= f_lo => unknown
+  double f_hi_hz = 0.0;
   std::string mod;
   bool crc_ok = true;
   double age_s = 0.0;
@@ -2364,8 +2419,10 @@ void poll_decode_metrics() {
         if (obj_end == std::string::npos) break;
         const std::string item = body.substr(obj, obj_end - obj + 1);
         DecodeMarker m;
-        double f = 0.0, age = 0.0;
+        double f = 0.0, age = 0.0, flo = 0.0, fhi = 0.0;
         if (json_find_double(item, "f_hz", f)) m.f_hz = f;
+        if (json_find_double(item, "f_lo_hz", flo)) m.f_lo_hz = flo;
+        if (json_find_double(item, "f_hi_hz", fhi)) m.f_hi_hz = fhi;
         if (json_find_double(item, "age_s", age)) m.age_s = age;
         m.crc_ok = item.find("\"crc_ok\": true") != std::string::npos;
         const auto mq = item.find("\"mod\"");
@@ -4024,6 +4081,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
       state.history_write_row = 0;
       std::fill(state.history_grayscale.begin(), state.history_grayscale.end(), 0);
       std::fill(state.history_mask.begin(), state.history_mask.end(), 0);
+      std::fill(state.history_class_id.begin(), state.history_class_id.end(), 0);
       std::fill(state.history_row_frame_numbers.begin(), state.history_row_frame_numbers.end(), -1);
       std::fill(state.history_row_indices_within_frame.begin(),
                 state.history_row_indices_within_frame.end(),
@@ -4810,6 +4868,7 @@ void ensure_history_capacity(ChannelVisualizationState& state, int width, int ma
   state.history_write_row = 0;
   state.history_grayscale.assign(static_cast<size_t>(width) * static_cast<size_t>(clamped_rows), 0);
   state.history_mask.assign(static_cast<size_t>(width) * static_cast<size_t>(clamped_rows), 0);
+  state.history_class_id.assign(static_cast<size_t>(width) * static_cast<size_t>(clamped_rows), 0);
   state.history_row_frame_numbers.assign(static_cast<size_t>(clamped_rows), -1);
   state.history_row_indices_within_frame.assign(static_cast<size_t>(clamped_rows), -1);
 }
@@ -4835,6 +4894,10 @@ void write_history_rows(ChannelVisualizationState& state,
     std::fill(state.history_mask.begin() + static_cast<std::ptrdiff_t>(dst_offset),
               state.history_mask.begin() + static_cast<std::ptrdiff_t>(dst_offset + row_bytes),
               0);
+    if (state.history_class_id.size() == state.history_mask.size()) {
+      std::fill(state.history_class_id.begin() + static_cast<std::ptrdiff_t>(dst_offset),
+                state.history_class_id.begin() + static_cast<std::ptrdiff_t>(dst_offset + row_bytes), 0);
+    }
     state.history_row_frame_numbers[static_cast<size_t>(dst_row)] = frame_number;
     state.history_row_indices_within_frame[static_cast<size_t>(dst_row)] = row;
     state.history_write_row = (state.history_write_row + 1) % state.history_capacity_rows;
@@ -4994,6 +5057,47 @@ bool patch_history_mask_for_frame(ChannelVisualizationState& state,
 
   const size_t row_bytes = static_cast<size_t>(width);
   const int mask_row_count = static_cast<int>(mask_rows.size() / row_bytes);
+
+  // Freeze the per-column class-id for THIS frame from the decode markers current NOW, so each captured
+  // row keeps its classification (separation in time) instead of the whole waterfall column recoloring as
+  // later decodes arrive. Region = the decode band that contains the column (narrowest wins); band-less
+  // markers fall back to nearest-center within tol; columns in no band stay 0 (unclassified/neutral).
+  const bool has_cls = state.history_class_id.size() == state.history_mask.size();
+  std::vector<uint8_t> col_cls;
+  if (has_cls && visualization_class_colors_enabled()) {
+    const auto dm = decode_metrics_snapshot();
+    const double center = state.info.center_frequency_hz;
+    const double span = resolved_display_span_hz(state, width);
+    if (span > 0.0 && !dm.recent.empty()) {
+      col_cls.assign(row_bytes, 0);
+      const double lo = center - span * 0.5;
+      const double hi = lo + span;
+      const double tol = span * kClassColorFreqTolFrac;
+      auto abs_f = [center](double v) { return std::abs(v) < 1e9 ? center + v : v; };
+      for (int c = 0; c < width; ++c) {
+        const double f = lo + (static_cast<double>(c) + 0.5) / static_cast<double>(width) * span;
+        int band_idx = -1, near_idx = -1;
+        double best_bw = 1e30, best_d = tol;
+        for (const auto& mk : dm.recent) {
+          const double fc = abs_f(mk.f_hz);
+          if (fc < lo || fc > hi) continue;
+          if (mk.f_hi_hz > mk.f_lo_hz) {
+            const double bl = abs_f(mk.f_lo_hz), bh = abs_f(mk.f_hi_hz);
+            if (f >= bl && f <= bh) {
+              const double bw = bh - bl;
+              if (bw < best_bw) { best_bw = bw; band_idx = class_table_index(mk.mod); }
+            }
+          } else {
+            const double d = std::abs(fc - f);
+            if (d < best_d) { best_d = d; near_idx = class_table_index(mk.mod); }
+          }
+        }
+        const int use_idx = (best_bw < 1e30) ? band_idx : near_idx;
+        col_cls[static_cast<size_t>(c)] = (use_idx >= 0) ? static_cast<uint8_t>(use_idx + 1) : 0;
+      }
+    }
+  }
+
   bool patched_any_row = false;
   for (int row = 0; row < state.history_capacity_rows; ++row) {
     if (state.history_row_frame_numbers[static_cast<size_t>(row)] != frame_number) {
@@ -5008,6 +5112,14 @@ bool patch_history_mask_for_frame(ChannelVisualizationState& state,
     std::copy(mask_rows.begin() + static_cast<std::ptrdiff_t>(src_offset),
               mask_rows.begin() + static_cast<std::ptrdiff_t>(src_offset + row_bytes),
               state.history_mask.begin() + static_cast<std::ptrdiff_t>(dst_offset));
+    if (has_cls) {
+      auto cls_dst = state.history_class_id.begin() + static_cast<std::ptrdiff_t>(dst_offset);
+      if (!col_cls.empty()) {
+        std::copy(col_cls.begin(), col_cls.end(), cls_dst);
+      } else {
+        std::fill(cls_dst, cls_dst + static_cast<std::ptrdiff_t>(row_bytes), 0);
+      }
+    }
     patched_any_row = true;
   }
   return patched_any_row;
@@ -5194,14 +5306,12 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
   }
   ui_state.detector_label = active_detector_label;
 
-  // Live decode markers for the "Color Mask by Class" overlay: fetched ONCE per compose (they are
-  // channel-independent) so the per-channel loop below doesn't repeat the snapshot deep-copy + json
-  // rescan on the render thread.
+  // "Color Mask by Class": the per-pixel class is frozen into channel.history_class_id when each row is
+  // captured (see patch_history_mask_for_frame), so here we just hand the ring + its color LUT to the
+  // overlay -- no per-frame recompute, so old rows keep their class (time separation). LUT is class-id ->
+  // color (index 0 = unclassified/neutral); built once, channel-independent.
   const bool class_colors_enabled = visualization_class_colors_enabled();
-  DecodeMetricsSnapshot class_color_dm;
-  if (class_colors_enabled) {
-    class_color_dm = decode_metrics_snapshot();
-  }
+  const std::vector<RgbColor> class_id_lut = class_id_color_lut();
   for (int channel_index = 0; channel_index < active_channels; ++channel_index) {
     const auto& channel = has_active_channels
         ? *active_channel_states[static_cast<size_t>(channel_index)]
@@ -5336,40 +5446,13 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                                   blue_limit,
                                   red_limit);
     if (overlay_enabled) {
-      // "Color Mask by Class": tint each mask column by the class of the nearest live decode marker
-      // (rt_metrics.json), matched on frequency. Columns with no nearby decode keep the default lime,
-      // so plain detections still show. No-op unless the classifier daemon is publishing markers.
-      std::vector<RgbColor> class_col_colors;
-      const RgbColor* class_col_ptr = nullptr;
-      if (class_colors_enabled && !class_color_dm.recent.empty() && span_hz > 0.0 &&
-          history_width > 0) {
-        const double center = channel.info.center_frequency_hz;
-        const double lo = center - span_hz * 0.5;
-        const double hi = lo + span_hz;
-        const double tol = span_hz * kClassColorFreqTolFrac;
-        class_col_colors.assign(static_cast<size_t>(history_width), kUnclassifiedOverlayColor);
-        for (int c = 0; c < history_width; ++c) {
-          const double f =
-              lo + (static_cast<double>(c) + 0.5) / static_cast<double>(history_width) * span_hz;
-          double best = tol;
-          const std::string* best_mod = nullptr;
-          for (const auto& mk : class_color_dm.recent) {
-            const double f_abs = std::abs(mk.f_hz) < 1e9 ? center + mk.f_hz : mk.f_hz;
-            if (f_abs < lo || f_abs > hi) {
-              continue;  // off-screen marker: don't bleed its class onto edge columns
-            }
-            const double d = std::abs(f_abs - f);
-            if (d < best) {
-              best = d;
-              best_mod = &mk.mod;
-            }
-          }
-          if (best_mod) {
-            class_col_colors[static_cast<size_t>(c)] = class_overlay_color(*best_mod);
-          }
-        }
-        class_col_ptr = class_col_colors.data();
-      }
+      // Per-signal-region + time coloring: the class per pixel was frozen into history_class_id when the
+      // row was captured. A null ring (feature off, or not yet sized) makes overlay_mask_ring fall back
+      // to the single lime detection color.
+      const std::vector<uint8_t>* class_ring =
+          (class_colors_enabled && channel.history_class_id.size() == channel.history_mask.size())
+              ? &channel.history_class_id
+              : nullptr;
       overlay_mask_ring(canvas,
                         output_width,
                         output_height,
@@ -5383,7 +5466,8 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
                         channel.history_valid_rows,
                         channel.history_write_row,
                         overlay_alpha,
-                        class_col_ptr);
+                        class_ring,
+                        class_ring ? &class_id_lut : nullptr);
     }
 
     fill_rect(canvas, output_width, output_height, panel_x - 8, mask_y - 8, main_width + 16, channel_mask_height + 16, {14, 18, 28});

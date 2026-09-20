@@ -444,6 +444,11 @@ struct ChannelVisualizationState {
   int history_write_row = 0;
   std::vector<uint8_t> history_grayscale;
   std::vector<uint8_t> history_mask;
+  // Parallel to history_mask (same ring layout): the per-pixel class index FROZEN when each row was
+  // captured (0 = unclassified, else 1-based index into class_color_table). Lets the class-color overlay
+  // separate signals by time as well as frequency -- old rows keep the class they had, new rows get the
+  // current classification, instead of the whole column recoloring as new decodes arrive.
+  std::vector<uint8_t> history_class_id;
   std::vector<int64_t> history_row_frame_numbers;
   std::vector<int> history_row_indices_within_frame;
   std::vector<float> current_psd_trace;

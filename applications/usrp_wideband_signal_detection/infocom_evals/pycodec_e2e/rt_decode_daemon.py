@@ -247,8 +247,12 @@ class Metrics:
         self.comp_logical = 0              # decompressed cf32 bytes represented
         self.comp_stored = 0               # bytes actually stored
 
-    def note_decode(self, f_hz: float, mod: str, crc_ok: bool):
-        self.recent.append({"f_hz": f_hz, "mod": mod, "crc_ok": bool(crc_ok), "t": time.time()})
+    def note_decode(self, f_hz: float, mod: str, crc_ok: bool,
+                    f_lo_hz: float = 0.0, f_hi_hz: float = 0.0):
+        # f_lo_hz/f_hi_hz = the signal's frequency band edges (from the detected subband bandwidth); the
+        # viz uses them for per-signal-region coloring (color the whole band, not a frequency point).
+        self.recent.append({"f_hz": f_hz, "mod": mod, "crc_ok": bool(crc_ok),
+                            "f_lo_hz": f_lo_hz, "f_hi_hz": f_hi_hz, "t": time.time()})
         self.recent = self.recent[-16:]
 
     def note_frame_bits(self, mod: str, bits: int, errors: int,
@@ -346,6 +350,7 @@ class Metrics:
             "frames_by_modulation": self.by_mod,
             "uptime_s": round(time.time() - self.started, 1),
             "recent_decodes": [{"f_hz": r["f_hz"], "mod": r["mod"], "crc_ok": r["crc_ok"],
+                                "f_lo_hz": r.get("f_lo_hz", 0.0), "f_hi_hz": r.get("f_hi_hz", 0.0),
                                 "age_s": round(time.time() - r["t"], 1)}
                                for r in self.recent if time.time() - r["t"] < 30.0],
             "last_payload_text": self.last_payload_text,
@@ -571,7 +576,9 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                 # Per-signal class marker for the viz (recent_decodes): a frequency-tagged predicted
                 # class so the "Color Mask by Class" overlay can tint the mask, and the detection-panel
                 # triangle can label the band. classify-only has no CRC, so mark it ok=True (classified).
-                metrics.note_decode(snip_center + center, top.label, True)
+                # Pass the band edges (center +/- bw/2) so the overlay colors the whole signal region.
+                metrics.note_decode(snip_center + center, top.label, True,
+                                    snip_center + center - bw / 2.0, snip_center + center + bw / 2.0)
                 band_info.append(f"{center/1e6:+.1f}MHz[{top.label} {top.conf:.2f}]")
                 continue
             if clf is not None:
@@ -627,7 +634,8 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
             frames.extend(got)
             band_info.append(f"{center/1e6:+.1f}MHz/{how}:{len(got)}")
             for f in got:
-                metrics.note_decode(snip_center + center, f.payload_mod, f.payload_crc_ok)
+                metrics.note_decode(snip_center + center, f.payload_mod, f.payload_crc_ok,
+                                    snip_center + center - bw / 2.0, snip_center + center + bw / 2.0)
                 if f.pn9_payload:
                     metrics.note_frame_bits(f.payload_mod, f.payload_len_bits,
                                             f.bit_errors, truth_idx)
