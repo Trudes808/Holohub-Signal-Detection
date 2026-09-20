@@ -747,12 +747,13 @@ RgbColor mask_overlay_color(float normalized_value) {
 
 // ---- Per-class overlay colors ("Color Mask by Class" toggle) --------------------------------------
 // When the classifier is running, the live decode daemon (rt_metrics.json) tags each decoded signal
-// with a modulation class. This table maps each SIGNAL class label to an overlay hue so the detection
-// mask is colored by class instead of the single lime. It is the single source of truth for class hues
-// -- adding a future class is ONE entry here (plus the classifier emitting that label). Any label not
-// listed falls back to the default lime overlay color: that intentionally covers undecoded regions AND
-// the classifier's "NOISE" verdict, so a lit-but-not-a-signal detection reads as a plain lime detection
-// rather than a distinct hue. (Add a NOISE entry here if you want noise called out separately.)
+// with a modulation class. This table maps each class label to an overlay hue so the detection mask is
+// colored by class instead of the single lime. It is the single source of truth for class hues -- adding
+// a future class is ONE entry here (plus the classifier emitting that label). All five classes get a
+// distinct, well-separated hue that stays legible on the dark-blue spectrogram (green / magenta / orange
+// / cyan / red -- deliberately NO blue, which disappears into the blue waterfall background); a lit column
+// with no nearby class marker (detected but unclassified) uses the neutral kUnclassifiedOverlayColor
+// below -- deliberately NOT the lime default, so it never reads as the PSK green.
 struct ClassColorEntry {
   const char* label;
   RgbColor color;
@@ -760,13 +761,18 @@ struct ClassColorEntry {
 
 const std::vector<ClassColorEntry>& class_color_table() {
   static const std::vector<ClassColorEntry> table = {
-      {"PSK", {90, 220, 110}},   // green
-      {"QAM", {200, 110, 255}},  // purple
-      {"FSK", {255, 176, 64}},   // amber
-      {"OFDM", {72, 148, 255}},  // blue
+      {"PSK", {70, 214, 106}},   // green
+      {"QAM", {214, 84, 230}},   // magenta
+      {"FSK", {255, 150, 40}},   // orange
+      {"OFDM", {40, 214, 224}},  // cyan (not blue -- blue blends into the spectrogram background)
+      {"NOISE", {255, 70, 70}},  // red
   };
   return table;
 }
+
+// Neutral for detected-but-unclassified mask columns in class-color mode (distinct from all five hues
+// and from the lime default). Also the fallback for an unknown label.
+constexpr RgbColor kUnclassifiedOverlayColor{200, 205, 212};  // neutral gray
 
 RgbColor class_overlay_color(const std::string& label) {
   for (const auto& entry : class_color_table()) {
@@ -774,7 +780,7 @@ RgbColor class_overlay_color(const std::string& label) {
       return entry.color;
     }
   }
-  return mask_overlay_color(0.0f);  // default lime for unknown / undecoded classes
+  return kUnclassifiedOverlayColor;  // unknown label -> neutral, not lime
 }
 
 // A mask column is colored by the nearest live decode marker within this fraction of the display span.
@@ -2843,6 +2849,10 @@ void render_visualization_ui_overlay() {
                                 entry.color.b / 255.0f, 1.0f),
                          "%s", entry.label);
     }
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(kUnclassifiedOverlayColor.r / 255.0f, kUnclassifiedOverlayColor.g / 255.0f,
+                              kUnclassifiedOverlayColor.b / 255.0f, 1.0f),
+                       "other");
   }
   ImGui::PopStyleVar(2);
   ImGui::End();
@@ -5337,7 +5347,7 @@ std::vector<uint8_t> compose_visualization_rgb(const std::vector<ChannelVisualiz
         const double lo = center - span_hz * 0.5;
         const double hi = lo + span_hz;
         const double tol = span_hz * kClassColorFreqTolFrac;
-        class_col_colors.assign(static_cast<size_t>(history_width), mask_overlay_color(0.0f));
+        class_col_colors.assign(static_cast<size_t>(history_width), kUnclassifiedOverlayColor);
         for (int c = 0; c < history_width; ++c) {
           const double f =
               lo + (static_cast<double>(c) + 0.5) / static_cast<double>(history_width) * span_hz;
