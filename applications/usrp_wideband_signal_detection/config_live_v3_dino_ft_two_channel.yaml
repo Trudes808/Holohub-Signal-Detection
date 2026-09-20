@@ -341,4 +341,9 @@ finetuned_dino_detector:
   # detection 83-100% across SNR; container A/B vs M2_dr on the sparse scene 43%->86%. Robust params
   # stay at operator defaults (low_pct 20, high_pct 95, min_range 8, floor_below_calib 25) = training.
   adaptive_robust_floor: true
+  # Invalid-frame guard floor raised above real busy-band activity (4-15% measured 2026-09-20 OTA);
+  # the default 0.03 false-suppressed legitimate dense frames AND deadlocked the cold-start baseline.
+  # The guard now only needs to catch broadband (~100%) garbage. See config_live_v3_dino_ft.yaml.
+  invalid_frame_min_occupancy: 0.40
+  invalid_frame_occupancy_k: 2.0
 

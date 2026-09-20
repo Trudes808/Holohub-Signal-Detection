@@ -155,6 +155,7 @@ sudo docker exec -d \
   -e USRP_CENTER_FREQ_HZ="${USRP_CENTER_FREQ_HZ:-}" \
   -e USRP_OVERLAY="${USRP_OVERLAY:-}" \
   -e USRP_CLASS_COLORS="${USRP_CLASS_COLORS:-}" \
+  -e DINO_GUARD_DEBUG="${DINO_GUARD_DEBUG:-}" \
   "${CONTAINER_NAME}" bash -lc "
   cp '${SOURCE_APP_DIR}/${CONFIG_NAME}' '${BUILD_APP_DIR}/' 2>/dev/null || true
   mkdir -p /tmp/xdg-runtime-root && chmod 700 /tmp/xdg-runtime-root

@@ -155,6 +155,12 @@ class FinetunedDinoDetector : public holoscan::Operator {
   std::vector<uint64_t> frame_count_;
   std::vector<double>   occ_baseline_;             // per-channel EWMA occupancy of accepted frames (guard)
   uint64_t              invalid_frames_suppressed_ = 0;
+  // DIAGNOSTIC (env DINO_GUARD_DEBUG=1, read once at init; inert otherwise): when the invalid-frame guard
+  // suppresses a frame, log the ingest metadata (pkts/expected, partial flag, content fingerprint vs the
+  // last ACCEPTED frame's) so a corrupt frame can be characterized as a short-count drop, a stale-buffer
+  // reuse, or a full-count-but-corrupt frame. No ingest change; fires only on already-suppressed frames.
+  bool                  guard_debug_ = false;
+  std::vector<uint64_t> prev_accept_fingerprint_;
   std::vector<ChannelBuffers> channel_buffers_;
   std::shared_ptr<FinetunedDinoTorchRuntime> runtime_;
 

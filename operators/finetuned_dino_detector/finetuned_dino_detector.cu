@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <tuple>
 
@@ -445,6 +446,8 @@ void FinetunedDinoDetector::initialize() {
   const int channels = channel_filter_.get() >= 0 ? 1 : std::max(1, num_channels_.get());
   frame_count_.assign(channels, 0);
   occ_baseline_.assign(channels, -1.0);   // <0 => not yet initialized (invalid-frame guard)
+  prev_accept_fingerprint_.assign(channels, 0ull);
+  guard_debug_ = [] { const char* e = std::getenv("DINO_GUARD_DEBUG"); return e && std::atoi(e) != 0; }();
   channel_buffers_.assign(channels, ChannelBuffers{});
   runtime_ = std::make_shared<FinetunedDinoTorchRuntime>();
   if (!runtime_->load(model_script_path_.get(), torch_dtype_.get())) {
@@ -855,10 +858,33 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
                      100.0 * occ, 100.0 * thresh, base >= 0.0 ? 100.0 * base : -1.0,
                      static_cast<unsigned long long>(invalid_frames_suppressed_));
       }
+      // DIAGNOSTIC: characterize the corrupt frame from the ingest metadata (env DINO_GUARD_DEBUG).
+      // Logs EVERY suppressed frame (rare -- only corrupt ones reach here) so short-count drops,
+      // stale-buffer reuse (fp == last accepted), and full-count-but-corrupt frames are distinguishable.
+      if (guard_debug_) {
+        const uint32_t pib  = meta ? meta->get<uint32_t>("chdr_packets_in_batch", 0u) : 0u;
+        const uint32_t pexp = meta ? meta->get<uint32_t>("chdr_expected_packets_in_batch", 0u) : 0u;
+        const bool part     = meta ? meta->get<bool>("chdr_partial_batch", false) : false;
+        const uint64_t fp   = meta ? meta->get<uint64_t>("chdr_content_fingerprint", 0ull) : 0ull;
+        const uint64_t pfp  = (ch < prev_accept_fingerprint_.size()) ? prev_accept_fingerprint_[ch] : 0ull;
+        std::fprintf(stderr,
+            "[dino_guard_dbg] SUPPRESS ch%d frame=%llu occ=%.3f%% thr=%.3f%% base=%.4f%% "
+            "pkts=%u/%u short=%d partial=%d fp=%016llx prev_fp=%016llx fp_eq_prev=%d\n",
+            static_cast<int>(channel_number), static_cast<unsigned long long>(frame_number),
+            100.0 * occ, 100.0 * thresh, base >= 0.0 ? 100.0 * base : -1.0,
+            pib, pexp, (pexp > 0u && pib < pexp) ? 1 : 0, part ? 1 : 0,
+            static_cast<unsigned long long>(fp), static_cast<unsigned long long>(pfp),
+            (fp != 0ull && fp == pfp) ? 1 : 0);
+      }
     } else {
       base = (base < 0.0) ? occ
                           : (1.0 - invalid_frame_baseline_alpha_.get()) * base
                                 + invalid_frame_baseline_alpha_.get() * occ;
+      // DIAGNOSTIC: remember this ACCEPTED frame's content fingerprint so a later suppressed frame can be
+      // tested for stale-buffer reuse. Gated -> zero cost on the normal path.
+      if (guard_debug_ && ch < prev_accept_fingerprint_.size()) {
+        prev_accept_fingerprint_[ch] = meta ? meta->get<uint64_t>("chdr_content_fingerprint", 0ull) : 0ull;
+      }
     }
   }
 

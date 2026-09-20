@@ -258,11 +258,11 @@ finetuned_dino_detector:
   threshold: 0.6
   model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m3_491_bf16.ts"
   torch_dtype: "fp32"               # vestigial: bf16 compute is baked into the traced .ts
-  # LIVE @ 491.52 MSps: with downsample mode the frame cost is ~2 tiles (rate-adaptive), so a
-  # low stride is affordable and the ROI history reads as a continuous ribbon (viz holds the last
-  # mask up to 48 frames) instead of chunk-by-chunk. Native mode (below) is 20+ tiles/frame and
-  # forced the coarse stride-16 blocks.
-  emit_stride: 4
+  # LIVE @ 491.52 MSps: stride 4 (=11.7 Hz) with ~47-49 ms inference plus CHDR/FFT/viz GPU work
+  # intermittently oversubscribes the GB10 -> 'Fell behind' RX-backlog -> recycled-mbuf garbage batch =
+  # full-width bright bar (root-caused 2026-09-20 OTA: single@4 -> 23 Fell-behind + 7 bars/120s;
+  # @12 -> 0/0). 12 gives inference headroom; viz mask-history keeps the ROI ribbon continuous.
+  emit_stride: 12
   channel_filter: -1
   # Native nfft-FFT at 491.52 MSps = 480 kHz/bin, DOUBLE M2_dr's trained 240 kHz/bin -> every
   # signal reads half-width at the wrong scale. Downsample mode FFTs wide (auto-sized to the actual
@@ -287,6 +287,11 @@ finetuned_dino_detector:
   # detection 83-100% across SNR; container A/B vs M2_dr on the sparse scene 43%->86%. Robust params
   # stay at operator defaults (low_pct 20, high_pct 95, min_range 8, floor_below_calib 25) = training.
   adaptive_robust_floor: true
+  # Invalid-frame guard floor raised above real busy-band activity (4-15% measured 2026-09-20 OTA);
+  # the default 0.03 false-suppressed legitimate dense frames AND deadlocked the cold-start baseline.
+  # The guard now only needs to catch broadband (~100%) garbage. See config_live_v3_dino_ft.yaml.
+  invalid_frame_min_occupancy: 0.40
+  invalid_frame_occupancy_k: 2.0
   # OTA-measured (detector_mask_sanity_ota): the anti-alias rolloff cliff at the outermost bins
   # survives the flatten and fires the model (17.5% of the outer 3% margins lit vs 0.32% in-band).
   # Zero the outer 3% of mask columns per side after inference. 0 disables (= base config).

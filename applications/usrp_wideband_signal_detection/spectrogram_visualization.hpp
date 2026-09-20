@@ -78,7 +78,9 @@ class SpectrogramPreviewOp : public Operator {
   Parameter<float> db_ceil_;
   Parameter<bool> timing_summary_enable_;
   Parameter<int> timing_summary_every_n_;
+  Parameter<double> broadband_suppress_frac_;   // skip a frame this fraction near-saturated (garbage); <=0 off
   uint64_t frames_seen_ = 0;
+  uint64_t broadband_frames_skipped_ = 0;
   cudaStream_t reduce_stream_ = nullptr;
   uint8_t* device_output_ = nullptr;
   void* pinned_output_ = nullptr;
@@ -282,6 +284,7 @@ class SpectrogramToHolovizOp : public Operator {
   std::atomic<bool> history_budget_warning_emitted_{false};
   std::atomic<bool> channel_filter_override_warning_emitted_{false};
   std::vector<uint64_t> latest_rendered_frame_numbers_;
+  uint64_t max_hold_reset_epoch_seen_ = 0;  // consumes the "Reset Max Hold" button (global epoch)
 
   void ensure_channel_resource_capacity(size_t channel_index, size_t required_bytes);
 

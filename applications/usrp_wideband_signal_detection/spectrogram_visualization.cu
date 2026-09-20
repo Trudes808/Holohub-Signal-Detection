@@ -301,6 +301,19 @@ std::atomic<bool>& global_class_colors_enabled() {
   return enabled;
 }
 
+// "Reset Max Hold" button -> compute-thread clear. The UI thread bumps this epoch; the render/state
+// loop clears every channel's peak-hold trace when it sees a new value (lock-free hand-off).
+std::atomic<uint64_t>& global_max_hold_reset_epoch() {
+  static std::atomic<uint64_t> epoch{0};
+  return epoch;
+}
+void request_max_hold_reset() {
+  global_max_hold_reset_epoch().fetch_add(1, std::memory_order_relaxed);
+}
+uint64_t max_hold_reset_epoch() {
+  return global_max_hold_reset_epoch().load(std::memory_order_relaxed);
+}
+
 std::mutex& visualization_ui_state_mutex() {
   static std::mutex mutex;
   return mutex;
@@ -1645,6 +1658,13 @@ void SpectrogramPreviewOp::setup(OperatorSpec& spec) {
              "Timing Summary Every N",
              "Emit a live preview timing summary every N preview frames per channel.",
              128);
+  spec.param(broadband_suppress_frac_,
+             "broadband_suppress_frac",
+             "Broadband suppress frac",
+             "Skip (do not render) a preview frame whose near-saturated pixel fraction reaches this. "
+             "A uniform full-scale frame is recycled-mbuf corruption under RX/GPU pressure, never real "
+             "RF; skipping it keeps the bright bar out of the waterfall and PSD max-hold. <=0 disables.",
+             0.85);
 }
 
 void SpectrogramPreviewOp::initialize() {
@@ -1740,6 +1760,28 @@ void SpectrogramPreviewOp::compute(InputContext& op_input,
   out_t message;
   message.pixels.resize(static_cast<size_t>(preview_width) * static_cast<size_t>(preview_height));
   std::memcpy(message.pixels.data(), pinned_output_, bytes);
+  // Broadband-garbage guard (display-only). A uniform full-scale frame is recycled-mbuf corruption
+  // under RX/GPU pressure (root-caused 2026-09-20 OTA: full-count 10240/10240 batch, distinct
+  // fingerprint, clusters around 'Fell behind' events), never real RF. Skip it entirely so it can
+  // neither paint a bright bar in the waterfall nor pin the PSD max-hold. broadband_suppress_frac is
+  // the fraction of near-saturated (>=~90% full-scale) pixels that flags the frame; <=0 disables it.
+  if (const double supp = broadband_suppress_frac_.get(); supp > 0.0 && !message.pixels.empty()) {
+    size_t hi = 0;
+    for (uint8_t v : message.pixels) { if (v >= 230) ++hi; }
+    const double frac_hi = static_cast<double>(hi) / static_cast<double>(message.pixels.size());
+    if (frac_hi >= supp) {
+      if ((broadband_frames_skipped_++ % 32) == 0) {
+        const uint32_t pib  = meta ? meta->get<uint32_t>("chdr_packets_in_batch", 0u) : 0u;
+        const uint32_t pexp = meta ? meta->get<uint32_t>("chdr_expected_packets_in_batch", 0u) : 0u;
+        const bool part     = meta ? meta->get<bool>("chdr_partial_batch", false) : false;
+        HOLOSCAN_LOG_WARN("Skipping broadband-garbage spectrogram ch{} frame {} frac_hi={:.3f}>={:.3f} "
+                          "pkts={}/{} partial={} (total skipped={})",
+                          configured_channel, frame_number, frac_hi, supp,
+                          pib, pexp, part ? 1 : 0, broadband_frames_skipped_);
+      }
+      return;  // do not emit -> no waterfall row, no PSD / max-hold / density update for this frame
+    }
+  }
   message.width = preview_width;
   message.height = preview_height;
   message.source_rows = canonical_rows;
@@ -2894,6 +2936,11 @@ void render_visualization_ui_overlay() {
   bool class_colors = visualization_class_colors_enabled();
   if (ImGui::Checkbox("Color Mask by Class", &class_colors)) {
     set_visualization_class_colors_enabled(class_colors);
+  }
+  // Clears the PSD peak-hold trace so a past broadband transient (garbage OR real wideband RF) stops
+  // pinning the MAX HOLD line. Consumed on the compute thread via the global reset epoch.
+  if (ImGui::Button("Reset Max Hold")) {
+    request_max_hold_reset();
   }
   if (class_colors) {
     // Inline legend so viewers can read the class hues at a glance.
@@ -4225,6 +4272,16 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
     }
     if (latest_rendered_frame_numbers_.size() < snapshot_mailboxes.size()) {
       latest_rendered_frame_numbers_.resize(snapshot_mailboxes.size(), 0);
+    }
+    // Consume a "Reset Max Hold" button press: clear every channel's peak-hold trace once.
+    {
+      const uint64_t reset_epoch = max_hold_reset_epoch();
+      if (reset_epoch != max_hold_reset_epoch_seen_) {
+        max_hold_reset_epoch_seen_ = reset_epoch;
+        for (auto& st : channel_states_) {
+          st.max_hold_trace.clear();
+        }
+      }
     }
 
     for (size_t channel_index = 0; channel_index < snapshot_mailboxes.size(); ++channel_index) {

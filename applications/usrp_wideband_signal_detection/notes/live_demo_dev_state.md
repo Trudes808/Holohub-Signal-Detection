@@ -95,6 +95,18 @@ Two detectors selectable at runtime (dashboard dropdown, via the conductor): **c
 - **LIVE OTA (2026-09-20):** full pipeline on the real X410, M3 + classifier + class overlay; 16 live
   class markers (OFDM dominant = WiFi), CHDR partial_drops=0, GPU ~77%. Screenshots in
   `dino_ft_class_overlay/results/live_ota_*.png`.
+- **Bright-bar root cause + fix (2026-09-20, OTA):** the intermittent full-width bright bar (also pins
+  PSD max-hold) = a **uniform full-scale recycled-mbuf garbage frame** (full-count 10240/10240, distinct
+  fp, NOT short/partial) formed when DINO GPU load stalls the RX (`Fell behind`). Load-driven: single
+  `emit_stride=4` → 23 Fell-behind + 7 bars/120s; **`=12` → 0/0**; dual `=16` → 0/0. Also found the
+  invalid-frame guard mis-calibrated (`min_occupancy=0.03` < real 4-15% busy-band → 10 false-suppressions
+  + cold-start baseline deadlock). Fixes (live DINO configs + viz only; eval/loopback untouched):
+  `emit_stride 4→12` (dino_ft, _sb), guard `min_occupancy 0.03→0.40`/`k 6→2` (all 3 live DINO), a viz
+  **broadband-suppress guard** (`SpectrogramPreviewOp`, param `broadband_suppress_frac` default 0.85,
+  skips uniform-full-scale frames), and a **"Reset Max Hold"** ImGui button. Record:
+  `infocom_evals/signal_detection_experiments/dino_ft_bright_bar_rootcause/`. Memory
+  `dino-ft-bright-bar-rootcause`. (The older short-packet bar was already fixed by CHDR zero-fill
+  `14b7ae67`; re-verified.)
 
 ## 6. The class-color overlay (feature built this effort)
 
@@ -128,6 +140,10 @@ Two detectors selectable at runtime (dashboard dropdown, via the conductor): **c
   X410 IPs: sfp0=192.168.10.2 (data), sfp1=192.168.21.2 (control). Host: enp1s0f0np0=192.168.10.1 (data,
   DPDK), enp1s0f1np1=192.168.21.1 (control). A stray 192.168.21.1/24 tends to re-appear on the data NIC
   after rewiring — harmless once cables are right.
+- **X410 `rx xport timed out getting a response from mgmt_portal`** at RX-streamer start (control RPC
+  works, rates/freq/gain set, then `get_rx_stream` times out): MPM is in a bad state (often after a
+  restart or a prior stream not cleanly stopped). Fix = `ssh root@192.168.21.2 systemctl restart
+  usrp-hwd`, wait ~10 s for it to re-serve, then re-run. Also clears an X410 stuck streaming stale.
 - **Loopback dst-MAC:** pcaps need dst-MAC `4c:bb:47:2c:45:13` or DPDK drops them (memory
   `loopback-dstmac-spark`).
 - **`pkill -f` self-match** (exit 144): commands containing the literal process name match their own
@@ -148,7 +164,8 @@ invalid-frame guard.
 
 - **v4 default detector:** currently coherent (mirrors v3); consider defaulting v4 to DINO-FT M3 so the
   class colors show best (one-line: set the v4 preset's demo_control detector to `cuda_dino_finetuned`).
-- **Dual-channel OTA:** validated on loopback (partial_drops=0); not yet run on two live RF streams.
+- **Dual-channel OTA:** now run on two live RF streams (2026-09-20, 2.4 + 1.0 GHz): CHDR
+  partial_drops=0, panic_resets=0, Fell-behind=0 at DINO `emit_stride=16` — clean.
 - **Class overlay label accuracy on OTA:** classifier is out-of-distribution on real WiFi/BT — retrain
   on OTA-like classes if label accuracy (not just the coloring mechanism) matters for the demo.
 - **Artifact:** could add the live-OTA shot to RSdrKitPhtsFgSsyX5K3Ca alongside the loopback ones.
@@ -156,6 +173,6 @@ invalid-frame guard.
 
 ## 10. Memory pointers (auto-loaded each session)
 
-`dino-ft-finetune-plan`, `class-color-mask-overlay`, `loopback-46875-frame-seam`,
-`x410-swapped-sfp-cables`, `dino-ft-rt-overlay-not-detector`, `dino-ft-live-artifact-is-ingest`,
-`loopback-dstmac-spark`, `spark-port-environment`.
+`dino-ft-finetune-plan`, `dino-ft-bright-bar-rootcause`, `class-color-mask-overlay`,
+`loopback-46875-frame-seam`, `x410-swapped-sfp-cables`, `dino-ft-rt-overlay-not-detector`,
+`dino-ft-live-artifact-is-ingest`, `loopback-dstmac-spark`, `spark-port-environment`.

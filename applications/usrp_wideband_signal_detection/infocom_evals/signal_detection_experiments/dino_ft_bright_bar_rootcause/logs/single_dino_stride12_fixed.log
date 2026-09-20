@@ -1,0 +1,1252 @@
+[info] [gxf_executor.cpp:344] Creating context
+[info] [fragment.cpp:969] Loading extensions from configs...
+[info] [common.h:768] Finished reading Advanced Network configuration
+[info] [adv_network_dpdk_mgr.cpp:662] Attempting to use 1 ports for high-speed network
+[info] [adv_network_dpdk_mgr.cpp:671] Setting DPDK log level to: Info
+[info] [adv_network_dpdk_mgr.cpp:691] DPDK EAL arguments: operator --file-prefix=nwlrbbmqbh -l 9,10 --log-level=9 --log-level=pmd.net.mlx5:info -a 0000:01:00.0,txq_inline_max=0,dv_flow_en=2 
+Log level 9 higher than maximum (8)
+EAL: Detected CPU lcores: 20
+EAL: Detected NUMA nodes: 1
+EAL: Detected shared linkage of DPDK
+EAL: Multi-process socket /var/run/dpdk/nwlrbbmqbh/mp_socket
+EAL: Selected IOVA mode 'VA'
+EAL: Probe PCI driver: mlx5_pci (15b3:1021) device: 0000:01:00.0 (socket -1)
+mlx5_net: PCI information matches for device "rocep1s0f0"
+mlx5_net: enhanced MPS is enabled
+mlx5_net: port 0 MAC address is 4C:BB:47:2C:45:13
+TELEMETRY: No legacy callbacks, legacy socket not created
+[info] [adv_network_dpdk_mgr.cpp:705] sdr_data (0000:01:00.0): identified as port 0
+[info] [adv_network_dpdk_mgr.cpp:459] Adjusting buffer size to 4224 for headroom
+[info] [adv_network_dpdk_mgr.cpp:459] Adjusting buffer size to 192 for headroom
+[info] [adv_network_dpdk_mgr.cpp:459] Adjusting buffer size to 170 for headroom
+[info] [manager.cpp:116] Registering memory regions
+[info] [manager.cpp:178] Successfully allocated memory region CH1_Data_RX_GPU at 0x1be000000 type 2 with 4096 bytes (262144 elements @ 4224 bytes total 1107296256)
+[info] [manager.cpp:178] Successfully allocated memory region CH1_CHDR_Headers_RX_CPU at 0x1baffff80 type 2 with 64 bytes (262144 elements @ 192 bytes total 50331648)
+[info] [manager.cpp:178] Successfully allocated memory region Headers_RX_CPU at 0x1b857ff00 type 2 with 42 bytes (262144 elements @ 170 bytes total 44564480)
+[info] [manager.cpp:191] Finished allocating memory regions
+[info] [adv_network_dpdk_mgr.cpp:749] DPDK init (0000:01:00.0) -- RX: ENABLED TX: DISABLED
+[info] [adv_network_dpdk_mgr.cpp:759] Configuring RX queue: Channel 1 data (0) on port 0
+[info] [adv_network_dpdk_mgr.cpp:808] Created mempool RXP_P0_Q0_MR0 : mbufs=262144 elsize=170 ptr=0x17f94e180
+[info] [adv_network_dpdk_mgr.cpp:808] Created mempool RXP_P0_Q0_MR1 : mbufs=262144 elsize=192 ptr=0x1b217f740
+[info] [adv_network_dpdk_mgr.cpp:808] Created mempool RXP_P0_Q0_MR2 : mbufs=262144 elsize=4224 ptr=0x1abd7ef80
+[info] [adv_network_dpdk_mgr.cpp:818] Max packet size needed for RX: 4202
+[info] [adv_network_dpdk_mgr.cpp:916] Max packet size needed with TX: 4202
+[info] [adv_network_dpdk_mgr.cpp:927] Setting port config for port 0 mtu:4184
+[info] [adv_network_dpdk_mgr.cpp:958] Initializing port 0 with 1 RX queues and 0 TX queues...
+mlx5_net: port 0 Rx queues number update: 0 -> 1
+[info] [adv_network_dpdk_mgr.cpp:974] Successfully configured ethdev
+[info] [adv_network_dpdk_mgr.cpp:984] Successfully set descriptors to 8192/8192
+[info] [adv_network_dpdk_mgr.cpp:996] Port 0 in isolation mode
+[info] [adv_network_dpdk_mgr.cpp:1008] Setting up port:0, queue:0, Num scatter:3 pool:0x17f94e180
+[info] [adv_network_dpdk_mgr.cpp:1029] Successfully setup RX port 0 queue 0
+[info] [adv_network_dpdk_mgr.cpp:1059] Not enabling promiscuous mode on port 0 since flow isolation is enabled
+mlx5_net: [mlx5dr_cmd_query_caps]: Failed to query wire port regc value
+mlx5_net: port 0 Rx queues number update: 1 -> 1
+[info] [adv_network_dpdk_mgr.cpp:1070] Successfully started port 0
+[info] [adv_network_dpdk_mgr.cpp:1073] Port 0, MAC address: 4C:BB:47:2C:45:13
+[info] [adv_network_dpdk_mgr.cpp:1085] Adding RX flow Channel 1 data packets
+[info] [adv_network_dpdk_mgr.cpp:1330] Adding UDP port match for src/dst 49153/1234
+[info] [adv_network_dpdk_mgr.cpp:1126] Setting up RX burst pool with 8191 batches of size 8192
+[info] [adv_network_dpdk_mgr.cpp:1145] Setting up RX burst pool with 8191 batches of size 2048
+[info] [adv_network_dpdk_mgr.cpp:1164] Setting up RX meta pool with 256 buffers
+[info] [adv_network_dpdk_mgr.cpp:1220] Setting up TX meta pool with 256 buffers
+[info] [adv_network_dpdk_stats.cpp:81] Initializing DPDK stats
+[info] [adv_network_dpdk_stats.cpp:102] Port 0, Queue 0: Memory regions: Headers_RX_CPU, CH1_CHDR_Headers_RX_CPU, CH1_Data_RX_GPU
+[info] [adv_network_dpdk_stats.cpp:177] Found rx_q0_errors counter at index 10
+[info] [adv_network_dpdk_stats.cpp:199] Initialized DPDK xstats for port 0, found 64 stats
+[info] [adv_network_dpdk_stats.cpp:201] Found rx_missed counter at index 4
+[info] [adv_network_dpdk_stats.cpp:207] Found mbuf allocation counter at index 7
+[info] [adv_network_dpdk_stats.cpp:216] Initialized DPDK stats
+[info] [adv_network_dpdk_mgr.cpp:1512] Config validated successfully
+[info] [adv_network_dpdk_mgr.cpp:1525] Starting advanced network workers
+[info] [adv_network_dpdk_mgr.cpp:1609] Done starting workers
+[info] [main.cpp:482] Configured the Advanced Network manager
+[info] [adv_network_dpdk_mgr.cpp:1619] Flushing packets on port 0 queue 0
+[info] [adv_network_dpdk_mgr.cpp:1916] Starting RX Core 10, port 0, queue 0, socket 0
+[info] [adv_network_dpdk_mgr.cpp:225] RX pool inventory port=0 queue=0 ('Channel 1 data') seg=0 pool='RXP_P0_Q0_MR0' avail=260096 in_use=2048 total=262144
+[info] [adv_network_dpdk_mgr.cpp:225] RX pool inventory port=0 queue=0 ('Channel 1 data') seg=1 pool='RXP_P0_Q0_MR1' avail=260096 in_use=2048 total=262144
+[info] [adv_network_dpdk_mgr.cpp:225] RX pool inventory port=0 queue=0 ('Channel 1 data') seg=2 pool='RXP_P0_Q0_MR2' avail=258048 in_use=4096 total=262144
+[info] [adv_network_dpdk_stats.cpp:243] Starting stats thread on core 9
+[info] [main.cpp:180] Reserved advanced-network cores and SMT siblings [9,10] from non-DPDK process threads
+[info] [main.cpp:487] Configured pipeline_shutdown_term for chdrConverterOp
+[info] [main.cpp:509] USRP_SAMPLE_RATE_HZ override active: 491520000 Hz (supersedes config channel_sample_rates_hz/fft.span)
+[info] [fft_runtime_config.hpp:169] Derived runtime FFT config span_hz=491520000 source=explicit_input_sample_rate_hz reference_span_hz=500000000 reference_fft_size=20480 requested_fft_size=20480 actual_fft_size=20480 packet_samples=1024 packets_per_fft=20 resolution_hz=24000 override_fft_bin_size=0
+[info] [main.cpp:759] Sharing pipeline_shutdown_term with visualization shutdown handling
+[error] [fragment.cpp:322] Unable to find the parameter item/map with key 'visualization.detector_label'
+[error] [arg.hpp:515] No item available in the argument list.
+[error] [fragment.cpp:322] Unable to find the parameter item/map with key 'visualization.screenshot_path'
+[error] [arg.hpp:515] No item available in the argument list.
+[warning] [component.cpp:65] component 'spectrogramVisualizerOp': Arg 'refresh_hz' not found in spec_.params(). The defined parameters are (row_average_n, db_floor, allow_backpressure_valve, overlay_alpha, tensor_name, demo_title, class_colors_enable, channel_filter, timing_summary_every_n, history_frames, demo_subtitle, demo_controls_snr, dino_chunk_rows, shutdown_scheduling_term, num_channels, output_width, rows_per_frame, output_height, decode_metrics_json, span_hz, render_every_n_frames, db_ceil, red_limit, mask_frame_offset, demo_control_json, center_frequency_hz, blue_limit, fft_size, display_time_rows, dino_chunk_cols, overlay_enable, detector_label, display_freq_bins, history_memory_budget_mb, timing_summary_enable).
+[info] [spectrogram_visualization.cu:3963] LIVE DECODE panel enabled: watching /workspace/spectrograms/rt_metrics.json
+[info] [spectrogram_visualization.cu:3968] DEMO CONTROLS panel enabled: writing /workspace/spectrograms/demo_control.json
+[info] [spectrogram_visualization.cu:3979] Spectrogram visualizer initializing with num_channels=1 display_freq_bins=1920 rows_per_frame=8 render_every_n_frames=1
+[info] [spectrogram_visualization.cu:3984] Spectrogram visualizer live history clamped to width=1920 rows=102
+[finetuned_dino_detector] loaded TorchScript /workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m3_491_bf16.ts
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=0 packets=0 rate=0.000 Mpps full_flushes=0 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=19088868 max_burst=0 max_ring_depth=0 seg0(avail/in_use)=260096/2048 seg1(avail/in_use)=260096/2048 seg2(avail/in_use)=258048/4096 seg3(avail/in_use)=0/0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=0 packets=0 rate=0.000 Mpps full_flushes=0 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=19242196 max_burst=0 max_ring_depth=0 seg0(avail/in_use)=260096/2048 seg1(avail/in_use)=260096/2048 seg2(avail/in_use)=258048/4096 seg3(avail/in_use)=0/0
+[finetuned_dino_detector] warmup done (3 x [4,1,256,1024])
+[copilot-probe] LoggingHolovizOp::initialize()
+[info] [main.cpp:451] LoggingHolovizOp::initialize()
+[warning] [holoviz.cpp:1526] An argument named "window_close_scheduling_term" was provided, but this parameter name is deprecated. Please provide this argument via its new name, "window_close_condition", instead. Now renaming the argument to "window_close_condition".
+[info] [spectrogram.cu:144] Spectrogram save disabled.
+[info] [snippet_compression.cu:189] snippet_compression: codec=none bfp_block=64 control_json=/workspace/spectrograms/demo_control.json
+[info] [gxf_executor.cpp:2508] Activating Graph...
+[info] [event_based_scheduler.cpp:156] Adding thread to default thread pool without pin cores
+[info] [event_based_scheduler.cpp:156] Adding thread to default thread pool without pin cores
+[info] [event_based_scheduler.cpp:156] Adding thread to default thread pool without pin cores
+[info] [event_based_scheduler.cpp:156] Adding thread to default thread pool without pin cores
+[info] [gxf_executor.cpp:2579] Running Graph...
+[info] [event_based_scheduler.cpp:442] EventBasedScheduler started worker thread [pool name: default_pool, thread uid: 0]
+[info] [event_based_scheduler.cpp:442] EventBasedScheduler started worker thread [pool name: default_pool, thread uid: 1]
+[info] [event_based_scheduler.cpp:442] EventBasedScheduler started worker thread [pool name: default_pool, thread uid: 2]
+[info] [event_based_scheduler.cpp:442] EventBasedScheduler started worker thread [pool name: default_pool, thread uid: 3]
+[info] [gxf_executor.cpp:2581] Waiting for completion...
+[info] [context.cpp:54] _______________
+[info] [context.cpp:54] Vulkan Version:
+[info] [context.cpp:54]  - available:  1.3.275
+[info] [context.cpp:54]  - requesting: 1.2.0
+[info] [context.cpp:54] ______________________
+[info] [context.cpp:54] Used Instance Layers :
+[info] [context.cpp:54] 
+[info] [context.cpp:54] Used Instance Extensions :
+[info] [context.cpp:54] VK_KHR_surface
+[info] [context.cpp:54] VK_KHR_xcb_surface
+[info] [context.cpp:54] VK_EXT_debug_utils
+[info] [context.cpp:54] VK_KHR_external_memory_capabilities
+[info] [context.cpp:54] ____________________
+[info] [context.cpp:54] Compatible Devices :
+[info] [context.cpp:54] 0: NVIDIA Tegra NVIDIA GB10
+[info] [context.cpp:54] Physical devices found : 
+[info] [context.cpp:54] 1
+[info] [context.cpp:54] ________________________
+[info] [context.cpp:54] Used Device Extensions :
+[info] [context.cpp:54] VK_KHR_swapchain
+[info] [context.cpp:54] VK_KHR_external_memory
+[info] [context.cpp:54] VK_KHR_external_memory_fd
+[info] [context.cpp:54] VK_KHR_external_semaphore
+[info] [context.cpp:54] VK_KHR_external_semaphore_fd
+[info] [context.cpp:54] VK_KHR_push_descriptor
+[info] [context.cpp:54] VK_EXT_line_rasterization
+[info] [context.cpp:54] VK_KHR_sampler_ycbcr_conversion
+[info] [context.cpp:54] 
+[info] [vulkan_app.cpp:448] Using device 0: NVIDIA Tegra NVIDIA GB10 (UUID fb9233ebdf7465407a2a699ffd9d2cf)
+[info] [framebuffer_sequence.cpp:132] Using surface format 'B8G8R8A8Unorm, SrgbNonlinear'
+[info] [framebuffer_sequence.cpp:152] Using depth format 'D32Sfloat'
+[info] [framebuffer_sequence.cpp:283] Using present mode 'Immediate'
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=0 packets=0 rate=0.000 Mpps full_flushes=0 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=18915837 max_burst=0 max_ring_depth=0 seg0(avail/in_use)=260096/2048 seg1(avail/in_use)=260096/2048 seg2(avail/in_use)=258048/4096 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:982] Begin receiving samples on channel 0 (first burst packets=1024)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5
+[info] [framebuffer_sequence.cpp:283] Using present mode 'Immediate'
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=100000
+[info] [holoviz.cpp:2136] Input spec:
+- type: color
+  name: spectrogram
+  opacity: 1.000000
+  priority: 0
+  image_format: r8g8b8_unorm
+
+[finetuned_dino_detector] power-level match OFF: rate=491.5 MS/s ref=245.8 MS/s -> level_offset=0.00 dB (gain_offset=13.01 dB, trim=0.00 dB); effective db_vmin=-34.64
+[finetuned_dino_detector] robust normalization ON: floor(p20)=-31.14 dB high(p95)=-19.65 dB range=11.49 dB -> ROBUST (fixed_vmin=-47.65, clip_vmin=-35.22, span=34.0)
+[finetuned_dino_detector] per-freq floor flatten ON (q=75 frac=0.0050 -> sigma=102.4 bins @ fft=20480, max_boost=12.0 dB signal_cap=6.0 dB)
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=110888 packets=167657 rate=0.168 Mpps full_flushes=163 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=15362716 max_burst=30 max_ring_depth=30 seg0(avail/in_use)=225559/36585 seg1(avail/in_use)=225559/36585 seg2(avail/in_use)=223511/38633 seg3(avail/in_use)=0/0
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 93.86 ms (mean 93.86 ms over 1 frames)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.000 bursts=469 packets=480256 rate=0.480 Mpps queued=46 emitted=46 empty_polls=69287 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=9216 max_burst_packets=1024 refcounted_bursts=9 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=268427 packets=480005 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=3247848 max_burst=64 max_ring_depth=53 seg0(avail/in_use)=237074/25070 seg1(avail/in_use)=237074/25070 seg2(avail/in_use)=235026/27118 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=900000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.000 bursts=469 packets=480256 rate=0.480 Mpps queued=47 emitted=47 empty_polls=13708 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=8192 max_burst_packets=1024 refcounted_bursts=8 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1100000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=307112 packets=480008 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2753954 max_burst=64 max_ring_depth=24 seg0(avail/in_use)=248586/13558 seg1(avail/in_use)=248586/13558 seg2(avail/in_use)=246538/15606 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1300000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=63.796 max_chdr_to_fft_ms=164.761
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.519/3.395 preview_compute_ms(avg/max)=5.380/21.085 fft_to_preview_emit_ms(avg/max)=5.899/21.591
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.000 bursts=469 packets=480256 rate=0.480 Mpps queued=47 emitted=47 empty_polls=13270 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=7168 max_burst_packets=1024 refcounted_bursts=7 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=366637 packets=480009 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2636951 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=249857/12287 seg1(avail/in_use)=249857/12287 seg2(avail/in_use)=247809/14335 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1700000
+[info] [main.cpp:401] Processed 1730150400 samples from channel 0 at 345.24 MSps (11.05 Gbps) gpu_util_pct(mean=36.50,max=39)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=1900000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.000 bursts=469 packets=480256 rate=0.480 Mpps queued=47 emitted=47 empty_polls=12864 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=6144 max_burst_packets=1024 refcounted_bursts=6 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2000000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=368799 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2596519 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=251130/11014 seg1(avail/in_use)=251130/11014 seg2(avail/in_use)=249082/13062 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2100000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=128 processed=128 rendered=128 drop_vis_busy=0 drop_render_busy=71 cadence_skips=0 masks(received/backfilled/deferred/peak)=16/10/33/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=80.19/139.11 preview_age_ms(avg/max)=74.42/129.90 compose_ms(avg/max)=5.64/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.55 ch0_frames=128 ch0_last_frame=199 ch0_fft_age_ms(avg/max)=80.19/139.11 ch0_preview_age_ms(avg/max)=74.42/129.90
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2200000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 0 (268 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.000 bursts=468 packets=479232 rate=0.479 Mpps queued=47 emitted=47 empty_polls=13047 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=4096 max_burst_packets=1024 refcounted_bursts=4 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2500000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=382719 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2613992 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=252404/9740 seg1(avail/in_use)=252404/9740 seg2(avail/in_use)=250356/11788 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2600000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.620 max_chdr_to_fft_ms=93.780
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.466/1.095 preview_compute_ms(avg/max)=5.024/7.197 fft_to_preview_emit_ms(avg/max)=5.490/7.777
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2800000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.000 bursts=469 packets=480256 rate=0.480 Mpps queued=47 emitted=47 empty_polls=16283 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=2900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3000000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=367285 packets=480005 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2684601 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=253679/8465 seg1(avail/in_use)=253679/8465 seg2(avail/in_use)=251631/10513 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3300000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.001 bursts=469 packets=480256 rate=0.480 Mpps queued=47 emitted=47 empty_polls=14206 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3500000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=404380 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2523523 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=254953/7191 seg1(avail/in_use)=254953/7191 seg2(avail/in_use)=252905/9239 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3800000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.002 bursts=450 packets=460800 rate=0.460 Mpps queued=45 emitted=45 empty_polls=14807 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=3900000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 48.16 ms (mean 50.96 ms over 32 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.846 max_chdr_to_fft_ms=95.961
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.496/4.398 preview_compute_ms(avg/max)=4.982/9.965 fft_to_preview_emit_ms(avg/max)=5.478/10.324
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4000000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=390147 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2647467 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=256227/5917 seg1(avail/in_use)=256227/5917 seg2(avail/in_use)=254179/7965 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4100000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 491.51 MSps (15.73 Gbps) gpu_util_pct(mean=67.50,max=75)
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=256 processed=256 rendered=256 drop_vis_busy=0 drop_render_busy=143 cadence_skips=0 masks(received/backfilled/deferred/peak)=33/24/68/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.73/139.11 preview_age_ms(avg/max)=74.16/129.90 compose_ms(avg/max)=5.51/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=399 ch0_fft_age_ms(avg/max)=79.27/107.04 ch0_preview_age_ms(avg/max)=73.89/102.31
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 1 (219 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4300000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=481 packets=492544 rate=0.481 Mpps queued=48 emitted=48 empty_polls=13896 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=383346 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2552184 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=257501/4643 seg1(avail/in_use)=257501/4643 seg2(avail/in_use)=255453/6691 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4800000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=479 packets=490496 rate=0.479 Mpps queued=48 emitted=48 empty_polls=13411 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=4900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=405893 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2617559 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=256239/5898 seg1(avail/in_use)=256246/5898 seg2(avail/in_use)=254198/7946 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5200000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.299 max_chdr_to_fft_ms=97.566
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.465/1.093 preview_compute_ms(avg/max)=5.168/10.380 fft_to_preview_emit_ms(avg/max)=5.633/10.963
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.021 bursts=480 packets=491520 rate=0.481 Mpps queued=48 emitted=48 empty_polls=16285 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=399395 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2584674 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=249808/12336 seg1(avail/in_use)=249808/12336 seg2(avail/in_use)=247760/14384 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5700000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=481 packets=492544 rate=0.480 Mpps queued=48 emitted=48 empty_polls=14996 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=5900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=417599 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2702889 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=240842/21302 seg1(avail/in_use)=240842/21302 seg2(avail/in_use)=238794/23350 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=6000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=6100000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 2 (244 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=6200000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=384 processed=384 rendered=384 drop_vis_busy=0 drop_render_busy=215 cadence_skips=0 masks(received/backfilled/deferred/peak)=49/36/102/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.59/139.11 preview_age_ms(avg/max)=74.08/129.90 compose_ms(avg/max)=5.44/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=599 ch0_fft_age_ms(avg/max)=79.32/112.08 ch0_preview_age_ms(avg/max)=73.93/107.33
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=13895 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=6300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=6400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=416111 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2418888 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=252356/9788 seg1(avail/in_use)=252356/9788 seg2(avail/in_use)=250308/11836 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=6500000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 489.25 MSps (15.66 Gbps) gpu_util_pct(mean=38.50,max=40)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.644 max_chdr_to_fft_ms=95.296
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.496/1.787 preview_compute_ms(avg/max)=5.166/10.065 fft_to_preview_emit_ms(avg/max)=5.662/10.432
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=6600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=6700000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=14855 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=6800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=361406 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2664530 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=253629/8515 seg1(avail/in_use)=253629/8515 seg2(avail/in_use)=251581/10563 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=6900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=7000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=7100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=7200000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.021 bursts=480 packets=491520 rate=0.481 Mpps queued=48 emitted=48 empty_polls=14312 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=7300000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=398945 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2611198 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=254903/7241 seg1(avail/in_use)=254903/7241 seg2(avail/in_use)=252855/9289 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=7400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=7500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=7600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=7700000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.029 bursts=480 packets=491520 rate=0.478 Mpps queued=48 emitted=48 empty_polls=14282 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=7800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=418774 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2507535 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=256177/5967 seg1(avail/in_use)=256177/5967 seg2(avail/in_use)=254129/8015 seg3(avail/in_use)=0/0
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 49.45 ms (mean 50.08 ms over 64 frames)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=7900000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.941 max_chdr_to_fft_ms=95.703
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.510/1.564 preview_compute_ms(avg/max)=5.174/11.560 fft_to_preview_emit_ms(avg/max)=5.684/11.948
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=8000000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 3 (198 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=8100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=8200000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=512 processed=512 rendered=512 drop_vis_busy=0 drop_render_busy=287 cadence_skips=0 masks(received/backfilled/deferred/peak)=66/47/135/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.54/139.11 preview_age_ms(avg/max)=74.04/129.90 compose_ms(avg/max)=5.40/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=799 ch0_fft_age_ms(avg/max)=79.39/112.90 ch0_preview_age_ms(avg/max)=73.91/108.15
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=479 packets=490496 rate=0.479 Mpps queued=48 emitted=48 empty_polls=13513 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=8300000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=394770 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2504055 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=257213/4931 seg1(avail/in_use)=257213/4931 seg2(avail/in_use)=255165/6979 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=8400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=8500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=8600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=8700000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.020 bursts=480 packets=491520 rate=0.482 Mpps queued=48 emitted=48 empty_polls=12731 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=8800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=413533 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2528566 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=256582/5559 seg1(avail/in_use)=256585/5559 seg2(avail/in_use)=254537/7607 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=8900000
+[info] [main.cpp:401] Processed 2474639360 samples from channel 0 at 494.02 MSps (15.81 Gbps) gpu_util_pct(mean=66.00,max=75)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=9000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=9100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=9200000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.329 max_chdr_to_fft_ms=96.054
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.512/1.158 preview_compute_ms(avg/max)=5.180/10.885 fft_to_preview_emit_ms(avg/max)=5.693/11.210
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=481 packets=492544 rate=0.480 Mpps queued=48 emitted=48 empty_polls=14419 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=419761 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2503851 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=249758/12386 seg1(avail/in_use)=249758/12386 seg2(avail/in_use)=247710/14434 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=9300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=9400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=9500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=9600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=9700000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=11178 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=404277 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2438687 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=251032/11112 seg1(avail/in_use)=251032/11112 seg2(avail/in_use)=248984/13160 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=9800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=9900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=10000000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 4 (193 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=10100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=10200000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=479 packets=490496 rate=0.478 Mpps queued=48 emitted=48 empty_polls=12654 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=408755 packets=480005 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2488362 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=252307/9837 seg1(avail/in_use)=252307/9837 seg2(avail/in_use)=250259/11885 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=10300000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=640 processed=640 rendered=640 drop_vis_busy=0 drop_render_busy=359 cadence_skips=0 masks(received/backfilled/deferred/peak)=83/59/169/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.55/139.11 preview_age_ms(avg/max)=74.04/129.90 compose_ms(avg/max)=5.45/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=999 ch0_fft_age_ms(avg/max)=79.60/105.23 ch0_preview_age_ms(avg/max)=74.03/100.53
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=10400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=10500000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.600 max_chdr_to_fft_ms=94.845
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.501/1.202 preview_compute_ms(avg/max)=5.086/7.766 fft_to_preview_emit_ms(avg/max)=5.587/8.134
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=10600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=10700000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.020 bursts=482 packets=493568 rate=0.484 Mpps queued=48 emitted=48 empty_polls=16406 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=4096 max_burst_packets=1024 refcounted_bursts=4 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=391336 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2644785 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=243340/18804 seg1(avail/in_use)=243340/18804 seg2(avail/in_use)=241292/20852 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=10800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=10900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=11000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=11100000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=400408 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2720018 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=244614/17530 seg1(avail/in_use)=244614/17530 seg2(avail/in_use)=242566/19578 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=478 packets=489472 rate=0.479 Mpps queued=48 emitted=48 empty_polls=16102 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=11200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=11300000
+[info] [main.cpp:401] Processed 2453667840 samples from channel 0 at 490.48 MSps (15.70 Gbps) gpu_util_pct(mean=31.50,max=33)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=11400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=11500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=11600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=427336 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2588091 max_burst=59 max_ring_depth=21 seg0(avail/in_use)=256128/6016 seg1(avail/in_use)=256128/6016 seg2(avail/in_use)=254080/8064 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.029 bursts=480 packets=491520 rate=0.478 Mpps queued=48 emitted=48 empty_polls=12408 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=11700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=11800000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 47.92 ms (mean 49.76 ms over 96 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.926 max_chdr_to_fft_ms=95.319
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.490/1.222 preview_compute_ms(avg/max)=5.069/8.305 fft_to_preview_emit_ms(avg/max)=5.559/8.503
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=11900000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 5 (267 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=12000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=12100000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=370884 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2599061 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=257402/4742 seg1(avail/in_use)=257402/4742 seg2(avail/in_use)=255354/6790 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.018 bursts=480 packets=491520 rate=0.483 Mpps queued=48 emitted=48 empty_polls=15055 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=12200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=12300000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=768 processed=768 rendered=768 drop_vis_busy=0 drop_render_busy=431 cadence_skips=0 masks(received/backfilled/deferred/peak)=99/69/204/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.67/139.11 preview_age_ms(avg/max)=74.17/129.90 compose_ms(avg/max)=5.51/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=1199 ch0_fft_age_ms(avg/max)=80.28/108.27 ch0_preview_age_ms(avg/max)=74.86/102.16
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=12400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=12500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=12600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=431839 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2569721 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=258675/3469 seg1(avail/in_use)=258675/3469 seg2(avail/in_use)=256627/5517 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=14999 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=12700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=12800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=12900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=13000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=13100000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=405588 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2630443 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=249709/12435 seg1(avail/in_use)=249709/12435 seg2(avail/in_use)=247661/14483 seg3(avail/in_use)=0/0
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.272 max_chdr_to_fft_ms=96.756
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.488/1.321 preview_compute_ms(avg/max)=5.105/11.342 fft_to_preview_emit_ms(avg/max)=5.593/11.915
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.027 bursts=480 packets=491520 rate=0.478 Mpps queued=48 emitted=48 empty_polls=18703 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=13200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=13300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=13400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=13500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=13600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=395843 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2648797 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=250983/11161 seg1(avail/in_use)=250983/11161 seg2(avail/in_use)=248935/13209 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=16745 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=13700000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 492.71 MSps (15.77 Gbps) gpu_util_pct(mean=72.50,max=77)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=13800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=13900000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 6 (240 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=14000000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=398147 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2556880 max_burst=53 max_ring_depth=21 seg0(avail/in_use)=252257/9887 seg1(avail/in_use)=252257/9887 seg2(avail/in_use)=250209/11935 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=14100000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.021 bursts=481 packets=492544 rate=0.483 Mpps queued=48 emitted=48 empty_polls=13992 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=14200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=14300000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=896 processed=896 rendered=896 drop_vis_busy=0 drop_render_busy=503 cadence_skips=0 masks(received/backfilled/deferred/peak)=116/80/237/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.61/139.11 preview_age_ms(avg/max)=74.13/129.90 compose_ms(avg/max)=5.51/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=1399 ch0_fft_age_ms(avg/max)=79.24/107.13 ch0_preview_age_ms(avg/max)=73.86/102.34
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=14400000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.580 max_chdr_to_fft_ms=95.687
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.497/1.136 preview_compute_ms(avg/max)=5.018/10.247 fft_to_preview_emit_ms(avg/max)=5.514/11.037
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=14500000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=406205 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2557664 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=253530/8614 seg1(avail/in_use)=253530/8614 seg2(avail/in_use)=251482/10662 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=14600000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=479 packets=490496 rate=0.479 Mpps queued=48 emitted=48 empty_polls=12785 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=14700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=14800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=14900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=15000000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=417894 packets=480005 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2484130 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=254805/7339 seg1(avail/in_use)=254805/7339 seg2(avail/in_use)=252757/9387 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=15100000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=12973 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=15200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=15300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=15400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=15500000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=413652 packets=480007 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2601670 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=245838/16306 seg1(avail/in_use)=245838/16306 seg2(avail/in_use)=243790/18354 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=15600000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.031 bursts=480 packets=491520 rate=0.477 Mpps queued=48 emitted=48 empty_polls=13567 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=15700000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 48.94 ms (mean 49.66 ms over 128 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.961 max_chdr_to_fft_ms=97.741
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.493/1.816 preview_compute_ms(avg/max)=5.057/10.609 fft_to_preview_emit_ms(avg/max)=5.550/10.827
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=15800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=15900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=425112 packets=480005 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2456468 max_burst=64 max_ring_depth=24 seg0(avail/in_use)=240626/21515 seg1(avail/in_use)=240629/21515 seg2(avail/in_use)=238581/23563 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=16000000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 7 (264 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=16100000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.019 bursts=481 packets=492544 rate=0.483 Mpps queued=48 emitted=48 empty_polls=11797 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 491.28 MSps (15.72 Gbps) gpu_util_pct(mean=28.75,max=29)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=16200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=16300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=16400000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=1024 processed=1024 rendered=1024 drop_vis_busy=0 drop_render_busy=575 cadence_skips=0 masks(received/backfilled/deferred/peak)=133/90/273/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.46/139.11 preview_age_ms(avg/max)=73.99/129.90 compose_ms(avg/max)=5.55/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=1599 ch0_fft_age_ms(avg/max)=78.41/117.23 ch0_preview_age_ms(avg/max)=72.99/112.60
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=395446 packets=480008 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2658793 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=248385/13759 seg1(avail/in_use)=248385/13759 seg2(avail/in_use)=246337/15807 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=16500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=16600000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=479 packets=490496 rate=0.478 Mpps queued=48 emitted=48 empty_polls=11568 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=16700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=16800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=16900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=396758 packets=480005 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2542689 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=249660/12484 seg1(avail/in_use)=249660/12484 seg2(avail/in_use)=247612/14532 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=17000000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.229 max_chdr_to_fft_ms=98.679
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.531/1.401 preview_compute_ms(avg/max)=5.029/11.389 fft_to_preview_emit_ms(avg/max)=5.560/11.744
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=13025 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=17100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=17200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=17300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=17400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=404779 packets=480008 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2599039 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=250932/11212 seg1(avail/in_use)=250932/11212 seg2(avail/in_use)=248884/13260 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=17500000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.022 bursts=480 packets=491520 rate=0.481 Mpps queued=48 emitted=48 empty_polls=13347 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=17600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=17700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=17800000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 8 (249 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=17900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=413180 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2498472 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=252206/9938 seg1(avail/in_use)=252206/9938 seg2(avail/in_use)=250158/11986 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=18000000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.020 bursts=480 packets=491520 rate=0.482 Mpps queued=48 emitted=48 empty_polls=12819 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=18100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=18200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=18300000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.558 max_chdr_to_fft_ms=95.966
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.525/1.330 preview_compute_ms(avg/max)=5.060/11.299 fft_to_preview_emit_ms(avg/max)=5.585/11.727
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=18400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=389153 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2672212 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=253480/8664 seg1(avail/in_use)=253480/8664 seg2(avail/in_use)=251432/10712 seg3(avail/in_use)=0/0
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=1152 processed=1152 rendered=1152 drop_vis_busy=0 drop_render_busy=647 cadence_skips=0 masks(received/backfilled/deferred/peak)=149/100/310/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.42/139.11 preview_age_ms(avg/max)=73.97/129.90 compose_ms(avg/max)=5.55/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=1799 ch0_fft_age_ms(avg/max)=79.13/113.94 ch0_preview_age_ms(avg/max)=73.83/109.36
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=18500000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 491.42 MSps (15.73 Gbps) gpu_util_pct(mean=72.75,max=73)
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=481 packets=492544 rate=0.481 Mpps queued=48 emitted=48 empty_polls=14600 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=18600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=18700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=18800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=392507 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2588646 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=254754/7390 seg1(avail/in_use)=254754/7390 seg2(avail/in_use)=252706/9438 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=18900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=19000000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.030 bursts=479 packets=490496 rate=0.476 Mpps queued=48 emitted=48 empty_polls=14386 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=19100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=19200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=19300000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=395756 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2574835 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=256028/6116 seg1(avail/in_use)=256028/6116 seg2(avail/in_use)=253980/8164 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=19400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=19500000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.017 bursts=481 packets=492544 rate=0.484 Mpps queued=48 emitted=48 empty_polls=13107 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=19600000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 48.55 ms (mean 49.53 ms over 160 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.943 max_chdr_to_fft_ms=97.335
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=19700000
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.485/1.491 preview_compute_ms(avg/max)=4.996/10.440 fft_to_preview_emit_ms(avg/max)=5.481/10.663
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=19800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=405583 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2561565 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=257302/4842 seg1(avail/in_use)=257302/4842 seg2(avail/in_use)=255254/6890 seg3(avail/in_use)=0/0
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 9 (231 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=19900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=20000000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.027 bursts=480 packets=491520 rate=0.478 Mpps queued=48 emitted=48 empty_polls=11785 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=20100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=20200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=20300000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=423163 packets=480008 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2563847 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=252711/9431 seg1(avail/in_use)=252713/9431 seg2(avail/in_use)=250665/11479 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=20400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=20500000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=1280 processed=1280 rendered=1280 drop_vis_busy=0 drop_render_busy=719 cadence_skips=0 masks(received/backfilled/deferred/peak)=166/111/344/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.45/139.11 preview_age_ms(avg/max)=74.01/129.90 compose_ms(avg/max)=5.53/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=1999 ch0_fft_age_ms(avg/max)=79.70/111.69 ch0_preview_age_ms(avg/max)=74.39/106.93
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=12284 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=20600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=20700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=20800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=401962 packets=480005 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2602681 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=249609/12535 seg1(avail/in_use)=249609/12535 seg2(avail/in_use)=247561/14583 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=20900000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 491.90 MSps (15.74 Gbps) gpu_util_pct(mean=32.00,max=33)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=21000000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.292 max_chdr_to_fft_ms=96.914
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.533/1.367 preview_compute_ms(avg/max)=4.912/11.643 fft_to_preview_emit_ms(avg/max)=5.444/11.806
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.022 bursts=479 packets=490496 rate=0.480 Mpps queued=48 emitted=48 empty_polls=13602 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=21100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=21200000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=402101 packets=480007 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2613028 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=240642/21502 seg1(avail/in_use)=240642/21502 seg2(avail/in_use)=238594/23550 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=21300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=21400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=21500000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.021 bursts=480 packets=491520 rate=0.482 Mpps queued=48 emitted=48 empty_polls=12694 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=21600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=21700000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=392538 packets=480008 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2552826 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=252154/9990 seg1(avail/in_use)=252154/9990 seg2(avail/in_use)=250106/12038 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=21800000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 10 (210 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=21900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=22000000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.027 bursts=481 packets=492544 rate=0.479 Mpps queued=48 emitted=48 empty_polls=16686 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=22100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=22200000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=381559 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2664406 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=253428/8716 seg1(avail/in_use)=253428/8716 seg2(avail/in_use)=251380/10764 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=22300000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.544 max_chdr_to_fft_ms=93.980
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.483/1.363 preview_compute_ms(avg/max)=5.062/8.899 fft_to_preview_emit_ms(avg/max)=5.545/9.309
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=22400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.027 bursts=479 packets=490496 rate=0.477 Mpps queued=48 emitted=48 empty_polls=13611 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=22500000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=1408 processed=1408 rendered=1408 drop_vis_busy=0 drop_render_busy=791 cadence_skips=0 masks(received/backfilled/deferred/peak)=183/122/381/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.36/139.11 preview_age_ms(avg/max)=73.93/129.90 compose_ms(avg/max)=5.56/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=2199 ch0_fft_age_ms(avg/max)=78.49/108.59 ch0_preview_age_ms(avg/max)=73.12/103.98
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=22600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=22700000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=387765 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2613351 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=254701/7443 seg1(avail/in_use)=254701/7443 seg2(avail/in_use)=252653/9491 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=22800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=22900000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.020 bursts=480 packets=491520 rate=0.482 Mpps queued=48 emitted=48 empty_polls=14062 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=23000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=23100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=23200000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=423299 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2590271 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=255975/6169 seg1(avail/in_use)=255975/6169 seg2(avail/in_use)=253927/8217 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=23300000
+[info] [main.cpp:401] Processed 2453667840 samples from channel 0 at 488.70 MSps (15.64 Gbps) gpu_util_pct(mean=72.00,max=74)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=23400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.021 bursts=480 packets=491520 rate=0.481 Mpps queued=48 emitted=48 empty_polls=11786 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=23500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=23600000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 51.77 ms (mean 49.50 ms over 192 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=65.136 max_chdr_to_fft_ms=96.762
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.498/1.222 preview_compute_ms(avg/max)=5.069/10.474 fft_to_preview_emit_ms(avg/max)=5.567/10.744
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=431950 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2577291 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=257249/4895 seg1(avail/in_use)=257249/4895 seg2(avail/in_use)=255201/6943 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=23700000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 11 (192 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=23800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=23900000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=14947 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=24000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=24100000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=400755 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2719224 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=258522/3622 seg1(avail/in_use)=258522/3622 seg2(avail/in_use)=256474/5670 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=24200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=24300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=24400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=15673 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=24500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=24600000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=1536 processed=1536 rendered=1536 drop_vis_busy=0 drop_render_busy=864 cadence_skips=0 masks(received/backfilled/deferred/peak)=200/134/415/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.39/139.11 preview_age_ms(avg/max)=73.96/129.90 compose_ms(avg/max)=5.57/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=2400 ch0_fft_age_ms(avg/max)=79.68/102.93 ch0_preview_age_ms(avg/max)=74.24/98.24
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=408006 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2569787 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=249556/12588 seg1(avail/in_use)=249556/12588 seg2(avail/in_use)=247508/14636 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=24700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=24800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=24900000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.103 max_chdr_to_fft_ms=94.453
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.472/1.763 preview_compute_ms(avg/max)=4.991/10.775 fft_to_preview_emit_ms(avg/max)=5.464/11.458
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.022 bursts=481 packets=492544 rate=0.482 Mpps queued=48 emitted=48 empty_polls=16520 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=25000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=25100000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=409237 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2653806 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=250829/11315 seg1(avail/in_use)=250829/11315 seg2(avail/in_use)=248781/13363 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=25200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=25300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=25400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=17983 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=25500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=25600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=413938 packets=480013 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2573444 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=252096/10048 seg1(avail/in_use)=252096/10048 seg2(avail/in_use)=250048/12096 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=25700000
+[info] [main.cpp:401] Processed 2474639360 samples from channel 0 at 494.31 MSps (15.82 Gbps) gpu_util_pct(mean=34.25,max=35)
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 12 (227 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=25800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=25900000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=479 packets=490496 rate=0.478 Mpps queued=48 emitted=48 empty_polls=12737 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=26000000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=391244 packets=480008 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2660005 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=244665/17478 seg1(avail/in_use)=244666/17478 seg2(avail/in_use)=242618/19526 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=26100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=26200000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.578 max_chdr_to_fft_ms=97.252
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.489/1.400 preview_compute_ms(avg/max)=5.107/11.648 fft_to_preview_emit_ms(avg/max)=5.596/12.011
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=26300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=26400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.015 bursts=480 packets=491520 rate=0.484 Mpps queued=48 emitted=48 empty_polls=13166 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=26500000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=385712 packets=480009 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2586675 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=244399/17745 seg1(avail/in_use)=244399/17745 seg2(avail/in_use)=242351/19793 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=26600000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=1664 processed=1664 rendered=1664 drop_vis_busy=0 drop_render_busy=935 cadence_skips=0 masks(received/backfilled/deferred/peak)=216/145/447/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.42/139.11 preview_age_ms(avg/max)=73.98/129.90 compose_ms(avg/max)=5.58/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=2599 ch0_fft_age_ms(avg/max)=79.73/105.65 ch0_preview_age_ms(avg/max)=74.33/100.78
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=26700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=26800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=26900000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=481 packets=492544 rate=0.480 Mpps queued=48 emitted=48 empty_polls=12029 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=27000000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=415446 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2556890 max_burst=63 max_ring_depth=20 seg0(avail/in_use)=255912/6232 seg1(avail/in_use)=255912/6232 seg2(avail/in_use)=253864/8280 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=27100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=27200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=27300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=27400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.028 bursts=479 packets=490496 rate=0.477 Mpps queued=48 emitted=48 empty_polls=13133 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=27500000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=378602 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2742936 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=257186/4958 seg1(avail/in_use)=257186/4958 seg2(avail/in_use)=255138/7006 seg3(avail/in_use)=0/0
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 49.88 ms (mean 49.46 ms over 224 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.883 max_chdr_to_fft_ms=96.853
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.546/1.325 preview_compute_ms(avg/max)=4.963/10.449 fft_to_preview_emit_ms(avg/max)=5.509/10.879
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=27600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=27700000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 13 (199 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=27800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=27900000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.022 bursts=481 packets=492544 rate=0.482 Mpps queued=48 emitted=48 empty_polls=12475 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=28000000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=409809 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2467127 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=258165/3979 seg1(avail/in_use)=258165/3979 seg2(avail/in_use)=256118/6026 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=28100000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 491.33 MSps (15.72 Gbps) gpu_util_pct(mean=65.75,max=70)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=28200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=28300000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=14198 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=28400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=361772 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2668084 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=249493/12651 seg1(avail/in_use)=249493/12651 seg2(avail/in_use)=247445/14699 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=28500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=28600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=28700000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=1792 processed=1792 rendered=1792 drop_vis_busy=0 drop_render_busy=1007 cadence_skips=0 masks(received/backfilled/deferred/peak)=233/155/483/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.39/139.11 preview_age_ms(avg/max)=73.96/129.90 compose_ms(avg/max)=5.59/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=2799 ch0_fft_age_ms(avg/max)=79.00/110.60 ch0_preview_age_ms(avg/max)=73.69/105.44
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=28800000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.279 max_chdr_to_fft_ms=97.298
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.499/1.571 preview_compute_ms(avg/max)=5.016/10.925 fft_to_preview_emit_ms(avg/max)=5.515/11.297
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=13554 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=28900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=405855 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2593247 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=250766/11378 seg1(avail/in_use)=250766/11378 seg2(avail/in_use)=248718/13426 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=29000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=29100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=29200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=29300000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=479 packets=490496 rate=0.478 Mpps queued=48 emitted=48 empty_polls=12276 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=29400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=407004 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2499384 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=252040/10104 seg1(avail/in_use)=252040/10104 seg2(avail/in_use)=249992/12152 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=29500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=29600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=29700000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 14 (187 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=29800000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.021 bursts=482 packets=493568 rate=0.483 Mpps queued=48 emitted=48 empty_polls=14174 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=4096 max_burst_packets=1024 refcounted_bursts=4 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=29900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=403909 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2546346 max_burst=48 max_ring_depth=22 seg0(avail/in_use)=253313/8831 seg1(avail/in_use)=253313/8831 seg2(avail/in_use)=251265/10879 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=30000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=30100000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.532 max_chdr_to_fft_ms=96.084
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.476/1.097 preview_compute_ms(avg/max)=5.013/7.718 fft_to_preview_emit_ms(avg/max)=5.490/8.542
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=30200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=30300000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.029 bursts=478 packets=489472 rate=0.476 Mpps queued=48 emitted=48 empty_polls=16097 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=30400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=420395 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2612576 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=254587/7557 seg1(avail/in_use)=254587/7557 seg2(avail/in_use)=252539/9605 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=30500000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 491.84 MSps (15.74 Gbps) gpu_util_pct(mean=31.50,max=42)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=30600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=30700000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=1920 processed=1920 rendered=1920 drop_vis_busy=0 drop_render_busy=1080 cadence_skips=0 masks(received/backfilled/deferred/peak)=250/165/516/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.34/139.11 preview_age_ms(avg/max)=73.92/129.90 compose_ms(avg/max)=5.59/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=3000 ch0_fft_age_ms(avg/max)=78.66/105.39 ch0_preview_age_ms(avg/max)=73.33/100.60
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=30800000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=13165 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=393637 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2640446 max_burst=55 max_ring_depth=23 seg0(avail/in_use)=245621/16523 seg1(avail/in_use)=245621/16523 seg2(avail/in_use)=243573/18571 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=30900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=31000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=31100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=31200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=31300000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.018 bursts=481 packets=492544 rate=0.484 Mpps queued=48 emitted=48 empty_polls=13393 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=429474 packets=480007 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2505333 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=236654/25490 seg1(avail/in_use)=236654/25490 seg2(avail/in_use)=234606/27538 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=31400000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 47.35 ms (mean 49.41 ms over 256 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.905 max_chdr_to_fft_ms=98.450
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.501/1.351 preview_compute_ms(avg/max)=5.113/11.305 fft_to_preview_emit_ms(avg/max)=5.614/11.600
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=31500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=31600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=31700000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 15 (172 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=31800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=407202 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2555820 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=248167/13977 seg1(avail/in_use)=248167/13977 seg2(avail/in_use)=246119/16025 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.028 bursts=479 packets=490496 rate=0.477 Mpps queued=48 emitted=48 empty_polls=16318 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=31900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=32000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=32100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=32200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=32300000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=403065 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2585216 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=249441/12703 seg1(avail/in_use)=249441/12703 seg2(avail/in_use)=247393/14751 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=480 packets=491520 rate=0.481 Mpps queued=48 emitted=48 empty_polls=13407 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=32400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=32500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=32600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=32700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=32800000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.286 max_chdr_to_fft_ms=95.926
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.478/3.930 preview_compute_ms(avg/max)=5.077/10.625 fft_to_preview_emit_ms(avg/max)=5.555/11.412
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=366496 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2725358 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=250714/11430 seg1(avail/in_use)=250714/11430 seg2(avail/in_use)=248666/13478 seg3(avail/in_use)=0/0
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=2048 processed=2048 rendered=2048 drop_vis_busy=0 drop_render_busy=1151 cadence_skips=0 masks(received/backfilled/deferred/peak)=266/176/548/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.37/139.11 preview_age_ms(avg/max)=73.94/129.90 compose_ms(avg/max)=5.59/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=3199 ch0_fft_age_ms(avg/max)=79.77/106.35 ch0_preview_age_ms(avg/max)=74.25/101.51
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=481 packets=492544 rate=0.481 Mpps queued=48 emitted=48 empty_polls=13561 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=32900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=33000000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 491.21 MSps (15.72 Gbps) gpu_util_pct(mean=53.50,max=56)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=33100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=33200000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=398056 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2535247 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=251988/10156 seg1(avail/in_use)=251988/10156 seg2(avail/in_use)=249940/12204 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=33300000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.022 bursts=480 packets=491520 rate=0.481 Mpps queued=48 emitted=48 empty_polls=13073 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=33400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=33500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=33600000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 16 (157 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=33700000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=408867 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2492252 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=253261/8883 seg1(avail/in_use)=253261/8883 seg2(avail/in_use)=251213/10931 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=33800000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.028 bursts=480 packets=491520 rate=0.478 Mpps queued=48 emitted=48 empty_polls=12156 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=33900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=34000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=34100000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.600 max_chdr_to_fft_ms=97.156
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.495/1.358 preview_compute_ms(avg/max)=5.042/10.196 fft_to_preview_emit_ms(avg/max)=5.537/10.507
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=34200000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=402627 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2550978 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=254535/7609 seg1(avail/in_use)=254535/7609 seg2(avail/in_use)=252487/9657 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=479 packets=490496 rate=0.478 Mpps queued=48 emitted=48 empty_polls=17557 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=34300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=34400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=34500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=34600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=34700000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=401545 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2571066 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=255808/6336 seg1(avail/in_use)=255808/6336 seg2(avail/in_use)=253760/8384 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=12905 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=34800000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=2176 processed=2176 rendered=2176 drop_vis_busy=0 drop_render_busy=1223 cadence_skips=0 masks(received/backfilled/deferred/peak)=283/187/583/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.27/139.11 preview_age_ms(avg/max)=73.85/129.90 compose_ms(avg/max)=5.59/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=3399 ch0_fft_age_ms(avg/max)=77.70/108.10 ch0_preview_age_ms(avg/max)=72.37/102.45
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=34900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=35000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=35100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=35200000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=427626 packets=480007 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2473423 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=257081/5063 seg1(avail/in_use)=257081/5063 seg2(avail/in_use)=255033/7111 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.015 bursts=481 packets=492544 rate=0.485 Mpps queued=48 emitted=48 empty_polls=11943 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=35300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=35400000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 48.69 ms (mean 49.41 ms over 288 frames)
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 489.11 MSps (15.65 Gbps) gpu_util_pct(mean=40.25,max=53)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.873 max_chdr_to_fft_ms=97.517
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.463/1.130 preview_compute_ms(avg/max)=5.104/9.585 fft_to_preview_emit_ms(avg/max)=5.567/9.984
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=35500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=35600000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 17 (223 snippet(s), 1 variable-rate container).
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=383321 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2605278 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=253824/8320 seg1(avail/in_use)=253824/8320 seg2(avail/in_use)=251776/10368 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=35700000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.031 bursts=480 packets=491520 rate=0.477 Mpps queued=48 emitted=48 empty_polls=12356 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=35800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=35900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=36000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=36100000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=397570 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2652400 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=249388/12756 seg1(avail/in_use)=249388/12756 seg2(avail/in_use)=247340/14804 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=36200000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=479 packets=490496 rate=0.478 Mpps queued=48 emitted=48 empty_polls=12067 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=36300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=36400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=36500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=36600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=360417 packets=480010 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2716791 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=240418/21726 seg1(avail/in_use)=240418/21726 seg2(avail/in_use)=238370/23774 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=36700000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.192 max_chdr_to_fft_ms=97.979
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.518/3.064 preview_compute_ms(avg/max)=5.041/12.027 fft_to_preview_emit_ms(avg/max)=5.559/12.607
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.018 bursts=481 packets=492544 rate=0.484 Mpps queued=48 emitted=48 empty_polls=14329 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=36800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=36900000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=2304 processed=2304 rendered=2304 drop_vis_busy=0 drop_render_busy=1296 cadence_skips=0 masks(received/backfilled/deferred/peak)=300/198/618/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.28/139.11 preview_age_ms(avg/max)=73.87/129.90 compose_ms(avg/max)=5.60/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=3600 ch0_fft_age_ms(avg/max)=79.48/112.90 ch0_preview_age_ms(avg/max)=74.15/108.12
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=37000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=37100000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=402778 packets=480009 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2682285 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=251929/10215 seg1(avail/in_use)=251929/10215 seg2(avail/in_use)=249881/12263 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=37200000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.028 bursts=480 packets=491520 rate=0.478 Mpps queued=48 emitted=48 empty_polls=15783 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=37300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=37400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=37500000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 18 (262 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=37600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=402005 packets=480008 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2529749 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=253201/8943 seg1(avail/in_use)=253201/8943 seg2(avail/in_use)=251153/10991 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=37700000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.020 bursts=480 packets=491520 rate=0.482 Mpps queued=48 emitted=48 empty_polls=14009 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=37800000
+[info] [main.cpp:401] Processed 2474639360 samples from channel 0 at 494.36 MSps (15.82 Gbps) gpu_util_pct(mean=45.25,max=47)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=37900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=38000000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.660 max_chdr_to_fft_ms=98.105
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.485/1.317 preview_compute_ms(avg/max)=5.107/11.819 fft_to_preview_emit_ms(avg/max)=5.592/12.142
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=389651 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2637608 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=254474/7670 seg1(avail/in_use)=254474/7670 seg2(avail/in_use)=252426/9718 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=38100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=38200000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=16147 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=38300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=38400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=38500000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=381337 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2652468 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=255748/6396 seg1(avail/in_use)=255748/6396 seg2(avail/in_use)=253700/8444 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=38600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=38700000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=479 packets=490496 rate=0.478 Mpps queued=48 emitted=48 empty_polls=16478 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=38800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=38900000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=2432 processed=2432 rendered=2432 drop_vis_busy=0 drop_render_busy=1367 cadence_skips=0 masks(received/backfilled/deferred/peak)=316/209/652/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.36/139.11 preview_age_ms(avg/max)=73.95/129.90 compose_ms(avg/max)=5.59/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=3799 ch0_fft_age_ms(avg/max)=80.90/120.34 ch0_preview_age_ms(avg/max)=75.45/115.42
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=39000000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=422665 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2593750 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=257021/5123 seg1(avail/in_use)=257021/5123 seg2(avail/in_use)=254973/7171 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=39100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=39200000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=10819 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=39300000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 48.58 ms (mean 49.38 ms over 320 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.858 max_chdr_to_fft_ms=94.950
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.492/3.150 preview_compute_ms(avg/max)=5.122/10.303 fft_to_preview_emit_ms(avg/max)=5.614/10.796
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=39400000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 19 (210 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=39500000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=389942 packets=480007 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2543783 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=253237/8906 seg1(avail/in_use)=253238/8906 seg2(avail/in_use)=251190/10954 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=39600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=39700000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.027 bursts=481 packets=492544 rate=0.479 Mpps queued=48 emitted=48 empty_polls=12837 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=39800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=39900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=40000000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=369458 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2663981 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=249328/12816 seg1(avail/in_use)=249328/12816 seg2(avail/in_use)=247280/14864 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=40100000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.020 bursts=480 packets=491520 rate=0.482 Mpps queued=48 emitted=48 empty_polls=16745 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=40200000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 491.54 MSps (15.73 Gbps) gpu_util_pct(mean=54.25,max=67)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=40300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=40400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=355417 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2669769 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=250601/11543 seg1(avail/in_use)=250601/11543 seg2(avail/in_use)=248553/13591 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=40500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=40600000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.271 max_chdr_to_fft_ms=95.948
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.456/1.298 preview_compute_ms(avg/max)=5.055/11.782 fft_to_preview_emit_ms(avg/max)=5.511/12.065
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.027 bursts=479 packets=490496 rate=0.478 Mpps queued=48 emitted=48 empty_polls=14667 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=40700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=40800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=40900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=425471 packets=480005 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2585632 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=251876/10268 seg1(avail/in_use)=251876/10268 seg2(avail/in_use)=249828/12316 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=41000000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=2560 processed=2560 rendered=2560 drop_vis_busy=0 drop_render_busy=1440 cadence_skips=0 masks(received/backfilled/deferred/peak)=333/220/687/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.31/139.11 preview_age_ms(avg/max)=73.89/129.90 compose_ms(avg/max)=5.58/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=4000 ch0_fft_age_ms(avg/max)=78.28/107.83 ch0_preview_age_ms(avg/max)=72.81/102.98
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=41100000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.022 bursts=480 packets=491520 rate=0.481 Mpps queued=48 emitted=48 empty_polls=12300 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=41200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=41300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=41400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=372349 packets=480008 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2773917 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=242908/19236 seg1(avail/in_use)=242908/19236 seg2(avail/in_use)=240860/21284 seg3(avail/in_use)=0/0
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 20 (216 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=41500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=41600000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.027 bursts=481 packets=492544 rate=0.480 Mpps queued=48 emitted=48 empty_polls=14217 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=41700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=41800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=41900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=399690 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2619507 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=244181/17963 seg1(avail/in_use)=244181/17963 seg2(avail/in_use)=242133/20011 seg3(avail/in_use)=0/0
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.617 max_chdr_to_fft_ms=97.352
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.510/1.841 preview_compute_ms(avg/max)=5.075/10.071 fft_to_preview_emit_ms(avg/max)=5.585/10.680
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=42000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=42100000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=480 packets=491520 rate=0.481 Mpps queued=48 emitted=48 empty_polls=13335 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=42200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=42300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=42400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=401748 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2607271 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=255695/6449 seg1(avail/in_use)=255695/6449 seg2(avail/in_use)=253647/8497 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=42500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=42600000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 490.99 MSps (15.71 Gbps) gpu_util_pct(mean=37.25,max=39)
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.022 bursts=479 packets=490496 rate=0.480 Mpps queued=48 emitted=48 empty_polls=14996 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=42700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=42800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=403856 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2567733 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=256968/5176 seg1(avail/in_use)=256968/5176 seg2(avail/in_use)=254920/7224 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=42900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=43000000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=2688 processed=2688 rendered=2688 drop_vis_busy=0 drop_render_busy=1511 cadence_skips=0 masks(received/backfilled/deferred/peak)=349/230/722/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.29/139.11 preview_age_ms(avg/max)=73.88/129.90 compose_ms(avg/max)=5.58/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=4199 ch0_fft_age_ms(avg/max)=78.99/109.44 ch0_preview_age_ms(avg/max)=73.66/104.68
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=43100000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=481 packets=492544 rate=0.481 Mpps queued=48 emitted=48 empty_polls=13342 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=43200000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 48.17 ms (mean 49.39 ms over 352 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.937 max_chdr_to_fft_ms=98.002
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.448/1.840 preview_compute_ms(avg/max)=5.188/11.140 fft_to_preview_emit_ms(avg/max)=5.635/11.620
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=43300000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=383868 packets=480008 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2602276 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=253987/8156 seg1(avail/in_use)=253988/8156 seg2(avail/in_use)=251939/10205 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=43400000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 21 (212 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=43500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=43600000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=17902 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=43700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=43800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=394126 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2614941 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=249274/12870 seg1(avail/in_use)=249274/12870 seg2(avail/in_use)=247226/14918 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=43900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=44000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=44100000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.027 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=11347 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=44200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=44300000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=387205 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2667796 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=250547/11597 seg1(avail/in_use)=250547/11597 seg2(avail/in_use)=248499/13645 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=44400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=44500000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.258 max_chdr_to_fft_ms=95.869
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.514/1.262 preview_compute_ms(avg/max)=4.938/10.871 fft_to_preview_emit_ms(avg/max)=5.452/11.269
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=44600000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=13246 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=44700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=44800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=400367 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2550583 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=251821/10323 seg1(avail/in_use)=251821/10323 seg2(avail/in_use)=249773/12371 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=44900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=45000000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 491.99 MSps (15.74 Gbps) gpu_util_pct(mean=61.25,max=68)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=45100000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=2816 processed=2816 rendered=2816 drop_vis_busy=0 drop_render_busy=1583 cadence_skips=0 masks(received/backfilled/deferred/peak)=366/241/755/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.32/139.11 preview_age_ms(avg/max)=73.91/129.90 compose_ms(avg/max)=5.58/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=4399 ch0_fft_age_ms(avg/max)=79.86/115.69 ch0_preview_age_ms(avg/max)=74.50/110.82
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=479 packets=490496 rate=0.479 Mpps queued=48 emitted=48 empty_polls=15203 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=45200000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=370208 packets=480007 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2683982 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=253094/9050 seg1(avail/in_use)=253094/9050 seg2(avail/in_use)=251046/11098 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=45300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=45400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=45500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=45600000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=481 packets=492544 rate=0.481 Mpps queued=48 emitted=48 empty_polls=13253 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 22 (212 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=45700000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=398593 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2615095 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=254367/7777 seg1(avail/in_use)=254367/7777 seg2(avail/in_use)=252319/9825 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=45800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=45900000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.639 max_chdr_to_fft_ms=96.244
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.531/6.649 preview_compute_ms(avg/max)=5.092/11.266 fft_to_preview_emit_ms(avg/max)=5.622/11.848
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=46000000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=479 packets=490496 rate=0.479 Mpps queued=48 emitted=48 empty_polls=13639 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=46100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=46200000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=414729 packets=480005 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2550749 max_burst=64 max_ring_depth=24 seg0(avail/in_use)=255642/6502 seg1(avail/in_use)=255642/6502 seg2(avail/in_use)=253594/8550 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=46300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=46400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=46500000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=481 packets=492544 rate=0.481 Mpps queued=48 emitted=48 empty_polls=16211 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=46600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=46700000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=395354 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2643577 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=236436/25708 seg1(avail/in_use)=236436/25708 seg2(avail/in_use)=234388/27756 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=46800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=46900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=47000000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.020 bursts=480 packets=491520 rate=0.482 Mpps queued=48 emitted=48 empty_polls=17007 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=47100000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=2944 processed=2944 rendered=2944 drop_vis_busy=0 drop_render_busy=1656 cadence_skips=0 masks(received/backfilled/deferred/peak)=383/252/790/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.31/139.11 preview_age_ms(avg/max)=73.90/129.90 compose_ms(avg/max)=5.59/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=4600 ch0_fft_age_ms(avg/max)=78.97/108.77 ch0_preview_age_ms(avg/max)=73.69/104.06
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=419727 packets=480007 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2624178 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=247949/14195 seg1(avail/in_use)=247949/14195 seg2(avail/in_use)=245901/16243 seg3(avail/in_use)=0/0
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 48.04 ms (mean 49.40 ms over 384 frames)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=47200000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.829 max_chdr_to_fft_ms=95.983
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.482/1.151 preview_compute_ms(avg/max)=5.060/10.631 fft_to_preview_emit_ms(avg/max)=5.542/10.858
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=47300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=47400000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 23 (195 snippet(s), 1 variable-rate container).
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 488.85 MSps (15.64 Gbps) gpu_util_pct(mean=34.25,max=36)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=47500000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=15997 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=47600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=429105 packets=480008 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2587575 max_burst=64 max_ring_depth=24 seg0(avail/in_use)=249221/12923 seg1(avail/in_use)=249221/12923 seg2(avail/in_use)=247173/14971 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=47700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=47800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=47900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=48000000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=12510 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=48100000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=384636 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2643846 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=250494/11650 seg1(avail/in_use)=250494/11650 seg2(avail/in_use)=248446/13698 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=48200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=48300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=48400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=48500000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.222 max_chdr_to_fft_ms=97.742
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.483/1.173 preview_compute_ms(avg/max)=4.998/9.379 fft_to_preview_emit_ms(avg/max)=5.482/9.881
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=479 packets=490496 rate=0.479 Mpps queued=48 emitted=48 empty_polls=13931 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=48600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=412405 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2507332 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=251768/10376 seg1(avail/in_use)=251768/10376 seg2(avail/in_use)=249720/12424 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=48700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=48800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=48900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=49000000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=13754 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=49100000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=394718 packets=480007 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2697286 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=253041/9103 seg1(avail/in_use)=253041/9103 seg2(avail/in_use)=250993/11151 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=49200000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=3072 processed=3072 rendered=3072 drop_vis_busy=0 drop_render_busy=1728 cadence_skips=0 masks(received/backfilled/deferred/peak)=400/263/824/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.31/139.11 preview_age_ms(avg/max)=73.91/129.90 compose_ms(avg/max)=5.58/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=4800 ch0_fft_age_ms(avg/max)=79.47/107.22 ch0_preview_age_ms(avg/max)=74.07/102.59
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=49300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=49400000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 24 (188 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=49500000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.028 bursts=480 packets=491520 rate=0.478 Mpps queued=48 emitted=48 empty_polls=15077 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=49600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=413281 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2494210 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=254315/7829 seg1(avail/in_use)=254315/7829 seg2(avail/in_use)=252267/9877 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=49700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=49800000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.667 max_chdr_to_fft_ms=95.969
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.472/1.198 preview_compute_ms(avg/max)=5.101/10.638 fft_to_preview_emit_ms(avg/max)=5.573/11.415
+[info] [main.cpp:401] Processed 2474639360 samples from channel 0 at 494.08 MSps (15.81 Gbps) gpu_util_pct(mean=67.00,max=67)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=49900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=50000000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.020 bursts=480 packets=491520 rate=0.482 Mpps queued=48 emitted=48 empty_polls=12954 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=430717 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2515710 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=255588/6556 seg1(avail/in_use)=255588/6556 seg2(avail/in_use)=253540/8604 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=50100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=50200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=50300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=50400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=50500000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.026 bursts=481 packets=492544 rate=0.480 Mpps queued=48 emitted=48 empty_polls=18256 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=387017 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2610295 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=256862/5282 seg1(avail/in_use)=256862/5282 seg2(avail/in_use)=254814/7330 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=50600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=50700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=50800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=50900000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=51000000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.020 bursts=479 packets=490496 rate=0.481 Mpps queued=48 emitted=48 empty_polls=13408 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=391595 packets=480008 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2599652 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=258134/4010 seg1(avail/in_use)=258134/4010 seg2(avail/in_use)=256086/6058 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=51100000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 51.98 ms (mean 49.40 ms over 416 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.927 max_chdr_to_fft_ms=94.676
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.482/1.370 preview_compute_ms(avg/max)=5.020/11.349 fft_to_preview_emit_ms(avg/max)=5.502/11.707
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=51200000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=3200 processed=3200 rendered=3200 drop_vis_busy=0 drop_render_busy=1799 cadence_skips=0 masks(received/backfilled/deferred/peak)=416/274/857/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.36/139.11 preview_age_ms(avg/max)=73.95/129.90 compose_ms(avg/max)=5.58/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=4999 ch0_fft_age_ms(avg/max)=80.46/105.79 ch0_preview_age_ms(avg/max)=75.06/101.15
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 25 (175 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=51300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=51400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=51500000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.027 bursts=481 packets=492544 rate=0.480 Mpps queued=48 emitted=48 empty_polls=13382 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=396830 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2544352 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=249167/12977 seg1(avail/in_use)=249167/12977 seg2(avail/in_use)=247119/15025 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=51600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=51700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=51800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=51900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=426980 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2619115 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=240200/21944 seg1(avail/in_use)=240200/21944 seg2(avail/in_use)=238152/23992 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=479 packets=490496 rate=0.479 Mpps queued=48 emitted=48 empty_polls=14628 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=52000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=52100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=52200000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 491.76 MSps (15.74 Gbps) gpu_util_pct(mean=32.00,max=32)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=52300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=52400000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.202 max_chdr_to_fft_ms=95.761
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.497/1.145 preview_compute_ms(avg/max)=4.978/7.849 fft_to_preview_emit_ms(avg/max)=5.476/8.207
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=418877 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2558826 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=251713/10431 seg1(avail/in_use)=251713/10431 seg2(avail/in_use)=249665/12479 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=481 packets=492544 rate=0.481 Mpps queued=48 emitted=48 empty_polls=13641 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=52500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=52600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=52700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=52800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=52900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=362941 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2645331 max_burst=45 max_ring_depth=20 seg0(avail/in_use)=252987/9157 seg1(avail/in_use)=252987/9157 seg2(avail/in_use)=250939/11205 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=480 packets=491520 rate=0.479 Mpps queued=48 emitted=48 empty_polls=13567 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=53000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=53100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=53200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=53300000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=3328 processed=3328 rendered=3328 drop_vis_busy=0 drop_render_busy=1871 cadence_skips=0 masks(received/backfilled/deferred/peak)=433/286/892/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.32/139.11 preview_age_ms(avg/max)=73.92/129.90 compose_ms(avg/max)=5.57/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=5199 ch0_fft_age_ms(avg/max)=78.39/109.82 ch0_preview_age_ms(avg/max)=73.05/105.14
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 26 (201 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=53400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=417183 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2502790 max_burst=64 max_ring_depth=23 seg0(avail/in_use)=254260/7884 seg1(avail/in_use)=254260/7884 seg2(avail/in_use)=252212/9932 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.020 bursts=480 packets=491520 rate=0.482 Mpps queued=48 emitted=48 empty_polls=13217 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=53500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=53600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=53700000
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.582 max_chdr_to_fft_ms=98.615
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.460/1.287 preview_compute_ms(avg/max)=5.148/11.792 fft_to_preview_emit_ms(avg/max)=5.608/12.156
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=53800000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=53900000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=384835 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2537474 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=255533/6611 seg1(avail/in_use)=255533/6611 seg2(avail/in_use)=253485/8659 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.021 bursts=480 packets=491520 rate=0.482 Mpps queued=48 emitted=48 empty_polls=12219 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=54000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=54100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=54200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=54300000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=54400000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=412995 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2493547 max_burst=64 max_ring_depth=19 seg0(avail/in_use)=256806/5338 seg1(avail/in_use)=256806/5338 seg2(avail/in_use)=254758/7386 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.028 bursts=480 packets=491520 rate=0.478 Mpps queued=48 emitted=48 empty_polls=13059 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=54500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=54600000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 490.71 MSps (15.70 Gbps) gpu_util_pct(mean=71.00,max=71)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=54700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=54800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=404379 packets=480007 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2509756 max_burst=64 max_ring_depth=20 seg0(avail/in_use)=253761/8383 seg1(avail/in_use)=253761/8383 seg2(avail/in_use)=251713/10431 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=54900000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.027 bursts=480 packets=491520 rate=0.478 Mpps queued=48 emitted=48 empty_polls=15380 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=55000000
+[finetuned_dino_detector] downsample: FFT 20480 -> model 1024 (gain corr 13.01 dB), 512 rows -> 2 tiles; inference 49.14 ms (mean 49.41 ms over 448 frames)
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.987 max_chdr_to_fft_ms=94.697
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.504/1.055 preview_compute_ms(avg/max)=4.950/8.535 fft_to_preview_emit_ms(avg/max)=5.454/8.833
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=55100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=55200000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 27 (204 snippet(s), 1 variable-rate container).
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=55300000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=3456 processed=3456 rendered=3456 drop_vis_busy=0 drop_render_busy=1943 cadence_skips=0 masks(received/backfilled/deferred/peak)=449/296/927/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.35/139.11 preview_age_ms(avg/max)=73.94/129.90 compose_ms(avg/max)=5.57/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=5399 ch0_fft_age_ms(avg/max)=79.99/109.68 ch0_preview_age_ms(avg/max)=74.52/104.84
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=391686 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2450221 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=249206/12937 seg1(avail/in_use)=249207/12937 seg2(avail/in_use)=247159/14985 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=55400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=479 packets=490496 rate=0.479 Mpps queued=48 emitted=48 empty_polls=10355 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=55500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=55600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=55700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=55800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=433328 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2568620 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=250385/11759 seg1(avail/in_use)=250385/11759 seg2(avail/in_use)=248337/13807 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=55900000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=480 packets=491520 rate=0.481 Mpps queued=48 emitted=48 empty_polls=17365 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=56000000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=56100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=56200000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=56300000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=406366 packets=480006 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2567451 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=251659/10485 seg1(avail/in_use)=251659/10485 seg2(avail/in_use)=249611/12533 seg3(avail/in_use)=0/0
+[info] [fft.cu:247] FFT ingress live ch=0 window_samples=128 window_emitted=128 mean_chdr_to_fft_ms=64.217 max_chdr_to_fft_ms=96.343
+[info] [spectrogram_visualization.cu:1845] Spectrogram preview timing ch=0 frames=128 fft_to_preview_ms(avg/max)=0.502/1.303 preview_compute_ms(avg/max)=5.068/10.541 fft_to_preview_emit_ms(avg/max)=5.570/10.838
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=56400000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.025 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=14822 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=2048 max_burst_packets=1024 refcounted_bursts=2 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=56500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=56600000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=56700000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=56800000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=411430 packets=480006 rate=0.480 Mpps full_flushes=468 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2582087 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=251886/10256 seg1(avail/in_use)=251888/10256 seg2(avail/in_use)=249840/12304 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=56900000
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.024 bursts=481 packets=492544 rate=0.481 Mpps queued=48 emitted=48 empty_polls=16560 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=57000000
+[info] [main.cpp:401] Processed 2464153600 samples from channel 0 at 492.20 MSps (15.75 Gbps) gpu_util_pct(mean=33.00,max=33)
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=57100000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=57200000
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 28 (201 snippet(s), 1 variable-rate container).
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=408325 packets=480007 rate=0.480 Mpps full_flushes=469 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=2573703 max_burst=64 max_ring_depth=21 seg0(avail/in_use)=243966/18178 seg1(avail/in_use)=243966/18178 seg2(avail/in_use)=241918/20226 seg3(avail/in_use)=0/0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=57300000
+[info] [spectrogram_visualization.cu:4223] Visualizer timing: frames_seen=3584 processed=3584 rendered=3584 drop_vis_busy=0 drop_render_busy=2015 cadence_skips=0 masks(received/backfilled/deferred/peak)=466/306/960/1 sync_ms(avg/max)=0.00/0.00 reduce_ms(avg/max)=0.00/0.00 history_ms(avg/max)=0.00/0.00 fft_age_ms(avg/max)=79.33/139.11 preview_age_ms(avg/max)=73.92/129.90 compose_ms(avg/max)=5.57/11.66 render_ms(avg/max)=0.00/0.00 drop_rate=0.56 ch0_frames=128 ch0_last_frame=5599 ch0_fft_age_ms(avg/max)=78.85/110.47 ch0_preview_age_ms(avg/max)=73.42/105.10
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.023 bursts=480 packets=491520 rate=0.480 Mpps queued=48 emitted=48 empty_polls=14099 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=3072 max_burst_packets=1024 refcounted_bursts=3 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=57400000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=57500000
+[warning] [chdr_rx.cu:1073] CHDR ch=0 packet with payload 4032 B (expected 4096), count=57600000
+[info] [adv_network_dpdk_mgr.cpp:176] RX worker summary port=0 queue=0 window_s=1.000 bursts=246565 packets=311550 rate=0.312 Mpps full_flushes=305 timeout_flushes=0 malformed=0 ring_full_drops=0 idle_polls=3698675 max_burst=64 max_ring_depth=22 seg0(avail/in_use)=260096/2048 seg1(avail/in_use)=260096/2048 seg2(avail/in_use)=258048/4096 seg3(avail/in_use)=0/0
+[info] [chdr_rx.cu:215] CHDR summary ch=0 window_s=1.000 bursts=197 packets=201728 rate=0.202 Mpps queued=20 emitted=20 empty_polls=26236 backlog_events=0 out_q_depth=0 max_out_q_depth=3 aggr_pkts_recv=0 max_burst_packets=1024 refcounted_bursts=0 partial_drops=0 consecutive_partial_flushes=0 panic_resets=0
+[info] [gxf_executor.cpp:2529] Interrupt signal received. Shutting down gracefully...
+[info] [adv_network_dpdk_mgr.cpp:2464] advanced_network DPDK manager shutdown called 1
+[info] [adv_network_dpdk_mgr.cpp:2513] advanced_network DPDK manager stats
+[info] [adv_network_dpdk_mgr.cpp:2114] Total packets received by application (port/queue 0/0): 57600000
+[info] [adv_network_dpdk_mgr.cpp:1445] Port 0:
+[info] [adv_network_dpdk_mgr.cpp:1447]  - Received packets:    57600000
+[info] [adv_network_dpdk_mgr.cpp:1448]  - Transmit packets:    0
+[info] [adv_network_dpdk_mgr.cpp:1449]  - Received bytes:      238348800000
+[info] [adv_network_dpdk_mgr.cpp:1450]  - Transmit bytes:      0
+[info] [adv_network_dpdk_mgr.cpp:1451]  - Missed packets:      0
+[info] [adv_network_dpdk_mgr.cpp:1452]  - Errored packets:     0
+[info] [adv_network_dpdk_mgr.cpp:1453]  - RX out of buffers:   0
+[info] [adv_network_dpdk_mgr.cpp:1455]    ** Extended Stats **
+[info] [spectrogram_visualization.cu:4071] SpectrogramToHolovizOp::stop() begin
+[info] [spectrogram_visualization.cu:4109] SpectrogramToHolovizOp::stop() calling Operator::stop()
+[info] [spectrogram_visualization.cu:4111] SpectrogramToHolovizOp::stop() complete
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_good_packets:		57600000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_good_bytes:		238348800000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_q0_packets:		57600000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_q0_bytes:		238348800000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_unicast_bytes:		238348800000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_multicast_bytes:		915
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_unicast_packets:		57600000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_multicast_packets:		5
+[info] [adv_network_dpdk_mgr.cpp:1485]       tx_multicast_bytes:		915
+[info] [adv_network_dpdk_mgr.cpp:1485]       tx_multicast_packets:		5
+[info] [adv_network_dpdk_mgr.cpp:1485]       tx_phy_packets:		5
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_phy_packets:		57600000
+[info] [adv_network_dpdk_mgr.cpp:1485]       tx_phy_bytes:		935
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_phy_bytes:		238579200000
+[info] [adv_network_dpdk_mgr.cpp:2476] advanced_network DPDK manager shutting down
+mlx5_net: port 0: 2 flows flushed before stopping
+[info] [adv_network_dpdk_mgr.cpp:2491] Stopped DPDK port 0 ('sdr_data') during shutdown
+[info] [adv_network_dpdk_mgr.cpp:2499] Waiting for DPDK worker lcore 10 to exit
+[info] [adv_network_dpdk_mgr.cpp:2506] DPDK worker lcore 10 exited with status 0
+[info] [chdr_rx.cu:1097] ChdrConverterOpRx exit report:
+[info] [chdr_rx.cu:1113] 
+------- CH 0 --------
+   Processed bytes: 238348800000
+ Processed packets: 57600000
+ Active receive sec: 119.993
+ Average throughput: 491.55 MSps (15.73 Gbps)
+ Completed batches queued: 5625
+Completed batches emitted: 5625
+        RX bursts received: 56250
+           Empty RX polls: 1745037
+     Partial batch drops: 0
+Consecutive partial flushes: 0
+            Panic resets: 0
+         Backlog events: 0
+       Max out_q depth: 3
+      Max burst packets: 1024
+ Mean release dwell ms: 1.711
+  Max release dwell ms: 54.585
+
+[info] [event_based_scheduler.cpp:955] Stopping all async jobs
+[info] [event_based_scheduler.cpp:424] Dispatcher thread has stopped checking jobs
+[info] [event_based_scheduler.cpp:934] Waiting to join all async threads
+[info] [event_based_scheduler.cpp:604] Async event handler thread exiting.
+[info] [event_based_scheduler.cpp:941] Waiting to join max duration thread
+[info] [event_based_scheduler.cpp:949] All async worker threads joined, deactivating all entities
+[info] [fft.cu:330] FFT ingress latency ch=0 samples=5622 emitted_frames=5622 mean_chdr_to_fft_ms=64.573 max_chdr_to_fft_ms=164.761
+[copilot-probe] LoggingHolovizOp::stop() begin
+[info] [main.cpp:458] LoggingHolovizOp::stop() begin
+[copilot-probe] LoggingHolovizOp::stop() complete
+[info] [main.cpp:462] LoggingHolovizOp::stop() complete
+[info] [signal_snipper.cu:432] signal_snipper: processed 468 masks, emitted 6255 snippets.
+[info] [sigmf_file_sink.cpp:244] sigmf_file_sink: flushed pack 29 (39 snippet(s), 1 variable-rate container).
+[info] [sigmf_file_sink.cpp:396] sigmf_file_sink: total files written 30, no overflow (0 dropped).
+[info] [event_based_scheduler.cpp:912] Event Based scheduler finished.
+[info] [gxf_executor.cpp:2588] Deactivating Graph...
+[warning] [double_buffer_receiver.cpp:40] Unprocessed num of message 3 in queue: fftOpCh0:in
+[info] [event_based_scheduler.cpp:684] Total execution time of EBS scheduler : 123255.795979 ms
+
+[info] [gxf_executor.cpp:2597] Graph execution finished.
+[info] [adv_network_dpdk_mgr.cpp:2464] advanced_network DPDK manager shutdown called 0
+[info] [adv_network_dpdk_mgr.cpp:2464] advanced_network DPDK manager shutdown called 0
+[info] [adv_network_dpdk_mgr.cpp:2513] advanced_network DPDK manager stats
+[info] [adv_network_dpdk_mgr.cpp:1445] Port 0:
+[info] [adv_network_dpdk_mgr.cpp:1447]  - Received packets:    57600000
+[info] [adv_network_dpdk_mgr.cpp:1448]  - Transmit packets:    0
+[info] [adv_network_dpdk_mgr.cpp:1449]  - Received bytes:      238348800000
+[info] [adv_network_dpdk_mgr.cpp:1450]  - Transmit bytes:      0
+[info] [adv_network_dpdk_mgr.cpp:1451]  - Missed packets:      0
+[info] [adv_network_dpdk_mgr.cpp:1452]  - Errored packets:     0
+[info] [adv_network_dpdk_mgr.cpp:1453]  - RX out of buffers:   0
+[info] [adv_network_dpdk_mgr.cpp:1455]    ** Extended Stats **
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_good_packets:		57600000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_good_bytes:		238348800000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_q0_packets:		57600000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_q0_bytes:		238348800000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_unicast_bytes:		238348800000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_multicast_bytes:		915
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_unicast_packets:		57600000
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_multicast_packets:		5
+[info] [adv_network_dpdk_mgr.cpp:1485]       tx_multicast_bytes:		915
+[info] [adv_network_dpdk_mgr.cpp:1485]       tx_multicast_packets:		5
+[info] [adv_network_dpdk_mgr.cpp:1485]       tx_phy_packets:		5
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_phy_packets:		57600000
+[info] [adv_network_dpdk_mgr.cpp:1485]       tx_phy_bytes:		935
+[info] [adv_network_dpdk_mgr.cpp:1485]       rx_phy_bytes:		238579200000
+[info] [gxf_executor.cpp:379] Destroying context
