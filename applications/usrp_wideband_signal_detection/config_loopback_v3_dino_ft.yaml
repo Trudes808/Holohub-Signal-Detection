@@ -270,9 +270,10 @@ finetuned_dino_detector:
   downsample_fft_size: 0            # 0 = auto-size from the live rate (keeps ~2-tile cost at any rate)
   # The X410 analog anti-alias filter rolls off toward the band edges; the fixed db_vmin/vmax clip
   # maps that tilt into the model's active range and it fires on the edges (activity where the raw
-  # spectrogram shows none). Flattening the per-frequency floor removes it. (Off for the shipped
-  # loopback config since that trained on unflattened captures; at the off-distribution live rate the
-  # edge artifact dominates, so flatten on.)
+  # spectrogram shows none). Flattening the per-frequency floor removes it. M3_491 is fine-tuned WITH
+  # this flatten (dino_fine_tuning/src/frontend.py flatten=True), so keep it ON for BOTH live and
+  # loopback to match the training front-end. (The older M2_dr model trained unflattened -- that is why
+  # the operator DEFAULT is off; the stale "off for loopback" note referred to M2_dr.)
   flatten_noise_floor: true
   # Per-frame adaptive normalization: anchor [0,1] to the per-frame noise floor so a narrow live scene
   # fills the range like training and moderate signals are not compressed into noise (recovers them, cuts FP).

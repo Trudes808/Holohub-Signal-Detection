@@ -354,13 +354,15 @@ void FinetunedDinoDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(power_level_trim_db_, "power_level_trim_db", "Power level trim",
              "Manual scalar dB nudge added to the level match to absorb gain/antenna/cable differences "
              "between the training captures and deployment. 0 = pure rate-derived.", 0.0);
-  // Default OFF: the training preprocessing (dino_fine_tuning frames_to_db) does NO flattening -- the
-  // model was trained on raw dB spectrograms that CONTAIN the receiver envelope, so flattening imposes
-  // a shape the model never saw. Kept as an opt-in tool for models trained on flat-floor data.
+  // Default OFF is for LEGACY checkpoints (the old dino_fine_tuning frames_to_db path did no
+  // flattening). The shipped M3_491 model is fine-tuned WITH the per-frequency floor flatten -- see
+  // dino_fine_tuning/src/frontend.py (flatten=True; reference_q 75 / smooth 0.005 / max_boost 12 /
+  // signal_cap 6, matching the operator defaults below) -- so the M3 live+loopback configs set this
+  // TRUE. Do NOT turn it off for M3: inference would then diverge from the training front-end.
   spec.param(flatten_noise_floor_, "flatten_noise_floor", "Flatten noise floor",
              "Estimate a smooth per-frequency floor and lift low-floor bins up to a data-derived "
-             "reference before inference. OFF by default: this model was trained WITH the envelope "
-             "present, so flattening is out-of-distribution.", false);
+             "reference before inference. Default OFF for legacy models; the M3_491 configs set it true "
+             "because M3 was fine-tuned WITH flatten -- keep it matched to the model's training.", false);
   spec.param(flatten_reference_q_, "flatten_reference_q", "Flatten reference quantile",
              "Blend mean->max of the per-freq floor for the reference level (50-100). Dimensionless "
              "-> bandwidth-invariant.", 75.0);
