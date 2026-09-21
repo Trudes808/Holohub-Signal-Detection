@@ -314,10 +314,9 @@ finetuned_dino_detector:
   # mask up to 48 frames) instead of chunk-by-chunk. Native mode (below) is 20+ tiles/frame and
   # forced the coarse stride-16 blocks.
   # DUAL: M5-S ~37 ms/emit MEASURED under dual contention (2x FFT/viz/snips) > the 21.3 ms frame
-  # period, so dual DINO is compute-bound at ~6 masks/s/channel REGARDLESS of stride -- stride 2
-  # just backpressures the ingest (dropped frames) for the SAME mask rate. stride 8 = stable floor
-  # (~43% duty, clean ingest). A slower viz scroll (rows_per_frame) makes the sparse masks read better.
-  emit_stride: 8
+  # period. stride 8 = stable floor (~43% duty, clean ingest); stride 1 self-throttles (heavy
+  # backpressure, ~170 ms mask lag). stride 4 = middle ground being trialed on v4dual.
+  emit_stride: 4
   channel_filter: -1
   # Native nfft-FFT at 491.52 MSps = 480 kHz/bin, DOUBLE M2_dr's trained 240 kHz/bin -> every
   # signal reads half-width at the wrong scale. Downsample mode FFTs wide (auto-sized to the actual
