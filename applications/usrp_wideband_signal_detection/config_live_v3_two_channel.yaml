@@ -167,7 +167,7 @@ visualization:
     display_time_rows: 2048
     display_freq_bins: 20480
     history_memory_budget_mb: 1024
-    rows_per_frame: 8   # waterfall scroll cadence (display-only, no pipeline cost) — match the single-channel feel; was 2, which made dual look ~4x slower than it is
+    rows_per_frame: 8   # waterfall scroll cadence (display-only, no pipeline cost); override at launch with USRP_ROWS_PER_FRAME=N (e.g. 6 = ~25% slower)
     mask_frame_offset: 0
     allow_backpressure_valve: true
     # SCROLL SMOOTHNESS (2026-09-09): render_every_n_frames must stay 1 — history scrolls on EVERY

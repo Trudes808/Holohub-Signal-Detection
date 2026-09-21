@@ -1206,6 +1206,18 @@ double compute_display_time_bin_seconds(double span_hz, int fft_size, int rows_p
   return fft_window_seconds / static_cast<double>(std::max(1, rows_per_frame));
 }
 
+// Optional launch-time override for the waterfall scroll cadence (display rows emitted per incoming
+// frame). USRP_ROWS_PER_FRAME=N (N>0) overrides the config's rows_per_frame so the scroll speed can
+// be tuned without editing configs; unset/invalid keeps the config value. Display-only, no pipeline
+// cost. Mirrors the USRP_OVERLAY env pattern and is forwarded across detector-switch relaunches.
+int resolve_rows_per_frame(int configured) {
+  if (const char* e = std::getenv("USRP_ROWS_PER_FRAME")) {
+    const int v = std::atoi(e);
+    if (v > 0) return v;
+  }
+  return configured;
+}
+
 double compute_displayed_frame_ratio(int render_every_n_frames) {
   return 1.0 / static_cast<double>(std::max(1, render_every_n_frames));
 }
@@ -3974,12 +3986,12 @@ void SpectrogramToHolovizOp::initialize() {
   const int live_width = live_visualization_width(display_freq_bins_.get(), output_width_.get());
   const int live_rows =
       live_visualization_history_rows(display_time_rows_.get(), output_height_.get(), num_channels_.get());
-  const int rows_per_frame = std::max(1, rows_per_frame_.get());
+  const int rows_per_frame = std::max(1, resolve_rows_per_frame(rows_per_frame_.get()));
   const int render_every_n_frames = std::max(1, render_every_n_frames_.get());
   HOLOSCAN_LOG_INFO("Spectrogram visualizer initializing with num_channels={} display_freq_bins={} rows_per_frame={} render_every_n_frames={}",
                     channel_count,
                     live_width,
-                    rows_per_frame_.get(),
+                    rows_per_frame,
                     render_every_n_frames_.get());
   HOLOSCAN_LOG_INFO("Spectrogram visualizer live history clamped to width={} rows={}",
                     live_width,
@@ -4351,7 +4363,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
                           resolved_span_hz,
                           live_visualization_width(display_freq_bins_.get(), output_width_.get()),
                           state.info.fft_size,
-                          rows_per_frame_.get(),
+                          resolve_rows_per_frame(rows_per_frame_.get()),
                           render_every_n_frames_.get());
         state.info.dino_chunk_rows = dino_chunk_rows_.get();
         state.info.dino_chunk_cols = dino_chunk_cols_.get();

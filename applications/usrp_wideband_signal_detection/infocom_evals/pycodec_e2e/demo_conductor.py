@@ -156,8 +156,9 @@ class Conductor:
                     "-e", f"USRP_SAMPLE_RATE_HZ={self.args.rate_hz:.0f}"]
         if not getattr(self.args, "dual", False):
             env_args += ["-e", f"USRP_CENTER_FREQ_HZ={self.args.center_hz:.0f}"]
-        # Forward the v4/v4dual overlay + class-color flags so a detector-switch relaunch keeps them on.
-        for k in ("USRP_OVERLAY", "USRP_CLASS_COLORS"):
+        # Forward the v4/v4dual overlay + class-color flags and the viz scroll-cadence override so a
+        # detector-switch relaunch keeps them on.
+        for k in ("USRP_OVERLAY", "USRP_CLASS_COLORS", "USRP_ROWS_PER_FRAME"):
             if os.environ.get(k):
                 env_args += ["-e", f"{k}={os.environ[k]}"]
         self.run_or_print(["docker", "exec", "-d", *env_args,

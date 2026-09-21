@@ -14,6 +14,8 @@ set -euo pipefail
 # DEST_PORTS, DURATION, ...), e.g.:
 #   sudo env FREQS="915e6 1800e6" GAIN=40 ./bash_scripts/run_live_demo.sh
 # (Use `sudo env VAR=...` — a plain VAR=... prefix does not survive sudo.)
+# Viz knob: USRP_ROWS_PER_FRAME=N sets the waterfall scroll cadence (display-only; default 8 per
+# config; lower = slower scroll, e.g. 6 ≈ 25% slower). Forwarded across detector-switch relaunches.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 source "${SCRIPT_DIR}/container_env.sh"
@@ -177,6 +179,7 @@ sudo docker exec -d \
   -e USRP_OVERLAY="${USRP_OVERLAY:-}" \
   -e USRP_CLASS_COLORS="${USRP_CLASS_COLORS:-}" \
   -e DINO_GUARD_DEBUG="${DINO_GUARD_DEBUG:-}" \
+  -e USRP_ROWS_PER_FRAME="${USRP_ROWS_PER_FRAME:-}" \
   "${CONTAINER_NAME}" bash -lc "
   cp '${SOURCE_APP_DIR}/${CONFIG_NAME}' '${BUILD_APP_DIR}/' 2>/dev/null || true
   mkdir -p /tmp/xdg-runtime-root && chmod 700 /tmp/xdg-runtime-root

@@ -172,7 +172,7 @@ visualization:
     display_time_rows: 2048
     display_freq_bins: 20480
     history_memory_budget_mb: 1024
-    rows_per_frame: 8   # waterfall scroll cadence (display-only, no pipeline cost) — match the single-channel feel; was 2, which made dual look ~4x slower than it is
+    rows_per_frame: 8   # waterfall scroll cadence (display-only, no pipeline cost); override at launch with USRP_ROWS_PER_FRAME=N (e.g. 6 = ~25% slower)
     mask_frame_offset: 0
     allow_backpressure_valve: true
     # SCROLL SMOOTHNESS (2026-09-09): render_every_n_frames must stay 1 — history scrolls on EVERY
@@ -313,9 +313,10 @@ finetuned_dino_detector:
   # low stride is affordable and the ROI history reads as a continuous ribbon (viz holds the last
   # mask up to 48 frames) instead of chunk-by-chunk. Native mode (below) is 20+ tiles/frame and
   # forced the coarse stride-16 blocks.
-  # DUAL: the M4 ViT-B note (~110 ms/emit under dual contention -> stride 16) does not apply to
-  # M5-S. ViT-S is ~2x faster (~22 ms solo, single-pass), so dual contention is ~53 ms/emit;
-  # stride 8 (one mask per ~170 ms per channel) budgets DINO at ~30% GPU next to 2x FFT/viz/snips.
+  # DUAL: M5-S ~37 ms/emit MEASURED under dual contention (2x FFT/viz/snips) > the 21.3 ms frame
+  # period, so dual DINO is compute-bound at ~6 masks/s/channel REGARDLESS of stride -- stride 2
+  # just backpressures the ingest (dropped frames) for the SAME mask rate. stride 8 = stable floor
+  # (~43% duty, clean ingest). A slower viz scroll (rows_per_frame) makes the sparse masks read better.
   emit_stride: 8
   channel_filter: -1
   # Native nfft-FFT at 491.52 MSps = 480 kHz/bin, DOUBLE M2_dr's trained 240 kHz/bin -> every

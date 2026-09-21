@@ -128,7 +128,7 @@ visualization:
     display_time_rows: 2048
     display_freq_bins: 20480
     history_memory_budget_mb: 1024
-    rows_per_frame: 8
+    rows_per_frame: 8   # waterfall scroll cadence (display-only, no pipeline cost); override at launch with USRP_ROWS_PER_FRAME=N (e.g. 6 = ~25% slower)
     mask_frame_offset: 0
     allow_backpressure_valve: true
     render_every_n_frames: 1
