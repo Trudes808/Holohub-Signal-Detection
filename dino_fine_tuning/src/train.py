@@ -63,6 +63,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--backbone", default="vitb16", help="dinov3 backbone: vitb16 (M4) | vits16 (M5-S)")
+    ap.add_argument("--weights-path", default=None, help="override cfg weights_path (e.g. the ViT-S .pth)")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
@@ -81,10 +83,11 @@ def main():
     vl = DataLoader(va, batch_size=cfg["batch_size"], shuffle=False,
                     num_workers=cfg["num_workers"], pin_memory=True)
 
-    model = DinoSegmenter(cfg["weights_path"], feat_layers=tuple(cfg["feat_layers"]),
-                          mode=args.mode, unfreeze_last_n=cfg["unfreeze_last_n"]).to(device)
+    model = DinoSegmenter(args.weights_path or cfg["weights_path"], feat_layers=tuple(cfg["feat_layers"]),
+                          mode=args.mode, unfreeze_last_n=cfg["unfreeze_last_n"],
+                          backbone=args.backbone).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
-    log(f"trainable params: {n_train:.2f}M  (mode={args.mode})")
+    log(f"trainable params: {n_train:.2f}M  (mode={args.mode}, backbone={args.backbone})")
     loss_fn = DiceBCELoss(pos_weight=cfg["pos_weight"], dice_w=cfg["dice_w"],
                           bce_w=cfg["bce_w"]).to(device)
     opt = torch.optim.AdamW(model.param_groups(cfg["lr_head"], cfg["lr_backbone"]),
@@ -136,7 +139,8 @@ def main():
         state = {"model": model.state_dict(), "opt": opt.state_dict(),
                  "epoch": epoch, "best_iou": best_iou, "gstep": gstep,
                  "history": history, "cfg": cfg, "mode": args.mode,
-                 "atten_max": args.atten_max, "name": args.name}
+                 "atten_max": args.atten_max, "name": args.name,
+                 "backbone": args.backbone, "weights_path": args.weights_path or cfg["weights_path"]}
         torch.save(state, ckpt_last)
         if val["iou"] > best_iou:
             best_iou = val["iou"]; state["best_iou"] = best_iou

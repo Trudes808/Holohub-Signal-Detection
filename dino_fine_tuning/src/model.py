@@ -53,15 +53,20 @@ class SegHead(nn.Module):
         return self.out(x)  # B,1,H,W
 
 
+_VIT_EMBED_DIM = {"vitb16": 768, "vits16": 384, "vits16plus": 384, "vitl16": 1024}
+
+
 class DinoSegmenter(nn.Module):
     def __init__(self, weights_path: str, feat_layers=(2, 5, 8, 11),
-                 mode="frozen", unfreeze_last_n=4):
+                 mode="frozen", unfreeze_last_n=4, backbone="vitb16"):
         super().__init__()
-        self.backbone = B.dinov3_vitb16(pretrained=True, weights=weights_path)
+        ctor = getattr(B, f"dinov3_{backbone}")  # e.g. dinov3_vitb16 / dinov3_vits16
+        self.backbone = ctor(pretrained=True, weights=weights_path)
+        self.backbone_name = backbone
         self.feat_layers = list(feat_layers)
         self.mode = mode
         self.unfreeze_last_n = unfreeze_last_n
-        self.head = SegHead(embed_dim=768, n_layers=len(feat_layers))
+        self.head = SegHead(embed_dim=_VIT_EMBED_DIM[backbone], n_layers=len(feat_layers))
         self.register_buffer("mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1))
         self._configure_freeze()

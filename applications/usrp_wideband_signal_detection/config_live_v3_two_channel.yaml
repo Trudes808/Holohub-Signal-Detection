@@ -157,6 +157,7 @@ logger:
   log_interval: 5
 
 visualization:
+  detector_label: "Coherent Power"   # on-screen active-detector badge (top-right)
   enable: true
   renderer:
     num_channels: 2

@@ -68,11 +68,32 @@ case "${MODE}" in
     V3_STACK=1
     V3_DUAL=1
     ;;
+  v3m5s)
+    # Single-channel v3 pipeline whose DINO detector is the fine-tuned ViT-S (M5-S): ~10 ms bs=2
+    # forward, single-pass, so emit_stride=1 runs per-frame. STARTS ON COHERENT POWER (like v3);
+    # the conductor's cuda_dino_finetuned target is the M5-S config, so selecting DINO in DEMO
+    # CONTROLS switches to M5-S (not M4). Detection overlay ON so DINO masks are visible for eval.
+    # GAIN=10 (same as v3): the busy 2.4 GHz band saturates the front end at 15, dropping strong signals.
+    CONFIG_NAME=config_live_v3_single_channel.yaml
+    export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234} \
+           GAIN=${GAIN:-10} USRP_OVERLAY=1
+    V3_STACK=1
+    ;;
+  v3m5sdual)
+    # v3m5s on BOTH channels: ch0 @ 2.4 GHz, ch1 @ 1 GHz, 491.52 MSps each. STARTS ON COHERENT POWER;
+    # selecting DINO switches to M5-S dual (emit_stride 8, single-pass, in budget next to 2x FFT/viz/snips).
+    # GAIN=10 like v3m5s (busy 2.4 GHz saturates at 15); override GAIN=15 if the 1 GHz band reads low.
+    CONFIG_NAME=config_live_v3_two_channel.yaml
+    export CHANNELS=${CHANNELS:-"0 1"} FREQS=${FREQS:-"2400e6 1000e6"} \
+           DEST_PORTS=${DEST_PORTS:-"1234 1235"} GAIN=${GAIN:-10} USRP_OVERLAY=1
+    V3_STACK=1
+    V3_DUAL=1
+    ;;
   *.yaml)
     CONFIG_NAME=${MODE}
     ;;
   *)
-    echo "Usage: sudo $0 [single|dual|v3|v3dual|v4|v4dual|<config.yaml>]" >&2
+    echo "Usage: sudo $0 [single|dual|v3|v3dual|v4|v4dual|v3m5s|v3m5sdual|<config.yaml>]" >&2
     exit 1
     ;;
 esac

@@ -129,12 +129,16 @@ def main() -> int:
     device = resolve_device(args.device)
 
     ckpt = torch.load(args.ckpt, map_location=device)
-    weights_path = args.weights_path or train_cfg["weights_path"]
+    backbone = ckpt.get("backbone", "vitb16")
+    # Seed the arch with the same base weights the checkpoint was trained from (the trained weights are
+    # then loaded over them below), so ViT-S checkpoints rebuild as ViT-S, not ViT-B.
+    weights_path = args.weights_path or ckpt.get("weights_path") or train_cfg["weights_path"]
     model = DinoSegmenter(
         weights_path,
         feat_layers=tuple(train_cfg["feat_layers"]),
         mode=ckpt.get("mode", "ft_lastN"),
         unfreeze_last_n=int(train_cfg.get("unfreeze_last_n", 4)),
+        backbone=backbone,
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()

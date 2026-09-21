@@ -2739,7 +2739,7 @@ static const char* const kDemoSnrNames[] = {"clean", "30", "20", "15", "12", "9"
 // to restore, re-add {"cuda_dino", "CUDA-DINO"} / {"cuda_dino_finetuned_sb", "DINO-FT (SB ignore)"}
 // here and bump the Combo count below.
 static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino_finetuned"};
-static const char* const kDemoDetectorLabels[] = {"CoherentPower", "DINO-FT (M3_491)"};
+static const char* const kDemoDetectorLabels[] = {"Coherent Power", "DINO v3 M5-S"};
 
 // Demo 2026-09-09: HIDE the ingest-throughput readouts (sidebar MSps/Gbps, footer INGEST line, the
 // MSps history bar chart). The number reflects samples actually ingested, which sheds below the
