@@ -65,7 +65,7 @@ USRP_CLASSIFIER_MODELS="${USRP_CLASSIFIER_MODELS:-resnet1d,cnn1d,tprime_lg}"
 USRP_SNIP_ADDITIVE_GUARD_HZ="${USRP_SNIP_ADDITIVE_GUARD_HZ:-10e6}"
 # seed the DEMO CONTROLS control file so the checklist/labels paint before the daemon's first write
 sudo mkdir -p "${JOB}" && sudo chmod 1777 "${JOB}" 2>/dev/null || true
-printf '{"gate": "tprime", "snr": "clean", "detector": "cuda_dino_finetuned", "classifiers": "resnet1d,cnn1d,tprime_lg", "color_model": "resnet1d", "seq": 1}\n' \
+printf '{"gate": "tprime", "snr": "clean", "detector": "cuda_dino_finetuned", "classifiers": "resnet1d,cnn1d,tprime_lg", "color_model": "resnet1d", "channel_mode": "dual", "seq": 1}\n' \
   | sudo tee "${JOB}/demo_control.json" > /dev/null
 sudo chmod 666 "${JOB}/demo_control.json"
 sudo docker exec "${CN}" bash -lc "cp '${SOURCE_APP_DIR}/${CONFIG_NAME}' '${BUILD_APP_DIR}/' 2>/dev/null || true"

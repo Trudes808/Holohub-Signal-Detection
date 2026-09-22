@@ -2760,6 +2760,7 @@ struct DemoControlState {
   int detector = 0;   // index into kDemoDetectorNames
   bool cls_on[3] = {true, true, true};  // classifier CHECKLIST (demo_classifier_names() order)
   int color_model = 0;  // index into demo_classifier_names(): which model tints the Color-Mask overlay
+  int channel_mode = 1; // 0=single, 1=dual; the loopback channel supervisor relaunches on change
   uint64_t seq = 0;
   bool loaded = false;
 };
@@ -2773,6 +2774,8 @@ static const char* const kDemoSnrNames[] = {"clean", "30", "20", "15", "12", "9"
 // here and bump the Combo count below.
 static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino_finetuned"};
 static const char* const kDemoDetectorLabels[] = {"Coherent Power", "DINO v3 M5-S"};
+static const char* const kDemoChannelModeNames[] = {"single", "dual"};
+static const char* const kDemoChannelModeLabels[] = {"Single", "Dual"};
 
 // The three classifier model names (checklist / gate / color-source). Defaults are the v1 amc
 // set; the v2 demo overrides via USRP_CLASSIFIER_MODELS="resnet1d,cnn1d,tprime_lg" (read at init).
@@ -2904,6 +2907,9 @@ void demo_control_load_once(DemoControlState& st, const std::string& path) {
   if (json_find_string(text, "color_model", v)) {
     st.color_model = demo_names_index(demo_classifier_names(), v, st.color_model);
   }
+  if (json_find_string(text, "channel_mode", v)) {
+    st.channel_mode = demo_option_index(kDemoChannelModeNames, v, st.channel_mode);
+  }
   json_find_u64(text, "seq", st.seq);
 }
 
@@ -2924,6 +2930,7 @@ void demo_control_write(const DemoControlState& st, const std::string& path) {
         << " \"detector\": \"" << kDemoDetectorNames[st.detector] << "\",\n"
         << " \"classifiers\": \"" << cls_list << "\",\n"
         << " \"color_model\": \"" << demo_classifier_names()[st.color_model] << "\",\n"
+        << " \"channel_mode\": \"" << kDemoChannelModeNames[st.channel_mode] << "\",\n"
         << " \"seq\": " << st.seq << "\n}\n";
   }
   std::error_code ec;
@@ -3097,6 +3104,11 @@ void render_visualization_ui_overlay() {
       ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 3.0f));
       ImGui::PushItemWidth(170.0f);
       bool changed = false;
+      // Channel-mode toggle (top of the panel): Single vs Dual. Writing channel_mode to the control
+      // file triggers the loopback channel supervisor to relaunch the app with the matching config
+      // (and start/stop the ch1 replay). ~15 s reconfigure, like the detector switch.
+      changed |= ImGui::Combo("Channels", &st.channel_mode, kDemoChannelModeLabels, 2);
+      ImGui::Separator();
       // Classifier CHECKLIST (v3): enable any subset; the daemon hot-loads /
       // unloads models and the COMPUTE panel shows each one's cost.
       ImGui::TextUnformatted("Classifiers");
