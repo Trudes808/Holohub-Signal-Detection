@@ -47,6 +47,7 @@ FSK_PROFILE = dict(sps=8, h=0.5, bt=0.5)
 V2_GUARD_HZ = 5e6   # v2 classifier: additive guard per side (snipper produces occupied_bw + 2*this)
 _v2_last_classify = [0.0]          # throttle state (module-global wall time of last classify pass)
 args_classify_min_interval = 0.0   # seconds; >0 rate-limits v2 classify to cut GPU contention
+_last_metrics_write = [0.0]        # throttle rt_metrics.json writes so a fast backlog can't hammer disk
 
 # Frequency-plan truth for the staircase-family replay captures (loop-invariant:
 # no time alignment needed). Center -> family, plus the burst geometry
@@ -538,6 +539,16 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
                           a.get("wfgt:orig_sample_rate", 245.76e6)))
     metrics.stream_rate_hz = max(metrics.stream_rate_hz,
                                  float(a.get("wfgt:orig_sample_rate", 0.0)))
+    # v2 throttle BEFORE the expensive IQ read: the snipper floods ~100+ snippets/s and reading each
+    # (decompress + find_subbands) is what caps the classify cadence. Skip throttled snippets here
+    # (no read, no marker, no log) so the daemon clears the backlog and classifies at the target rate.
+    if clf is not None and args_classify_only and getattr(clf, "V2", False):
+        now = time.time()
+        if args_classify_min_interval > 0.0 and \
+                (now - _v2_last_classify[0]) < args_classify_min_interval:
+            metrics.snips += 1
+            return None
+        _v2_last_classify[0] = now
     start, count = int(a["core:sample_start"]), int(a["core:sample_count"])
     if "wfgt:comp_byte_offset" in a and hasattr(data, "read_compressed"):
         # Compressed container: chunks are byte-addressed; core:sample_* stay logical.
@@ -562,15 +573,7 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
         # snippet once and do NOT re-channelize -- channelizing strips the guard band the v2
         # models require. One marker per snippet, tinted by the selected color_model.
         if clf is not None and args_classify_only and getattr(clf, "V2", False):
-            # Rate-limit the classifier: the v2 models (esp. resnet1d 2D-conv) contend with the
-            # detector on the shared GB10, and classifying every snippet backs the detector up
-            # (waterfall tears). The overlay only needs a few updates/s, so cap the cadence.
-            now = time.time()
-            if args_classify_min_interval > 0.0 and \
-                    (now - _v2_last_classify[0]) < args_classify_min_interval:
-                metrics.snips += 1
-                return f"snip frame#{a.get('wfgt:frame_number','?')} v2 (throttled)"
-            _v2_last_classify[0] = now
+            # (rate-limit handled at the top of process_annotation, before the IQ read)
             res = clf.classify(iq)
             metrics.snips += 1
             if not res:
@@ -962,18 +965,22 @@ def main():
                 processed += 1
                 if line:
                     print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
-                # stream metrics per snippet so the HoloViz panel updates live
-                try:
-                    tmp = metrics_path + ".tmp"
-                    with open(tmp, "w") as f:
-                        d = metrics.as_dict()
-                        if clf is not None:
-                            d["resources"] = clf.resource_report()
-                            d["classify_only"] = args_classify_only
-                        json.dump(d, f, indent=1)
-                    os.replace(tmp, metrics_path)
-                except OSError:
-                    pass
+                # stream metrics so the HoloViz panel updates live, gated to ~20/s so a fast
+                # throttled backlog doesn't hammer the disk with JSON writes.
+                now_w = time.time()
+                if now_w - _last_metrics_write[0] >= 0.05:
+                    _last_metrics_write[0] = now_w
+                    try:
+                        tmp = metrics_path + ".tmp"
+                        with open(tmp, "w") as f:
+                            d = metrics.as_dict()
+                            if clf is not None:
+                                d["resources"] = clf.resource_report()
+                                d["classify_only"] = args_classify_only
+                            json.dump(d, f, indent=1)
+                        os.replace(tmp, metrics_path)
+                    except OSError:
+                        pass
             seen[mp] = processed
             new_work = True
             packs_this_pass += 1
