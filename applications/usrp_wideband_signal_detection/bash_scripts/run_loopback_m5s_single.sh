@@ -43,7 +43,7 @@ sudo docker exec "${CN}" bash -lc \
 
 echo "==> [3/5] launch M5-S single app (${CONFIG_NAME}) detached on ${DEMO_DISPLAY} @ ${RATE_HZ} Hz"
 USRP_OVERLAY="${USRP_OVERLAY:-1}"
-USRP_CLASS_COLORS="${USRP_CLASS_COLORS:-1}"
+USRP_CLASS_COLORS="${USRP_CLASS_COLORS:-0}"   # class-color overlay retired; controls hidden (default off)
 USRP_CLASSIFIER_MODELS="${USRP_CLASSIFIER_MODELS:-resnet1d,cnn1d,tprime_lg}"
 USRP_SNIP_ADDITIVE_GUARD_HZ="${USRP_SNIP_ADDITIVE_GUARD_HZ:-10e6}"
 sudo mkdir -p "${JOB}" && sudo chmod 1777 "${JOB}" 2>/dev/null || true

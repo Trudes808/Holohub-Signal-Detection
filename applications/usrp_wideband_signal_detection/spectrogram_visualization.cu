@@ -3031,10 +3031,14 @@ void render_visualization_ui_overlay() {
   if (ImGui::Checkbox("Overlay Detection Mask", &overlay_enabled)) {
     set_visualization_overlay_enabled(overlay_enabled);
   }
-  bool class_colors = visualization_class_colors_enabled();
-  if (ImGui::Checkbox("Color Mask by Class", &class_colors)) {
-    set_visualization_class_colors_enabled(class_colors);
-  }
+  // "Color Mask by Class" checkbox hidden (the class-color overlay is retired -- it did not work as
+  // intended). Launch no longer sets USRP_CLASS_COLORS, so class_colors stays false: the inline class
+  // legend below is skipped and the detection overlay uses its default single color. Restore the
+  // checkbox to revive the taxonomy tint.
+  const bool class_colors = visualization_class_colors_enabled();
+  // if (ImGui::Checkbox("Color Mask by Class", &class_colors)) {
+  //   set_visualization_class_colors_enabled(class_colors);
+  // }
   // Clears the PSD peak-hold trace so a past broadband transient (garbage OR real wideband RF) stops
   // pinning the MAX HOLD line. Consumed on the compute thread via the global reset epoch.
   if (ImGui::Button("Reset Max Hold")) {
@@ -3115,12 +3119,12 @@ void render_visualization_ui_overlay() {
       for (int i = 0; i < 3; ++i) {
         changed |= ImGui::Checkbox(demo_classifier_labels()[i].c_str(), &st.cls_on[i]);
       }
-      // Which classifier tints the "Color Mask by Class" overlay (v2 pipeline; the daemon
-      // applies it live via demo_control.json "color_model").
-      const char* color_src_labels[3] = {demo_classifier_labels()[0].c_str(),
-                                          demo_classifier_labels()[1].c_str(),
-                                          demo_classifier_labels()[2].c_str()};
-      changed |= ImGui::Combo("Color source", &st.color_model, color_src_labels, 3);
+      // "Color source" dropdown hidden (paired with the retired "Color Mask by Class" overlay).
+      // st.color_model is still persisted to demo_control.json but is no longer user-selectable here.
+      // const char* color_src_labels[3] = {demo_classifier_labels()[0].c_str(),
+      //                                     demo_classifier_labels()[1].c_str(),
+      //                                     demo_classifier_labels()[2].c_str()};
+      // changed |= ImGui::Combo("Color source", &st.color_model, color_src_labels, 3);
       if (demo_snr_enabled_storage()) {  // replay-only knob (pcap switching)
         static const char* const kSnrCombo[] = {"Clean", "30 dB", "20 dB", "15 dB",
                                                 "12 dB", "9 dB", "6 dB", "0 dB",

@@ -60,7 +60,7 @@ echo "==> [3/5] launch M5-S dual app (${CONFIG_NAME}) detached on ${DEMO_DISPLAY
 # v5 dashboard env (mirror run_live_demo.sh v5dual): detection overlay ON, class-colored masks, the
 # release_v2 classifier taxonomy (so the panels read QPSK/802.11AX/BLE/5G_NR/BFM), additive snip guard.
 USRP_OVERLAY="${USRP_OVERLAY:-1}"
-USRP_CLASS_COLORS="${USRP_CLASS_COLORS:-1}"
+USRP_CLASS_COLORS="${USRP_CLASS_COLORS:-0}"   # class-color overlay retired; controls hidden (default off)
 USRP_CLASSIFIER_MODELS="${USRP_CLASSIFIER_MODELS:-resnet1d,cnn1d,tprime_lg}"
 USRP_SNIP_ADDITIVE_GUARD_HZ="${USRP_SNIP_ADDITIVE_GUARD_HZ:-10e6}"
 # seed the DEMO CONTROLS control file so the checklist/labels paint before the daemon's first write

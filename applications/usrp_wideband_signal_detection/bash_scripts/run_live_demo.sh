@@ -92,13 +92,14 @@ case "${MODE}" in
     V3_DUAL=1
     ;;
   v5)
-    # v5 = v4 (M5-S DINO detector, overlay + class-colors ON) with the release_v2 CLASSIFIER stack:
+    # v5 = M5-S DINO detector + detection overlay ON, with the release_v2 CLASSIFIER stack:
     # 6 classes (qpsk/bfm/he/nr5g/ble/noise), the snipper feeds occupied_bw + 10 MHz (additive
-    # guard), and DEMO CONTROLS gains a "Color source" dropdown to pick which of resnet1d/cnn1d/
-    # tprime_lg tints the masks. Starts on Coherent Power; switch to DINO v3 M5-S in DEMO CONTROLS.
+    # guard). The class-color overlay ("Color Mask by Class" + "Color source") is retired -- those
+    # DEMO CONTROLS are hidden and the overlay uses its default color. Starts on Coherent Power;
+    # switch to DINO v3 M5-S in DEMO CONTROLS.
     CONFIG_NAME=config_live_v3_single_channel.yaml
     export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234} \
-           GAIN=${GAIN:-10} USRP_OVERLAY=1 USRP_CLASS_COLORS=1 \
+           GAIN=${GAIN:-10} USRP_OVERLAY=1 \
            USRP_CLASSIFIER_MODELS="resnet1d,cnn1d,tprime_lg" USRP_SNIP_ADDITIVE_GUARD_HZ=10e6
     V3_STACK=1
     AMC_V2=1
@@ -107,7 +108,7 @@ case "${MODE}" in
     # v5 on BOTH channels (ch0 2.4 GHz + ch1 1 GHz, 491.52 MSps each). DINO dual = M5-S stride 4.
     CONFIG_NAME=config_live_v3_two_channel.yaml
     export CHANNELS=${CHANNELS:-"0 1"} FREQS=${FREQS:-"2400e6 1000e6"} \
-           DEST_PORTS=${DEST_PORTS:-"1234 1235"} GAIN=${GAIN:-15} USRP_OVERLAY=1 USRP_CLASS_COLORS=1 \
+           DEST_PORTS=${DEST_PORTS:-"1234 1235"} GAIN=${GAIN:-15} USRP_OVERLAY=1 \
            USRP_CLASSIFIER_MODELS="resnet1d,cnn1d,tprime_lg" USRP_SNIP_ADDITIVE_GUARD_HZ=10e6
     V3_STACK=1
     V3_DUAL=1
