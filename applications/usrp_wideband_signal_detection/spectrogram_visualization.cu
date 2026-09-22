@@ -4304,6 +4304,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
        << " rendered=" << timing_stats_.frames_rendered
        << " drop_vis_busy=" << timing_stats_.dropped_vis_stream_busy
        << " drop_render_busy=" << timing_stats_.dropped_render_queue_busy
+       << " backlog_folded=" << timing_stats_.backlog_folded_into_history
        << " cadence_skips=" << timing_stats_.render_skipped_by_cadence
        << " masks(received/backfilled/deferred/peak)="
        << timing_stats_.masks_received << "/"
@@ -4375,6 +4376,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
   bool any_updates = false;
   uint64_t processed_visual_frame_count = 0;
   uint64_t spectrogram_backlog_drop_count = 0;
+  uint64_t spectrogram_backlog_folded_count = 0;
   std::vector<std::deque<VisualSpectrogramMessage>> residual_spectrogram_queues(snapshot_mailboxes.size());
   std::vector<std::deque<DetectorMaskMessage>> residual_mask_queues(snapshot_mailboxes.size());
   uint64_t drained_mask_count = 0;
@@ -4418,9 +4420,31 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
       }
 
       if (allow_backpressure_valve_.get()) {
+        // Backpressure: compose renders one frame per tick, but frames arrive faster than that.
+        // We used to drop the backlog outright, which punched time gaps into the waterfall so the
+        // scroll tore / looked non-sequential. Instead fold every backlog frame's rows into the
+        // history ring in arrival order (a cheap memcpy) so the scroll stays continuous; only the
+        // newest kept frame below drives the mask/PSD/labels for this compose.
         while (mailbox.spectrogram_queue.size() > kLiveSpectrogramSmoothBacklogDepth) {
+          auto backlog = std::move(mailbox.spectrogram_queue.front());
           mailbox.spectrogram_queue.pop_front();
-          ++spectrogram_backlog_drop_count;
+          if (backlog.channel == static_cast<int>(channel_index) && !backlog.pixels.empty() &&
+              backlog.width > 0 && backlog.height > 0) {
+            const int backlog_history_rows = clamp_history_rows_to_budget(
+                std::max(1, backlog.width),
+                live_visualization_history_rows(display_time_rows_.get(), output_height_.get(),
+                                                num_channels_.get()),
+                history_memory_budget_mb_.get());
+            state.info.frame_number = static_cast<int64_t>(backlog.frame_number);
+            append_spectrogram_history(state,
+                                       backlog.pixels,
+                                       std::max(1, backlog.width),
+                                       std::max(1, backlog.height),
+                                       backlog_history_rows);
+            ++spectrogram_backlog_folded_count;
+          } else {
+            ++spectrogram_backlog_drop_count;
+          }
         }
       }
 
@@ -4608,6 +4632,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
   {
     std::lock_guard<std::mutex> lock(timing_mutex_);
     timing_stats_.dropped_render_queue_busy += spectrogram_backlog_drop_count;
+    timing_stats_.backlog_folded_into_history += spectrogram_backlog_folded_count;
     timing_stats_.masks_received += drained_mask_count;
     timing_stats_.masks_backfilled += backfilled_mask_count;
     timing_stats_.masks_deferred += deferred_mask_count;
@@ -4615,7 +4640,8 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
   }
 
   dropped_frames_ += spectrogram_backlog_drop_count;
-  total_frames_ += spectrogram_backlog_drop_count + processed_visual_frame_count;
+  total_frames_ += spectrogram_backlog_drop_count + spectrogram_backlog_folded_count +
+                   processed_visual_frame_count;
 
   {
     std::lock_guard<std::mutex> lock(preview_mailbox_mutex());

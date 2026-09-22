@@ -227,6 +227,7 @@ class SpectrogramToHolovizOp : public Operator {
     uint64_t frames_rendered = 0;
     uint64_t dropped_vis_stream_busy = 0;
     uint64_t dropped_render_queue_busy = 0;
+    uint64_t backlog_folded_into_history = 0;
     uint64_t render_skipped_by_cadence = 0;
     uint64_t masks_received = 0;
     uint64_t masks_backfilled = 0;
