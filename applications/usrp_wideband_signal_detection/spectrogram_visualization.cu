@@ -4402,6 +4402,11 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
       }
     }
 
+    // Strided detectors (DINO-FT) mask only every Nth frame; hold the most recent mask over the
+    // unmasked frames -- both the sparsely rendered front frames and the folded-backlog frames --
+    // so the ROI history reads as a continuous ribbon. Age-capped so a dead detector's boxes do
+    // not linger on screen.
+    constexpr int64_t kMaskPersistMaxFrames = 48;
     for (size_t channel_index = 0; channel_index < snapshot_mailboxes.size(); ++channel_index) {
       auto& mailbox = snapshot_mailboxes[channel_index];
       pending_mask_peak = std::max<uint64_t>(pending_mask_peak, mailbox.mask_queue.size());
@@ -4441,6 +4446,19 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
                                        std::max(1, backlog.width),
                                        std::max(1, backlog.height),
                                        backlog_history_rows);
+            // Carry the most recent detector mask onto this folded frame so the ROI ribbon stays
+            // continuous instead of showing blank rows between the sparsely rendered front frames
+            // (mirrors the front-frame persistence below). A folded frame that has its own mask is
+            // overwritten with the real one by the late-mask backfill in the front-frame path.
+            const int64_t backlog_frame = static_cast<int64_t>(backlog.frame_number);
+            const int64_t backlog_mask_age = backlog_frame - state.latest_mask_frame_number;
+            if (!state.latest_mask.pixels.empty() && state.latest_mask_frame_number > 0 &&
+                backlog_mask_age >= -kMaskPersistMaxFrames && backlog_mask_age <= kMaskPersistMaxFrames) {
+              patch_history_mask_for_frame(state,
+                                           backlog_frame + static_cast<int64_t>(mask_frame_offset_.get()),
+                                           state.latest_mask.pixels,
+                                           state.latest_mask.width);
+            }
             ++spectrogram_backlog_folded_count;
           } else {
             ++spectrogram_backlog_drop_count;
@@ -4580,8 +4598,7 @@ void SpectrogramToHolovizOp::compute(InputContext& op_input,
         // most recent mask over the unmasked frames so the ROI history reads as a continuous
         // ribbon instead of one thin row per inference. Stride-1 detectors always take the
         // current-frame branch above, so this is a no-op for them. Age-capped so a dead
-        // detector's last boxes do not linger on screen.
-        constexpr int64_t kMaskPersistMaxFrames = 48;
+        // detector's last boxes do not linger on screen. (kMaskPersistMaxFrames hoisted above.)
         if (!current_frame_mask.has_value() && !state.latest_mask.pixels.empty() &&
             state.latest_mask_frame_number > 0 &&
             static_cast<int64_t>(spectrogram.frame_number) - state.latest_mask_frame_number <=
