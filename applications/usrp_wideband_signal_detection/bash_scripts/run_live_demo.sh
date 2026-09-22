@@ -231,7 +231,7 @@ if [[ "${V3_STACK:-0}" == "1" ]]; then
     /tmp/usrp_spectrograms/snip_stats*.json
   # v5: release_v2 classifier (6 classes, win=8192, input at occupied_bw+10 MHz from the snipper)
   AMC_V2_ARGS=""
-  if [[ "${AMC_V2:-0}" == "1" ]]; then AMC_V2_ARGS="--amc-v2 --color-model resnet1d"; fi
+  if [[ "${AMC_V2:-0}" == "1" ]]; then AMC_V2_ARGS="--amc-v2 --color-model resnet1d --classify-min-interval-ms ${AMC_MIN_INTERVAL_MS:-100}"; fi
   (cd "${APP_DIR_HOST}/infocom_evals/pycodec_e2e" && \
    PYCODEC_ROOT="${V3_USER_HOME}/Documents/holoscan_waveform_generation" \
    exec "${VENV_PY}" rt_decode_daemon.py --snips /tmp/usrp_spectrograms/snippets \

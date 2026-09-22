@@ -797,26 +797,34 @@ RgbColor mask_overlay_color(float normalized_value) {
 // with no nearby class marker (detected but unclassified) uses the neutral kUnclassifiedOverlayColor
 // below -- deliberately NOT the lime default, so it never reads as the PSK green.
 struct ClassColorEntry {
-  const char* label;
+  const char* label;    // key the daemon emits (recent_decodes 'mod') -- matched for coloring
+  const char* display;  // pretty label shown in the legend / CLASSIFIER OUTPUTS panel
   RgbColor color;
 };
 
+// The v2 (release_v2) class taxonomy is active when the classifier model set is the v2 one;
+// set by set_visualization_classifier_models() from USRP_CLASSIFIER_MODELS.
+bool& g_use_v2_classes() { static bool b = false; return b; }
+
 const std::vector<ClassColorEntry>& class_color_table() {
-  static const std::vector<ClassColorEntry> table = {
-      {"PSK", {70, 214, 106}},   // green   (v1 amc)
-      {"QAM", {214, 84, 230}},   // magenta (v1 amc)
-      {"FSK", {255, 150, 40}},   // orange  (v1 amc)
-      {"OFDM", {40, 214, 224}},  // cyan    (v1 amc; not blue -- blue blends into the background)
-      {"NOISE", {255, 70, 70}},  // red     (v1 amc)
-      // release_v2 taxonomy (lowercase labels the v2 daemon emits). "noise" is intentionally
-      // omitted so it falls through to the neutral gray (no tint) rather than reading as a signal.
-      {"qpsk", {70, 214, 106}},   // green
-      {"he",   {40, 214, 224}},   // cyan   (802.11ax)
-      {"ble",  {214, 84, 230}},   // magenta(Bluetooth LE)
-      {"nr5g", {255, 150, 40}},   // orange (5G NR)
-      {"bfm",  {235, 215, 70}},   // yellow (broadcast FM)
+  static const std::vector<ClassColorEntry> v1 = {
+      {"PSK", "PSK", {70, 214, 106}},    // green
+      {"QAM", "QAM", {214, 84, 230}},    // magenta
+      {"FSK", "FSK", {255, 150, 40}},    // orange
+      {"OFDM", "OFDM", {40, 214, 224}},  // cyan (not blue -- blue blends into the background)
+      {"NOISE", "NOISE", {255, 70, 70}}, // red
   };
-  return table;
+  // release_v2 taxonomy: key = the lowercase label the v2 daemon emits; display = pretty name.
+  // Order matches classes.json. "noise" gets the neutral gray so it never reads as a signal tint.
+  static const std::vector<ClassColorEntry> v2 = {
+      {"qpsk", "QPSK", {70, 214, 106}},        // green
+      {"bfm", "BFM", {235, 215, 70}},          // yellow
+      {"he", "802.11AX", {40, 214, 224}},      // cyan
+      {"nr5g", "5G_NR", {255, 150, 40}},       // orange
+      {"ble", "BLE", {214, 84, 230}},          // magenta
+      {"noise", "NOISE", {200, 205, 212}},     // neutral gray (no distracting tint)
+  };
+  return g_use_v2_classes() ? v2 : v1;
 }
 
 // Neutral for detected-but-unclassified mask columns in class-color mode (distinct from all five hues
@@ -2340,7 +2348,7 @@ struct DecodeMetricsSnapshot {
   bool classify_only = false;
   // cumulative output-label counts per model (classifier.models.<name>.preds):
   // [PSK, QAM, FSK, OFDM, NOISE] in kClsLabels order
-  std::map<std::string, std::array<uint64_t, 5>> cls_preds;
+  std::map<std::string, std::array<uint64_t, 8>> cls_preds;  // counts in active class_color_table() order
   double snips_per_s = -1.0;          // detection->snip rate (EMA of deltas)
   // ---- app-side throughput/compute (app_metrics.json from the rate monitor)
   double app_msps = -1.0, app_gbps = -1.0;
@@ -2590,10 +2598,10 @@ void poll_decode_metrics() {
                                                          : text.find('}', popen);
           if (pclose != std::string::npos) {
             const std::string pbody = text.substr(popen, pclose - popen + 1);
-            static const char* const kClsLabels[5] = {"PSK", "QAM", "FSK", "OFDM", "NOISE"};
-            std::array<uint64_t, 5> counts{};
-            for (int li = 0; li < 5; ++li) {
-              json_find_u64(pbody, kClsLabels[li], counts[li]);
+            std::array<uint64_t, 8> counts{};
+            const auto& tbl = class_color_table();
+            for (size_t li = 0; li < tbl.size() && li < counts.size(); ++li) {
+              json_find_u64(pbody, tbl[li].label, counts[li]);
             }
             next.cls_preds[name] = counts;
           }
@@ -2801,6 +2809,12 @@ void set_visualization_classifier_models(const std::string& csv) {
   demo_classifier_labels() = {pretty_classifier_label(names[0]),
                               pretty_classifier_label(names[1]),
                               pretty_classifier_label(names[2])};
+  // v2 model set => v2 class taxonomy (qpsk/bfm/he/nr5g/ble/noise) for the legend + panels.
+  bool v2 = false;
+  for (const auto& n : names) {
+    if (n == "cnn1d" || n == "tprime_lg") v2 = true;
+  }
+  g_use_v2_classes() = v2;
 }
 int demo_names_index(const std::vector<std::string>& names, const std::string& value, int fallback) {
   for (size_t i = 0; i < names.size(); ++i) {
@@ -3024,7 +3038,7 @@ void render_visualization_ui_overlay() {
       first = false;
       ImGui::TextColored(ImVec4(entry.color.r / 255.0f, entry.color.g / 255.0f,
                                 entry.color.b / 255.0f, 1.0f),
-                         "%s", entry.label);
+                         "%s", entry.display);
     }
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(kUnclassifiedOverlayColor.r / 255.0f, kUnclassifiedOverlayColor.g / 255.0f,
@@ -3238,9 +3252,8 @@ void render_visualization_ui_overlay() {
         draw_list->AddText(ImVec2(x0 + 130.0f, sidebar_text_y + 3.0f), panel_muted, line);
         sidebar_text_y += 22.0f;
         for (const auto& r : dm.cls_resources) {
-          const char* disp = r.name == "vtcnn2" ? "VT-CNN2"
-                             : (r.name == "resnet1d" ? "ResNet1D" : "T-PRIME");
-          draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_text, disp);
+          const std::string disp = pretty_classifier_label(r.name);
+          draw_list->AddText(ImVec2(x0, sidebar_text_y), panel_text, disp.c_str());
           if (r.ms_avg >= 0.0) {
             std::snprintf(line, sizeof(line), "%.1f ms", r.ms_avg);
             draw_list->AddText(ImVec2(x0 + 92.0f, sidebar_text_y), panel_muted, line);
@@ -3381,9 +3394,8 @@ void render_visualization_ui_overlay() {
         sidebar_text_y += 22.0f;
         for (const auto& m : dm.cls_models) {
           const bool is_gate = m.name == dm.cls_gate;
-          const char* disp = m.name == "vtcnn2" ? "VT-CNN2"
-                             : (m.name == "resnet1d" ? "ResNet1D" : "T-PRIME");
-          std::snprintf(line, sizeof(line), "%s%s", is_gate ? "> " : "  ", disp);
+          const std::string disp = pretty_classifier_label(m.name);
+          std::snprintf(line, sizeof(line), "%s%s", is_gate ? "> " : "  ", disp.c_str());
           draw_list->AddText(ImVec2(x0, sidebar_text_y),
                              is_gate ? panel_text : panel_muted, line);
           ImU32 acc_color = panel_muted;
@@ -3588,24 +3600,26 @@ void render_visualization_ui_overlay() {
         float oy = fy0 + 6.0f;
         draw_list->AddText(ImVec2(ox0, oy), accent_blue, "CLASSIFIER OUTPUTS (cumulative)");
         oy += 18.0f;
-        static const char* const kClsLabels[5] = {"PSK", "QAM", "FSK", "OFDM", "NOISE"};
-        static const char* const kModelOrder[3] = {"vtcnn2", "resnet1d", "tprime"};
-        static const char* const kModelShort[3] = {"VT-CNN2", "ResNet1D", "T-PRIME"};
+        const auto& tbl = class_color_table();          // active taxonomy (v1 or v2)
+        const auto& mnames = demo_classifier_names();    // active model keys
+        const auto& mlabels = demo_classifier_labels();  // pretty model labels
         const float col0 = ox0, colw = 82.0f;
-        // header row: model columns
+        // header row: model columns (only the models that have reported)
         for (int mi = 0; mi < 3; ++mi) {
-          if (dm.cls_preds.count(kModelOrder[mi])) {
+          if (dm.cls_preds.count(mnames[mi])) {
             draw_list->AddText(ImVec2(col0 + 62.0f + mi * colw, oy), panel_muted,
-                               kModelShort[mi]);
+                               mlabels[mi].c_str());
           }
         }
         oy += 16.0f;
         char cc[24];
-        for (int li = 0; li < 5; ++li) {
-          draw_list->AddText(ImVec2(col0, oy), li == 4 ? panel_muted : panel_text,
-                             kClsLabels[li]);
+        for (size_t li = 0; li < tbl.size() && li < 8; ++li) {
+          const std::string key = tbl[li].label;
+          const bool is_noise = (key == "NOISE" || key == "noise");
+          draw_list->AddText(ImVec2(col0, oy), is_noise ? panel_muted : panel_text,
+                             tbl[li].display);
           for (int mi = 0; mi < 3; ++mi) {
-            const auto it = dm.cls_preds.find(kModelOrder[mi]);
+            const auto it = dm.cls_preds.find(mnames[mi]);
             if (it == dm.cls_preds.end()) continue;
             const uint64_t v = it->second[li];
             if (v >= 100000) {
@@ -3652,9 +3666,8 @@ void render_visualization_ui_overlay() {
       double tot_mem = 0.0, tot_flops = 0.0;
       for (const auto& r : dm.cls_resources) {
         if (ty > fy1 - 30.0f) break;
-        const char* disp = r.name == "vtcnn2" ? "VT-CNN2"
-                           : (r.name == "resnet1d" ? "ResNet1D" : "T-PRIME");
-        draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_text, disp);
+        const std::string disp = pretty_classifier_label(r.name);
+        draw_list->AddText(ImVec2(tx0 + 12.0f, ty), panel_text, disp.c_str());
         std::snprintf(cell, sizeof(cell), "%.2f M", r.params / 1e6);
         draw_list->AddText(ImVec2(kParX, ty), panel_text, cell);
         if (r.gpu_mb >= 0.0) {

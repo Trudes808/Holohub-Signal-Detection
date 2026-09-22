@@ -45,6 +45,8 @@ from pycodec.ofdm import decode_frames_ofdm, snap_profile_rate  # noqa: E402
 PROFILE = dict(sps=8, pulse_shape="rrc", rolloff=0.35, span_symbols=10)
 FSK_PROFILE = dict(sps=8, h=0.5, bt=0.5)
 V2_GUARD_HZ = 5e6   # v2 classifier: additive guard per side (snipper produces occupied_bw + 2*this)
+_v2_last_classify = [0.0]          # throttle state (module-global wall time of last classify pass)
+args_classify_min_interval = 0.0   # seconds; >0 rate-limits v2 classify to cut GPU contention
 
 # Frequency-plan truth for the staircase-family replay captures (loop-invariant:
 # no time alignment needed). Center -> family, plus the burst geometry
@@ -560,6 +562,15 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
         # snippet once and do NOT re-channelize -- channelizing strips the guard band the v2
         # models require. One marker per snippet, tinted by the selected color_model.
         if clf is not None and args_classify_only and getattr(clf, "V2", False):
+            # Rate-limit the classifier: the v2 models (esp. resnet1d 2D-conv) contend with the
+            # detector on the shared GB10, and classifying every snippet backs the detector up
+            # (waterfall tears). The overlay only needs a few updates/s, so cap the cadence.
+            now = time.time()
+            if args_classify_min_interval > 0.0 and \
+                    (now - _v2_last_classify[0]) < args_classify_min_interval:
+                metrics.snips += 1
+                return f"snip frame#{a.get('wfgt:frame_number','?')} v2 (throttled)"
+            _v2_last_classify[0] = now
             res = clf.classify(iq)
             metrics.snips += 1
             if not res:
@@ -734,6 +745,9 @@ def main():
     ap.add_argument("--color-model", default="resnet1d",
                     help="v2: which model's prediction tints the Color-Mask overlay "
                          "(live-switchable via demo_control.json 'color_model')")
+    ap.add_argument("--classify-min-interval-ms", type=float, default=0.0,
+                    help="v2: min wall-time between classify passes (rate-limit to cut GPU "
+                         "contention with the detector; 0 = every snippet)")
     ap.add_argument("--control-json", default=None,
                     help="demo_control.json written by the dashboard's DEMO CONTROLS "
                          "panel; the 'gate' field is applied live "
@@ -759,6 +773,8 @@ def main():
     global args_classify_only
     args_classify_only = args.classify_only
     args_center_hz = args.center_hz
+    global args_classify_min_interval
+    args_classify_min_interval = args.classify_min_interval_ms / 1000.0
     truth = TruthScorer(args.truth_meta, args.truth_lib) if args.truth_meta else None
     if truth:
         print(f"truth: {len(truth.placements)} placements, "
