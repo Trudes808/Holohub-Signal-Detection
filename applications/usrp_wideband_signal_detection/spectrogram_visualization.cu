@@ -3045,10 +3045,24 @@ void render_visualization_ui_overlay() {
                                 entry.color.b / 255.0f, 1.0f),
                          "%s", entry.display);
     }
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(kUnclassifiedOverlayColor.r / 255.0f, kUnclassifiedOverlayColor.g / 255.0f,
-                              kUnclassifiedOverlayColor.b / 255.0f, 1.0f),
-                       "other");
+    // Only show a separate "other" (unclassified) chip when the active taxonomy has no neutral
+    // entry of its own -- v2's NOISE already IS the neutral gray, so NOISE and "other" would be
+    // duplicate chips; condense to just NOISE.
+    bool has_neutral = false;
+    for (const auto& entry : class_color_table()) {
+      if (entry.color.r == kUnclassifiedOverlayColor.r &&
+          entry.color.g == kUnclassifiedOverlayColor.g &&
+          entry.color.b == kUnclassifiedOverlayColor.b) {
+        has_neutral = true;
+        break;
+      }
+    }
+    if (!has_neutral) {
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(kUnclassifiedOverlayColor.r / 255.0f, kUnclassifiedOverlayColor.g / 255.0f,
+                                kUnclassifiedOverlayColor.b / 255.0f, 1.0f),
+                         "other");
+    }
   }
   ImGui::PopStyleVar(2);
   ImGui::End();
