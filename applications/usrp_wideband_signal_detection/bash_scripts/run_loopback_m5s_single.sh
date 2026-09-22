@@ -35,7 +35,7 @@ DISPLAY="${DEMO_DISPLAY}" xhost +local: >/dev/null 2>&1 || true
 sudo ip link set "${SENDER_IFACE}" up mtu 9000
 
 echo "==> [2/5] stop any stale app + tcpreplay, clean DPDK hugepages"
-sudo pkill -f '^tcpreplay' 2>/dev/null || true
+sudo pkill -f 'tcpreplay --preload-pcap' 2>/dev/null || true  # matches the sudo/setsid/nohup wrapper + child
 sudo docker exec "${CN}" bash -lc \
   "pkill -f '(^|/)usrp_wideband_signal_detection( |\$)' || true; \
    for i in \$(seq 1 30); do pgrep -f '(^|/)usrp_wideband_signal_detection( |\$)' >/dev/null || break; sleep 1; done; \
@@ -47,10 +47,13 @@ USRP_CLASS_COLORS="${USRP_CLASS_COLORS:-1}"
 USRP_CLASSIFIER_MODELS="${USRP_CLASSIFIER_MODELS:-resnet1d,cnn1d,tprime_lg}"
 USRP_SNIP_ADDITIVE_GUARD_HZ="${USRP_SNIP_ADDITIVE_GUARD_HZ:-10e6}"
 sudo mkdir -p "${JOB}" && sudo chmod 1777 "${JOB}" 2>/dev/null || true
-# preserve any existing channel_mode the supervisor set; seed single otherwise
-printf '{"gate": "tprime", "snr": "clean", "detector": "cuda_dino_finetuned", "classifiers": "resnet1d,cnn1d,tprime_lg", "color_model": "resnet1d", "channel_mode": "single", "seq": 1}\n' \
-  | sudo tee "${JOB}/demo_control.json" > /dev/null
-sudo chmod 666 "${JOB}/demo_control.json"
+# Seed the control file only if absent, so a supervisor-driven relaunch preserves the user's live
+# detector/channel/color selections (the supervisor owns the file when it is managing the demo).
+if [[ ! -f "${JOB}/demo_control.json" ]]; then
+  printf '{"gate": "resnet1d", "snr": "clean", "detector": "cuda_dino_finetuned", "classifiers": "resnet1d,cnn1d,tprime_lg", "color_model": "resnet1d", "channel_mode": "single", "seq": 1}\n' \
+    | sudo tee "${JOB}/demo_control.json" > /dev/null
+  sudo chmod 666 "${JOB}/demo_control.json"
+fi
 sudo docker exec "${CN}" bash -lc "cp '${SOURCE_APP_DIR}/${CONFIG_NAME}' '${BUILD_APP_DIR}/' 2>/dev/null || true"
 sudo docker exec -d -e DISPLAY="${DEMO_DISPLAY}" \
   -e USRP_SAMPLE_RATE_HZ="${RATE_HZ}" -e USRP_CENTER_FREQ_HZ="${CENTER_HZ}" \

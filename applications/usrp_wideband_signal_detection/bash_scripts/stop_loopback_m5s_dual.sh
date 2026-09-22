@@ -6,7 +6,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 source "${SCRIPT_DIR}/container_env.sh" 2>/dev/null || true
 CN="${CONTAINER_NAME:-usrp_x410_sig_det_sat3737}"
 echo "==> stopping tcpreplay loops"
-sudo pkill -f '^tcpreplay' 2>/dev/null || true
+sudo pkill -f 'tcpreplay --preload-pcap' 2>/dev/null || true  # matches the sudo/setsid/nohup wrapper + child
 echo "==> stopping container-side app"
 sudo docker exec "${CN}" bash -lc \
   "pkill -f '(^|/)usrp_wideband_signal_detection( |\$)' || true; \
