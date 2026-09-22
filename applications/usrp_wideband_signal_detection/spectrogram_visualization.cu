@@ -1649,6 +1649,11 @@ void clear_preview_mailbox_channel(size_t channel_index) {
 
 }  // namespace
 
+// Forward decl (holoscan::ops scope): the rt_metrics parser + classifier panels below iterate the
+// ACTIVE classifier model names so v5's resnet1d/cnn1d/tprime_lg parse (not just the hardcoded v1
+// set). Defined with the demo-control helpers further down, in this same namespace.
+std::vector<std::string>& demo_classifier_names();
+
 std::vector<uint8_t> reduce_mask_to_history_rows_gpu(const uint8_t* device_input,
                                                      int src_height,
                                                      int src_width,
@@ -2574,7 +2579,7 @@ void poll_decode_metrics() {
     // search from "models" so the gate VALUE (e.g. "tprime") is not matched
     const auto models_pos = text.find("\"models\"", cls_pos);
     if (models_pos != std::string::npos) {
-      for (const char* name : {"vtcnn2", "resnet1d", "tprime"}) {
+      for (const auto& name : demo_classifier_names()) {
         const auto mpos = text.find(std::string("\"") + name + "\"", models_pos);
         if (mpos == std::string::npos) continue;
         const auto open = text.find('{', mpos);
@@ -2619,7 +2624,7 @@ void poll_decode_metrics() {
     const double wdt = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - win_last).count();
     win_last = std::chrono::steady_clock::now();
-    for (const char* name : {"vtcnn2", "resnet1d", "tprime"}) {
+    for (const auto& name : demo_classifier_names()) {
       const auto mpos = text.find(std::string("\"") + name + "\"", res_pos);
       if (mpos == std::string::npos) continue;
       const auto open = text.find('{', mpos);
