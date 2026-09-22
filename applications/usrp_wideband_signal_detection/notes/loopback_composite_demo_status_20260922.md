@@ -67,3 +67,44 @@ Two visualization fixes committed this session, both verified live:
 - Rebuild after code/config change: `sudo ./bash_scripts/rebuild_demo_container_app.sh`
 - Success signal in the app log: `Visualizer timing: ... drop_render_busy=0 ... drop_rate=0.00`
   with `backlog_folded` climbing and `masks backfilled ≈ received`.
+
+## NIGHT PROGRESS (2026-09-22, unattended block) — what landed + what's next
+
+### Delivered + committed (all revertable; restore tag still `demo-known-good-20260922`)
+1. **Loopback dual test bed** (`3904f250`): `bash_scripts/run_loopback_m5s_dual.sh` (+`stop_...`).
+   Replays the 491.52 MSps composite on BOTH channels (frame-aligned `_46f.spark.pcap` pair) over
+   the QSFP loopback into the M5-S dual config, full v5 dashboard (overlay + release_v2 taxonomy).
+   Verified: clean ingest (partial_drops=0, ring_full_drops=0), DINO live, GPU ~68-75%.
+   NOTE: uses the EXISTING 491.52 composite pcap (the user-approved fallback). The release_v2 pcap
+   was NOT regenerated — see "release_v2 pcap" below.
+2. **Single↔dual "Channels" toggle** (`18a6f37a`): a combo at the top of the DEMO CONTROLS panel
+   writes `channel_mode` to demo_control.json; `bash_scripts/loopback_channel_supervisor.sh` watches
+   it and relaunches `run_loopback_m5s_single.sh` (1 tcpreplay, emit_stride=1 per-frame) or the dual
+   runner (~15-25 s reconfigure). Verified BOTH directions live (dashboard subtitle/panels adapt,
+   1 vs 2 tcpreplay loops, clean ingest). Run it with:
+   `sudo env DEMO_DISPLAY=:1 ./bash_scripts/loopback_channel_supervisor.sh dual`
+
+### Dual "look good" (FFT-row decimation) — ANALYZED, NOT shipped (real obstacle found)
+The user's idea (take every 4th FFT row instead of every 4th whole frame) hits the model geometry:
+- The M5-S `.ts` is traced at a FIXED tile `[B,1,tile_rows=256,nfft=1024]`. The downsample path makes
+  ~512 rows/frame → 2 tiles. `emit_stride=4` dual = 2 tiles / 4 frames = **0.5 tile/frame/ch** (GPU 75%).
+- **Intra-frame decimation** (512→128 rows, process EVERY frame): 128 rows still tiles to ONE 256-row
+  tile (half-padded, full cost) → **1 tile/frame/ch = 2× the stride-4 budget** → runs HOTTER, not
+  cooler. So this variant does NOT fit (matches the measured "stride-1 self-throttles, ~170 ms lag").
+- **The variant that DOES fit** = accumulate every-4th-row ACROSS 4 frames in a rolling buffer →
+  512 decimated rows spanning 4 frames → 2 tiles / 4 frames (SAME budget) but CONTINUOUS coverage
+  (no gap → no striping). Cost: the emitted mask spans 4 frames, so the viz/snipper must map it back
+  onto 4 frames of per-frame display history (the "detection overlay may be hard" part). This needs
+  the user watching to validate DINO detection quality on time-decimated input (domain shift), so it
+  was deferred rather than shipped blind. RECOMMENDED next step, together.
+- Cheaper interim option (config only, revertable): `finetuned_dino_detector.emit_stride: 2` on dual
+  — halves the striping; may fit at the loopback rate (~340 MSps) though not at full 491.52. Untested.
+
+### release_v2 pcap — NOT generated (needs hardware or a payload-swap)
+The loopback pcaps are CAPTURED off the X410 CHDR-over-UDP stream (tx_samples_from_file TX->RX +
+tcpdump), NOT built by a software packetizer. That capture path needs the X410 TX/RX cabling, but the
+rig is in QSFP-loopback cabling (CX7<->CX7) which I can't physically recable. Options for the
+release_v2 composite specifically: (a) recable + capture via the existing tool, or (b) a software
+payload-swap: template an existing `_46f.spark.pcap`, overwrite its sc16 payload with the upsampled
+(100->491.52) release_v2 IQ keeping CHDR/UDP framing (mind [[loopback-dstmac-spark]] dst-MAC + the
+46f frame-alignment). Deferred; the existing composite pcap is the working stand-in.
