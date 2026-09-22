@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -346,6 +347,17 @@ void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask, SnippetBatch
   dsp.enable_downsample = enable_downsample_.get();
   dsp.bandwidth_margin_hz = bandwidth_margin_hz_.get();
   dsp.fir_num_taps = fir_num_taps_.get();
+  // v2 classifier feed: USRP_SNIP_ADDITIVE_GUARD_HZ>0 forces an ADDITIVE guard band
+  // (keep_bw = detected_bw + guard, oversample 0), so snippets land at occupied_bw + guard --
+  // the input the release_v2 models were trained on (occupied_bw + 10 MHz). Read once, cached.
+  static const double kAdditiveGuardHz = []() {
+    const char* e = std::getenv("USRP_SNIP_ADDITIVE_GUARD_HZ");
+    return (e && *e) ? std::atof(e) : 0.0;
+  }();
+  if (kAdditiveGuardHz > 0.0) {
+    dsp.bandwidth_margin_hz = kAdditiveGuardHz;
+    dsp.oversample_percent = 0.0;
+  }
 
   const bool frequency_mode = mode_.get() == "frequency";
   const SnipComplex* frame_iq = entry->device_iq.get();

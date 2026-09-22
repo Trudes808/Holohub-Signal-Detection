@@ -91,11 +91,33 @@ case "${MODE}" in
     V3_STACK=1
     V3_DUAL=1
     ;;
+  v5)
+    # v5 = v4 (M5-S DINO detector, overlay + class-colors ON) with the release_v2 CLASSIFIER stack:
+    # 6 classes (qpsk/bfm/he/nr5g/ble/noise), the snipper feeds occupied_bw + 10 MHz (additive
+    # guard), and DEMO CONTROLS gains a "Color source" dropdown to pick which of resnet1d/cnn1d/
+    # tprime_lg tints the masks. Starts on Coherent Power; switch to DINO v3 M5-S in DEMO CONTROLS.
+    CONFIG_NAME=config_live_v3_single_channel.yaml
+    export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234} \
+           GAIN=${GAIN:-10} USRP_OVERLAY=1 USRP_CLASS_COLORS=1 \
+           USRP_CLASSIFIER_MODELS="resnet1d,cnn1d,tprime_lg" USRP_SNIP_ADDITIVE_GUARD_HZ=10e6
+    V3_STACK=1
+    AMC_V2=1
+    ;;
+  v5dual)
+    # v5 on BOTH channels (ch0 2.4 GHz + ch1 1 GHz, 491.52 MSps each). DINO dual = M5-S stride 4.
+    CONFIG_NAME=config_live_v3_two_channel.yaml
+    export CHANNELS=${CHANNELS:-"0 1"} FREQS=${FREQS:-"2400e6 1000e6"} \
+           DEST_PORTS=${DEST_PORTS:-"1234 1235"} GAIN=${GAIN:-15} USRP_OVERLAY=1 USRP_CLASS_COLORS=1 \
+           USRP_CLASSIFIER_MODELS="resnet1d,cnn1d,tprime_lg" USRP_SNIP_ADDITIVE_GUARD_HZ=10e6
+    V3_STACK=1
+    V3_DUAL=1
+    AMC_V2=1
+    ;;
   *.yaml)
     CONFIG_NAME=${MODE}
     ;;
   *)
-    echo "Usage: sudo $0 [single|dual|v3|v3dual|v4|v4dual|v3m5s|v3m5sdual|<config.yaml>]" >&2
+    echo "Usage: sudo $0 [single|dual|v3|v3dual|v4|v4dual|v3m5s|v3m5sdual|v5|v5dual|<config.yaml>]" >&2
     exit 1
     ;;
 esac
@@ -166,8 +188,14 @@ if [[ "${V3_STACK:-0}" == "1" ]]; then
   sudo rm -rf /tmp/usrp_spectrograms/snippets 2>/dev/null || true
   # fs.protected_regular blocks root overwriting a user-owned sidecar in /tmp
   sudo rm -f /tmp/usrp_stream_params.json
-  printf '{"gate": "tprime", "snr": "clean", "detector": "coherent_power", "classifiers": "vtcnn2,resnet1d,tprime", "seq": 1}\n' \
-    | sudo tee /tmp/usrp_spectrograms/demo_control.json > /dev/null
+  if [[ "${AMC_V2:-0}" == "1" ]]; then
+    # v5: release_v2 classifier taxonomy + a color_model (which model tints the masks).
+    printf '{"gate": "resnet1d", "snr": "clean", "detector": "coherent_power", "classifiers": "resnet1d,cnn1d,tprime_lg", "color_model": "resnet1d", "seq": 1}\n' \
+      | sudo tee /tmp/usrp_spectrograms/demo_control.json > /dev/null
+  else
+    printf '{"gate": "tprime", "snr": "clean", "detector": "coherent_power", "classifiers": "vtcnn2,resnet1d,tprime", "seq": 1}\n' \
+      | sudo tee /tmp/usrp_spectrograms/demo_control.json > /dev/null
+  fi
   sudo chmod 666 /tmp/usrp_spectrograms/demo_control.json
 fi
 
@@ -180,6 +208,8 @@ sudo docker exec -d \
   -e USRP_CLASS_COLORS="${USRP_CLASS_COLORS:-}" \
   -e DINO_GUARD_DEBUG="${DINO_GUARD_DEBUG:-}" \
   -e USRP_ROWS_PER_FRAME="${USRP_ROWS_PER_FRAME:-}" \
+  -e USRP_CLASSIFIER_MODELS="${USRP_CLASSIFIER_MODELS:-}" \
+  -e USRP_SNIP_ADDITIVE_GUARD_HZ="${USRP_SNIP_ADDITIVE_GUARD_HZ:-}" \
   "${CONTAINER_NAME}" bash -lc "
   cp '${SOURCE_APP_DIR}/${CONFIG_NAME}' '${BUILD_APP_DIR}/' 2>/dev/null || true
   mkdir -p /tmp/xdg-runtime-root && chmod 700 /tmp/xdg-runtime-root
@@ -199,10 +229,13 @@ if [[ "${V3_STACK:-0}" == "1" ]]; then
   # daemon's first write
   sudo rm -f /tmp/usrp_spectrograms/rt_metrics.json /tmp/usrp_spectrograms/daemon_live.log \
     /tmp/usrp_spectrograms/snip_stats*.json
+  # v5: release_v2 classifier (6 classes, win=8192, input at occupied_bw+10 MHz from the snipper)
+  AMC_V2_ARGS=""
+  if [[ "${AMC_V2:-0}" == "1" ]]; then AMC_V2_ARGS="--amc-v2 --color-model resnet1d"; fi
   (cd "${APP_DIR_HOST}/infocom_evals/pycodec_e2e" && \
    PYCODEC_ROOT="${V3_USER_HOME}/Documents/holoscan_waveform_generation" \
    exec "${VENV_PY}" rt_decode_daemon.py --snips /tmp/usrp_spectrograms/snippets \
-     --classify-only --no-band-truth \
+     --classify-only --no-band-truth ${AMC_V2_ARGS} \
      --metrics-out /tmp/usrp_spectrograms/rt_metrics.json \
      > /tmp/usrp_spectrograms/daemon_live.log 2>&1) &
   DAEMON_PID=$!

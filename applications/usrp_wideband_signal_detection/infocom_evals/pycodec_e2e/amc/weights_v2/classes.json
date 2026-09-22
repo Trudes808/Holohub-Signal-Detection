@@ -1,0 +1,19 @@
+{
+ "classes": [
+  "qpsk",
+  "bfm",
+  "he",
+  "nr5g",
+  "ble",
+  "noise"
+ ],
+ "note": "Output index order. Models emit raw logits; apply softmax.",
+ "descriptions": {
+  "qpsk": "Single-carrier QPSK, RRC beta 0.35",
+  "bfm": "Broadcast FM multiplex (stereo + RDS), frequency-scaled",
+  "he": "IEEE 802.11ax HE-SU, CBW20/40/80",
+  "nr5g": "5G NR downlink FR1 with SSB, 5-80 MHz channels",
+  "ble": "Bluetooth LE 1M, native and scaled",
+  "noise": "No signal present (snipper false alarm), synthesised"
+ }
+}

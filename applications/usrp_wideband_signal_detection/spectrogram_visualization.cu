@@ -803,11 +803,18 @@ struct ClassColorEntry {
 
 const std::vector<ClassColorEntry>& class_color_table() {
   static const std::vector<ClassColorEntry> table = {
-      {"PSK", {70, 214, 106}},   // green
-      {"QAM", {214, 84, 230}},   // magenta
-      {"FSK", {255, 150, 40}},   // orange
-      {"OFDM", {40, 214, 224}},  // cyan (not blue -- blue blends into the spectrogram background)
-      {"NOISE", {255, 70, 70}},  // red
+      {"PSK", {70, 214, 106}},   // green   (v1 amc)
+      {"QAM", {214, 84, 230}},   // magenta (v1 amc)
+      {"FSK", {255, 150, 40}},   // orange  (v1 amc)
+      {"OFDM", {40, 214, 224}},  // cyan    (v1 amc; not blue -- blue blends into the background)
+      {"NOISE", {255, 70, 70}},  // red     (v1 amc)
+      // release_v2 taxonomy (lowercase labels the v2 daemon emits). "noise" is intentionally
+      // omitted so it falls through to the neutral gray (no tint) rather than reading as a signal.
+      {"qpsk", {70, 214, 106}},   // green
+      {"he",   {40, 214, 224}},   // cyan   (802.11ax)
+      {"ble",  {214, 84, 230}},   // magenta(Bluetooth LE)
+      {"nr5g", {255, 150, 40}},   // orange (5G NR)
+      {"bfm",  {235, 215, 70}},   // yellow (broadcast FM)
   };
   return table;
 }
@@ -2735,10 +2742,11 @@ DecodeMetricsSnapshot decode_metrics_snapshot() {
 // demo_conductor.py (SNR -> which replay pcap loops; detector -> app
 // restart with the other pipeline config). ----
 struct DemoControlState {
-  int gate = 2;       // index into kDemoGateNames (default tprime)
+  int gate = 2;       // index into demo_classifier_names() (default tprime)
   int snr = 0;        // index into kDemoSnrNames (default clean composite)
   int detector = 0;   // index into kDemoDetectorNames
-  bool cls_on[3] = {true, true, true};  // classifier CHECKLIST (kDemoGateNames order)
+  bool cls_on[3] = {true, true, true};  // classifier CHECKLIST (demo_classifier_names() order)
+  int color_model = 0;  // index into demo_classifier_names(): which model tints the Color-Mask overlay
   uint64_t seq = 0;
   bool loaded = false;
 };
@@ -2752,6 +2760,54 @@ static const char* const kDemoSnrNames[] = {"clean", "30", "20", "15", "12", "9"
 // here and bump the Combo count below.
 static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino_finetuned"};
 static const char* const kDemoDetectorLabels[] = {"Coherent Power", "DINO v3 M5-S"};
+
+// The three classifier model names (checklist / gate / color-source). Defaults are the v1 amc
+// set; the v2 demo overrides via USRP_CLASSIFIER_MODELS="resnet1d,cnn1d,tprime_lg" (read at init).
+// One binary serves both: the checklist/write/color-source all derive from these strings.
+std::vector<std::string>& demo_classifier_names() {
+  static std::vector<std::string> a = {"vtcnn2", "resnet1d", "tprime"};
+  return a;
+}
+std::vector<std::string>& demo_classifier_labels() {
+  static std::vector<std::string> a = {"VT-CNN2", "ResNet1D", "T-PRIME"};
+  return a;
+}
+std::string pretty_classifier_label(const std::string& n) {
+  if (n == "vtcnn2") return "VT-CNN2";
+  if (n == "resnet1d") return "ResNet1D";
+  if (n == "tprime") return "T-PRIME";
+  if (n == "cnn1d") return "CNN1D";
+  if (n == "tprime_lg") return "T-PRIME-LG";
+  std::string u;
+  u.reserve(n.size());
+  for (char c : n) u.push_back((c >= 'a' && c <= 'z') ? char(c - 32) : c);
+  return u;
+}
+void set_visualization_classifier_models(const std::string& csv) {
+  std::vector<std::string> names;
+  size_t i = 0;
+  while (i < csv.size() && names.size() < 3) {
+    size_t j = csv.find(',', i);
+    if (j == std::string::npos) j = csv.size();
+    std::string tok = csv.substr(i, j - i);
+    size_t a = tok.find_first_not_of(" \t");
+    size_t b = tok.find_last_not_of(" \t");
+    if (a != std::string::npos) names.push_back(tok.substr(a, b - a + 1));
+    i = j + 1;
+  }
+  if (names.empty()) return;
+  while (names.size() < 3) names.push_back(names.back());
+  demo_classifier_names() = names;
+  demo_classifier_labels() = {pretty_classifier_label(names[0]),
+                              pretty_classifier_label(names[1]),
+                              pretty_classifier_label(names[2])};
+}
+int demo_names_index(const std::vector<std::string>& names, const std::string& value, int fallback) {
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (value == names[i]) return static_cast<int>(i);
+  }
+  return fallback;
+}
 
 // Demo 2026-09-09: HIDE the ingest-throughput readouts (sidebar MSps/Gbps, footer INGEST line, the
 // MSps history bar chart). The number reflects samples actually ingested, which sheds below the
@@ -2816,15 +2872,18 @@ void demo_control_load_once(DemoControlState& st, const std::string& path) {
   if (!in.is_open()) return;
   std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   std::string v;
-  if (json_find_string(text, "gate", v)) st.gate = demo_option_index(kDemoGateNames, v, st.gate);
+  if (json_find_string(text, "gate", v)) st.gate = demo_names_index(demo_classifier_names(), v, st.gate);
   if (json_find_string(text, "snr", v)) st.snr = demo_option_index(kDemoSnrNames, v, st.snr);
   if (json_find_string(text, "detector", v)) {
     st.detector = demo_option_index(kDemoDetectorNames, v, st.detector);
   }
   if (json_find_string(text, "classifiers", v)) {
     for (int i = 0; i < 3; ++i) {
-      st.cls_on[i] = v.find(kDemoGateNames[i]) != std::string::npos;
+      st.cls_on[i] = v.find(demo_classifier_names()[i]) != std::string::npos;
     }
+  }
+  if (json_find_string(text, "color_model", v)) {
+    st.color_model = demo_names_index(demo_classifier_names(), v, st.color_model);
   }
   json_find_u64(text, "seq", st.seq);
 }
@@ -2838,13 +2897,14 @@ void demo_control_write(const DemoControlState& st, const std::string& path) {
     for (int i = 0; i < 3; ++i) {
       if (st.cls_on[i]) {
         if (!cls_list.empty()) cls_list += ",";
-        cls_list += kDemoGateNames[i];
+        cls_list += demo_classifier_names()[i];
       }
     }
-    out << "{\n \"gate\": \"" << kDemoGateNames[st.gate] << "\",\n"
+    out << "{\n \"gate\": \"" << demo_classifier_names()[st.gate] << "\",\n"
         << " \"snr\": \"" << kDemoSnrNames[st.snr] << "\",\n"
         << " \"detector\": \"" << kDemoDetectorNames[st.detector] << "\",\n"
         << " \"classifiers\": \"" << cls_list << "\",\n"
+        << " \"color_model\": \"" << demo_classifier_names()[st.color_model] << "\",\n"
         << " \"seq\": " << st.seq << "\n}\n";
   }
   std::error_code ec;
@@ -3008,8 +3068,14 @@ void render_visualization_ui_overlay() {
       // unloads models and the COMPUTE panel shows each one's cost.
       ImGui::TextUnformatted("Classifiers");
       for (int i = 0; i < 3; ++i) {
-        changed |= ImGui::Checkbox(kDemoGateLabels[i], &st.cls_on[i]);
+        changed |= ImGui::Checkbox(demo_classifier_labels()[i].c_str(), &st.cls_on[i]);
       }
+      // Which classifier tints the "Color Mask by Class" overlay (v2 pipeline; the daemon
+      // applies it live via demo_control.json "color_model").
+      const char* color_src_labels[3] = {demo_classifier_labels()[0].c_str(),
+                                          demo_classifier_labels()[1].c_str(),
+                                          demo_classifier_labels()[2].c_str()};
+      changed |= ImGui::Combo("Color source", &st.color_model, color_src_labels, 3);
       if (demo_snr_enabled_storage()) {  // replay-only knob (pcap switching)
         static const char* const kSnrCombo[] = {"Clean", "30 dB", "20 dB", "15 dB",
                                                 "12 dB", "9 dB", "6 dB", "0 dB",
@@ -3978,6 +4044,12 @@ void SpectrogramToHolovizOp::initialize() {
     set_visualization_demo_control_path(demo_control_json_.get());
     set_visualization_demo_snr_enabled(demo_controls_snr_.get());
     HOLOSCAN_LOG_INFO("DEMO CONTROLS panel enabled: writing {}", demo_control_json_.get());
+  }
+  // v2 demo: the three classifier model names (checklist / gate / color-source) come from the env
+  // so one binary serves v1 (default vtcnn2,resnet1d,tprime) and v2 (resnet1d,cnn1d,tprime_lg).
+  if (const char* e = std::getenv("USRP_CLASSIFIER_MODELS"); e && *e) {
+    set_visualization_classifier_models(e);
+    HOLOSCAN_LOG_INFO("Classifier models set from USRP_CLASSIFIER_MODELS: {}", e);
   }
   render_stop_ = false;
   render_work_pending_ = false;

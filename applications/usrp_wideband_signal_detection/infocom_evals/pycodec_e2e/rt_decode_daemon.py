@@ -44,6 +44,7 @@ from pycodec.ofdm import decode_frames_ofdm, snap_profile_rate  # noqa: E402
 
 PROFILE = dict(sps=8, pulse_shape="rrc", rolloff=0.35, span_symbols=10)
 FSK_PROFILE = dict(sps=8, h=0.5, bt=0.5)
+V2_GUARD_HZ = 5e6   # v2 classifier: additive guard per side (snipper produces occupied_bw + 2*this)
 
 # Frequency-plan truth for the staircase-family replay captures (loop-invariant:
 # no time alignment needed). Center -> family, plus the burst geometry
@@ -170,11 +171,20 @@ class TruthScorer:
         return "NOISE", None
 
 
-def load_classifier(weights: str | None, device: str | None, gate: str):
+def load_classifier(weights: str | None, device: str | None, gate: str,
+                    v2: bool = False, color_model: str | None = None):
     try:
-        from amc.classify import AmcClassifier
+        if v2:
+            from amc.classify_v2 import AmcClassifier
+        else:
+            from amc.classify import AmcClassifier
         clf = AmcClassifier(weights_dir=weights, device=device, gate=gate)
-        print(f"amc: 3-model classifier ready on {clf.device}, gate={gate}", flush=True)
+        if color_model and color_model in getattr(clf, "models", {}):
+            clf.color_model = color_model
+        cm = getattr(clf, "color_model", None)
+        print(f"amc: 3-model classifier ready on {clf.device} "
+              f"({'v2' if v2 else 'v1'}), gate={clf.gate}"
+              + (f", color_model={cm}" if cm else ""), flush=True)
         return clf
     except Exception as e:
         print(f"amc: classifier unavailable ({e}) — falling back to blind cascade",
@@ -545,6 +555,33 @@ def process_annotation(a, data, metrics: Metrics, clf=None) -> str:
     frames = []
     band_info = []
     try:
+        # v2 classifier (classify-only): the snippet is ALREADY the isolated signal at
+        # occupied_bw + 10 MHz (snipper frequency mode, additive guard), so classify the WHOLE
+        # snippet once and do NOT re-channelize -- channelizing strips the guard band the v2
+        # models require. One marker per snippet, tinted by the selected color_model.
+        if clf is not None and args_classify_only and getattr(clf, "V2", False):
+            res = clf.classify(iq)
+            metrics.snips += 1
+            if not res:
+                return f"snip frame#{a.get('wfgt:frame_number','?')} v2 cls[-]"
+            subs = find_subbands(iq, snip_fs)
+            center, bw = (max(subs, key=lambda cb: cb[1]) if subs
+                          else (0.0, max(1e6, snip_fs - 2 * V2_GUARD_HZ)))
+            t = None
+            if not args_no_band_truth:
+                f_band = snip_center + center
+                if abs(f_band) > 1e9:
+                    f_band -= args_center_hz
+                t = band_truth(f_band)[0] or "NOISE"
+            for name, r in res.items():
+                metrics.note_cls(name, r.label, r.ms, t)
+            col = res.get(clf.color_model) or max(res.values(), key=lambda r: r.conf)
+            metrics.note_decode(snip_center + center, col.label, True,
+                                snip_center + center - bw / 2.0,
+                                snip_center + center + bw / 2.0)
+            return (f"snip frame#{a.get('wfgt:frame_number','?')} v2 "
+                    f"cls[{center/1e6:+.1f}MHz {col.label} {col.conf:.2f}]  "
+                    f"[{(time.time()-t0)*1e3:.0f} ms]")
         for center, bw in find_subbands(iq, snip_fs):
             ch, chfs = channelize(iq, snip_fs, center, bw)
             if bw / chfs > 0.55:
@@ -691,6 +728,12 @@ def main():
     ap.add_argument("--amc-device", default=None, help="cuda|cpu (default: auto)")
     ap.add_argument("--gate", default="tprime", choices=["tprime", "resnet1d", "vtcnn2"],
                     help="which model's prediction routes the decoder")
+    ap.add_argument("--amc-v2", action="store_true",
+                    help="use the release_v2 classifier (6 classes qpsk/bfm/he/nr5g/ble/noise, "
+                         "win=8192, input already at occupied_bw+10 MHz from the snipper)")
+    ap.add_argument("--color-model", default="resnet1d",
+                    help="v2: which model's prediction tints the Color-Mask overlay "
+                         "(live-switchable via demo_control.json 'color_model')")
     ap.add_argument("--control-json", default=None,
                     help="demo_control.json written by the dashboard's DEMO CONTROLS "
                          "panel; the 'gate' field is applied live "
@@ -722,7 +765,8 @@ def main():
               f"{truth.frames_expected} PN9 frames / {truth.bits_expected} bits expected",
               flush=True)
     clf = None if args.no_amc else load_classifier(args.amc_weights, args.amc_device,
-                                                   args.gate)
+                                                   args.gate, v2=args.amc_v2,
+                                                   color_model=args.color_model)
     metrics = Metrics(truth=truth, gate=args.gate)
     seen: dict[str, int] = {}   # pack meta path -> annotations processed
     pack_sizes: dict[str, int] = {}     # data path -> bytes seen (sink accounting)
@@ -838,6 +882,11 @@ def main():
                 if clf.set_enabled(names):
                     print(f"[{time.strftime('%H:%M:%S')}] === DEMO CONTROL: classifiers -> "
                           f"{sorted(clf.models) or ['(none)']} ===", flush=True)
+            cm = ctl.get("color_model")
+            if cm and cm in clf.models and cm != getattr(clf, "color_model", None):
+                clf.color_model = cm
+                print(f"[{time.strftime('%H:%M:%S')}] === DEMO CONTROL: color_model -> {cm} ===",
+                      flush=True)
             gate = ctl.get("gate")
             if gate in clf.models and gate != clf.gate:
                 clf.gate = gate
