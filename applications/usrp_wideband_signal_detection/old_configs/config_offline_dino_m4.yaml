@@ -249,7 +249,7 @@ finetuned_dino_detector:
   fft_window: "hann"
   db_vmin: -47.6526985168457
   db_vmax: 20.45633316040039
-  threshold: 0.5
+  threshold: 0.6
   model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m4_491_bf16.ts"
   torch_dtype: "fp32"               # vestigial: bf16 compute is baked into the traced .ts
   # LIVE @ 491.52 MSps: downsample mode makes each frame ~2 tiles, but the ~47 ms inference at
