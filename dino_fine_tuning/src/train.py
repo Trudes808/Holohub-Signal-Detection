@@ -67,7 +67,12 @@ def main():
     ap.add_argument("--weights-path", default=None, help="override cfg weights_path (e.g. the ViT-S .pth)")
     args = ap.parse_args()
 
+    from paths import resolve
     cfg = yaml.safe_load(open(args.config))
+    cfg["weights_path"] = str(resolve(cfg["weights_path"]))
+    if args.weights_path:
+        args.weights_path = str(resolve(args.weights_path))
+    args.dataset = str(resolve(args.dataset))
     if args.epochs:
         cfg["epochs"] = args.epochs
     device = "cuda"

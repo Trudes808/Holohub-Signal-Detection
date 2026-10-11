@@ -14,7 +14,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import dinov3.hub.backbones as B
+try:
+    import dinov3.hub.backbones as B
+except ImportError:  # dinov3 checkout not on PYTHONPATH: locate it (sibling of the repo / $DINOV3_ROOT)
+    import paths as _paths
+    _paths.ensure_import_paths()
+    import dinov3.hub.backbones as B
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)

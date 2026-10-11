@@ -229,10 +229,11 @@ def main():
     rng = np.random.default_rng(cfg["seed"])
     limit = args.limit_captures.split(",") if args.limit_captures else None
 
-    caps = discover_captures(Path(cfg["captures_dir"]), limit)
+    from paths import resolve
+    caps = discover_captures(resolve(cfg["captures_dir"]), limit)
     log(f"captures: {[c.stem for c in caps]}")
 
-    out_dir = Path(cfg["out_dir"] + args.out_suffix)
+    out_dir = resolve(str(cfg["out_dir"]) + args.out_suffix)
 
     # calibration
     vmin, vmax = cfg.get("db_vmin"), cfg.get("db_vmax")

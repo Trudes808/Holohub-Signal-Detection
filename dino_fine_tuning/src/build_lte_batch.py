@@ -23,9 +23,9 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-FT_ROOT = Path("/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning")
-for p in ("/home/bqn82/dinov3", str(FT_ROOT / "src")):
-    sys.path.insert(0, p)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from paths import FT_ROOT, ensure_import_paths  # noqa: E402
+ensure_import_paths()
 import rfdata as rf
 import finetuned_infer as fi
 
@@ -48,7 +48,7 @@ def _link(src: Path, dst: Path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--captures-dir", default="/home/bqn82/captures/lte")
+    ap.add_argument("--captures-dir", default=str(FT_ROOT / "data" / "captures_lte"))
     ap.add_argument("--out-root", default=str(FT_ROOT / "notebooks/sweep_lte"))
     ap.add_argument("--m1-ckpt", default=str(FT_ROOT / "checkpoints/M1_ft/best.pt"))
     ap.add_argument("--m2-ckpt", default=str(FT_ROOT / "checkpoints/M2_ft/best.pt"))

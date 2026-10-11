@@ -16,8 +16,7 @@ if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
-#USER_HOME="$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)"
-USER_HOME="/home/bqn82/"
+USER_HOME="$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)"
 
 
 DETECTORS="${DETECTORS:-coherent_power cuda_dino finetuned_dino finetuned_dino_m2 yolo26s yolo26m}"
@@ -35,7 +34,7 @@ declare -A CFG=(
   [yolo26s]="config_yolo26s_single_channel.yaml"
   [yolo26m]="config_yolo26m_single_channel.yaml"
 )
-CAPTURES_DIR="${CAPTURES_DIR:-${USER_HOME}/captures}"
+CAPTURES_DIR="${CAPTURES_DIR:-${USER_HOME}/Documents/captures}"
 ATTENS="${ATTENS:-0 5 10 15 20 25 30 30_v2 35 40 45 50 55 60}"   # notebook's SNR sweep (30_v2 averaged into 30 dB)
 CLEANUP_STAGED="${CLEANUP_STAGED:-1}"   # rm each capture's staged copy after use so /tmp doesn't fill (set 0 to keep)
 if [[ $# -gt 0 ]]; then

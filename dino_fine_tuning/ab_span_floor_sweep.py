@@ -7,7 +7,7 @@ against a ground-truth mask built from the generator annotations. Reports pixel 
 IoU (the recall-vs-FP tradeoff the operator comment warns about) plus region-detection recall overall and
 for the hard sparse low-SNR case. Baseline = span 34.0, floor_frac 0.12.
 
-Run: PYTHONPATH=/home/genesys-dgx1/Documents/dinov3 <.venv-ml python> ab_span_floor_sweep.py
+Run: python ab_span_floor_sweep.py   (dinov3 is located via src/paths.py / $DINOV3_ROOT)
 """
 import sys
 sys.path.insert(0, "src")
@@ -25,7 +25,7 @@ SPANS = [24.0, 30.0, 34.0, 40.0, 48.0]
 FLOORS = [0.08, 0.12, 0.16, 0.20]
 LOW = ("-3..3", "3..10")
 
-model = load_model("checkpoints/M3_491/best.pt", "configs/train_491.yaml", DEVICE)
+model = load_model("checkpoints/M3_491/best.pt", "configs/train.yaml", DEVICE)
 NFFT = fe.FrontEndCfg().nfft
 print(f"model loaded; thr={THR}; grid span={SPANS} x floor_frac={FLOORS}; grid={ROWS}x{NFFT}\n")
 

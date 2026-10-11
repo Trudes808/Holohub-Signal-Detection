@@ -12,10 +12,10 @@ import frontend as fe
 from eval_heldout import load_model, per_snr_eval
 
 DEVICE = "cuda"
-THR = 0.6  # deployment threshold (config_live_v3_dino_ft.yaml)
+THR = 0.6  # deployment threshold (finetuned_dino_detector.threshold in the live DINO-FT configs)
 SIGMF = "data/dataset_491/heldout_sigmf"
 
-model = load_model("checkpoints/M3_491/best.pt", "configs/train_491.yaml", DEVICE)
+model = load_model("checkpoints/M3_491/best.pt", "configs/train.yaml", DEVICE)
 print(f"model loaded; threshold={THR}; held-out = {SIGMF}\n")
 
 

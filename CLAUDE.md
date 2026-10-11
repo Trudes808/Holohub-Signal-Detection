@@ -4,15 +4,16 @@
 
 - Keep changes narrow and local. Do not refactor unrelated parts of Holohub while working on one app.
 - Prefer existing helper scripts and documented workflows over ad hoc build, container, or run commands.
-- When the task is specific to `applications/usrp_wideband_signal_detection`, follow the path-scoped rule in `.claude/rules/usrp_wideband_signal_detection.md`.
+- Fork-specific user documentation: repo-root `README.md` (entry points), `applications/usrp_wideband_signal_detection/README.md` (install / live demo / offline preprocessing / configs), `dino_fine_tuning/README.md` (retraining). Upstream HoloHub docs live in `doc/holohub_upstream_README.md`. Keep those three READMEs current when workflows change.
 
 ## USRP Folder Organization (KEEP THIS)
 
 `applications/usrp_wideband_signal_detection/` is organized as follows — preserve this layout
 when adding files, and update references when moving anything:
 
-- **Top-level `config*.yaml`**: only the *current* runnable configs (the 5 documented in the app
-  README). These are the only configs `rebuild_demo_container_app.sh` syncs into the build tree.
+- **Top-level `config*.yaml`**: only the *current* runnable configs (the table in the app README §6;
+  every one is referenced by a wrapper, the conductor, or an offline driver). These are the only
+  configs `rebuild_demo_container_app.sh` syncs into the build tree.
 - **`bash_scripts/`**: all shell wrappers (build/rebuild/run/enter/after_reboot) plus the shared
   `container_env.sh` (container/image identity) and `container_repo_guard.sh`. Scripts use an
   absolute `SCRIPT_DIR` and derive `APP_DIR="${SCRIPT_DIR}/.."`; keep repo-root math and helper
@@ -21,7 +22,8 @@ when adding files, and update references when moving anything:
   Calibrate scripts run from the app root (they `cd "${SCRIPT_DIR}/.."`) and source
   `bash_scripts/container_env.sh`.
 - **`old_configs/`**: superseded/experimental configs (runnable via `CONFIG_NAME=old_configs/<name>.yaml`).
-- **`notes/`**: historical development markdowns and design plans.
+- **`notes/`**: historical development markdowns and design plans (including the pre-fork root notes
+  `sage_*`, `running_pytorch_in_holohub.md`, `USRP_X410_Holoscan_FFT_README.txt`).
 - New shell scripts go in `bash_scripts/`; new dev notes go in `notes/`; non-current configs go
   in `old_configs/`. Do not scatter `.sh`/notes/stale configs back into the app root.
 
@@ -41,13 +43,14 @@ when adding files, and update references when moving anything:
 
 ## Experiment Entry Points
 
-- Coherent live (calibrated per-freq): `config_coherent_power_perf_perfreq_single_channel.yaml`
-- Coherent live (dynamic floor): `config_coherent_power_perf_dynamic_single_channel.yaml`
-- DINO live: `config_cuda_dino_performance_single_channel.yaml`
-- Signal snipper (cut detected signals to SigMF / classifier): `config_signal_snipper_single_channel.yaml`
-- Cable-loopback replay: `config_coherent_power_performance_single_channel_replay.yaml`
+- Live demo (current): `sudo ./bash_scripts/run_live_demo.sh v5` / `v5dual` (coherent start, DINO v3 M5-S via DEMO CONTROLS; configs `config_live_v3_*.yaml`, `config_live_v3_dino_ft_m5s*.yaml`).
+- Plain live runs: `config_coherent_power_perf_dynamic_single_channel.yaml` (dynamic floor), `config_coherent_power_perf_perfreq_single_channel.yaml` (calibrated), `config_cuda_dino_performance_single_channel.yaml`, `config_cuda_dino_finetuned_performance_single_channel.yaml` (M5-S).
+- No-radio loopback: `bash_scripts/run_loopback_m5s_{single,dual}.sh`, `loopback_channel_supervisor.sh` (tcpreplay over the QSFP loopback; configs `config_loopback_v3_*.yaml` for the older 245.76 composite demo).
+- Offline dataset preprocessing (detector + snipper over a directory -> `<dir>_preprocessed`): `sudo python3 preprocess_dataset.py <dir> --detector {coherent_power|cuda_dino|cuda_dino_finetuned}`.
+- Signal snipper live (headless): `config_signal_snipper_single_channel.yaml`
 - Frozen-input capture: `config_coherent_power_capture_chdr_single_channel.yaml`
-- Offline eval (both detectors, same operators as live): `python3 run_cuda_dino_offline_file.py <file.sigmf-data> --detector {coherent_power|cuda_dino} --config <cfg>`, or the notebook `infocom_evals/signal_detection_experiments/debugging_signal_detection_eval.ipynb`.
+- Offline eval (all detectors, same operators as live): `python3 run_cuda_dino_offline_file.py <file.sigmf-data> --detector {coherent_power|cuda_dino|cuda_dino_finetuned} --config <cfg>`; sweeps + scoring per `infocom_evals/signal_detection_experiments/run_signal_detection_README.md`.
+- Fine-tuning: `dino_fine_tuning/README.md` (M2 recipe = `build_dataset.py` + `train.py --mode ft_lastN`; deployed lineage M3 -> M4 -> M5-S).
 - Calibration: `sudo ./calibration/calibrate_coherent_power_config.sh` and `sudo ./calibration/calibrate_dino_coherence_config.sh`.
 
 ## Validation Rules

@@ -22,11 +22,9 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-FT_ROOT = Path("/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning")
-EVAL_DIR = Path("/home/bqn82/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection"
-                "/infocom_evals/signal_detection_experiments")
-for p in ("/home/bqn82/dinov3", str(FT_ROOT / "src"), str(EVAL_DIR)):
-    sys.path.insert(0, p)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from paths import FT_ROOT, EVAL_DIR, ensure_import_paths  # noqa: E402
+ensure_import_paths()
 
 import eval_viz as v
 import mask_eval_metrics as mem
@@ -53,7 +51,7 @@ def main():
     ap.add_argument("--sweep", default="/tmp/usrp_spectrograms/batch_eval/sweep_20260630")
     ap.add_argument("--out-root",
                     default=str(FT_ROOT / "notebooks/sweep_detectors"))  # writable (/tmp sweep is root-owned)
-    ap.add_argument("--captures-dir", default="/home/bqn82/captures")
+    ap.add_argument("--captures-dir", default=str(FT_ROOT / "data" / "captures"))
     ap.add_argument("--ft-ckpt", default=str(FT_ROOT / "checkpoints/M1_ft/best.pt"))
     ap.add_argument("--detector-name", default="finetuned_dino",
                     help="run-dir name for this model (e.g. finetuned_dino, finetuned_dino_m2)")

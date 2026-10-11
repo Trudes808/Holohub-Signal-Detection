@@ -23,7 +23,10 @@ from scipy.signal import resample_poly
 
 FS = 491_520_000.0          # deployment rate
 FS_LIB = 245_760_000.0      # library waveform rate
-LIB = Path("/home/genesys-dgx1/Documents/holoscan_waveform_generation/generated_waveforms_24576")
+import os
+# Library of real waveforms (9 classes @ 245.76 MSps, .mat + .json per entry); override with ARGUS_WAVEFORM_LIB.
+LIB = Path(os.environ.get("ARGUS_WAVEFORM_LIB",
+                          "~/Documents/holoscan_waveform_generation/generated_waveforms_24576")).expanduser()
 CLASSES = ["BPSK", "QPSK", "16QAM", "OFDM", "802_11ax", "5G_Downlink",
            "Bluetooth", "Broadband_FM", "Narrowband_FM"]
 

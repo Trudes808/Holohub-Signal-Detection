@@ -51,7 +51,9 @@ CONTAINER_NAME = (
 HOST_SCRATCH_ROOT = Path("/tmp/usrp_spectrograms")
 CONTAINER_SCRATCH_ROOT = Path("/workspace/spectrograms")
 CONTAINER_REPO_ROOT = Path("/workspace/holohub")
-HOST_CAPTURES_ROOT = Path(os.environ.get("HOST_CAPTURES_ROOT", "/home/bqn82/captures")).expanduser()
+# The read-only captures mount of the container (build_demo_container.sh CAPTURES_HOST_DIR).
+_INVOKING_HOME = Path(os.path.expanduser(f"~{os.environ.get('SUDO_USER', '')}" if os.environ.get("SUDO_USER") else "~"))
+HOST_CAPTURES_ROOT = Path(os.environ.get("HOST_CAPTURES_ROOT", str(_INVOKING_HOME / "Documents" / "captures"))).expanduser()
 CONTAINER_CAPTURES_ROOT = Path("/workspace/captures")
 GENERATED_CONFIG_ROOT = REPO_ROOT / "applications/usrp_wideband_signal_detection/generated_configs"
 CONTAINER_BINARY_CANDIDATES = (

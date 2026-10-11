@@ -80,7 +80,7 @@ def make_specs(n_dense, n_sparse, dur_s, seed0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", default="/home/genesys-dgx1/Documents/Holohub-Signal-Detection/dino_fine_tuning/data/dataset_491")
+    ap.add_argument("--out-dir", default=str(Path(__file__).resolve().parents[1] / "data" / "dataset_491"))
     ap.add_argument("--dur-s", type=float, default=0.4)
     ap.add_argument("--train-dense", type=int, default=30)
     ap.add_argument("--train-sparse", type=int, default=40)

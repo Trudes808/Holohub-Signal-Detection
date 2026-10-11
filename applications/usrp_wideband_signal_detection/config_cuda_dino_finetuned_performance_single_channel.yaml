@@ -1,16 +1,15 @@
 # SPDX-FileCopyrightText: 2026 National Instruments Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# Live config for the fine-tuned DINOv3 segmenter detector (detector_type: cuda_dino_finetuned).
+# Plain live / offline-eval config for the fine-tuned DINOv3 segmenter detector
+# (detector_type: cuda_dino_finetuned) with the deployed M5-S (ViT-S) export -- no snipper, no demo
+# controls. The finetuned_dino_detector block is the same as the live demo's
+# config_live_v3_dino_ft_m5s.yaml; keep them in sync when retuning.
 #
-# The detector taps RAW IQ (upstream of the wide analysis FFT) and runs its OWN dedicated
-# nfft-point FFT to reproduce the model's trained per-pixel physics. The model input shape
-# (tile_rows x nfft) and the dB clip / threshold MUST match the checkpoint's geometry contract
-# (the *.meta.json emitted next to the .ts by export_dinov3_finetuned_torchscript.py).
-#
-# As shipped this points at the 256x1024 M2 checkpoint (bring-up / validation). To run the
-# 1024x512-time target once retrained, set: tile_rows: 512, keep nfft: 1024, and point
-# model_script_path at the 512x1024 .ts (its db_vmin/db_vmax/threshold from the new meta.json).
+# The detector taps RAW IQ (upstream of the wide analysis FFT) and runs its OWN nfft-point FFT to
+# reproduce the model's trained per-pixel physics. tile_rows x nfft, db_vmin/db_vmax, fft_window and
+# threshold MUST match the checkpoint's geometry contract (the *.meta.json written next to the .ts by
+# export_dinov3_finetuned_torchscript.py). Bench: DGX Spark (NIC 0000:01:00.0, hugepage RX regions).
 ---
 num_runs: -1
 
@@ -49,7 +48,7 @@ advanced_network:
         num_bufs: 131072
         buf_size: 64
       - name: "CH1_Data_RX_GPU"
-        kind: "device"
+        kind: "huge"   # GB10 integrated GPU: NIC DMAs into host hugepages, GPU reads coherently (x86 GPUDirect bench: "device")
         affinity: 0
         access:
           - local
@@ -58,7 +57,7 @@ advanced_network:
 
     interfaces:
       - name: sdr_data
-        address: 0000:a2:00.0
+        address: 0000:01:00.0
         rx:
           flow_isolation: true
           queues:
@@ -189,21 +188,53 @@ spectrogram:
 
 finetuned_dino_detector:
   num_channels: 1
-  # ---- geometry contract: MUST match the checkpoint's exported *.meta.json ----
-  tile_rows: 256                    # model input time rows (mult of 16); 512 for the retrained target
-  nfft: 1024                        # model input freq bins (mult of 16) -> dedicated FFT size
-  fft_window: "hann"                # analysis window; MUST match the checkpoint meta.json fft_window
-  db_vmin: -47.6526985168457        # global fixed dB->[0,1] clip from the M2_dr (dataset_dr) calibration
+  tile_rows: 256
+  nfft: 1024
+  fft_window: "hann"
+  db_vmin: -47.6526985168457
   db_vmax: 20.45633316040039
-  threshold: 0.95                   # M2_dr operating point (real-OTA + labeled threshold sweeps); tune here
-  # ---- model + runtime ----
-  # M2_dr = band/rate-invariant domain-randomized segmenter (trained 20.48-245.76 MS/s, Hann window).
-  model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m2_dr_bf16.ts"
-  torch_dtype: "fp32"               # fp32 | fp16 (bf16 compute is baked into the traced .ts)
+  threshold: 0.6
+  model_script_path: "/workspace/holohub/dino_fine_tuning/weights/finetuned_dino_m5s_491_bf16.ts"
+  torch_dtype: "fp32"               # vestigial: bf16 compute is baked into the traced .ts
+  # LIVE @ 491.52 MSps: downsample mode makes each frame ~2 tiles, but the ~47 ms inference at
+  # stride 4 (=11.7 Hz) plus the CHDR/FFT/viz GPU work intermittently oversubscribes the GB10 ->
+  # 'Fell behind' RX-backlog events that assemble a recycled-mbuf garbage batch = the full-width
+  # bright bar (root-caused 2026-09-20 OTA: single@4 -> 23 Fell-behind + 7 bars/120s; dual@16 -> 0).
+  # 12 gives the inference comfortable headroom (kills the backlog garbage) while the viz mask-history
+  # (holds the last mask up to 48 frames) keeps the ROI ribbon continuous. The broadband-suppress
+  # guard in the viz still catches any residual bar. Native mode (below) is 20+ tiles/frame.
   emit_stride: 1
   channel_filter: -1
-  # Real-time "downsample" mode (experimental): run a wide FFT then bilinear-resize the freq axis to
-  # the model width before inference, so per-frame cost is bounded/rate-independent (trades freq
-  # detail for speed). false = validated native path (dedicated nfft-point FFT, tile natively).
-  real_time_downsample: false
-  downsample_fft_size: 10240        # wide FFT for downsample mode (~245.76 MSps grid; 20480 @ 500 MHz)
+  # Native nfft-FFT at 491.52 MSps = 480 kHz/bin, DOUBLE M2_dr's trained 240 kHz/bin -> every
+  # signal reads half-width at the wrong scale. Downsample mode FFTs wide (auto-sized to the actual
+  # rate) then resizes the freq axis to nfft inside torch, so the model sees its trained per-pixel
+  # geometry REGARDLESS of the live rate -- the fix for the wrong-scale / mis-placed detections.
+  real_time_downsample: true
+  circular_edge_inference: false   # M5-S single-pass (10.4ms) so emit_stride=1 fits the 21.3ms frame period
+  downsample_fft_size: 0            # 0 = auto-size from the live rate (keeps ~2-tile cost at any rate)
+  # The X410 analog anti-alias filter rolls off toward the band edges; the fixed db_vmin/vmax clip
+  # maps that tilt into the model's active range and it fires on the edges (activity where the raw
+  # spectrogram shows none). Flattening the per-frequency floor removes it. M3_491 is fine-tuned WITH
+  # this flatten (dino_fine_tuning/src/frontend.py flatten=True), so keep it ON for BOTH live and
+  # loopback to match the training front-end. (The older M2_dr model trained unflattened -- that is why
+  # the operator DEFAULT is off; the stale "off for loopback" note referred to M2_dr.)
+  flatten_noise_floor: true
+  # Per-frame adaptive normalization: anchor [0,1] to the per-frame noise floor so a narrow live scene
+  # fills the range like training and moderate signals are not compressed into noise (recovers them, cuts FP).
+  adaptive_normalization: true
+  adaptive_span_db: 34.0
+  adaptive_floor_frac: 0.12
+  # Robust floor ON: M3_491 is fine-tuned ON this exact robust normalization at the 491.52 deployment
+  # geometry (dense+sparse, per-signal SNR). Offline validation (dino_ft_robust_norm/): held-out region
+  # detection 83-100% across SNR; container A/B vs M2_dr on the sparse scene 43%->86%. Robust params
+  # stay at operator defaults (low_pct 20, high_pct 95, min_range 8, floor_below_calib 25) = training.
+  adaptive_robust_floor: true
+  # Invalid-frame guard floor raised well above real busy-band activity. MEASURED 2026-09-20 (OTA @
+  # 2.4 GHz, GAIN 15): legitimate frames run 4-15% mask occupancy, so the operator default 0.03
+  # false-suppressed real dense frames AND deadlocked the cold-start baseline (it only updates on
+  # accepted frames -> if every early frame exceeds the floor, it can never warm up). The bright-bar
+  # root cause is fixed upstream (CHDR per-packet zero-fill, commit 14b7ae67), so this guard now only
+  # needs to catch broadband (~100%) garbage. 0.40 >> real activity, << broadband corruption; k=2 keeps
+  # k*baseline from inflating the threshold past the floor for realistic (<=~0.20) baselines.
+  invalid_frame_min_occupancy: 0.40
+  invalid_frame_occupancy_k: 2.0

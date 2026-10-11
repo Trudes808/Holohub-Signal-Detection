@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Create the 'dinov3' conda env for fine-tuning DINOv3 on RF spectrograms.
-# Driver CUDA 12.4 (RTX 4000 Ada, sm_89) -> cu124 torch wheels.
+# Pick the torch wheel index for your driver: CUDA_WHEEL_INDEX=cu124 (x86 RTX 4000 Ada, default),
+# cu130 (DGX Spark / CUDA 13), ...
 set -euo pipefail
 
 ENV_NAME=dinov3
@@ -17,10 +18,10 @@ conda activate "${ENV_NAME}"
 
 echo "[setup] installing torch (cu124) + deps via pip"
 pip install --upgrade pip
-pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision
+pip install --index-url "https://download.pytorch.org/whl/${CUDA_WHEEL_INDEX:-cu124}" torch torchvision
 pip install \
   torchmetrics omegaconf numpy scipy pandas scikit-learn \
-  matplotlib seaborn tqdm pillow einops ftfy regex termcolor iopath
+  matplotlib seaborn tqdm pillow einops ftfy regex termcolor iopath pyyaml
 
 echo "[setup] verifying torch + cuda + dinov3 backbone load"
 python - <<'PY'

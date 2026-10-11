@@ -92,7 +92,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--captures-dir", default=os.path.expanduser("~/Documents/captures"))
     ap.add_argument("--labels-dir", required=True, help="coherent-teacher mask dirs (from label_ota.sh)")
-    ap.add_argument("--out-dir", default="/home/genesys-dgx1/Documents/Holohub-Signal-Detection/dino_fine_tuning/data/dataset_ota")
+    ap.add_argument("--out-dir", default=str(Path(__file__).resolve().parents[1] / "data" / "dataset_ota"))
     ap.add_argument("--glob", default="x410_ota_*.sigmf-data",
                     help="capture glob; only files with _on_ or _noise_ in the name are used")
     ap.add_argument("--min-sig-px", type=int, default=8, help="tile is 'signal' if mask sum >= this")

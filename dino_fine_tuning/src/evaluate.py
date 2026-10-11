@@ -28,8 +28,7 @@ from dataset import RFSegDataset
 from model import DinoSegmenter
 
 # reuse the existing eval primitives / bucket edges
-_MEM_DIR = Path("/home/bqn82/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection/"
-                "infocom_evals/signal_detection_experiments")
+from paths import EVAL_DIR as _MEM_DIR, resolve  # noqa: E402
 sys.path.insert(0, str(_MEM_DIR))
 import mask_eval_metrics as mem  # noqa: E402
 
@@ -174,6 +173,8 @@ def main():
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
+    cfg["weights_path"] = str(resolve(cfg["weights_path"]))
+    args.dataset = str(resolve(args.dataset))
     device = "cuda"
     meta = json.loads((Path(args.dataset) / "dataset_meta.json").read_text())
 

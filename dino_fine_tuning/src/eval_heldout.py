@@ -28,10 +28,12 @@ SNR_EDGES = [(-3, 3), (3, 10), (10, 20), (20, 32)]
 
 def load_model(ckpt_path, train_yaml, device):
     import yaml
-    cfg = yaml.safe_load(open(train_yaml))
+    from paths import resolve, backbone_weights
+    cfg = yaml.safe_load(open(resolve(train_yaml)))
     ck = torch.load(ckpt_path, map_location=device)
-    m = DinoSegmenter(cfg["weights_path"], feat_layers=tuple(cfg["feat_layers"]),
-                      mode=ck.get("mode", "ft_lastN"), unfreeze_last_n=cfg["unfreeze_last_n"]).to(device)
+    m = DinoSegmenter(backbone_weights(ck.get("weights_path"), cfg["weights_path"]), feat_layers=tuple(cfg["feat_layers"]),
+                      mode=ck.get("mode", "ft_lastN"), unfreeze_last_n=cfg["unfreeze_last_n"],
+                      backbone=ck.get("backbone", "vitb16")).to(device)
     m.load_state_dict(ck["model"]); m.eval()
     return m
 
@@ -108,7 +110,7 @@ def per_snr_eval(model, sigmf_dir, thr, device, cfg):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--train-yaml", default="configs/train_491.yaml")
+    ap.add_argument("--train-yaml", default="configs/train.yaml")
     ap.add_argument("--dataset", default="data/dataset_491")
     ap.add_argument("--out", default="checkpoints/M3_491/heldout_eval")
     args = ap.parse_args()

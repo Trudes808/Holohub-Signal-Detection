@@ -335,15 +335,21 @@ endforeach()
 
   file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/old_configs)
 
+  # Configs staged next to the binary at build time. (bash_scripts/rebuild_demo_container_app.sh also
+  # syncs every top-level config*.yaml; this list only has to cover the documented entry points and
+  # must never name a file that was retired to old_configs/, or the build breaks on a missing DEPENDS.)
   set(USRP_WIDEBAND_CONFIG_FILES
     config_coherent_power_perf_perfreq_single_channel.yaml
     config_coherent_power_perf_dynamic_single_channel.yaml
     config_cuda_dino_performance_single_channel.yaml
     config_cuda_dino_finetuned_performance_single_channel.yaml
-    config_coherent_power_performance_single_channel_replay.yaml
     config_coherent_power_capture_chdr_single_channel.yaml
     config_coherent_power_performance_emit_stride1_two_channel.yaml
     config_signal_snipper_single_channel.yaml
+    config_live_v3_single_channel.yaml
+    config_live_v3_two_channel.yaml
+    config_live_v3_dino_ft_m5s.yaml
+    config_live_v3_dino_ft_m5s_two_channel.yaml
   )
 
   set(USRP_WIDEBAND_CONFIG_OUTPUTS)

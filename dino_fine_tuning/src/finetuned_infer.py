@@ -22,10 +22,13 @@ import rfdata as rf
 class FinetunedDetector:
     def __init__(self, ckpt_path, train_cfg, dataset_meta, device="cuda",
                  threshold=None, nfft=1024, tile_rows=256, amp=True):
+        from paths import backbone_weights
         st = torch.load(ckpt_path, map_location=device)
         self.model = DinoSegmenter(
-            train_cfg["weights_path"], feat_layers=tuple(train_cfg["feat_layers"]),
-            mode=st["mode"], unfreeze_last_n=train_cfg["unfreeze_last_n"]).to(device)
+            backbone_weights(st.get("weights_path"), train_cfg["weights_path"]),
+            feat_layers=tuple(train_cfg["feat_layers"]),
+            mode=st["mode"], unfreeze_last_n=train_cfg["unfreeze_last_n"],
+            backbone=st.get("backbone", "vitb16")).to(device)
         self.model.load_state_dict(st["model"])
         self.model.eval()
         self.vmin = float(dataset_meta["db_vmin"])

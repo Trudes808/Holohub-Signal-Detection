@@ -4,9 +4,11 @@
 # unless FORCE_BUILD=1. Progress is written to reports/STATUS.txt.
 set -uo pipefail
 
-ROOT=/home/bqn82/Holohub-Signal-Detection/dino_fine_tuning
-PY=/home/bqn82/miniforge3/envs/dinov3/bin/python
-export PYTHONPATH="/home/bqn82/dinov3:$ROOT/src"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)          # dino_fine_tuning/
+PY=${PY:-python}                                                   # interpreter of your env (conda dinov3, .venv-ml, ...)
+DINOV3_ROOT=${DINOV3_ROOT:-$(cd "$ROOT/../.." && pwd -P)/dinov3}   # facebookresearch/dinov3 checkout (sibling of the repo)
+export DINOV3_ROOT PYTHONPATH="$DINOV3_ROOT:$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+MODELS=${MODELS:-"M1_frozen M1_ft M2_frozen M2_ft"}                # subset e.g. MODELS="M2_ft"
 cd "$ROOT"
 
 DATASET="$ROOT/data/dataset"
@@ -39,11 +41,16 @@ train(){  # name  mode  extra...
       --mode "$mode" --name "$name" --out "checkpoints/$name" --resume "$@" \
       2>&1 | tee -a "reports/train_$name.log"
 }
-status "STEP 2/4 train 4 models"
-train M1_frozen frozen   --atten-max 30
-train M1_ft     ft_lastN --atten-max 30
-train M2_frozen frozen
-train M2_ft     ft_lastN
+status "STEP 2/4 train models: ${MODELS}"
+for m in ${MODELS}; do
+  case "$m" in
+    M1_frozen) train M1_frozen frozen   --atten-max 30 ;;
+    M1_ft)     train M1_ft     ft_lastN --atten-max 30 ;;
+    M2_frozen) train M2_frozen frozen ;;
+    M2_ft)     train M2_ft     ft_lastN ;;
+    *) status "unknown model $m (expected M1_frozen|M1_ft|M2_frozen|M2_ft)"; exit 1 ;;
+  esac
+done
 
 # 3) EVAL ------------------------------------------------------------------
 status "STEP 3/4 evaluate on shared all-dB test split"
@@ -54,15 +61,12 @@ evalm(){ # name  args...
       --name "$name" --out eval_out "$@" 2>&1 | tee -a reports/eval.log
 }
 evalm energy    --baseline energy
-evalm M1_frozen --ckpt checkpoints/M1_frozen/best.pt
-evalm M1_ft     --ckpt checkpoints/M1_ft/best.pt
-evalm M2_frozen --ckpt checkpoints/M2_frozen/best.pt
-evalm M2_ft     --ckpt checkpoints/M2_ft/best.pt
+for m in ${MODELS}; do evalm "$m" --ckpt "checkpoints/$m/best.pt"; done
 
 # 4) REPORT ----------------------------------------------------------------
 status "STEP 4/4 build report figures + tables"
 $PY src/report.py --eval-root eval_out \
-    --models energy,M1_frozen,M2_frozen,M1_ft,M2_ft \
+    --models "energy,$(echo ${MODELS} | tr " " ",")" \
     --reports reports --heatmap-model M2_ft 2>&1 | tee -a reports/report.log
 
 status "=== FULL RUN DONE ==="

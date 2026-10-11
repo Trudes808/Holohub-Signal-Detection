@@ -19,7 +19,7 @@ mkdir -p "$JOB" 2>/dev/null; cd "$APP"; source bash_scripts/container_env.sh 2>/
 CN=${CONTAINER_NAME:-usrp_x410_sig_det_sat3737}
 SENDER=${SENDER_IFACE:-enp1s0f1np1}
 BT=/workspace/holohub/build/usrp_wideband_signal_detection/applications/usrp_wideband_signal_detection
-CFG=config_live_v3_dino_ft_two_channel.yaml
+CFG=old_configs/config_live_v3_dino_ft_two_channel.yaml   # M3/M4-era dual config (retired); the current dual DINO path is run_loopback_m5s_dual.sh
 APPLOG=/tmp/usrp_spectrograms/demo_app.log
 DUMP=/tmp/usrp_spectrograms/dual_loop/dino
 PPS=${PPS:-480000}

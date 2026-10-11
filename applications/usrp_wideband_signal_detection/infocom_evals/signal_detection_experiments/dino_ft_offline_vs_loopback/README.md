@@ -97,13 +97,13 @@ the saturation perf ceiling.
 # offline leg
 cd applications/usrp_wideband_signal_detection
 python3 run_cuda_dino_offline_file.py ~/Documents/captures/x410_ota_2g4_gain10_20260908.sigmf-data \
-  --detector cuda_dino_finetuned --config "$PWD/config_live_v3_dino_ft.yaml" \
+  --detector cuda_dino_finetuned --config "$PWD/old_configs/config_live_v3_dino_ft.yaml" \
   --output-root /tmp/usrp_spectrograms/offline_eval/cuda_dino_finetuned_rt/x410_ota_2g4_gain10_20260908
 # pcap (once): python3 ../usrp_freq_detection/replay_rx_to_buff.py --sigmf-data <cap>.sigmf-data --out-pcap <...>.pcap
 #   then fix dst-MAC for THIS host's DPDK port:  tcprewrite --enet-dmac=4c:bb:47:2c:45:13 --infile=<...>.pcap --outfile=<...>.spark.pcap
 # loopback leg (network in loopback; NO sudo on the launcher)
 RATE_HZ=491520000 PPS=480000 PCAP=x410_ota_2g4_gain10_20260908.spark.pcap \
-  CONFIG_NAME=config_loopback_eval_dino_ft_rt.yaml ./bash_scripts/run_loopback_v3_demo.sh
+  CONFIG_NAME=old_configs/config_loopback_eval_dino_ft_rt.yaml ./bash_scripts/run_loopback_v3_demo.sh   # (both configs retired to old_configs/ in the 1.0 cleanup)
 # compare
 cd infocom_evals/signal_detection_experiments/dino_ft_offline_vs_loopback
 python3 compare_offline_vs_loopback.py --offline <offline out> --loopback /tmp/usrp_spectrograms/loopback_eval/dino_ft_rt/mask_arrays --out-dir ./results

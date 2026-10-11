@@ -1,5 +1,6 @@
 # Training configuration (shared by all experiments; overridden on CLI).
-weights_path: /home/bqn82/dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+# DINOv3 ViT-B/16 backbone; relative to dino_fine_tuning/ (default = the dinov3 checkout next to the repo).
+weights_path: ../../dinov3/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
 feat_layers: [2, 5, 8, 11]
 
 epochs: 18

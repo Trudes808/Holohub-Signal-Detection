@@ -8,7 +8,8 @@ set -euo pipefail
 #   ./label_ota.sh                 # all *_on_* captures in ~/Documents/captures
 # Env: CAP_DIR, LABELS_DIR (must be under /tmp/usrp_spectrograms or the repo), TEACHER_CFG, GLOB.
 
-APP_DIR="${APP_DIR:-/home/genesys-dgx1/Documents/Holohub-Signal-Detection/applications/usrp_wideband_signal_detection}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+APP_DIR="${APP_DIR:-${SCRIPT_DIR}/../applications/usrp_wideband_signal_detection}"
 USER_HOME=$(getent passwd "${SUDO_USER:-${USER}}" | cut -d: -f6)
 CAP_DIR="${CAP_DIR:-${USER_HOME}/Documents/captures}"
 LABELS_DIR="${LABELS_DIR:-/tmp/usrp_spectrograms/ota_labels}"

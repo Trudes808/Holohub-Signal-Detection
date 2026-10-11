@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
                         "dino_fine_tuning tree.")
     p.add_argument("--src-dir", default=None,
                    help="dino_fine_tuning/src dir to import model.py from (auto-detected if omitted).")
-    p.add_argument("--dinov3-repo", default="/home/bqn82/dinov3",
+    p.add_argument("--dinov3-repo", default=None,
                    help="Path to the DINOv3 repo (prepended to sys.path so `import dinov3` works). "
                         "Set empty if dinov3 is already installed/importable.")
     # geometry (the config contract) --------------------------------------------
@@ -118,6 +118,9 @@ def main() -> int:
                 f"--dinov3-repo {dinov3_repo} does not contain a 'dinov3/' package")
         sys.path.insert(0, str(dinov3_repo))
     sys.path.insert(0, str(src_dir))
+    from paths import backbone_weights, ensure_import_paths  # noqa: E402
+    if not args.dinov3_repo:
+        ensure_import_paths()  # $DINOV3_ROOT or the checkout next to the repo
     from model import DinoSegmenter  # noqa: E402
 
     train_yaml = Path(args.train_yaml) if args.train_yaml else (dft / "configs" / "train.yaml")
@@ -132,7 +135,7 @@ def main() -> int:
     backbone = ckpt.get("backbone", "vitb16")
     # Seed the arch with the same base weights the checkpoint was trained from (the trained weights are
     # then loaded over them below), so ViT-S checkpoints rebuild as ViT-S, not ViT-B.
-    weights_path = args.weights_path or ckpt.get("weights_path") or train_cfg["weights_path"]
+    weights_path = args.weights_path or backbone_weights(ckpt.get("weights_path"), train_cfg.get("weights_path"))
     model = DinoSegmenter(
         weights_path,
         feat_layers=tuple(train_cfg["feat_layers"]),
