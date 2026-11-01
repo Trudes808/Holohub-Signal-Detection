@@ -17,16 +17,22 @@
 #include "../../applications/usrp_wideband_signal_detection/spectrogram_visualization.hpp"
 
 #include <cuda_runtime.h>
+#include <cufft.h>
 #include <matx.h>
 #include <thrust/count.h>
 #include <thrust/execution_policy.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
+#include <vector>
 
 namespace holoscan::ops {
 
@@ -233,6 +239,149 @@ __global__ void ft_hist_percentiles_kernel(const unsigned int* __restrict__ hist
   stats[0] = lo_db; stats[1] = hi_db;
 }
 
+// out = in * w along the frequency axis (complex x real window); feeds the cuFFT plan in place.
+// Same arithmetic as the previous matx expression `iq_view * w_view` (re*g, im*g).
+__global__ void ft_window_rows_kernel(const float2* __restrict__ in, const float* __restrict__ w,
+                                      float2* __restrict__ out, long total, int fft_size) {
+  const long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const float g = w[idx % fft_size];
+  const float2 v = in[idx];
+  out[idx] = make_float2(v.x * g, v.y * g);
+}
+
+// SHORT-FFT front-end (downsample_time_pool): fft_rows x fft_size spectrum -> fftshifted, gain-corrected
+// dB on the reference row grid (img_rows x fft_size) by AREA averaging: output row r covers input rows
+// [r*ratio, (r+1)*ratio) with fractional end weights (exact mean when ratio is integral). domain_db=1:
+// mean of dB values (preserves a single periodogram's mean dB level, i.e. the trained noise level);
+// 0: dB of the mean power (Bartlett average). Fused so the full-rate dB image is never materialized.
+__global__ void ft_power_db_pool_kernel(const float2* __restrict__ spec, float* __restrict__ db_out,
+                                        int fft_rows, int fft_size, int img_rows, float ratio,
+                                        float gain_offset_db, int domain_db) {
+  const long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  const long total = (long)img_rows * fft_size;
+  if (idx >= total) return;
+  const int col = idx % fft_size;
+  const int r = idx / fft_size;
+  const int src_col = (col + fft_size / 2) % fft_size;
+  const float a = r * ratio;
+  const float b = (r + 1) * ratio;
+  int i0 = static_cast<int>(floorf(a));
+  int i1 = static_cast<int>(ceilf(b));
+  if (i1 > fft_rows) i1 = fft_rows;
+  float acc = 0.0f, wsum = 0.0f;
+  for (int i = i0; i < i1; ++i) {
+    const float w = fminf(b, (float)(i + 1)) - fmaxf(a, (float)i);
+    if (w <= 0.0f) continue;
+    const float2 c = spec[(long)i * fft_size + src_col];
+    const float p = c.x * c.x + c.y * c.y + 1e-12f;
+    acc += w * (domain_db ? 10.0f * log10f(p) : p);
+    wsum += w;
+  }
+  const float m = acc / fmaxf(wsum, 1e-12f);
+  db_out[idx] = (domain_db ? m : 10.0f * log10f(m)) - gain_offset_db;
+}
+
+// Normalization clip window decided ON THE GPU (no host round-trip): params = [clip_vmin, inv_span,
+// use_robust]. Same arithmetic as the previous host code (double for the scalar terms).
+__global__ void ft_set_clip_params_kernel(float* params, float vmin, float inv_span) {
+  if (threadIdx.x || blockIdx.x) return;
+  params[0] = vmin; params[1] = inv_span; params[2] = 0.0f;
+}
+__global__ void ft_clip_params_robust_kernel(const float* stats, float fixed_vmin, float fixed_inv_span,
+                                             double span, double floor_frac, float min_range,
+                                             float floor_below, float* params) {
+  if (threadIdx.x || blockIdx.x) return;
+  const float floor_db = stats[0];
+  const float drange = stats[1] - stats[0];
+  const bool too_flat = drange < min_range;
+  const bool floor_implausible = floor_db < fixed_vmin - floor_below;
+  const bool use_robust = !too_flat && !floor_implausible;
+  params[0] = use_robust ? static_cast<float>(static_cast<double>(floor_db) - floor_frac * span) : fixed_vmin;
+  params[1] = use_robust ? static_cast<float>(1.0 / span) : fixed_inv_span;
+  params[2] = use_robust ? 1.0f : 0.0f;
+}
+__global__ void ft_clip_params_ref_kernel(const float* reference, double span, double floor_frac,
+                                          float* params) {
+  if (threadIdx.x || blockIdx.x) return;
+  params[0] = static_cast<float>(static_cast<double>(reference[0]) - floor_frac * span);
+  params[1] = static_cast<float>(1.0 / span);
+  params[2] = 1.0f;
+}
+__global__ void ft_clip_normalize_dev_kernel(const float* __restrict__ db, float* __restrict__ out,
+                                             long total, const float* __restrict__ params) {
+  const long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const float vmin = params[0];
+  const float inv_span = params[1];
+  float v = (db[idx] - vmin) * inv_span;
+  out[idx] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+// Compact (rows x ncols) model-resolution mask -> wide (rows x wide_cols) emitted grid, nearest along
+// the columns with PyTorch's legacy-nearest index (src = min(floor(dst * (in/out)), in-1), float math)
+// so the output is identical to the previous torch nearest upsample.
+__global__ void ft_expand_cols_nearest_kernel(const uint8_t* __restrict__ compact, int rows, int ncols,
+                                              uint8_t* __restrict__ wide, int wide_cols, float scale) {
+  const long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  const long total = (long)rows * wide_cols;
+  if (idx >= total) return;
+  const int r = idx / wide_cols;
+  const int c = idx - (long)r * wide_cols;
+  int src = static_cast<int>(floorf(static_cast<float>(c) * scale));
+  if (src > ncols - 1) src = ncols - 1;
+  wide[idx] = compact[(long)r * ncols + src];
+}
+
+// Invalid-frame guard on the GPU: count set pixels, then zero the emitted mask if the occupancy is
+// over the threshold -- the same decision as before (occ = nz / px > thresh, doubles), no host sync.
+__global__ void ft_count_nonzero_kernel(const uint8_t* __restrict__ m, long n, unsigned long long* count) {
+  __shared__ unsigned int block_count;
+  if (threadIdx.x == 0) block_count = 0u;
+  __syncthreads();
+  unsigned int local = 0u;
+  for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += (long)blockDim.x * gridDim.x) {
+    local += (m[i] != 0) ? 1u : 0u;
+  }
+  atomicAdd(&block_count, local);
+  __syncthreads();
+  if (threadIdx.x == 0 && block_count) atomicAdd(count, static_cast<unsigned long long>(block_count));
+}
+__global__ void ft_zero_if_over_kernel(uint8_t* __restrict__ m, long n,
+                                       const unsigned long long* __restrict__ count, double count_n,
+                                       double thresh) {
+  const double occ = static_cast<double>(*count) / count_n;
+  if (!(occ > thresh)) return;
+  for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += (long)blockDim.x * gridDim.x) {
+    m[i] = 0;
+  }
+}
+
+// Pool-backed emit buffers (same contract as coherent_power's acquire_pooled_u8_buffer): the previous
+// per-frame cudaMalloc + cudaFree-in-deleter cost ~1-2 ms per frame and cudaFree synchronizes the
+// whole device. Consumers finish their GPU reads of DetectorMaskMessage::device_pixels before they
+// release it (the viz and snipper copy/synchronize first), so recycling on release is safe.
+std::mutex& ft_mask_pool_mutex() { static std::mutex m; return m; }
+std::map<size_t, std::vector<void*>>& ft_mask_pool() { static std::map<size_t, std::vector<void*>> p; return p; }
+std::shared_ptr<uint8_t> ft_acquire_pooled_mask(size_t bytes) {
+  void* ptr = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(ft_mask_pool_mutex());
+    auto& free_list = ft_mask_pool()[bytes];
+    if (!free_list.empty()) { ptr = free_list.back(); free_list.pop_back(); }
+  }
+  if (ptr == nullptr) {
+    throw_if_cuda_error(cudaMalloc(&ptr, bytes), "malloc pooled emit mask");
+  }
+  return std::shared_ptr<uint8_t>(static_cast<uint8_t*>(ptr), [bytes](uint8_t* p) {
+    if (p == nullptr) return;
+    std::lock_guard<std::mutex> lock(ft_mask_pool_mutex());
+    ft_mask_pool()[bytes].push_back(p);
+  });
+}
+
+inline int ft_blocks(long total, int threads) { return static_cast<int>((total + threads - 1) / threads); }
+
 // sigmoid(logit) >= threshold -> uint8 {0,1}
 __global__ void sigmoid_threshold_kernel(const float* __restrict__ logits,
                                          uint8_t* __restrict__ mask,
@@ -254,10 +403,20 @@ void FinetunedDinoDetector::ChannelBuffers::release() {
   cudaFree(frontend_reference_device);
   cudaFree(db_hist_device);
   cudaFree(robust_stats_device);
+  cudaFree(clip_params_device);
+  cudaFree(guard_count_device);
   cudaFree(tile_batch_device);
   cudaFree(logits_device);
   cudaFree(tile_mask_device);
+  cudaFree(compact_mask_device);
   cudaFree(window_device);
+  if (host_stats_pinned) cudaFreeHost(host_stats_pinned);
+  if (host_guard_count_pinned) cudaFreeHost(host_guard_count_pinned);
+  if (fft_plan_valid) cufftDestroy(static_cast<cufftHandle>(fft_plan));
+  for (cudaEvent_t* ev : {&ev_total0, &ev_total1, &ev_native0, &ev_native1}) {
+    if (*ev) cudaEventDestroy(*ev);
+    *ev = nullptr;
+  }
   spec_device = nullptr;
   normalized_device = nullptr;
   db_device = nullptr;
@@ -266,17 +425,39 @@ void FinetunedDinoDetector::ChannelBuffers::release() {
   frontend_reference_device = nullptr;
   db_hist_device = nullptr;
   robust_stats_device = nullptr;
+  clip_params_device = nullptr;
+  guard_count_device = nullptr;
+  host_stats_pinned = nullptr;
+  host_guard_count_pinned = nullptr;
   tile_batch_device = nullptr;
   logits_device = nullptr;
   tile_mask_device = nullptr;
+  compact_mask_device = nullptr;
   window_device = nullptr;
   window_len = 0;
-  rows = nfft = tile_rows = batch = 0;
+  fft_plan = 0;
+  fft_plan_valid = false;
+  fft_rows = fft_size = img_rows = img_cols = nfft = tile_rows = batch = 0;
 }
 
-void FinetunedDinoDetector::ChannelBuffers::ensure(size_t new_rows, size_t new_nfft,
-                                                   size_t new_tile_rows, size_t new_batch) {
-  if (new_rows == rows && new_nfft == nfft && new_tile_rows == tile_rows && new_batch == batch) {
+void FinetunedDinoDetector::ChannelBuffers::ensure(size_t new_fft_rows, size_t new_fft_size,
+                                                   size_t new_img_rows, size_t new_img_cols,
+                                                   size_t new_nfft, size_t new_tile_rows,
+                                                   size_t new_batch) {
+  // Geometry-independent pieces, created once: pinned readback slots and the per-frame events.
+  if (host_stats_pinned == nullptr) {
+    throw_if_cuda_error(cudaMallocHost(&host_stats_pinned, 8 * sizeof(float)), "pinned stats");
+    std::fill_n(host_stats_pinned, 8, 0.0f);
+  }
+  if (host_guard_count_pinned == nullptr) {
+    throw_if_cuda_error(cudaMallocHost(&host_guard_count_pinned, sizeof(unsigned long long)), "pinned guard");
+    *host_guard_count_pinned = 0ull;
+  }
+  for (cudaEvent_t* ev : {&ev_total0, &ev_total1, &ev_native0, &ev_native1}) {
+    if (*ev == nullptr) throw_if_cuda_error(cudaEventCreate(ev), "event create");
+  }
+  if (new_fft_rows == fft_rows && new_fft_size == fft_size && new_img_rows == img_rows &&
+      new_img_cols == img_cols && new_nfft == nfft && new_tile_rows == tile_rows && new_batch == batch) {
     return;
   }
   // Free the stale buffers and reallocate for the new geometry (see the coherent-detector
@@ -289,28 +470,51 @@ void FinetunedDinoDetector::ChannelBuffers::ensure(size_t new_rows, size_t new_n
   cudaFree(frontend_reference_device);
   cudaFree(db_hist_device);
   cudaFree(robust_stats_device);
+  cudaFree(clip_params_device);
+  cudaFree(guard_count_device);
   cudaFree(tile_batch_device);
   cudaFree(logits_device);
   cudaFree(tile_mask_device);
+  cudaFree(compact_mask_device);
   cudaFree(window_device);
+  if (fft_plan_valid) cufftDestroy(static_cast<cufftHandle>(fft_plan));
+  fft_plan_valid = false;
 
-  const size_t spec_elems = new_rows * new_nfft;
+  const size_t spec_elems = new_fft_rows * new_fft_size;
+  const size_t img_elems = new_img_rows * new_img_cols;
   const size_t tile_elems = new_batch * new_tile_rows * new_nfft;
-  throw_if_cuda_error(cudaMalloc(&window_device, new_nfft * sizeof(float)), "malloc window");
+  throw_if_cuda_error(cudaMalloc(&window_device, new_fft_size * sizeof(float)), "malloc window");
   window_len = 0;  // refilled in compute() for the current window type + fft_size
   throw_if_cuda_error(cudaMalloc(&spec_device, spec_elems * sizeof(ft_dino_complex)), "malloc spec");
-  throw_if_cuda_error(cudaMalloc(&normalized_device, spec_elems * sizeof(float)), "malloc normalized");
-  // Flatten scratch: full dB image + per-frequency (nfft-wide) floor buffers + scalar reference.
-  throw_if_cuda_error(cudaMalloc(&db_device, spec_elems * sizeof(float)), "malloc db");
-  throw_if_cuda_error(cudaMalloc(&col_stat_device, new_nfft * sizeof(float)), "malloc col_stat");
-  throw_if_cuda_error(cudaMalloc(&col_smooth_device, new_nfft * sizeof(float)), "malloc col_smooth");
+  throw_if_cuda_error(cudaMalloc(&normalized_device, img_elems * sizeof(float)), "malloc normalized");
+  // Flatten scratch: full dB image + per-frequency floor buffers + scalar reference.
+  throw_if_cuda_error(cudaMalloc(&db_device, img_elems * sizeof(float)), "malloc db");
+  throw_if_cuda_error(cudaMalloc(&col_stat_device, new_img_cols * sizeof(float)), "malloc col_stat");
+  throw_if_cuda_error(cudaMalloc(&col_smooth_device, new_img_cols * sizeof(float)), "malloc col_smooth");
   throw_if_cuda_error(cudaMalloc(&frontend_reference_device, sizeof(float)), "malloc frontend_reference");
   throw_if_cuda_error(cudaMalloc(&db_hist_device, ft_hist_bins * sizeof(unsigned int)), "malloc db_hist");
   throw_if_cuda_error(cudaMalloc(&robust_stats_device, 2 * sizeof(float)), "malloc robust_stats");
+  throw_if_cuda_error(cudaMalloc(&clip_params_device, 4 * sizeof(float)), "malloc clip_params");
+  throw_if_cuda_error(cudaMalloc(&guard_count_device, sizeof(unsigned long long)), "malloc guard_count");
   throw_if_cuda_error(cudaMalloc(&tile_batch_device, tile_elems * sizeof(float)), "malloc tiles");
   throw_if_cuda_error(cudaMalloc(&logits_device, tile_elems * sizeof(float)), "malloc logits");
   throw_if_cuda_error(cudaMalloc(&tile_mask_device, tile_elems * sizeof(uint8_t)), "malloc tile_mask");
-  rows = new_rows;
+  throw_if_cuda_error(cudaMalloc(&compact_mask_device, new_img_rows * new_nfft * sizeof(uint8_t)),
+                      "malloc compact_mask");
+  // One batched C2C plan per geometry (replaces matx::fft, which materialized the windowed input into a
+  // per-call cudaMallocAsync temporary and issued an extra ~64 MiB device copy every frame).
+  cufftHandle plan = 0;
+  int n[1] = {static_cast<int>(new_fft_size)};
+  if (cufftPlanMany(&plan, 1, n, nullptr, 1, static_cast<int>(new_fft_size), nullptr, 1,
+                    static_cast<int>(new_fft_size), CUFFT_C2C, static_cast<int>(new_fft_rows)) != CUFFT_SUCCESS) {
+    throw std::runtime_error("[finetuned_dino_detector] cufftPlanMany failed");
+  }
+  fft_plan = static_cast<int>(plan);
+  fft_plan_valid = true;
+  fft_rows = new_fft_rows;
+  fft_size = new_fft_size;
+  img_rows = new_img_rows;
+  img_cols = new_img_cols;
   nfft = new_nfft;
   tile_rows = new_tile_rows;
   batch = new_batch;
@@ -339,12 +543,25 @@ void FinetunedDinoDetector::setup(holoscan::OperatorSpec& spec) {
   spec.param(channel_filter_, "channel_filter", "Channel filter", "Single-channel filter; <0 = all.", -1);
   spec.param(emit_stride_, "emit_stride", "Emit stride", "Process every Nth frame.", 1);
   spec.param(torch_dtype_, "torch_dtype", "Torch dtype", "fp32 | fp16.", std::string("fp32"));
+  spec.param(torch_freeze_, "torch_freeze", "Freeze TorchScript",
+             "torch::jit::freeze the module at load: weights become constants and the per-forward fp32->bf16 "
+             "weight casts of the autocast-traced exports are folded once (bit-identical logits verified on "
+             "M5-S; ~1 ms per 2-tile forward). false = run the module as exported.", true);
   spec.param(real_time_downsample_, "real_time_downsample", "Downsample mode",
              "Wide FFT + bilinear resize freq to model width before inference (bounded cost). "
              "false = native per-tile path.", false);
   spec.param(downsample_fft_size_, "downsample_fft_size", "Downsample FFT size",
              "Wide FFT size for downsample mode (reproduces the app's dynamic spectrogram; e.g. 10240 "
              "at 245.76 MSps, 20480 at 500 MHz). Ignored when real_time_downsample=false.", 10240);
+  spec.param(downsample_time_pool_, "downsample_time_pool", "Downsample time pooling",
+             "Short-FFT front-end for the downsample path: FFT at downsample_fft_size (must be smaller than "
+             "the auto/reference size) and area-average rows back onto the reference row grid "
+             "(frame / auto_fft_size(rate) rows), so the model keeps its trained row time and 2 tiles per "
+             "frame while each column integrates every bin (2:1 / 4:1 bilinear instead of 10:1 / 20:1). "
+             "Requires flatten_noise_floor. Emitted mask grid is unchanged. Default off.", false);
+  spec.param(downsample_time_pool_domain_, "downsample_time_pool_domain", "Downsample time pool domain",
+             "db = mean of dB values (keeps a single periodogram's dB level, the trained noise level); "
+             "power = dB of the mean power.", std::string("db"));
   spec.param(match_training_power_level_, "match_training_power_level", "Match training power level",
              "OPT-IN rate/RBW term: add 10*log10(rate/reference_sample_rate_hz) to the vmin shift. Only "
              "correct when the deployment GAIN matches the training captures; otherwise it can be the "
@@ -448,9 +665,19 @@ void FinetunedDinoDetector::initialize() {
   occ_baseline_.assign(channels, -1.0);   // <0 => not yet initialized (invalid-frame guard)
   prev_accept_fingerprint_.assign(channels, 0ull);
   guard_debug_ = [] { const char* e = std::getenv("DINO_GUARD_DEBUG"); return e && std::atoi(e) != 0; }();
+  if (const char* e = std::getenv("DINO_DEBUG_STALL_FRAME"); e && e[0] != '\0') {
+    debug_stall_frame_ = std::strtoull(e, nullptr, 10);
+  }
+  if (const char* e = std::getenv("DINO_DEBUG_STALL_MS"); e && e[0] != '\0') {
+    debug_stall_ms_ = std::atoi(e);
+  }
+  if (debug_stall_frame_ != 0 && debug_stall_ms_ > 0) {
+    std::fprintf(stderr, "[finetuned_dino_detector] DEBUG STALL armed: frame %llu will sleep %d ms (test only)\n",
+                 static_cast<unsigned long long>(debug_stall_frame_), debug_stall_ms_);
+  }
   channel_buffers_.assign(channels, ChannelBuffers{});
   runtime_ = std::make_shared<FinetunedDinoTorchRuntime>();
-  if (!runtime_->load(model_script_path_.get(), torch_dtype_.get())) {
+  if (!runtime_->load(model_script_path_.get(), torch_dtype_.get(), torch_freeze_.get())) {
     std::fprintf(stderr, "[finetuned_dino_detector] WARN: TorchScript not loaded at init\n");
   } else {
     // Prime the model so the first real frame doesn't pay the ~hundreds-of-ms cuDNN-autotune cost
@@ -459,6 +686,35 @@ void FinetunedDinoDetector::initialize() {
     // Downsample-path forward is ~2 tiles, x2 when circular edge inference batches the rotated
     // copy -- prime the larger batch so the first live frame doesn't autotune.
     runtime_->warmup(tile_rows_.get(), nfft_.get(), 4);
+    // Measured on the loopback stress test (2026-10-21): the batch-4 warmup alone still left the
+    // FIRST live downsample frame at ~210 ms (batch-2 forward + the bilinear resize / nearest
+    // upsample kernels had never run) and the native path at its full first-batch autotune. Warm
+    // the EXACT live path for the common wide geometries (512 rows x 10240 @245.76 / 20480 @491.52)
+    // or the native tile batch (5120 rows / 256 = 20 tiles @245.76; 40 @491.52 autotunes once more).
+    if (real_time_downsample_.get()) {
+      const int rows = 512;
+      for (const int wide : {10240, 20480, 2048, 4096}) {
+        const bool fixed = downsample_fft_size_.get() > 0;
+        if (fixed && std::max(nfft_.get(), downsample_fft_size_.get()) != wide) continue;
+        if (!fixed && wide < 10240) continue;
+        float* dummy = nullptr;
+        uint8_t* dummy_mask = nullptr;
+        if (cudaMalloc(&dummy, static_cast<size_t>(rows) * wide * sizeof(float)) != cudaSuccess) continue;
+        if (cudaMalloc(&dummy_mask, static_cast<size_t>(rows) * nfft_.get()) != cudaSuccess) { cudaFree(dummy); continue; }
+        cudaMemset(dummy, 0, static_cast<size_t>(rows) * wide * sizeof(float));
+        for (int it = 0; it < 2; ++it) {
+          (void)runtime_->forward_downsampled(dummy, rows, wide, tile_rows_.get(), nfft_.get(),
+                                              static_cast<float>(threshold_.get()), dummy_mask,
+                                              nullptr, false, circular_edge_inference_.get());
+        }
+        cudaDeviceSynchronize();
+        cudaFree(dummy);
+        cudaFree(dummy_mask);
+      }
+      std::fprintf(stderr, "[finetuned_dino_detector] downsample-path warmup done\n");
+    } else {
+      runtime_->warmup(tile_rows_.get(), nfft_.get(), 20, 2);
+    }
   }
 
   // Validation mask dump (inert unless a dir is configured). make_shared here (complete type) so
@@ -510,6 +766,11 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
           ? meta->get<uint64_t>("chdr_batch_index", local_frame_number)
           : local_frame_number;
   if (emit_stride_.get() > 1 && (frame_number % emit_stride_.get()) != 0) return;
+  if (debug_stall_frame_ != 0 && debug_stall_ms_ > 0 && frame_number == debug_stall_frame_) {
+    std::fprintf(stderr, "[finetuned_dino_detector] DEBUG STALL: frame %llu sleeping %d ms\n",
+                 static_cast<unsigned long long>(frame_number), debug_stall_ms_);
+    std::this_thread::sleep_for(std::chrono::milliseconds(debug_stall_ms_));
+  }
 
   const int nfft = nfft_.get();          // model input width (fixed by the checkpoint)
   const int tile_rows = tile_rows_.get();
@@ -531,24 +792,45 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
     fft_size = (downsample_fft_size_.get() > 0) ? std::max(nfft, downsample_fft_size_.get())
                                                 : std::max(nfft, auto_fft_size(rate_hz));
   }
+  // Reference grid = the rows/cols of the EMITTED mask (and of the model image unless time pooling):
+  // rows of ref_fft samples. Normally ref_fft == fft_size. With downsample_time_pool, the transform is
+  // shorter (fft_size < ref_fft) and the dB image is area-pooled back onto the reference rows.
+  int ref_fft = fft_size;
+  bool pool = false;
+  if (downsample && downsample_time_pool_.get()) {
+    const int auto_ref = std::max(nfft, auto_fft_size(rate_hz));
+    if (downsample_fft_size_.get() > 0 && fft_size < auto_ref && flatten_noise_floor_.get()) {
+      pool = true;
+      ref_fft = auto_ref;
+    } else if (!time_pool_warned_) {
+      std::fprintf(stderr, "[finetuned_dino_detector] WARN: downsample_time_pool ignored (needs "
+                   "flatten_noise_floor and downsample_fft_size < auto size %d; got %d)\n", auto_ref, fft_size);
+      time_pool_warned_ = true;
+    }
+  }
 
-  // Total complex IQ samples in this frame -> whole fft_size-rows.
+  // Total complex IQ samples in this frame -> whole transform rows and reference rows.
   const long total_samples = static_cast<long>(iq_tensor.Size(0)) * static_cast<long>(iq_tensor.Size(1));
-  const int rows = static_cast<int>(total_samples / fft_size);
-  if (rows <= 0) return;
-  const int batch = (rows + tile_rows - 1) / tile_rows;
+  const int fft_rows = static_cast<int>(total_samples / fft_size);
+  const int rows = static_cast<int>(total_samples / ref_fft);   // emitted mask rows == model image rows
+  if (fft_rows <= 0 || rows <= 0) return;
+  const int img_rows = pool ? rows : fft_rows;   // == rows when not pooling
+  const int img_cols = fft_size;
+  const int batch = (img_rows + tile_rows - 1) / tile_rows;
 
   auto& buf = channel_buffers_[ch];
   // Run all operator work on the IQ producer's stream so ordering with the upstream copy holds.
   const cudaStream_t stream = iq_stream;
-  buf.ensure(static_cast<size_t>(rows), static_cast<size_t>(fft_size),
-             static_cast<size_t>(tile_rows), static_cast<size_t>(batch));
+  buf.ensure(static_cast<size_t>(fft_rows), static_cast<size_t>(fft_size), static_cast<size_t>(img_rows),
+             static_cast<size_t>(img_cols), static_cast<size_t>(nfft), static_cast<size_t>(tile_rows),
+             static_cast<size_t>(batch));
+  // Whole-operator GPU span for this frame (FFT + front-end + model + guard) between two persistent
+  // events; read after the single per-frame sync below.
+  cudaEventRecord(buf.ev_total0, stream);
 
   // ---- front-end: FFT (native nfft, or wide for downsample) -> dB -> [0,1] normalized ------
-  auto* iq_ptr = reinterpret_cast<ft_dino_complex*>(iq_tensor.Data());
-  auto iq_view = matx::make_tensor<ft_dino_complex>(iq_ptr, {rows, fft_size}, /*owning=*/false);
-  auto spec_view = matx::make_tensor<ft_dino_complex>(
-      reinterpret_cast<ft_dino_complex*>(buf.spec_device), {rows, fft_size}, /*owning=*/false);
+  auto* iq_ptr = reinterpret_cast<float2*>(iq_tensor.Data());
+  auto* spec_f2_mut = reinterpret_cast<float2*>(buf.spec_device);
   // Analysis window (freq axis) to suppress spectral leakage -- MUST match the training FFT window
   // (rfdata.frames_to_db). RMS-normalized so the noise-floor power is ~preserved. Filled once per
   // geometry; 'none' = legacy no-window.
@@ -569,14 +851,28 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
     for (int i = 0; i < fft_size; ++i) w[i] /= (rms > 1e-12f ? rms : 1.0f);
     throw_if_cuda_error(cudaMemcpyAsync(buf.window_device, w.data(), fft_size * sizeof(float),
                                         cudaMemcpyHostToDevice, stream), "window H2D");
+    // the host vector dies at scope exit: make sure the (pageable) copy has consumed it
+    throw_if_cuda_error(cudaStreamSynchronize(stream), "window H2D sync");
     buf.window_len = static_cast<size_t>(fft_size);
   }
-  // Per-row (batched) 1D FFT over the frequency axis; matx default norm matches torch (unnormalized).
+  // Per-row (batched) 1D FFT over the frequency axis via one cached cuFFT plan (unnormalized, like the
+  // previous matx::fft / torch). Windowed: window kernel writes the spectrum buffer, FFT in place.
+  const int threads = 256;
+  const long spec_total = static_cast<long>(fft_rows) * fft_size;
+  const cufftHandle plan = static_cast<cufftHandle>(buf.fft_plan);
+  if (cufftSetStream(plan, stream) != CUFFT_SUCCESS) throw std::runtime_error("[finetuned_dino_detector] cufftSetStream");
   if (use_window) {
-    auto w_view = matx::make_tensor<float>(buf.window_device, {fft_size}, /*owning=*/false);
-    (spec_view = matx::fft(iq_view * w_view)).run(stream);
+    ft_window_rows_kernel<<<ft_blocks(spec_total, threads), threads, 0, stream>>>(
+        iq_ptr, buf.window_device, spec_f2_mut, spec_total, fft_size);
+    if (cufftExecC2C(plan, reinterpret_cast<cufftComplex*>(spec_f2_mut), reinterpret_cast<cufftComplex*>(spec_f2_mut),
+                     CUFFT_FORWARD) != CUFFT_SUCCESS) {
+      throw std::runtime_error("[finetuned_dino_detector] cufftExecC2C failed");
+    }
   } else {
-    (spec_view = matx::fft(iq_view)).run(stream);
+    if (cufftExecC2C(plan, reinterpret_cast<cufftComplex*>(iq_ptr), reinterpret_cast<cufftComplex*>(spec_f2_mut),
+                     CUFFT_FORWARD) != CUFFT_SUCCESS) {
+      throw std::runtime_error("[finetuned_dino_detector] cufftExecC2C failed");
+    }
   }
 
   // Processing-gain correction: an unnormalized N-pt FFT scales a white-noise bin's power by N, so a
@@ -586,15 +882,7 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
   // Zero for native mode (fft_size == nfft); derived from FFT sizes only, so it reproduces on any OTA
   // rate/geometry with no per-capture calibration.
   const double gain_offset_db = 10.0 * std::log10(static_cast<double>(fft_size) / static_cast<double>(nfft));
-  // Training-power level match: the model uses a FIXED db_vmin/db_vmax, but an unnormalized nfft-pt
-  // FFT's noise floor scales with the RBW (~ sample rate), so a deployment rate != the training rate
-  // mis-levels the input under that fixed clip (a lower rate -> lower floor -> reads as background
-  // shifted, and the passband can look like signal). Anchor the deployment floor to the training level
-  // with a SINGLE scalar dB shift (no per-frequency term -> no shape change): 10*log10(rate/ref) + trim.
-  // power_level_trim_db is ALWAYS applied (a clearly-signed manual knob: +dB raises vmin -> darkens
-  // the floor -> fewer false positives; -dB brightens). The rate-derived RBW term is OPT-IN
-  // (match_training_power_level) because it only captures the RBW/rate part and can be the wrong sign
-  // when the deployment gain differs from the training captures (the usual dominant effect).
+  // Training-power level match: see match_training_power_level / power_level_trim_db params.
   double level_offset_db = power_level_trim_db_.get();
   if (match_training_power_level_.get()) {
     const double ref_rate = std::max(1.0, reference_sample_rate_hz_.get());
@@ -607,119 +895,105 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
                  match_training_power_level_.get() ? "ON" : "OFF", rate_hz / 1e6,
                  reference_sample_rate_hz_.get() / 1e6, level_offset_db, gain_offset_db,
                  power_level_trim_db_.get(), db_vmin_.get() + vmin_offset_db);
+    if (pool) {
+      std::fprintf(stderr, "[finetuned_dino_detector] short-FFT front-end: %d-pt FFT x %d rows -> area-pooled "
+                   "(%s) to %d rows (%.2f rows each) on the %d-pt reference grid\n", fft_size, fft_rows,
+                   downsample_time_pool_domain_.get().c_str(), rows,
+                   static_cast<double>(fft_rows) / rows, ref_fft);
+    }
     level_log_emitted_ = true;
   }
   const float inv_span = 1.0f / std::max(static_cast<float>(db_vmax_.get() - db_vmin_.get()), 1e-6f);
-  const long spec_total = static_cast<long>(rows) * fft_size;
-  const int threads = 256;
-  const int spec_blocks = static_cast<int>((spec_total + threads - 1) / threads);
+  const long img_total = static_cast<long>(img_rows) * img_cols;
+  const int img_blocks = ft_blocks(img_total, threads);
   const auto* spec_f2 = reinterpret_cast<const float2*>(buf.spec_device);
+  bool stage_frontend_logs = false;
+  float flatten_sigma = 0.0f;
 
   if (flatten_noise_floor_.get()) {
-    // Split the fused power->dB->clip so we can flatten the per-frequency floor on the dB image first.
+    // Split power->dB->clip so the per-frequency floor can be flattened on the dB image first.
     // gain_offset is subtracted here (trained-scale dB), so the clip below uses the raw db_vmin.
-    ft_power_to_db_shift_kernel<<<spec_blocks, threads, 0, stream>>>(
-        spec_f2, buf.db_device, rows, fft_size, static_cast<float>(gain_offset_db));
+    if (pool) {
+      ft_power_db_pool_kernel<<<img_blocks, threads, 0, stream>>>(
+          spec_f2, buf.db_device, fft_rows, fft_size, img_rows,
+          static_cast<float>(static_cast<double>(fft_rows) / static_cast<double>(img_rows)),
+          static_cast<float>(gain_offset_db), downsample_time_pool_domain_.get() == "power" ? 0 : 1);
+    } else {
+      ft_power_to_db_shift_kernel<<<img_blocks, threads, 0, stream>>>(
+          spec_f2, buf.db_device, img_rows, img_cols, static_cast<float>(gain_offset_db));
+    }
     // Bandwidth-invariant smoothing: sigma tracks a fixed fraction of the band, so the same config
     // works at any sample rate (the filter rolloff occupies a fixed fraction of Nyquist).
-    const float sigma = std::max(2.0f, static_cast<float>(flatten_smooth_frac_.get()) * fft_size);
+    const float sigma = std::max(2.0f, static_cast<float>(flatten_smooth_frac_.get()) * img_cols);
+    flatten_sigma = sigma;
     const int smooth_radius = std::max(1, static_cast<int>(std::ceil(sigma * 1.5f)));
-    const int col_blocks = (fft_size + threads - 1) / threads;
+    const int col_blocks = (img_cols + threads - 1) / threads;
     const float q = static_cast<float>(flatten_reference_q_.get() / 100.0);
     // Pass 1: uncapped per-freq floor -> smooth -> reference. Pass 2 (if signal-cap on): recompute the
     // floor with signal influence capped at reference+cap so strong bins don't inflate their own floor.
-    ft_col_mean_kernel<<<fft_size, threads, 0, stream>>>(buf.db_device, rows, fft_size, nullptr, 0.0f,
+    ft_col_mean_kernel<<<img_cols, threads, 0, stream>>>(buf.db_device, img_rows, img_cols, nullptr, 0.0f,
                                                          buf.col_stat_device);
-    ft_smooth_cols_kernel<<<col_blocks, threads, 0, stream>>>(buf.col_stat_device, fft_size, smooth_radius,
+    ft_smooth_cols_kernel<<<col_blocks, threads, 0, stream>>>(buf.col_stat_device, img_cols, smooth_radius,
                                                               sigma, buf.col_smooth_device);
-    ft_frontend_reference_kernel<<<1, threads, 0, stream>>>(buf.col_smooth_device, fft_size, q,
+    ft_frontend_reference_kernel<<<1, threads, 0, stream>>>(buf.col_smooth_device, img_cols, q,
                                                             buf.frontend_reference_device);
     if (flatten_signal_cap_db_.get() > 0.0) {
-      ft_col_mean_kernel<<<fft_size, threads, 0, stream>>>(
-          buf.db_device, rows, fft_size, buf.frontend_reference_device,
+      ft_col_mean_kernel<<<img_cols, threads, 0, stream>>>(
+          buf.db_device, img_rows, img_cols, buf.frontend_reference_device,
           static_cast<float>(flatten_signal_cap_db_.get()), buf.col_stat_device);
-      ft_smooth_cols_kernel<<<col_blocks, threads, 0, stream>>>(buf.col_stat_device, fft_size, smooth_radius,
+      ft_smooth_cols_kernel<<<col_blocks, threads, 0, stream>>>(buf.col_stat_device, img_cols, smooth_radius,
                                                                 sigma, buf.col_smooth_device);
-      ft_frontend_reference_kernel<<<1, threads, 0, stream>>>(buf.col_smooth_device, fft_size, q,
+      ft_frontend_reference_kernel<<<1, threads, 0, stream>>>(buf.col_smooth_device, img_cols, q,
                                                               buf.frontend_reference_device);
     }
-    ft_frontend_correction_kernel<<<spec_blocks, threads, 0, stream>>>(
-        buf.db_device, rows, fft_size, buf.col_smooth_device, buf.frontend_reference_device,
+    ft_frontend_correction_kernel<<<img_blocks, threads, 0, stream>>>(
+        buf.db_device, img_rows, img_cols, buf.col_smooth_device, buf.frontend_reference_device,
         static_cast<float>(flatten_max_boost_db_.get()));
-    // Clip vmin/span: fixed calibrated window, OR per-frame adaptive anchored to the data-derived floor.
-    float clip_vmin = static_cast<float>(db_vmin_.get() + level_offset_db);  // gain already subtracted above
-    float clip_inv_span = inv_span;
-    if (adaptive_normalization_.get()) {
-      const double span = std::max(1.0, adaptive_span_db_.get());
-      const float fixed_vmin = clip_vmin;  // the calibrated fallback (already set above)
-      if (adaptive_robust_floor_.get()) {
-        // Robust floor: a LOW percentile of the whole (flattened) dB image survives any occupancy, and a
-        // small floor-to-signal spread OR an implausibly low floor triggers a fallback to the fixed clip
-        // (dense/mostly-signal or noiseless frames, where a per-frame anchor collapses). See
-        // notes/dino_ft_finetune_plan.md (robustness across field distance/density).
-        constexpr int kBins = ft_hist_bins;
-        const float bin_w = (ft_hist_max_db - ft_hist_min_db) / static_cast<float>(kBins);
-        throw_if_cuda_error(cudaMemsetAsync(buf.db_hist_device, 0, kBins * sizeof(unsigned int), stream),
-                            "robust hist memset");
-        const int hist_blocks = std::min(spec_blocks, 512);
-        ft_db_histogram_kernel<<<hist_blocks, threads, kBins * sizeof(unsigned int), stream>>>(
-            buf.db_device, spec_total, kBins, ft_hist_min_db, 1.0f / bin_w, buf.db_hist_device);
-        ft_hist_percentiles_kernel<<<1, 32, 0, stream>>>(
-            buf.db_hist_device, kBins, ft_hist_min_db, bin_w,
-            static_cast<float>(adaptive_low_pct_.get()), static_cast<float>(adaptive_high_pct_.get()),
-            buf.robust_stats_device);
-        throw_if_cuda_error(cudaGetLastError(), "robust hist kernels");
-        float stats[2] = {0.0f, 0.0f};
-        throw_if_cuda_error(cudaMemcpyAsync(stats, buf.robust_stats_device, 2 * sizeof(float),
-                                            cudaMemcpyDeviceToHost, stream), "robust stats D2H");
-        throw_if_cuda_error(cudaStreamSynchronize(stream), "robust stats sync");
-        const float floor_db = stats[0];
-        const float drange = stats[1] - stats[0];
-        const bool too_flat = drange < static_cast<float>(adaptive_min_range_db_.get());
-        const bool floor_implausible =
-            floor_db < fixed_vmin - static_cast<float>(adaptive_floor_below_calib_db_.get());
-        const bool use_robust = !too_flat && !floor_implausible;
-        if (use_robust) {
-          clip_vmin = static_cast<float>(static_cast<double>(floor_db) - adaptive_floor_frac_.get() * span);
-          clip_inv_span = static_cast<float>(1.0 / span);
-        }  // else keep the fixed calibrated clip_vmin/clip_inv_span
-        if (!robust_log_emitted_) {
-          std::fprintf(stderr, "[finetuned_dino_detector] robust normalization ON: floor(p%.0f)=%.2f dB "
-                       "high(p%.0f)=%.2f dB range=%.2f dB -> %s (fixed_vmin=%.2f, clip_vmin=%.2f, span=%.1f)\n",
-                       adaptive_low_pct_.get(), floor_db, adaptive_high_pct_.get(), stats[1], drange,
-                       use_robust ? "ROBUST" : "FALLBACK-FIXED", fixed_vmin, clip_vmin, span);
-          robust_log_emitted_ = true;
-        }
-      } else {
-        float ref_db = 0.0f;
-        throw_if_cuda_error(cudaMemcpyAsync(&ref_db, buf.frontend_reference_device, sizeof(float),
-                                            cudaMemcpyDeviceToHost, stream), "adaptive ref D2H");
-        throw_if_cuda_error(cudaStreamSynchronize(stream), "adaptive ref sync");
-        clip_vmin = static_cast<float>(static_cast<double>(ref_db) - adaptive_floor_frac_.get() * span);
-        clip_inv_span = static_cast<float>(1.0 / span);
-        if (!adaptive_log_emitted_) {
-          std::fprintf(stderr, "[finetuned_dino_detector] adaptive normalization ON: per-frame floor=%.2f dB "
-                       "span=%.1f dB floor_frac=%.2f -> clip_vmin=%.2f\n", ref_db, span,
-                       adaptive_floor_frac_.get(), clip_vmin);
-          adaptive_log_emitted_ = true;
-        }
-      }
+    // Clip window: fixed calibrated, OR per-frame adaptive anchored to the data-derived floor -- decided
+    // on the GPU (same arithmetic as before, no D2H round trip / stream sync).
+    const float fixed_vmin = static_cast<float>(db_vmin_.get() + level_offset_db);  // gain already subtracted above
+    const double span = std::max(1.0, adaptive_span_db_.get());
+    if (adaptive_normalization_.get() && adaptive_robust_floor_.get()) {
+      // Robust floor: a LOW percentile of the whole (flattened) dB image survives any occupancy, and a
+      // small floor-to-signal spread OR an implausibly low floor triggers a fallback to the fixed clip
+      // (dense/mostly-signal or noiseless frames, where a per-frame anchor collapses). See
+      // notes/dino_ft_finetune_plan.md (robustness across field distance/density).
+      constexpr int kBins = ft_hist_bins;
+      const float bin_w = (ft_hist_max_db - ft_hist_min_db) / static_cast<float>(kBins);
+      throw_if_cuda_error(cudaMemsetAsync(buf.db_hist_device, 0, kBins * sizeof(unsigned int), stream),
+                          "robust hist memset");
+      const int hist_blocks = std::min(img_blocks, 512);
+      ft_db_histogram_kernel<<<hist_blocks, threads, kBins * sizeof(unsigned int), stream>>>(
+          buf.db_device, img_total, kBins, ft_hist_min_db, 1.0f / bin_w, buf.db_hist_device);
+      ft_hist_percentiles_kernel<<<1, 32, 0, stream>>>(
+          buf.db_hist_device, kBins, ft_hist_min_db, bin_w,
+          static_cast<float>(adaptive_low_pct_.get()), static_cast<float>(adaptive_high_pct_.get()),
+          buf.robust_stats_device);
+      ft_clip_params_robust_kernel<<<1, 1, 0, stream>>>(
+          buf.robust_stats_device, fixed_vmin, inv_span, span, adaptive_floor_frac_.get(),
+          static_cast<float>(adaptive_min_range_db_.get()),
+          static_cast<float>(adaptive_floor_below_calib_db_.get()), buf.clip_params_device);
+    } else if (adaptive_normalization_.get()) {
+      ft_clip_params_ref_kernel<<<1, 1, 0, stream>>>(buf.frontend_reference_device, span,
+                                                     adaptive_floor_frac_.get(), buf.clip_params_device);
+    } else {
+      ft_set_clip_params_kernel<<<1, 1, 0, stream>>>(buf.clip_params_device, fixed_vmin, inv_span);
     }
-    ft_clip_normalize_kernel<<<spec_blocks, threads, 0, stream>>>(
-        buf.db_device, buf.normalized_device, spec_total, clip_vmin, clip_inv_span);
+    ft_clip_normalize_dev_kernel<<<img_blocks, threads, 0, stream>>>(
+        buf.db_device, buf.normalized_device, img_total, buf.clip_params_device);
     throw_if_cuda_error(cudaGetLastError(), "flatten frontend kernels");
-    if (!flatten_log_emitted_) {
-      std::fprintf(stderr, "[finetuned_dino_detector] per-freq floor flatten ON (q=%.0f frac=%.4f "
-                   "-> sigma=%.1f bins @ fft=%d, max_boost=%.1f dB signal_cap=%.1f dB)\n",
-                   flatten_reference_q_.get(), flatten_smooth_frac_.get(), sigma, fft_size,
-                   flatten_max_boost_db_.get(), flatten_signal_cap_db_.get());
-      flatten_log_emitted_ = true;
+    // One-time startup log values: stage them into pinned memory, print after the frame sync.
+    if (!flatten_log_emitted_ || (adaptive_normalization_.get() && !robust_log_emitted_ && !adaptive_log_emitted_)) {
+      cudaMemcpyAsync(buf.host_stats_pinned, buf.robust_stats_device, 2 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+      cudaMemcpyAsync(buf.host_stats_pinned + 2, buf.clip_params_device, 3 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+      cudaMemcpyAsync(buf.host_stats_pinned + 5, buf.frontend_reference_device, sizeof(float), cudaMemcpyDeviceToHost, stream);
+      stage_frontend_logs = true;
     }
   } else {
     // Original fused path (validated): fold the gain + power-level offsets into vmin, single kernel.
     const float vmin = static_cast<float>(db_vmin_.get() + vmin_offset_db);
-    power_db_normalize_kernel<<<spec_blocks, threads, 0, stream>>>(
-        spec_f2, buf.normalized_device, rows, fft_size, vmin, inv_span);
+    power_db_normalize_kernel<<<img_blocks, threads, 0, stream>>>(
+        spec_f2, buf.normalized_device, img_rows, img_cols, vmin, inv_span);
     throw_if_cuda_error(cudaGetLastError(), "power_db_normalize kernel");
   }
 
@@ -731,85 +1005,78 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
     return;  // don't emit a bogus mask
   }
 
-  // Filled by whichever path runs; emitted once at the end. width = mask columns on the native grid.
-  uint8_t* emit_mask = nullptr;
+  // Filled by whichever path runs; emitted once at the end. width = mask columns on the emitted grid.
+  std::shared_ptr<uint8_t> emit_holder;
   int mask_width = 0;
+  // Emitted mask = compact model-resolution mask with each column repeated col_repeat times (downsample
+  // path): consumers can work on the compact form (snipper) with identical results.
+  int col_repeat = 1;
 
   if (downsample) {
-    // ---- downsample path: resize freq -> model width, tile, infer, threshold, upsample (torch) ----
-    const size_t mask_bytes = static_cast<size_t>(rows) * fft_size * sizeof(uint8_t);
-    throw_if_cuda_error(cudaMalloc(&emit_mask, mask_bytes), "malloc emit mask");
-    double inference_ms = 0.0;
-    const bool ok = runtime_->forward_downsampled(buf.normalized_device, rows, fft_size, tile_rows,
-                                                  nfft, static_cast<float>(threshold_.get()),
-                                                  emit_mask, stream, &inference_ms,
+    // ---- downsample path: resize freq -> model width, tile, infer, threshold (torch) -> compact mask ----
+    const bool ok = runtime_->forward_downsampled(buf.normalized_device, img_rows, img_cols, tile_rows, nfft,
+                                                  static_cast<float>(threshold_.get()),
+                                                  buf.compact_mask_device, stream, /*time_it=*/true,
                                                   circular_edge_inference_.get());
-    if (!ok) { cudaFree(emit_mask); return; }
-    ++inference_samples_;
-    inference_ms_ewma_ += (inference_ms - inference_ms_ewma_) / static_cast<double>(inference_samples_);
-    if (inference_samples_ == 1 || (inference_samples_ % 32) == 0) {
-      std::fprintf(stderr, "[finetuned_dino_detector] downsample: FFT %d -> model %d (gain corr "
-                   "%.2f dB), %d rows -> %d tiles; inference %.2f ms (mean %.2f ms over %llu frames)\n",
-                   fft_size, nfft, gain_offset_db, rows, batch, inference_ms, inference_ms_ewma_,
-                   static_cast<unsigned long long>(inference_samples_));
-    }
-    mask_width = fft_size;   // emitted on the wide (native display) grid
+    if (!ok) return;
+    mask_width = ref_fft;   // emitted on the wide (reference / native display) grid, as before
+    emit_holder = ft_acquire_pooled_mask(static_cast<size_t>(rows) * mask_width);
+    const long out_total = static_cast<long>(rows) * mask_width;
+    ft_expand_cols_nearest_kernel<<<ft_blocks(out_total, threads), threads, 0, stream>>>(
+        buf.compact_mask_device, rows, nfft, emit_holder.get(), mask_width,
+        static_cast<float>(nfft) / static_cast<float>(mask_width));
+    throw_if_cuda_error(cudaGetLastError(), "expand mask kernel");
+    col_repeat = (mask_width % nfft == 0) ? mask_width / nfft : 1;
   } else {
-
-  // ---- tile into [B,1,tile_rows,nfft] (pad the last tile with zeros) ------------------------
-  const size_t row_bytes = static_cast<size_t>(nfft) * sizeof(float);
-  const size_t tile_stride = static_cast<size_t>(tile_rows) * nfft;
-  throw_if_cuda_error(cudaMemsetAsync(buf.tile_batch_device, 0,
-                                      static_cast<size_t>(batch) * tile_stride * sizeof(float), stream),
-                      "memset tiles");
-  for (int b = 0; b < batch; ++b) {
-    const int r0 = b * tile_rows;
-    const int valid = std::min(tile_rows, rows - r0);
-    if (valid <= 0) break;
-    throw_if_cuda_error(
-        cudaMemcpyAsync(buf.tile_batch_device + static_cast<size_t>(b) * tile_stride,
-                        buf.normalized_device + static_cast<size_t>(r0) * nfft,
-                        static_cast<size_t>(valid) * row_bytes, cudaMemcpyDeviceToDevice, stream),
-        "tile copy");
-  }
-
-  // ---- inference ----------------------------------------------------------------------------
-  const bool ok = runtime_->forward(buf.tile_batch_device, batch, tile_rows, nfft,
-                                    buf.logits_device, stream);
-  if (!ok) return;  // don't emit a bogus mask
-
-  // ---- threshold + stitch tiles back to a native (rows x nfft) mask -------------------------
-  const long tile_total = static_cast<long>(batch) * tile_stride;
-  sigmoid_threshold_kernel<<<static_cast<int>((tile_total + threads - 1) / threads), threads, 0, stream>>>(
-      buf.logits_device, buf.tile_mask_device, tile_total, static_cast<float>(threshold_.get()));
-  throw_if_cuda_error(cudaGetLastError(), "sigmoid_threshold kernel");
-
-  // Per-emit device mask buffer, ownership handed to the message (downstream copies it out).
-  const size_t mask_bytes = static_cast<size_t>(rows) * nfft * sizeof(uint8_t);
-  throw_if_cuda_error(cudaMalloc(&emit_mask, mask_bytes), "malloc emit mask");
-  const size_t mask_row_bytes = static_cast<size_t>(nfft) * sizeof(uint8_t);
-  for (int b = 0; b < batch; ++b) {
-    const int r0 = b * tile_rows;
-    const int valid = std::min(tile_rows, rows - r0);
-    if (valid <= 0) break;
-    throw_if_cuda_error(
-        cudaMemcpyAsync(emit_mask + static_cast<size_t>(r0) * nfft,
-                        buf.tile_mask_device + static_cast<size_t>(b) * tile_stride,
-                        static_cast<size_t>(valid) * mask_row_bytes, cudaMemcpyDeviceToDevice, stream),
-        "stitch copy");
-  }
-  // Make the mask valid for the downstream's (blocking) copy out.
-  throw_if_cuda_error(cudaStreamSynchronize(stream), "stream sync before emit");
+    // ---- native path: tile into [B,1,tile_rows,nfft] (pad the last tile with zeros) -------------
+    cudaEventRecord(buf.ev_native0, stream);
+    const size_t row_bytes = static_cast<size_t>(nfft) * sizeof(float);
+    const size_t tile_stride = static_cast<size_t>(tile_rows) * nfft;
+    throw_if_cuda_error(cudaMemsetAsync(buf.tile_batch_device, 0,
+                                        static_cast<size_t>(batch) * tile_stride * sizeof(float), stream),
+                        "memset tiles");
+    for (int b = 0; b < batch; ++b) {
+      const int r0 = b * tile_rows;
+      const int valid = std::min(tile_rows, rows - r0);
+      if (valid <= 0) break;
+      throw_if_cuda_error(
+          cudaMemcpyAsync(buf.tile_batch_device + static_cast<size_t>(b) * tile_stride,
+                          buf.normalized_device + static_cast<size_t>(r0) * nfft,
+                          static_cast<size_t>(valid) * row_bytes, cudaMemcpyDeviceToDevice, stream),
+          "tile copy");
+    }
+    const bool ok = runtime_->forward(buf.tile_batch_device, batch, tile_rows, nfft,
+                                      buf.logits_device, stream);
+    if (!ok) return;  // don't emit a bogus mask
+    // ---- threshold + stitch tiles back to a native (rows x nfft) mask -------------------------
+    const long tile_total = static_cast<long>(batch) * tile_stride;
+    sigmoid_threshold_kernel<<<ft_blocks(tile_total, threads), threads, 0, stream>>>(
+        buf.logits_device, buf.tile_mask_device, tile_total, static_cast<float>(threshold_.get()));
+    throw_if_cuda_error(cudaGetLastError(), "sigmoid_threshold kernel");
+    emit_holder = ft_acquire_pooled_mask(static_cast<size_t>(rows) * nfft);
+    const size_t mask_row_bytes = static_cast<size_t>(nfft) * sizeof(uint8_t);
+    for (int b = 0; b < batch; ++b) {
+      const int r0 = b * tile_rows;
+      const int valid = std::min(tile_rows, rows - r0);
+      if (valid <= 0) break;
+      throw_if_cuda_error(
+          cudaMemcpyAsync(emit_holder.get() + static_cast<size_t>(r0) * nfft,
+                          buf.tile_mask_device + static_cast<size_t>(b) * tile_stride,
+                          static_cast<size_t>(valid) * mask_row_bytes, cudaMemcpyDeviceToDevice, stream),
+          "stitch copy");
+    }
+    cudaEventRecord(buf.ev_native1, stream);
     mask_width = nfft;
-  }  // end native path
+  }
+  uint8_t* emit_mask = emit_holder.get();
 
   // Band-edge sideband ignore (both paths): zero the outer mask columns per side. percent wins over
   // hz (converted with the live rate); capped at half the width. Runs after inference so the model
   // input is untouched -- only the emitted detections are trimmed.
+  int ignore_cols = 0;
   {
     const double pct = ignore_sideband_percent_.get();
     const double hz = ignore_sideband_hz_.get();
-    int ignore_cols = 0;
     if (pct > 0.0) {
       ignore_cols = static_cast<int>(std::floor(static_cast<double>(mask_width) * pct / 100.0));
     } else if (hz > 0.0 && rate_hz > 0.0) {
@@ -822,45 +1089,117 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
       throw_if_cuda_error(cudaMemset2DAsync(emit_mask + (mask_width - ignore_cols), mask_width, 0,
                                             ignore_cols, rows, stream),
                           "sideband memset right");
-      throw_if_cuda_error(cudaStreamSynchronize(stream), "sideband sync");
+      col_repeat = 1;   // the emitted mask is no longer an exact column replication of the compact one
     }
   }
 
   // INVALID-FRAME GUARD. Under real-time ingest saturation the pipeline drops packets, corrupting the
   // frame fill and making the segmenter fire a large spurious off-band blob (root cause confirmed in the
-  // offline-vs-loopback A/B: offline is drop-free and never spikes; loopback spikes to 6-10% occupancy on
-  // ~1-2% of frames while real activity stays <=~1.4%). A drop-corrupted frame is invalid, so the correct
-  // output is NO detections, not a false blob: suppress (zero) the mask when its occupancy is a gross
-  // outlier vs an adaptive per-channel baseline. The absolute floor catches spikes before the baseline
-  // warms up / on sparse scenes; the k*baseline term protects genuinely dense scenes from being clipped.
-  // Baseline updates only on ACCEPTED frames so a spike can't inflate it. Never fires offline (occ there
-  // stays far below the floor). Cost: one GPU reduction + sync per processed frame.
+  // offline-vs-loopback A/B). A drop-corrupted frame is invalid, so the correct output is NO detections:
+  // suppress (zero) the mask when its occupancy is a gross outlier vs an adaptive per-channel baseline.
+  // The absolute floor catches spikes before the baseline warms up / on sparse scenes; the k*baseline
+  // term protects genuinely dense scenes. Baseline updates only on ACCEPTED frames. Counting and the
+  // conditional zeroing run on the GPU; the count is read back after the frame's one sync below.
+  double guard_thresh = -1.0;
+  double guard_count_n = 0.0;
   if (invalid_frame_guard_.get() && rows > 0 && mask_width > 0) {
-    // Occupancy = fraction of set mask pixels. thrust::count_if runs on the op stream (ordered after the
-    // stitch/sideband writes above) and returns the count to host (synchronizing), so no separate sync.
-    const size_t guard_px = static_cast<size_t>(rows) * static_cast<size_t>(mask_width);
-    const long long nz = thrust::count_if(thrust::cuda::par.on(stream), emit_mask, emit_mask + guard_px,
-                                          ft_dino_is_nonzero{});
-    const double occ = static_cast<double>(nz) / static_cast<double>(guard_px);
-    double& base = occ_baseline_[ch];
-    const double thresh = std::max(
+    const double base = occ_baseline_[ch];
+    guard_thresh = std::max(
         invalid_frame_min_occupancy_.get(),
         base >= 0.0 ? invalid_frame_occupancy_k_.get() * base : invalid_frame_min_occupancy_.get());
-    if (occ > thresh) {
-      throw_if_cuda_error(
-          cudaMemsetAsync(emit_mask, 0, static_cast<size_t>(rows) * static_cast<size_t>(mask_width), stream),
-          "invalid-frame guard zero");
-      throw_if_cuda_error(cudaStreamSynchronize(stream), "invalid-frame guard zero sync");
+    // Exact replication -> count the compact mask (col_repeat x fewer pixels, same occupancy).
+    const bool count_compact = downsample && col_repeat > 1;
+    const uint8_t* count_src = count_compact ? buf.compact_mask_device : emit_mask;
+    const long count_px = count_compact ? static_cast<long>(rows) * nfft : static_cast<long>(rows) * mask_width;
+    const long emit_px = static_cast<long>(rows) * mask_width;
+    guard_count_n = static_cast<double>(count_px);
+    throw_if_cuda_error(cudaMemsetAsync(buf.guard_count_device, 0, sizeof(unsigned long long), stream),
+                        "guard count memset");
+    ft_count_nonzero_kernel<<<std::min(1024, ft_blocks(count_px, threads)), threads, 0, stream>>>(
+        count_src, count_px, buf.guard_count_device);
+    ft_zero_if_over_kernel<<<std::min(1024, ft_blocks(emit_px, threads)), threads, 0, stream>>>(
+        emit_mask, emit_px, buf.guard_count_device, guard_count_n, guard_thresh);
+    throw_if_cuda_error(cudaGetLastError(), "guard kernels");
+    throw_if_cuda_error(cudaMemcpyAsync(buf.host_guard_count_pinned, buf.guard_count_device,
+                                        sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream),
+                        "guard count D2H");
+  }
+
+  // ---- the ONE per-frame synchronization: the mask must be complete before it is emitted ----------
+  cudaEventRecord(buf.ev_total1, stream);
+  throw_if_cuda_error(cudaEventSynchronize(buf.ev_total1), "frame sync");
+
+  double detector_total_ms = -1.0;
+  {
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, buf.ev_total0, buf.ev_total1) == cudaSuccess) detector_total_ms = ms;
+  }
+  double detector_ms = -1.0;
+  if (downsample) {
+    detector_ms = runtime_->last_inference_ms();
+  } else {
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, buf.ev_native0, buf.ev_native1) == cudaSuccess) detector_ms = ms;
+  }
+  if (detector_ms >= 0.0) {
+    ++inference_samples_;
+    inference_ms_ewma_ += (detector_ms - inference_ms_ewma_) / static_cast<double>(inference_samples_);
+    if (inference_samples_ == 1 || (inference_samples_ % 32) == 0) {
+      if (downsample) {
+        std::fprintf(stderr, "[finetuned_dino_detector] downsample: FFT %d -> model %d (gain corr "
+                     "%.2f dB), %d rows -> %d tiles; inference %.2f ms (mean %.2f ms over %llu frames)\n",
+                     fft_size, nfft, gain_offset_db, img_rows, batch, detector_ms, inference_ms_ewma_,
+                     static_cast<unsigned long long>(inference_samples_));
+      } else {
+        std::fprintf(stderr, "[finetuned_dino_detector] native: FFT %d (model width), %d rows -> %d tiles; "
+                     "inference %.2f ms (mean %.2f ms over %llu frames)\n",
+                     nfft, rows, batch, detector_ms, inference_ms_ewma_,
+                     static_cast<unsigned long long>(inference_samples_));
+      }
+      std::fprintf(stderr, "[finetuned_dino_detector] frame %llu: total GPU %.2f ms (front-end + model path %.2f ms)\n",
+                   static_cast<unsigned long long>(frame_number), detector_total_ms, detector_ms);
+    }
+  }
+
+  // One-time startup logs (values staged into pinned memory before the sync).
+  if (stage_frontend_logs) {
+    const float* hs = buf.host_stats_pinned;
+    if (adaptive_normalization_.get() && adaptive_robust_floor_.get() && !robust_log_emitted_) {
+      std::fprintf(stderr, "[finetuned_dino_detector] robust normalization ON: floor(p%.0f)=%.2f dB "
+                   "high(p%.0f)=%.2f dB range=%.2f dB -> %s (fixed_vmin=%.2f, clip_vmin=%.2f, span=%.1f)\n",
+                   adaptive_low_pct_.get(), hs[0], adaptive_high_pct_.get(), hs[1], hs[1] - hs[0],
+                   hs[4] > 0.5f ? "ROBUST" : "FALLBACK-FIXED",
+                   static_cast<float>(db_vmin_.get() + level_offset_db), hs[2],
+                   std::max(1.0, adaptive_span_db_.get()));
+      robust_log_emitted_ = true;
+    } else if (adaptive_normalization_.get() && !adaptive_robust_floor_.get() && !adaptive_log_emitted_) {
+      std::fprintf(stderr, "[finetuned_dino_detector] adaptive normalization ON: per-frame floor=%.2f dB "
+                   "span=%.1f dB floor_frac=%.2f -> clip_vmin=%.2f\n", hs[5],
+                   std::max(1.0, adaptive_span_db_.get()), adaptive_floor_frac_.get(), hs[2]);
+      adaptive_log_emitted_ = true;
+    }
+    if (!flatten_log_emitted_) {
+      std::fprintf(stderr, "[finetuned_dino_detector] per-freq floor flatten ON (q=%.0f frac=%.4f "
+                   "-> sigma=%.1f bins @ fft=%d, max_boost=%.1f dB signal_cap=%.1f dB)\n",
+                   flatten_reference_q_.get(), flatten_smooth_frac_.get(), flatten_sigma, img_cols,
+                   flatten_max_boost_db_.get(), flatten_signal_cap_db_.get());
+      flatten_log_emitted_ = true;
+    }
+  }
+
+  // Invalid-frame guard bookkeeping (the zeroing already happened on the GPU).
+  if (guard_thresh >= 0.0) {
+    const double occ = static_cast<double>(*buf.host_guard_count_pinned) / guard_count_n;
+    double& base = occ_baseline_[ch];
+    if (occ > guard_thresh) {
       if ((invalid_frames_suppressed_++ % 8) == 0) {
         std::fprintf(stderr, "[finetuned_dino_detector] invalid-frame guard: suppressed ch%d frame %llu "
                      "occ=%.2f%% > thresh=%.2f%% (baseline=%.3f%%); total suppressed=%llu\n",
                      static_cast<int>(channel_number), static_cast<unsigned long long>(frame_number),
-                     100.0 * occ, 100.0 * thresh, base >= 0.0 ? 100.0 * base : -1.0,
+                     100.0 * occ, 100.0 * guard_thresh, base >= 0.0 ? 100.0 * base : -1.0,
                      static_cast<unsigned long long>(invalid_frames_suppressed_));
       }
       // DIAGNOSTIC: characterize the corrupt frame from the ingest metadata (env DINO_GUARD_DEBUG).
-      // Logs EVERY suppressed frame (rare -- only corrupt ones reach here) so short-count drops,
-      // stale-buffer reuse (fp == last accepted), and full-count-but-corrupt frames are distinguishable.
       if (guard_debug_) {
         const uint32_t pib  = meta ? meta->get<uint32_t>("chdr_packets_in_batch", 0u) : 0u;
         const uint32_t pexp = meta ? meta->get<uint32_t>("chdr_expected_packets_in_batch", 0u) : 0u;
@@ -871,7 +1210,7 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
             "[dino_guard_dbg] SUPPRESS ch%d frame=%llu occ=%.3f%% thr=%.3f%% base=%.4f%% "
             "pkts=%u/%u short=%d partial=%d fp=%016llx prev_fp=%016llx fp_eq_prev=%d\n",
             static_cast<int>(channel_number), static_cast<unsigned long long>(frame_number),
-            100.0 * occ, 100.0 * thresh, base >= 0.0 ? 100.0 * base : -1.0,
+            100.0 * occ, 100.0 * guard_thresh, base >= 0.0 ? 100.0 * base : -1.0,
             pib, pexp, (pexp > 0u && pib < pexp) ? 1 : 0, part ? 1 : 0,
             static_cast<unsigned long long>(fp), static_cast<unsigned long long>(pfp),
             (fp != 0ull && fp == pfp) ? 1 : 0);
@@ -880,8 +1219,6 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
       base = (base < 0.0) ? occ
                           : (1.0 - invalid_frame_baseline_alpha_.get()) * base
                                 + invalid_frame_baseline_alpha_.get() * occ;
-      // DIAGNOSTIC: remember this ACCEPTED frame's content fingerprint so a later suppressed frame can be
-      // tested for stale-buffer reuse. Gated -> zero cost on the normal path.
       if (guard_debug_ && ch < prev_accept_fingerprint_.size()) {
         prev_accept_fingerprint_[ch] = meta ? meta->get<uint64_t>("chdr_content_fingerprint", 0ull) : 0ull;
       }
@@ -896,10 +1233,10 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
     if (dump_host_buf_.size() < n) dump_host_buf_.resize(n);
     throw_if_cuda_error(cudaMemcpyAsync(dump_host_buf_.data(), emit_mask, n * sizeof(uint8_t),
                                         cudaMemcpyDeviceToHost, stream), "mask dump D2H");
-    // Optionally also grab the RT input spectrogram (normalized [0,1] image the model saw; same
-    // rows x mask_width grid as the mask) so the dumped mask can be overlaid on the actual spectrogram.
+    // Optionally also grab the RT input spectrogram (normalized [0,1] image the model saw).
     const float* spec_host = nullptr;
-    if (debug_spectrogram_dump_.get() && buf.normalized_device != nullptr) {
+    const size_t spec_n = static_cast<size_t>(img_rows) * static_cast<size_t>(img_cols);
+    if (debug_spectrogram_dump_.get() && buf.normalized_device != nullptr && spec_n == n) {
       if (dump_spec_host_buf_.size() < n) dump_spec_host_buf_.resize(n);
       throw_if_cuda_error(cudaMemcpyAsync(dump_spec_host_buf_.data(), buf.normalized_device,
                                           n * sizeof(float), cudaMemcpyDeviceToHost, stream),
@@ -907,8 +1244,19 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
       spec_host = dump_spec_host_buf_.data();
     }
     throw_if_cuda_error(cudaStreamSynchronize(stream), "mask dump sync");
+    MaskDumpFrameInfo info;
+    info.host_mono_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    info.detector_ms = detector_total_ms;
+    if (meta) {
+      info.chdr_batch_index = meta->get<uint64_t>("chdr_batch_index", 0ull);
+      info.chdr_pkts = meta->get<uint32_t>("chdr_packets_in_batch", 0u);
+      info.chdr_expected_pkts = meta->get<uint32_t>("chdr_expected_packets_in_batch", 0u);
+      info.chdr_partial = meta->get<bool>("chdr_partial_batch", false);
+    }
     mask_dump_->submit(static_cast<int>(channel_number), frame_number, rows, mask_width,
-                       dump_host_buf_.data(), spec_host);
+                       dump_host_buf_.data(), spec_host, &info);
   }
 
   holoscan::ops::DetectorMaskMessage mask_msg;
@@ -916,14 +1264,18 @@ void FinetunedDinoDetector::compute(holoscan::InputContext& op_input,
   mask_msg.height = rows;
   mask_msg.channel = channel_number;
   mask_msg.frame_number = frame_number;
-  mask_msg.device_pixels =
-      std::shared_ptr<uint8_t>(emit_mask, [](uint8_t* p) { cudaFree(p); });
+  mask_msg.col_repeat = col_repeat;
+  mask_msg.device_pixels = std::move(emit_holder);
   if (meta) {
     mask_msg.file_offset_complex    = meta->get<uint64_t>("offline_source_file_offset_complex", 0);
     mask_msg.data_end_complex       = meta->get<uint64_t>("offline_source_data_end_complex", 0);
     mask_msg.frame_end_complex      = meta->get<uint64_t>("offline_source_frame_end_complex", 0);
     mask_msg.complex_samples_read   = meta->get<uint64_t>("offline_source_complex_samples_read", 0);
     mask_msg.complex_samples_padded = meta->get<uint64_t>("offline_source_complex_samples_padded", 0);
+  }
+  if (meta) {
+    meta->set("detector_inference_ms", detector_total_ms);   // whole-operator GPU time (must fit the frame period)
+    meta->set("detector_model_path_ms", detector_ms);        // resize+forward+stitch (downsample) / tiles+forward+stitch (native)
   }
   op_output.emit(mask_msg, "mask_out");
   if (meta) meta->set("finetuned_dino_mask_emitted", true);

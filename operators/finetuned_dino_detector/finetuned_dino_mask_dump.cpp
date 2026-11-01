@@ -79,6 +79,7 @@ struct Job {
   int cols = 0;
   std::vector<uint8_t> data;
   std::vector<float> spec;   // optional rows*cols float32 input spectrogram (empty = not dumped)
+  MaskDumpFrameInfo info;    // per-frame bookkeeping (zeros/-1 when the caller did not supply it)
 };
 
 struct MaskDumpWriter::Impl {
@@ -123,8 +124,14 @@ struct MaskDumpWriter::Impl {
                       static_cast<size_t>(job.rows), static_cast<size_t>(job.cols));
       }
       if (manifest.is_open()) {
+        size_t nonzero = 0;
+        for (const uint8_t v : job.data) nonzero += (v != 0);
         manifest << seq << ',' << job.channel << ',' << job.frame << ',' << job.rows << ','
-                 << job.cols << ',' << fname << ',' << sname << '\n';
+                 << job.cols << ',' << fname << ',' << sname << ','
+                 << job.info.host_mono_ns << ',' << job.info.detector_ms << ','
+                 << job.info.chdr_batch_index << ',' << job.info.chdr_pkts << ','
+                 << job.info.chdr_expected_pkts << ',' << (job.info.chdr_partial ? 1 : 0) << ','
+                 << nonzero << '\n';
         manifest.flush();
       }
       written.fetch_add(1);
@@ -157,7 +164,8 @@ void MaskDumpWriter::configure(const std::string& dir, int max_frames) {
 
   impl_->manifest.open(dir + "/mask_dump_manifest.csv", std::ios::out | std::ios::trunc);
   if (impl_->manifest.is_open()) {
-    impl_->manifest << "seq,channel,frame_number,rows,cols,mask_npy,spec_npy\n";
+    impl_->manifest << "seq,channel,frame_number,rows,cols,mask_npy,spec_npy,host_mono_ns,detector_ms,"
+                       "chdr_batch_index,chdr_pkts,chdr_expected_pkts,chdr_partial,nonzero\n";
     impl_->manifest.flush();
     impl_->manifest_header_written = true;
   }
@@ -174,7 +182,8 @@ bool MaskDumpWriter::wants_more() const {
 }
 
 void MaskDumpWriter::submit(int channel, uint64_t frame_number, int rows, int cols,
-                            const uint8_t* host_mask, const float* host_spec) {
+                            const uint8_t* host_mask, const float* host_spec,
+                            const MaskDumpFrameInfo* info) {
   if (!enabled_ || !impl_ || host_mask == nullptr || rows <= 0 || cols <= 0) return;
   if (impl_->max_frames > 0 && impl_->submitted.load() >= impl_->max_frames) return;
 
@@ -183,6 +192,7 @@ void MaskDumpWriter::submit(int channel, uint64_t frame_number, int rows, int co
   job.frame = frame_number;
   job.rows = rows;
   job.cols = cols;
+  if (info != nullptr) job.info = *info;
   job.data.assign(host_mask, host_mask + static_cast<size_t>(rows) * cols);
   if (host_spec != nullptr) {
     job.spec.assign(host_spec, host_spec + static_cast<size_t>(rows) * cols);

@@ -28,17 +28,44 @@ struct FinetunedDinoTorchRuntime::Impl {
   bool is_loaded = false;
   torch::Dtype dtype = torch::kFloat32;
 #endif
+  // Persistent timing events (created once; the per-frame cudaEventCreate/Destroy pair cost ~70 us).
+  cudaEvent_t ev0 = nullptr;
+  cudaEvent_t ev1 = nullptr;
+  bool timed = false;
 };
 
 FinetunedDinoTorchRuntime::FinetunedDinoTorchRuntime() : impl_(std::make_unique<Impl>()) {}
-FinetunedDinoTorchRuntime::~FinetunedDinoTorchRuntime() = default;
+FinetunedDinoTorchRuntime::~FinetunedDinoTorchRuntime() {
+  if (impl_) {
+    if (impl_->ev0) cudaEventDestroy(impl_->ev0);
+    if (impl_->ev1) cudaEventDestroy(impl_->ev1);
+  }
+}
+
+double FinetunedDinoTorchRuntime::last_inference_ms() const {
+  if (!impl_ || !impl_->timed || !impl_->ev0 || !impl_->ev1) return -1.0;
+  float ms = 0.0f;
+  return (cudaEventElapsedTime(&ms, impl_->ev0, impl_->ev1) == cudaSuccess) ? static_cast<double>(ms) : -1.0;
+}
 
 bool FinetunedDinoTorchRuntime::load(const std::string& model_script_path,
-                                     const std::string& torch_dtype) {
+                                     const std::string& torch_dtype, bool freeze) {
 #if defined(HOLOHUB_HAS_TORCH)
   try {
     impl_->module = torch::jit::load(model_script_path, torch::kCUDA);
     impl_->module.eval();
+    if (freeze) {
+      auto count_casts = [](const std::shared_ptr<torch::jit::Graph>& g) {
+        int n = 0;
+        for (auto* node : g->nodes()) n += (node->kind() == c10::Symbol::fromQualString("aten::to")) ? 1 : 0;
+        return n;
+      };
+      const int before = count_casts(impl_->module.get_method("forward").graph());
+      impl_->module = torch::jit::freeze(impl_->module);
+      const int after = count_casts(impl_->module.get_method("forward").graph());
+      std::fprintf(stderr, "[finetuned_dino_detector] froze TorchScript module (top-level aten::to nodes %d -> %d)\n",
+                   before, after);
+    }
     // Mixed precision is baked into the .ts at export time (torch.jit.trace under autocast bf16), not
     // toggled here: converting a traced module to half breaks on hardcoded dtype casts in the graph
     // (e.g. the RoPE bias_mask .to(float32)). So the runtime always feeds fp32 and lets the traced
@@ -62,8 +89,8 @@ bool FinetunedDinoTorchRuntime::load(const std::string& model_script_path,
 
 bool FinetunedDinoTorchRuntime::forward_downsampled(const float* normalized_wide, int rows, int wide,
                                                     int tile_rows, int nfft, float threshold,
-                                                    uint8_t* out_mask_wide, cudaStream_t stream,
-                                                    double* inference_ms, bool wrap_edges) {
+                                                    uint8_t* out_mask_compact, cudaStream_t stream,
+                                                    bool time_it, bool wrap_edges) {
 #if defined(HOLOHUB_HAS_TORCH)
   if (!impl_->is_loaded) return false;
   namespace F = torch::nn::functional;
@@ -76,18 +103,21 @@ bool FinetunedDinoTorchRuntime::forward_downsampled(const float* normalized_wide
     c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
     auto fopts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
 
-    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
-    if (inference_ms) {
-      cudaEventCreate(&ev0);
-      cudaEventCreate(&ev1);
-      cudaEventRecord(ev0, stream);
+    impl_->timed = false;
+    if (time_it) {
+      if (!impl_->ev0) cudaEventCreate(&impl_->ev0);
+      if (!impl_->ev1) cudaEventCreate(&impl_->ev1);
+      cudaEventRecord(impl_->ev0, stream);
     }
 
     // wide dB image [1,1,rows,wide] -> bilinear resize freq to model width -> [1,1,rows,nfft]
     auto wide_t = torch::from_blob(const_cast<float*>(normalized_wide), {1, 1, rows, wide}, fopts);
-    auto resized = F::interpolate(
-        wide_t, F::InterpolateFuncOptions()
-                    .size(std::vector<int64_t>{rows, nfft}).mode(torch::kBilinear).align_corners(false));
+    torch::Tensor resized = wide_t;
+    if (wide != nfft) {
+      resized = F::interpolate(
+          wide_t, F::InterpolateFuncOptions()
+                      .size(std::vector<int64_t>{rows, nfft}).mode(torch::kBilinear).align_corners(false));
+    }
 
     // pad rows up to a whole number of tiles, then split into [B,1,tile_rows,nfft]
     const int batch = (rows + tile_rows - 1) / tile_rows;
@@ -109,10 +139,10 @@ bool FinetunedDinoTorchRuntime::forward_downsampled(const float* normalized_wide
     torch::jit::IValue model_in = (impl_->dtype == torch::kHalf) ? tiles_all.to(torch::kHalf) : tiles_all;
 
     auto logits = impl_->module.forward({model_in}).toTensor().to(torch::kFloat32);
-    auto mask_tiles = (torch::sigmoid(logits) >= threshold).to(torch::kFloat32);  // [B or 2B,1,tile_rows,nfft]
+    auto mask_tiles = (torch::sigmoid(logits) >= threshold).to(torch::kUInt8);  // [B or 2B,1,tile_rows,nfft]
     if (wrap_edges) {
       using torch::indexing::Slice;
-      auto m1 = mask_tiles.narrow(0, 0, batch);
+      auto m1 = mask_tiles.narrow(0, 0, batch).clone();
       auto m2 = torch::roll(mask_tiles.narrow(0, batch, batch), {-nfft / 2}, {3});  // back to true columns
       // Outer quarters come from the rotated pass (those columns sat mid-image there); the rotated
       // pass's own borders land mid-band and are discarded. Every output column is center-sourced.
@@ -124,27 +154,20 @@ bool FinetunedDinoTorchRuntime::forward_downsampled(const float* normalized_wide
       mask_tiles = m1;
     }
 
-    // stitch tiles back to [1,1,padded,nfft], crop to rows, nearest-upsample freq nfft->wide
-    auto stitched = mask_tiles.squeeze(1).contiguous().view({1, 1, padded, nfft});
+    // stitch tiles back to [padded,nfft], crop to rows, write the compact mask into the caller buffer
+    auto stitched = mask_tiles.squeeze(1).contiguous().view({padded, nfft});
     if (padded != rows) {
-      stitched = stitched.index({torch::indexing::Slice(), torch::indexing::Slice(),
-                                 torch::indexing::Slice(0, rows), torch::indexing::Slice()});
+      stitched = stitched.narrow(0, 0, rows);
     }
-    auto up = F::interpolate(
-        stitched, F::InterpolateFuncOptions().size(std::vector<int64_t>{rows, wide}).mode(torch::kNearest));
-    auto out_u8 = (up.squeeze(0).squeeze(0) >= 0.5f).to(torch::kUInt8).contiguous();  // [rows,wide]
-
-    cudaMemcpyAsync(out_mask_wide, out_u8.data_ptr<uint8_t>(),
-                    static_cast<size_t>(rows) * wide, cudaMemcpyDeviceToDevice, stream);
-    if (inference_ms) cudaEventRecord(ev1, stream);
-    cudaStreamSynchronize(stream);  // keep out_u8 alive until the copy completes + mask valid downstream
-    if (inference_ms) {
-      float ms = 0.0f;
-      cudaEventElapsedTime(&ms, ev0, ev1);
-      *inference_ms = static_cast<double>(ms);
-      cudaEventDestroy(ev0);
-      cudaEventDestroy(ev1);
+    auto out = torch::from_blob(out_mask_compact, {rows, nfft},
+                                torch::TensorOptions().dtype(torch::kUInt8).device(device));
+    out.copy_(stitched);
+    if (time_it) {
+      cudaEventRecord(impl_->ev1, stream);
+      impl_->timed = true;
     }
+    // No synchronize: every temporary above was allocated on `stream`, so the caching allocator only
+    // hands their blocks out again in stream order; the caller syncs `stream` before emitting.
     return true;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "[finetuned_dino_detector] forward_downsampled error: %s\n", e.what());
@@ -152,7 +175,7 @@ bool FinetunedDinoTorchRuntime::forward_downsampled(const float* normalized_wide
   }
 #else
   (void)normalized_wide; (void)rows; (void)wide; (void)tile_rows; (void)nfft; (void)threshold;
-  (void)out_mask_wide; (void)stream; (void)inference_ms;
+  (void)out_mask_compact; (void)stream; (void)time_it; (void)wrap_edges;
   return false;
 #endif
 }

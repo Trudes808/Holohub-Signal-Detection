@@ -80,6 +80,7 @@ target_link_libraries(finetuned_dino_detector
     holoscan::core
     matx::matx
     CUDA::cudart
+    CUDA::cufft
 )
 
 if(Torch_FOUND)

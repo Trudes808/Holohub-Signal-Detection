@@ -166,6 +166,7 @@ target_include_directories(CHDR_converter_wideband
 
 add_executable(usrp_wideband_signal_detection
   main.cpp
+  mask_dump_sink.hpp
   spectrogram_visualization.cu
   screenshot_sink.cpp
   signal_snip_core.cu

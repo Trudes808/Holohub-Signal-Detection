@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../usrp_freq_detection/CHDR_converter/chdr_rx.h"
 #include "fft_runtime_config.hpp"
+#include "mask_dump_sink.hpp"
 #include "sigmf_file_sink.hpp"
 #include "signal_snipper.hpp"
 #include "snippet_compression.hpp"
@@ -590,10 +591,20 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       enable_visualization ? std::max(1, from_config("visualization.renderer.render_every_n_frames").as<int>()) : 1;
     const int visual_emit_stride = 1;
     const int visual_mask_emit_stride = 1;
+    // Who consumes the FFT output: the spectrogram chain (dashboard / saves / spectrogram-fed logger
+    // or detector), an FFT-direct detector or dashboard (coherent), or the FFT-fed logger. The
+    // IQ-tapping fine-tuned DINO detector consumes neither, so in lean mode (no dashboard, no saves,
+    // logger disabled) the FFT output had NO consumer and the graph deadlock-stopped after a few
+    // batches (seen 2026-10-21, `visualization.enable: false` + cuda_dino_finetuned). Skip the FFT
+    // branch entirely in that case: detector + snipper + mask dump run straight off the CHDR
+    // converter, and the GPU is not spent on an FFT nobody reads.
+    const bool fft_required =
+        spectrogram_required || detector_consumes_fft_directly || visualization_consumes_fft_directly ||
+        (enable_logger_branch && !effective_log_from_spectrogram);
 
     std::vector<std::shared_ptr<holoscan::Operator>> fftOps;
     fftOps.reserve(static_cast<size_t>(pipeline_channels));
-    for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+    for (int channel_index = 0; fft_required && channel_index < pipeline_channels; ++channel_index) {
       fftOps.push_back(make_operator<ops::FFT>(
         std::string("fftOpCh") + std::to_string(channel_index),
         from_config("fft"),
@@ -721,12 +732,41 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
       }
     }
 
+    // VALIDATION ONLY: detector-agnostic dump of every emitted mask (same grid/frame_number the viz
+    // and snipper consume) so a live/loopback run can be scored against the offline eval and its
+    // cadence/latency/drops reconstructed. Off unless mask_dump.dir (config) or USRP_MASK_DUMP_DIR
+    // (env, wins) is set; zero cost when off. See mask_dump_sink.hpp.
+    std::vector<std::shared_ptr<holoscan::Operator>> maskDumpSinkOps;
+    {
+      const std::string mask_dump_dir = env_string("USRP_MASK_DUMP_DIR").value_or(
+          usrp_wideband::from_config_or<std::string>(*this, "mask_dump.dir", std::string{}));
+      const int mask_dump_max_frames =
+          usrp_wideband::from_config_or<int>(*this, "mask_dump.max_frames", 0);
+      if (enable_detector && !mask_dump_dir.empty()) {
+        for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
+          std::string dir = mask_dump_dir;
+          if (pipeline_channels > 1) dir += "/ch" + std::to_string(channel_index);
+          maskDumpSinkOps.push_back(make_operator<ops::MaskDumpSinkOp>(
+              std::string("maskDumpSinkOpCh") + std::to_string(channel_index),
+              holoscan::Arg("dir") = dir,
+              holoscan::Arg("max_frames") = mask_dump_max_frames));
+        }
+        HOLOSCAN_LOG_INFO("Emitted-mask dump ENABLED -> {} (max_frames={}, {} channel(s))",
+                          mask_dump_dir, mask_dump_max_frames, pipeline_channels);
+      }
+    }
+
     if (enable_visualization && !enable_spectrogram) {
       HOLOSCAN_LOG_ERROR("visualization.enable=true requires pipeline.enable_spectrogram=true");
       exit(1);
     }
 
-    if (bypass_spectrogram_passthrough) {
+    if (bypass_spectrogram_passthrough && !fft_required) {
+      HOLOSCAN_LOG_INFO(
+          "Lean mode with an IQ-tapping detector ({}): no consumer for the FFT output, so the FFT/"
+          "spectrogram branch is not instantiated (detector + snipper run straight off the CHDR converter).",
+          detector_type);
+    } else if (bypass_spectrogram_passthrough) {
       HOLOSCAN_LOG_INFO(
           "Bypassing spectrogramOp in lean performance mode; detector will consume FFT output directly.");
       HOLOSCAN_LOG_INFO(
@@ -920,14 +960,24 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
     if (unusedChdrOutputDropOp) {
       add_operator(unusedChdrOutputDropOp);
     }
+    for (auto& op : maskDumpSinkOps) {
+      add_operator(op);
+    }
 
     for (int channel_index = 0; channel_index < pipeline_channels; ++channel_index) {
       const char* chdr_port = channel_index == 0 ? "out0" : "out1";
-      auto& fftOp = fftOps[static_cast<size_t>(channel_index)];
-      add_flow(chdrConverterOp, fftOp, {{chdr_port, "in"}});
-
-      std::shared_ptr<holoscan::Operator> detector_source = fftOp;
-      std::shared_ptr<holoscan::Operator> logger_source = fftOp;
+      // fftOp stays null when the FFT branch is skipped (lean mode + IQ-tapping detector); every use
+      // below is gated by a condition that implies fft_required (coherent/cuda_dino detectors, the
+      // spectrogram chain, the FFT-fed logger, the FFT-direct dashboard).
+      std::shared_ptr<holoscan::Operator> fftOp;
+      std::shared_ptr<holoscan::Operator> detector_source;
+      std::shared_ptr<holoscan::Operator> logger_source;
+      if (fft_required) {
+        fftOp = fftOps[static_cast<size_t>(channel_index)];
+        add_flow(chdrConverterOp, fftOp, {{chdr_port, "in"}});
+        detector_source = fftOp;
+        logger_source = fftOp;
+      }
       if (spectrogram_required) {
         auto& spectrogramOp = spectrogramOps[static_cast<size_t>(channel_index)];
         add_flow(fftOp, spectrogramOp);
@@ -997,6 +1047,17 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
         }
       }
 
+      if (!maskDumpSinkOps.empty()) {
+        auto& dumpOp = maskDumpSinkOps[static_cast<size_t>(channel_index)];
+        if (detector_type == "coherent_power") {
+          add_flow(coherentDetectorOps[static_cast<size_t>(channel_index)], dumpOp, {{"mask_out", "in"}});
+        } else if (detector_type == "cuda_dino") {
+          add_flow(cudaDinoDetectorOps[static_cast<size_t>(channel_index)], dumpOp, {{"mask_out", "in"}});
+        } else if (detector_type == "cuda_dino_finetuned") {
+          add_flow(finetunedDinoDetectorOps[static_cast<size_t>(channel_index)], dumpOp, {{"mask_out", "in"}});
+        }
+      }
+
       if (enable_logger_branch && effective_log_from_spectrogram) {
         if (!enable_spectrogram) {
           HOLOSCAN_LOG_ERROR("pipeline.log_from_spectrogram=true requires pipeline.enable_spectrogram=true");
@@ -1044,6 +1105,19 @@ class UsrpWidebandSignalDetectionPipeline : public holoscan::Application {
 };
 
 int main(int argc, char** argv) {
+  // Keep freed stream-ordered allocations cached in the device's default memory pool. With the
+  // default release threshold (0) the pool returns memory to the OS at every synchronization, so the
+  // next cudaMallocAsync (MatX async tensors such as the FFT operator's per-frame output, the snipper)
+  // has to re-map it: measured 2026-10-21 at ~0.3 ms mean per call, ~11 calls per frame.
+  {
+    int device = 0;
+    cudaMemPool_t default_pool = nullptr;
+    if (cudaGetDevice(&device) == cudaSuccess &&
+        cudaDeviceGetDefaultMemPool(&default_pool, device) == cudaSuccess) {
+      uint64_t release_threshold = std::numeric_limits<uint64_t>::max();
+      cudaMemPoolSetAttribute(default_pool, cudaMemPoolAttrReleaseThreshold, &release_threshold);
+    }
+  }
   auto app = holoscan::make_application<UsrpWidebandSignalDetectionPipeline>();
 
   app->enable_metadata(true);

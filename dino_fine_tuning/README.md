@@ -74,6 +74,10 @@ pick the interpreter).
 its own `nfft`-point FFT to reproduce the trained per-pixel physics, so a model trained at
 245.76 MSps geometry is applied to a 491.52 MSps stream through the `real_time_downsample`
 front end; see §3 for the models trained directly at the deployment rate.
+The app also offers a short-FFT variant of that front end (`downsample_time_pool`, app README §7,
+`config_live_v3_dino_ft_m5s_sf2048.yaml`). M5-S was trained on the wide-FFT front end that
+`src/frontend.py` replicates, so port the pooling into `src/frontend.py` before retraining a model for
+that deployment.
 
 ---
 

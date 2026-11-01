@@ -213,7 +213,7 @@ void maybe_log_channel_summary(const std::shared_ptr<ChdrConverterOpRx::Channel>
       (window_s > 0.0) ? (static_cast<double>(channel->periodic_summary_packets) / window_s / 1.0e6)
                        : 0.0;
   HOLOSCAN_LOG_INFO(
-      "CHDR summary ch={} window_s={:.3f} bursts={} packets={} rate={:.3f} Mpps queued={} emitted={} empty_polls={} backlog_events={} out_q_depth={} max_out_q_depth={} aggr_pkts_recv={} max_burst_packets={} refcounted_bursts={} partial_drops={} consecutive_partial_flushes={} panic_resets={}",
+      "CHDR summary ch={} window_s={:.3f} bursts={} packets={} rate={:.3f} Mpps queued={} emitted={} empty_polls={} backlog_events={} out_q_depth={} max_out_q_depth={} aggr_pkts_recv={} max_burst_packets={} refcounted_bursts={} partial_drops={} consecutive_partial_flushes={} panic_resets={} ring_full_shed_bursts={} ring_full_shed_pkts={}",
       channel->channel_num,
       window_s,
       channel->periodic_summary_bursts,
@@ -230,7 +230,9 @@ void maybe_log_channel_summary(const std::shared_ptr<ChdrConverterOpRx::Channel>
       channel->burst_refcounts.size(),
       channel->timeout_like_partial_drains,
       channel->consecutive_partial_flushes,
-      channel->panic_resets);
+      channel->panic_resets,
+      channel->ring_full_shed_bursts,
+      channel->ring_full_shed_packets);
 
   channel->periodic_summary_start_ns = channel->periodic_summary_last_ns;
   channel->periodic_summary_batches_queued = 0;
@@ -461,6 +463,13 @@ void ChdrConverterOpRx::initialize() {
   }
 
   num_packets_per_batch = num_ffts_per_batch_.get() * num_packets_per_fft_.get();
+  if (const char* e = std::getenv("CHDR_DEBUG_FATAL_AT_BATCH"); e != nullptr && e[0] != '\0') {
+    debug_fatal_at_batch_ = std::strtoull(e, nullptr, 10);
+    if (debug_fatal_at_batch_ != 0) {
+      HOLOSCAN_LOG_WARN("CHDR TEST KNOB armed: a CUDA fault will be SIMULATED when batch {} is queued",
+                        debug_fatal_at_batch_);
+    }
+  }
   center_frequency_by_channel_ = parse_channel_values(channel_center_frequencies_hz_.get(),
                                                       "channel_center_frequencies_hz");
   sample_rate_by_channel_ = parse_channel_values(channel_sample_rates_hz_.get(),
@@ -504,7 +513,11 @@ std::optional<ChdrConverterOpRx::RxMsg> ChdrConverterOpRx::free_buf(
         std::shared_ptr<struct Channel> channel) {
   if (!channel->out_q.empty()) {
     auto first = channel->out_q.front();
-    if (cudaEventQuery(first.evt) == cudaSuccess) {
+    const cudaError_t query_status = cudaEventQuery(first.evt);
+    if (query_status != cudaSuccess && query_status != cudaErrorNotReady) {
+      fatal_cuda_error(channel, "cudaEventQuery(batch gather event)", query_status);
+    }
+    if (query_status == cudaSuccess) {
       const double release_latency_ms = elapsed_ms_since(first.queued_ns);
       channel->release_samples++;
       channel->total_release_latency_ms += release_latency_ms;
@@ -540,6 +553,29 @@ void ChdrConverterOpRx::release_burst_ref(
     channel->burst_refcounts.erase(ref);
     free_all_packets_and_burst_rx(burst);
   }
+}
+
+void ChdrConverterOpRx::fatal_cuda_error(std::shared_ptr<struct Channel> channel,
+                                         const char* where,
+                                         cudaError_t err) {
+  const int ch = channel ? static_cast<int>(channel->channel_num) : -1;
+  const uint64_t queued = channel ? channel->completed_batches_queued : 0;
+  const uint64_t emitted = channel ? channel->completed_batches_emitted : 0;
+  const size_t depth = channel ? channel->out_q.size() : 0;
+  HOLOSCAN_LOG_ERROR(
+      "FATAL CUDA error in CHDR converter ({}) on channel {}: {} ({}). The CUDA context is unusable; "
+      "check `sudo dmesg | grep -i xid` for the GPU-side cause. queued_batches={} emitted_batches={} "
+      "out_q_depth={}. Terminating without teardown.",
+      where, ch, cudaGetErrorString(err), static_cast<int>(err), queued, emitted, depth);
+  std::fprintf(stderr,
+               "[chdr_converter] FATAL CUDA error (%s) ch=%d: %s -- exiting with status 1 (no teardown)\n",
+               where, ch, cudaGetErrorString(err));
+  std::fflush(stdout);
+  std::fflush(stderr);
+  // _Exit, not exit(): running static destructors from this RX thread while the scheduler's worker
+  // threads and the DPDK lcores are still live is what produced the SIGSEGV. The OS reclaims the
+  // process; the run wrappers already clear the DPDK hugepage files before the next start.
+  std::_Exit(EXIT_FAILURE);
 }
 
 void ChdrConverterOpRx::flush_partial_batch(
@@ -718,10 +754,11 @@ void ChdrConverterOpRx::queue_completed_batch(
   }
 
   auto ret = cudaGetLastError();
+  if (debug_fatal_at_batch_ != 0 && channel->completed_batches_queued == debug_fatal_at_batch_) {
+    ret = cudaErrorIllegalAddress;  // TEST ONLY: simulated sticky fault (CHDR_DEBUG_FATAL_AT_BATCH)
+  }
   if (ret != cudaSuccess) {
-    HOLOSCAN_LOG_ERROR("CUDA error with {} packets in batch", num_ffts_per_batch_.get());
-    HOLOSCAN_LOG_ERROR("Error: {}", cudaGetErrorString(ret));
-    exit(1);
+    fatal_cuda_error(channel, "batch gather launch", ret);
   }
 
   channel->aggr_pkts_recv = 0;
@@ -891,7 +928,12 @@ void ChdrConverterOpRx::compute(
           channel->completed_batches_emitted,
           channel->burst_refcounts.size(),
           channel->out_q.empty() ? 0.0 : elapsed_ms_since(channel->out_q.front().queued_ns));
-      cudaStreamSynchronize(channel->streams[channel->cur_idx]);
+      // With the ring full, cur_idx is the oldest queued slot: wait for its gather. If the wait
+      // itself fails, the context is dead -- continuing would refill slots whose gathers never ran.
+      const cudaError_t sync_status = cudaStreamSynchronize(channel->streams[channel->cur_idx]);
+      if (sync_status != cudaSuccess) {
+        fatal_cuda_error(channel, "cudaStreamSynchronize(backlogged slot)", sync_status);
+      }
       if (!emitted_this_tick[q]) {
         emitted_this_tick[q] = free_bufs_and_emit_arrays(op_output, channel) ? 1 : 0;
       }
@@ -1037,6 +1079,41 @@ void ChdrConverterOpRx::process_channel_data(
       queue_completed_batch(channel, num_packets_per_batch, false);
     }
 
+    // Ring-full guard (2026-10-21 loopback stress test). out_q is FIFO over the slot ring, so with
+    // num_simul_batches entries queued, cur_idx IS the oldest queued slot: its batch is not emitted
+    // yet and its gather may not even have run. Filling it now would either hand that pending
+    // gather the NEW packet pointers (h_dev_ptrs is read when the kernel runs) or overwrite the
+    // un-emitted batch before downstream sees it -- a torn / mislabeled frame. compute()'s backlog
+    // handler waits for that slot at the start of each tick; this covers the case where a batch
+    // completes mid-burst and the remainder would start the next batch inside the same tick. Shed
+    // the remainder as a COUNTED drop (the GPU is >= num_simul_batches batches behind, and the NIC
+    // is already discarding at that point); never emit here (one emit per port per tick).
+    const size_t ring_slots = static_cast<size_t>(num_simul_batches_.get());
+    if (channel->out_q.size() >= ring_slots) {
+      const int shed_packets = std::max(0, burst_packets - packet_offset);
+      channel->ring_full_shed_bursts++;
+      channel->ring_full_shed_packets += static_cast<uint64_t>(shed_packets);
+      if (channel->ring_full_shed_bursts <= 3 || (channel->ring_full_shed_bursts % 1000) == 0) {
+        HOLOSCAN_LOG_WARN(
+            "CHDR ch={} slot ring full ({} batches not yet emitted, oldest queued {:.1f} ms ago): shedding {} "
+            "packets of this burst instead of refilling slot {} (shed so far: bursts={} packets={})",
+            channel->channel_num,
+            channel->out_q.size(),
+            channel->out_q.empty() ? 0.0 : elapsed_ms_since(channel->out_q.front().queued_ns),
+            shed_packets,
+            channel->cur_idx,
+            channel->ring_full_shed_bursts,
+            channel->ring_full_shed_packets);
+      }
+      if (packet_offset == 0) {
+        // Nothing of this burst is referenced by cur_msg yet: return it to the NIC now. Otherwise
+        // the copied head is already refcounted by the batch it completed and is released with it;
+        // the remainder is simply not copied.
+        free_all_packets_and_burst_rx(burst);
+      }
+      return;
+    }
+
     const uint32_t remaining_capacity = num_packets_per_batch - channel->aggr_pkts_recv;
     const int packets_to_copy = std::min<int>(remaining_capacity, burst_packets - packet_offset);
     if (packets_to_copy <= 0) {
@@ -1128,7 +1205,9 @@ void ChdrConverterOpRx::stop() {
         "       Max out_q depth: {}\n"
         "      Max burst packets: {}\n"
         " Mean release dwell ms: {:.3f}\n"
-        "  Max release dwell ms: {:.3f}\n",
+        "  Max release dwell ms: {:.3f}\n"
+        "  Ring-full shed bursts: {}\n"
+        " Ring-full shed packets: {}\n",
         channel->channel_num,
         channel->ttl_bytes_recv,
         channel->ttl_pkts_recv,
@@ -1146,7 +1225,9 @@ void ChdrConverterOpRx::stop() {
         channel->max_out_q_depth,
           channel->max_burst_packets,
         channel->release_samples == 0 ? 0.0 : channel->total_release_latency_ms / static_cast<double>(channel->release_samples),
-        channel->max_release_latency_ms);
+        channel->max_release_latency_ms,
+        channel->ring_full_shed_bursts,
+        channel->ring_full_shed_packets);
   }
   holoscan::Operator::stop();
 }

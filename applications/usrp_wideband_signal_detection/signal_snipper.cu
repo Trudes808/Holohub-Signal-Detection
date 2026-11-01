@@ -77,6 +77,21 @@ void SignalSnipperOp::setup(holoscan::OperatorSpec& spec) {
              "Full stream sample rate used if not present in metadata.", 0.0);
 }
 
+namespace {
+// compact[r][k] = wide[r][k * repeat]: the columns inside each group of `repeat` are identical by
+// construction (DetectorMaskMessage::col_repeat), so one sample per group is the whole information.
+__global__ void snip_gather_cols_kernel(const uint8_t* __restrict__ wide, int rows, int wide_cols, int repeat,
+                                        uint8_t* __restrict__ compact) {
+  const int compact_cols = wide_cols / repeat;
+  const long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  const long total = (long)rows * compact_cols;
+  if (idx >= total) return;
+  const int r = idx / compact_cols;
+  const int k = idx - (long)r * compact_cols;
+  compact[idx] = wide[(long)r * wide_cols + (long)k * repeat];
+}
+}  // namespace
+
 void SignalSnipperOp::initialize() {
   holoscan::Operator::initialize();
   // Draining multiple IQ messages plus a mask per compute merges metadata from several messages;
@@ -287,22 +302,59 @@ void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask, SnippetBatch
       mask.file_offset_complex > 0 ? mask.file_offset_complex
                                    : (mask.frame_number > 0 ? (mask.frame_number - 1) * entry->n_iq : 0);
 
-  // Copy the small mask to the host (reused scratch) and cluster it into per-signal boxes.
+  // Copy the mask to the host (pinned staging, async on snip_stream_) and cluster it into boxes. A
+  // column-replicated mask (col_repeat R > 1, e.g. the DINO real-time path: 1024 model columns
+  // repeated 10x/20x onto the display grid) is first gathered to its compact form on the GPU: the
+  // readback and the CPU labeling shrink R-fold, and every result below is IDENTICAL to labeling the
+  // wide mask (component pixel counts scale by R, column bounds map back exactly, see below).
   const size_t mask_bytes = static_cast<size_t>(mask.width) * static_cast<size_t>(mask.height);
-  host_mask_.resize(mask_bytes);
+  const int repeat = (mask.col_repeat > 1 && mask.device_pixels && mask.width % mask.col_repeat == 0)
+                         ? mask.col_repeat : 1;
+  const int work_cols = mask.width / repeat;
+  const size_t work_bytes = static_cast<size_t>(work_cols) * static_cast<size_t>(mask.height);
+  host_mask_.resize(work_bytes);
   if (mask.device_pixels) {
-    cudaMemcpy(host_mask_.data(), mask.device_pixels.get(), mask_bytes, cudaMemcpyDeviceToHost);
+    if (mask_pinned_bytes_ < work_bytes) {
+      if (mask_pinned_) cudaFreeHost(mask_pinned_);
+      mask_pinned_ = nullptr;
+      mask_pinned_bytes_ = 0;
+      if (cudaMallocHost(&mask_pinned_, work_bytes) != cudaSuccess) {
+        throw std::runtime_error("SignalSnipperOp: pinned mask staging allocation failed");
+      }
+      mask_pinned_bytes_ = work_bytes;
+    }
+    const uint8_t* src = mask.device_pixels.get();
+    if (repeat > 1) {
+      if (compact_device_bytes_ < work_bytes) {
+        if (compact_device_) cudaFree(compact_device_);
+        compact_device_ = nullptr;
+        compact_device_bytes_ = 0;
+        if (cudaMalloc(&compact_device_, work_bytes) != cudaSuccess) {
+          throw std::runtime_error("SignalSnipperOp: compact mask scratch allocation failed");
+        }
+        compact_device_bytes_ = work_bytes;
+      }
+      const long total = static_cast<long>(work_bytes);
+      snip_gather_cols_kernel<<<static_cast<int>((total + 255) / 256), 256, 0, snip_stream_>>>(
+          src, mask.height, mask.width, repeat, compact_device_);
+      src = compact_device_;
+      ++compact_masks_;
+    }
+    cudaMemcpyAsync(mask_pinned_, src, work_bytes, cudaMemcpyDeviceToHost, snip_stream_);
+    cudaStreamSynchronize(snip_stream_);
+    std::copy_n(mask_pinned_, work_bytes, host_mask_.begin());
   } else if (mask.pixels.size() >= mask_bytes) {
     std::copy_n(mask.pixels.begin(), mask_bytes, host_mask_.begin());
   } else {
     return;
   }
 
-  // Flood guard: a mask covering most of the band-time is a detector fault, not signal.
+  // Flood guard: a mask covering most of the band-time is a detector fault, not signal. (Compact: each
+  // set pixel stands for `repeat` wide pixels, so lit*repeat vs the wide pixel count is exact.)
   const double max_occ = max_mask_occupancy_.get();
   if (max_occ > 0.0 && mask_bytes > 0) {
-    const size_t lit = static_cast<size_t>(
-        std::count_if(host_mask_.begin(), host_mask_.begin() + mask_bytes,
+    const size_t lit = static_cast<size_t>(repeat) * static_cast<size_t>(
+        std::count_if(host_mask_.begin(), host_mask_.begin() + work_bytes,
                       [](uint8_t v) { return v != 0; }));
     if (static_cast<double>(lit) > max_occ * static_cast<double>(mask_bytes)) {
       ++flood_skips_;
@@ -324,11 +376,22 @@ void SignalSnipperOp::process_mask(const DetectorMaskMessage& mask, SnippetBatch
   if (min_mask_bw > 0.0 && sample_rate > 0.0 && mask.width > 0) {
     const double hz_per_col = sample_rate / static_cast<double>(mask.width);
     const int min_run_cols = static_cast<int>(std::ceil(min_mask_bw / hz_per_col));
-    snip::filter_mask_min_run_cols(host_mask_, mask.height, mask.width, min_run_cols);
+    // A compact run of l columns is a wide run of l*repeat: drop iff l*repeat < m  <=>  l < ceil(m/repeat).
+    const int min_run_work = (min_run_cols + repeat - 1) / repeat;
+    snip::filter_mask_min_run_cols(host_mask_, mask.height, work_cols, min_run_work);
   }
 
-  auto boxes =
-      snip::label_components(host_mask_, mask.height, mask.width, min_box_pixels_.get(), cc_scratch_);
+  // Keep iff pixel_count*repeat >= min_box_pixels  <=>  pixel_count >= ceil(min_box_pixels / repeat).
+  const int min_pixels_work = (min_box_pixels_.get() + repeat - 1) / repeat;
+  auto boxes = snip::label_components(host_mask_, mask.height, work_cols, min_pixels_work, cc_scratch_);
+  if (repeat > 1) {
+    // Back onto the wide grid: compact column k covers wide columns [k*repeat, k*repeat + repeat - 1].
+    for (auto& box : boxes) {
+      box.col0 *= repeat;
+      box.col1 = box.col1 * repeat + (repeat - 1);
+      box.pixel_count *= repeat;
+    }
+  }
   boxes = snip::merge_boxes(std::move(boxes), merge_gap_rows_.get(), merge_gap_cols_.get());
   boxes = snip::filter_boxes_by_size(std::move(boxes), geom,
                                      min_bandwidth_hz_.get(), min_duration_s_.get());
@@ -432,6 +495,10 @@ void SignalSnipperOp::stop() {
   if (snip_stream_ != nullptr) {
     cudaStreamSynchronize(snip_stream_);
     cudaStreamDestroy(snip_stream_);
+    if (mask_pinned_) cudaFreeHost(mask_pinned_);
+    mask_pinned_ = nullptr;
+    if (compact_device_) cudaFree(compact_device_);
+    compact_device_ = nullptr;
     snip_stream_ = nullptr;
   }
   for (auto& ev : event_pool_) {
@@ -441,8 +508,8 @@ void SignalSnipperOp::stop() {
   }
   event_pool_.clear();
   ring_.clear();
-  HOLOSCAN_LOG_INFO("signal_snipper: processed {} masks, emitted {} snippets.",
-                    masks_processed_, snippets_emitted_);
+  HOLOSCAN_LOG_INFO("signal_snipper: processed {} masks ({} via the compact column-replicated path), emitted {} snippets.",
+                    masks_processed_, compact_masks_, snippets_emitted_);
   holoscan::Operator::stop();
 }
 

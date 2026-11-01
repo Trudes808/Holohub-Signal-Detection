@@ -86,6 +86,13 @@ class SignalSnipperOp : public holoscan::Operator {
   // Per-frame host scratch, reused to avoid reallocating ~5 MB buffers every masked frame.
   std::vector<uint8_t> host_mask_;
   snip::CcScratch cc_scratch_;
+  // Mask readback staging: pinned host buffer (async D2H on snip_stream_, no legacy-stream cudaMemcpy)
+  // and a device scratch for the compact gather of column-replicated masks (DetectorMaskMessage::col_repeat).
+  uint8_t* mask_pinned_ = nullptr;
+  size_t mask_pinned_bytes_ = 0;
+  uint8_t* compact_device_ = nullptr;
+  size_t compact_device_bytes_ = 0;
+  uint64_t compact_masks_ = 0;
   std::deque<RingEntry> ring_;
   uint64_t iq_arrival_counter_ = 0;
   uint64_t last_processed_mask_frame_ = 0;

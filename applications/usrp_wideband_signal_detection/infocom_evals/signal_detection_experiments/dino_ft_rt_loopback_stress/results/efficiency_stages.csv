@@ -1,0 +1,15 @@
+stage,run,leg,rate_msps,offered_kpps,frames_emitted,frames_expected,packet_loss_pct,pool_drain_pct,pool_exhausted,sustained,detector_gpu_p50_ms,gpu_util_mean_pct,fell_behind,mask_dump_frames
+before,nodump_dinoft_rt_m5s_245,dinoft_rt_m5s,245.76,240.0,682,684,0.37,5.6,True,False,21.7,69.4,0,0
+before,dinoft_rt_m5s_245,dinoft_rt_m5s,245.76,240.0,342,342,0.0,8.3,False,False,22.0728,67.8,0,342
+stage1,s1_full_245,dinoft_rt_m5s,245.76,240.0,684,684,0.0,0.0,False,True,16.585,71.1,0,0
+stage2,s2_full_245,dinoft_rt_m5s,245.76,240.0,684,684,0.0,0.0,False,True,16.075000000000003,65.9,3,0
+stage3,s3_full_245,dinoft_rt_m5s_sf2048p,245.76,240.0,684,684,0.0,0.0,False,True,14.844999999999999,63.0,1,0
+stage3,s3_score_245,dinoft_rt_m5s_sf2048p,245.76,240.0,342,342,0.0,0.3,False,True,14.96995,61.2,0,342
+before,dinoft_rt_m5s_491,dinoft_rt_m5s,491.52,401.6,715,1026,30.38,0.0,True,False,32.7343,70.4,1,715
+before,dinoft_rt_m5s_491c,dinoft_rt_m5s,491.52,423.7,685,1026,33.29,0.1,True,False,33.8285,71.9,1,685
+stage1,s1_full_491,dinoft_rt_m5s,491.52,391.5,1024,1026,0.19,0.0,False,False,24.4,85.4,1,0
+stage2,s2_full_491,dinoft_rt_m5s,491.52,375.5,1026,1026,0.0,0.0,False,True,22.27,80.9,0,0
+stage3,s3_full_491,dinoft_rt_m5s_sf2048p,491.52,392.9,1026,1026,0.0,0.0,False,True,20.84,75.1,1,0
+stage3,s3_full_491_pm,dinoft_rt_m5s_sf2048p,491.52,385.4,1026,1026,0.0,0.0,False,True,20.81,77.8,0,0
+stage2,half_dinoft_rt_m5s_491geom,dinoft_rt_m5s,491.52,240.0,513,513,0.0,0.0,False,True,22.4,49.9,0,0
+stage3,half_dinoft_rt_m5s_sf2048p_491geom,dinoft_rt_m5s_sf2048p,491.52,240.0,513,513,0.0,0.0,False,True,19.91,46.9,0,0

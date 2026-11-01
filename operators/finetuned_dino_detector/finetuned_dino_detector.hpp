@@ -51,24 +51,37 @@ class FinetunedDinoDetector : public holoscan::Operator {
 
  private:
   struct ChannelBuffers {
-    void*    spec_device        = nullptr;   // rows x nfft  complex (cuda::std::complex<float>)
-    float*   normalized_device  = nullptr;   // rows x nfft  ([0,1])
-    float*   db_device          = nullptr;   // rows x nfft  dB (fftshifted, gain-corrected) for flatten
-    float*   col_stat_device    = nullptr;   // nfft  per-frequency floor estimate (dB)
-    float*   col_smooth_device  = nullptr;   // nfft  smoothed per-frequency floor (dB)
+    void*    spec_device        = nullptr;   // fft_rows x fft_size complex (cuda::std::complex<float>)
+    float*   normalized_device  = nullptr;   // img_rows x img_cols ([0,1]) -- the model's input image
+    float*   db_device          = nullptr;   // img_rows x img_cols dB (fftshifted, gain-corrected)
+    float*   col_stat_device    = nullptr;   // img_cols per-frequency floor estimate (dB)
+    float*   col_smooth_device  = nullptr;   // img_cols smoothed per-frequency floor (dB)
     float*   frontend_reference_device = nullptr;  // scalar reference floor level (dB)
     unsigned int* db_hist_device = nullptr;  // fixed-bin histogram of the dB image (robust normalization)
     float*   robust_stats_device = nullptr;  // [low_pct_db, high_pct_db] from the histogram CDF
-    float*   tile_batch_device  = nullptr;   // B x 1 x tile_rows x nfft (model input)
-    float*   logits_device      = nullptr;   // B x 1 x tile_rows x nfft (model output)
-    uint8_t* tile_mask_device   = nullptr;   // B x tile_rows x nfft (thresholded)
+    float*   clip_params_device = nullptr;   // [clip_vmin, clip_inv_span, use_robust, -] decided on GPU
+    unsigned long long* guard_count_device = nullptr;  // nonzero mask pixels (invalid-frame guard)
+    float*   host_stats_pinned  = nullptr;   // pinned: [stats0, stats1, params0, params1, params2, ref, -, -]
+    unsigned long long* host_guard_count_pinned = nullptr;  // pinned readback of guard_count_device
+    float*   tile_batch_device  = nullptr;   // B x 1 x tile_rows x nfft (native model input)
+    float*   logits_device      = nullptr;   // B x 1 x tile_rows x nfft (native model output)
+    uint8_t* tile_mask_device   = nullptr;   // B x tile_rows x nfft (native, thresholded)
+    uint8_t* compact_mask_device = nullptr;  // img_rows x nfft (downsample path model-resolution mask)
     float*   window_device      = nullptr;   // fft_size  analysis window (freq axis); leakage suppression
     size_t   window_len         = 0;         // fft_size the window is currently filled for
-    size_t rows = 0;
-    size_t nfft = 0;
+    int      fft_plan           = 0;         // cufftHandle (int) for fft_rows x fft_size C2C, 0 = none
+    bool     fft_plan_valid     = false;
+    cudaEvent_t ev_total0 = nullptr, ev_total1 = nullptr;    // whole-operator span per frame
+    cudaEvent_t ev_native0 = nullptr, ev_native1 = nullptr;  // native-path model span per frame
+    size_t fft_rows = 0;   // rows of fft_size-point transforms in a frame
+    size_t fft_size = 0;
+    size_t img_rows = 0;   // rows of the model input image (== fft_rows unless time pooling)
+    size_t img_cols = 0;   // cols of the model input image before the torch resize (== fft_size)
+    size_t nfft = 0;       // model width
     size_t tile_rows = 0;
     size_t batch = 0;
-    void ensure(size_t new_rows, size_t new_nfft, size_t new_tile_rows, size_t new_batch);
+    void ensure(size_t new_fft_rows, size_t new_fft_size, size_t new_img_rows, size_t new_img_cols,
+                size_t new_nfft, size_t new_tile_rows, size_t new_batch);
     void release();
   };
 
@@ -83,11 +96,19 @@ class FinetunedDinoDetector : public holoscan::Operator {
   holoscan::Parameter<int>         channel_filter_;
   holoscan::Parameter<int>         emit_stride_;
   holoscan::Parameter<std::string> torch_dtype_;         // "fp32" | "fp16"
+  holoscan::Parameter<bool>        torch_freeze_;        // torch::jit::freeze at load (folds per-forward weight casts)
   // Real-time "downsample" mode: run a wide FFT (downsample_fft_size) to reproduce the app's dynamic
   // spectrogram, then bilinear-resize the freq axis down to the model width before inference (bounded,
   // rate-independent cost). false = validated native path (dedicated nfft-point FFT, tile natively).
   holoscan::Parameter<bool>        real_time_downsample_;
   holoscan::Parameter<int>         downsample_fft_size_;
+  // Downsample path, optional SHORT-FFT front-end: transform at downsample_fft_size (< the auto/
+  // reference size, e.g. 2048 or 4096) and area-average consecutive rows back onto the reference
+  // row grid (frame / auto_fft_size(rate) rows, i.e. the trained 41.7 us row time), so the model
+  // still sees 2 tiles per frame but each column integrates every FFT bin it covers (a 2:1 or 4:1
+  // bilinear instead of 10:1 / 20:1, which skips 80-90% of the bins). Default off (validated path).
+  holoscan::Parameter<bool>        downsample_time_pool_;
+  holoscan::Parameter<std::string> downsample_time_pool_domain_;  // "db" (mean of dB) | "power" (dB of mean power)
 
   // Per-frequency noise-floor flatten (adapted from coherent_power's frontend correction): estimate a
   // smooth per-frequency floor from the frame and additively lift low-floor bins up to a data-derived
@@ -150,6 +171,7 @@ class FinetunedDinoDetector : public holoscan::Operator {
   bool level_log_emitted_ = false;
   bool adaptive_log_emitted_ = false;
   bool robust_log_emitted_ = false;
+  bool time_pool_warned_ = false;
   double inference_ms_ewma_ = 0.0;   // rolling mean of downsample inference time (ms)
   uint64_t inference_samples_ = 0;
   std::vector<uint64_t> frame_count_;
@@ -160,6 +182,11 @@ class FinetunedDinoDetector : public holoscan::Operator {
   // last ACCEPTED frame's) so a corrupt frame can be characterized as a short-count drop, a stale-buffer
   // reuse, or a full-count-but-corrupt frame. No ingest change; fires only on already-suppressed frames.
   bool                  guard_debug_ = false;
+  // DIAGNOSTIC (env DINO_DEBUG_STALL_FRAME + DINO_DEBUG_STALL_MS, read once at init; inert otherwise):
+  // sleep DINO_DEBUG_STALL_MS inside compute() on that ONE frame to emulate a hard consumer stall for
+  // ingest-robustness tests (CHDR slot-ring guard). Never set in production.
+  uint64_t              debug_stall_frame_ = 0;
+  int                   debug_stall_ms_ = 0;
   std::vector<uint64_t> prev_accept_fingerprint_;
   std::vector<ChannelBuffers> channel_buffers_;
   std::shared_ptr<FinetunedDinoTorchRuntime> runtime_;

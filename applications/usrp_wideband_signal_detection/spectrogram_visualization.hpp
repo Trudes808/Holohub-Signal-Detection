@@ -359,6 +359,11 @@ struct DetectorMaskMessage {
   std::shared_ptr<uint8_t> device_pixels;
   int width = 0;
   int height = 0;
+  // > 1: the mask is an exact column replication of a (width / col_repeat)-column mask (each source
+  // column repeated col_repeat times, e.g. the fine-tuned DINO real-time path's 1024-column model output
+  // on the 10240/20480-column display grid). Consumers may process the compact form instead (identical
+  // connected components / occupancy). 1 = no such structure (all other producers).
+  int col_repeat = 1;
   int channel = 0;
   uint64_t frame_number = 0;
   uint64_t file_offset_complex = 0;

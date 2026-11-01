@@ -17,7 +17,11 @@ class FinetunedDinoTorchRuntime {
   ~FinetunedDinoTorchRuntime();
 
   // Load the TorchScript module (dino_fine_tuning/weights/finetuned_dino_m*.ts), move to CUDA, eval().
-  bool load(const std::string& model_script_path, const std::string& torch_dtype);
+  // freeze: torch::jit::freeze the module (inline weights as constants + constant-propagate). The
+  // exports are traced under bf16 autocast, so an unfrozen forward re-casts every fp32 weight to bf16
+  // each call (~124 cast kernels per 2-tile forward); freezing folds those casts once. Verified
+  // bit-identical logits on the M5-S export (2026-10-21), ~1 ms faster per 2-tile forward.
+  bool load(const std::string& model_script_path, const std::string& torch_dtype, bool freeze = true);
 
   // Forward: input_device is B x 1 x tile_rows x nfft float in [0,1] (device); writes
   // logits_device (same shape). Runs on `stream`. Returns false on failure.
@@ -30,9 +34,12 @@ class FinetunedDinoTorchRuntime {
 
   // Real-time "downsample" path: normalized_wide is a rows x wide [0,1] dB spectrogram (device). The
   // frequency axis is bilinear-resized to the model width (nfft), tiled into tile_rows-row tiles, run
-  // through the segmenter, thresholded (sigmoid >= threshold), stitched, and nearest-upsampled back to
-  // rows x wide, written to out_mask_wide (device uint8). Everything runs in torch on `stream`.
-  // Returns false on failure. Optionally reports the pure-inference (resize+forward+post) time in ms.
+  // through the segmenter, thresholded (sigmoid >= threshold) and stitched into the COMPACT rows x nfft
+  // uint8 mask written to out_mask_compact (device, caller-owned). Everything is enqueued on `stream`
+  // and NOT synchronized here: torch temporaries go back to the caching allocator in stream order, and
+  // the caller synchronizes once per frame before emitting. The caller expands the compact mask to
+  // the wide grid (nearest, column replication) if it needs one. If time_it, the resize+forward+post
+  // span is bracketed by two persistent events; read it with last_inference_ms() AFTER that sync.
   //
   // wrap_edges: the M2_dr checkpoint has a measured BORDER bias -- on flat noise it fires on 30-70% of
   // its outermost columns and 0% mid-image (its training captures always had the receiver rolloff at
@@ -42,8 +49,11 @@ class FinetunedDinoTorchRuntime {
   // sat in the image center. No output column ever comes from a model border. Measured on the 491.52
   // OTA capture: edge-region firing 16.5% -> 0.00% with mid-band masks unchanged.
   bool forward_downsampled(const float* normalized_wide, int rows, int wide, int tile_rows, int nfft,
-                           float threshold, uint8_t* out_mask_wide, cudaStream_t stream,
-                           double* inference_ms = nullptr, bool wrap_edges = true);
+                           float threshold, uint8_t* out_mask_compact, cudaStream_t stream,
+                           bool time_it = false, bool wrap_edges = true);
+  // ms between the two events recorded by the last timed forward_downsampled(); -1 if unavailable.
+  // Only valid once the caller has synchronized the stream that forward was enqueued on.
+  double last_inference_ms() const;
 
   // Prime the model (a few dummy forwards) so the first real frame doesn't pay the one-time
   // cuDNN-autotune / allocation cost (~hundreds of ms). Call once after load(), before compute().

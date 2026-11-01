@@ -112,6 +112,11 @@ class ChdrConverterOpRx : public Operator {
     uint64_t completed_batches_emitted = 0;
     uint64_t bad_payload_pkts = 0;  // payload-size mismatches (foreign/truncated packets read as IQ)
     uint64_t backlog_events = 0;
+    // Ring-full guard: bursts (or burst remainders) shed because every rf_data slot still had an
+    // un-completed gather pending, so refilling cur_idx would have torn the frame (see
+    // process_channel_data). Counted drops instead of silent corruption.
+    uint64_t ring_full_shed_bursts = 0;
+    uint64_t ring_full_shed_packets = 0;
     uint64_t rx_bursts_received = 0;
     uint64_t empty_rx_polls = 0;
     uint64_t max_burst_packets = 0;
@@ -142,8 +147,18 @@ class ChdrConverterOpRx : public Operator {
   std::vector<std::shared_ptr<struct Channel>> channel_list;
   bool shutdown_requested_ = false;
   bool shutdown_force_exit_armed_ = false;
+  // TEST ONLY (env CHDR_DEBUG_FATAL_AT_BATCH=N, read once at init; 0 = inert): report a simulated
+  // cudaErrorIllegalAddress when batch N is queued, to exercise fatal_cuda_error() without faulting
+  // the GPU.
+  uint64_t debug_fatal_at_batch_ = 0;
 
   std::optional<RxMsg> free_buf(std::shared_ptr<struct Channel> channel);
+  // A CUDA error here means the context is unusable (sticky fault, e.g. after an Xid 31/109 in
+  // dmesg). Log one clear line and terminate immediately WITHOUT running static destructors: the
+  // previous exit(1) from this RX thread ran teardown while the other worker threads were still
+  // live and turned every such failure into a SIGSEGV whose backtrace pointed at the wrong place.
+  [[noreturn]] void fatal_cuda_error(std::shared_ptr<struct Channel> channel, const char* where,
+                                     cudaError_t err);
   bool free_bufs_and_emit_arrays(OutputContext& op_output, std::shared_ptr<struct Channel> channel);
   void retain_burst_ref(std::shared_ptr<struct Channel> channel, BurstParams* burst);
   void release_burst_ref(std::shared_ptr<struct Channel> channel, BurstParams* burst);

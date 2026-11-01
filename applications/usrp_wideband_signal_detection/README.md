@@ -250,6 +250,7 @@ See the header of each script for its inputs and policy knobs, and
 | --- | --- | --- |
 | `config_live_v3_single_channel.yaml` / `config_live_v3_two_channel.yaml` | coherent_power | **Live demo** start configs (`v5`, `v5dual`): snipper on, dashboard with DEMO CONTROLS. |
 | `config_live_v3_dino_ft_m5s.yaml` / `config_live_v3_dino_ft_m5s_two_channel.yaml` | cuda_dino_finetuned (M5-S) | Live demo DINO target (conductor switch) and the M5-S loopback runners. |
+| `config_live_v3_dino_ft_m5s_sf2048.yaml` | cuda_dino_finetuned (M5-S) | Same as the M5-S config with the short-FFT front-end (2048-point FFT, power-pooled rows): higher detection rate and less GPU per frame. Run it with `sudo ./bash_scripts/run_live_demo.sh config_live_v3_dino_ft_m5s_sf2048.yaml`, or point the conductor's `cuda_dino_finetuned` entry at it. |
 | `config_live_v3_dino.yaml` | cuda_dino | Live zero-shot DINO target of the conductor. |
 | `config_live_v3_dino_ft_sb.yaml` | cuda_dino_finetuned (M4) | Legacy conductor entry (hidden in the dropdown). |
 | `config_loopback_v3_{single_channel,dino,dino_ft,dino_ft_sb}.yaml` | all | 245.76 MSps composite loopback demo (`run_loopback_v3_demo.sh`); `dino_ft*` use the M3 export. |
@@ -273,8 +274,11 @@ Fine-tuned exports referenced by the configs (all gitignored, under `dino_fine_t
 
 ## 7. Config reference (the knobs you actually tune)
 
-**`pipeline`** — `detector_type`; `enable_signal_snipper` (adds snipper + sink);
-`enable_snippet_compression` (demo codec between snipper and sink).
+**`pipeline`** — `detector_type`; `enable_signal_snipper` (adds snipper + sink; `false` keeps the
+dashboard and the detector overlay and drops only the IQ cutting and writing);
+`enable_snippet_compression` (demo codec between snipper and sink). With `visualization.enable: false`
+and `cuda_dino_finetuned`, the detector and snipper run straight off the CHDR converter and no wide
+FFT is built (they tap raw IQ); the lean headless configuration.
 
 **`advanced_network.cfg`** — `interfaces[].address` (PCIe address of the DPDK NIC: `0000:01:00.0`
 on the Spark); `memory_regions[].kind` (`huge` on GB10 unified memory, `device` for GPUDirect on
@@ -301,10 +305,23 @@ rescales from `reference_span_hz` / `reference_fft_size` to the true rate.
 `nfft`, `fft_window`, `db_vmin` / `db_vmax`, `threshold`, `model_script_path`; front end
 `real_time_downsample`, `flatten_noise_floor`, `adaptive_normalization` (+ `adaptive_span_db`,
 `adaptive_floor_frac`, `adaptive_robust_floor`); `emit_stride`; ingest guard
-`invalid_frame_min_occupancy` / `invalid_frame_occupancy_k`.
+`invalid_frame_min_occupancy` / `invalid_frame_occupancy_k`. Short-FFT front-end of the downsample
+path: `downsample_fft_size` (e.g. `2048`; `0` = auto 10240 / 20480 from the rate) with
+`downsample_time_pool: true` FFTs short and area-pools rows back onto the reference row grid, so the
+model keeps 2 tiles per frame and the emitted mask grid is unchanged; `downsample_time_pool_domain`
+is `power` (dB of the mean power, the measured best) or `db`. It needs `flatten_noise_floor: true`.
+In that mode the mask is column-replicated and tagged with `col_repeat`, so the snipper labels the
+compact 1024-column mask instead of the wide one. `torch_freeze` (default `true`) freezes the
+TorchScript module at load, which folds the per-forward weight casts with bit-identical output.
 
 **`signal_snipper`** / **`sigmf_file_sink`** — see §3. `ring_depth` must exceed
 `2 × emit_stride + pipeline lag`; `max_queued_batches` / `write_budget_mb_s` bound the sink.
+
+**`mask_dump`** (validation only, off by default) — `dir` / `max_frames`, or env `USRP_MASK_DUMP_DIR`:
+dumps every emitted detector mask (any detector, the grid the viz/snipper consume) plus per-frame
+detector time, host cadence and CHDR fill to `.npy` + `mask_dump_manifest.csv`, so a live or loopback
+run can be scored against the offline eval (see
+`infocom_evals/signal_detection_experiments/dino_ft_rt_loopback_stress/`).
 
 **`visualization.renderer`** (display only) — `db_floor` / `db_ceil`, `dynamic_color_*`,
 `rows_per_frame`, `overlay_alpha`, `demo_title` / `demo_subtitle`, `detector_label`;
@@ -323,6 +340,7 @@ rescales from `reference_span_hz` / `reference_fft_size` to the true rate.
 | `rx xport timed out getting a response from mgmt_portal` | X410 MPM wedged: `ssh root@192.168.21.2 systemctl restart usrp-hwd`, wait 10 s. |
 | Full-width bright bar / max-hold pinned | GPU backlog recycling a buffer; raise the DINO `emit_stride`, keep `invalid_frame_min_occupancy: 0.40`. |
 | `preprocess_dataset.py`: "offline binary missing" | `sudo ./bash_scripts/rebuild_demo_container_app.sh`. |
+| App exits (status 1) after `FATAL CUDA error in CHDR converter` | The app's CUDA context died on the GPU side; `sudo dmesg \| grep -i xid` shows why. Restart the app. If it recurs, look for another GPU job or a real-time-priority process sharing the app's cores. |
 | Container "mounted from the wrong checkout" | The wrappers refuse to touch a container created from another clone; recreate it from this checkout. |
 
 More: [`notes/RUNNING_ON_DGX_SPARK.md`](notes/RUNNING_ON_DGX_SPARK.md) §7 and
