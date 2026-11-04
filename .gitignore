@@ -110,3 +110,12 @@ applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/snip_run/
 # fine-tuned DINOv3 TorchScript models (669 MB; produced the FT-DINO M1/M2 detector masks upstream,
 # not referenced by any runtime config; regenerable from dino_fine_tuning/ training)
 dino_fine_tuning/weights/
+
+# dino_fine_tuning/data is build output (gitignored via the global data/ rule) EXCEPT the committed
+# real-data statistics and the metadata of the user-provided real test recordings (their IQ stays local).
+!dino_fine_tuning/data/
+dino_fine_tuning/data/*
+!dino_fine_tuning/data/real_stats/
+dino_fine_tuning/data/real_stats/*.log
+!dino_fine_tuning/data/hard_test_cases/
+dino_fine_tuning/data/hard_test_cases/*.sigmf-data

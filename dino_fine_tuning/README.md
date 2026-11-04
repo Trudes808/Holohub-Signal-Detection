@@ -90,6 +90,7 @@ that deployment.
 | M3_491 | ViT-B/16 | synthetic dense+sparse composites at **491.52 MSps** through the exact deployment front end (`src/frontend.py`: flatten + robust p20 floor normalisation) | first model trained at the deployment rate; held-out detection 83–100 % across SNR |
 | M4_491_ota | ViT-B/16 | M3 data + real over-the-air captures labelled by the coherent detector (teacher) + antenna-off noise negatives | fixed the real-OTA domain gap |
 | **M5S_491_ota** | **ViT-S/16** | M4 data | **deployed**: ~10 ms per tile pair, so the live detector runs on every frame at 491.52 MSps |
+| M6S_multirate / **M7S_scenes_v2** | ViT-S/16 | multi-rate / multi-scenario synthetic scenes (`src/gen_scenes.py`: hoppers, adjacent cellular carriers and uplinks, ISM near-far collisions, 5 GHz, drones, land-mobile radios, broadcast FM, band-edge cut-offs, every X410 rate 5–500 MSps; realism calibrated on real captures) + the M4 OTA tiles | **M7-S = candidate successor of M5-S (2026-11-03; an M8-S trained on the v3 generator scores higher on synthetic sets but fills quiet high-gain frames on real N320 captures, so M7-S stays)**: real cellular/LMR/NR test recordings pixel recall 0.33 → 0.95, region det@0.5 24 → 80 %; synthetic held-out detection 65 → 87 %; legacy 491.52 held-out unchanged or better; OTA A/B pending (`config_live_v3_dino_ft_m7s.yaml`). Details in [`infocom_evals/.../dino_ft_multirate_scenes/`](../applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_experiments/dino_ft_multirate_scenes/README.md) |
 
 To retrain the deployed lineage (needs the waveform library for the synthetic composites,
 `ARGUS_WAVEFORM_LIB`, and OTA captures):
@@ -107,6 +108,23 @@ python ../applications/usrp_wideband_signal_detection/export_dinov3_finetuned_to
        --ckpt checkpoints/M5S_491_ota/best.pt --output weights/finetuned_dino_m5s_491_bf16.ts \
        --autocast bf16 --sample-rate-hz 491.52e6 --fft-window hann --threshold 0.6
 ```
+
+**Retrain with the scenario generator (M6-S recipe).** Measures the real-data statistics, builds the
+multi-rate dataset (parallel scene synthesis + the deployment front-end at each scene's own rate), merges it
+with the OTA tiles, trains, evaluates against M5-S and exports; every step is resumable:
+
+```bash
+python src/real_stats.py                                                   # -> data/real_stats (floor templates, OTA stats)
+python src/build_dataset_scenes.py --out-dir data/dataset_scenes --workers 12   # ~16k tiles + heldout_sigmf/ (--smoke to test)
+scripts/run_m6.sh all          # combine -> train (M6S_multirate) -> eval_scenes.py / eval_heldout.py -> export .ts
+python src/gen_scenes.py --scenario drone_ism --rate 61.44e6 --png /tmp/preview.png   # eyeball one scene
+python src/eval_scenes.py --model checkpoints/M6S_multirate/best.pt --sigmf <dir-of-sigmf> --real --out eval_out/x
+```
+
+`eval_scenes.py` evaluates any SigMF recording (cf32 / ci16 / cf64, any rate) through the deployment
+front-end and reports region detection by scenario, rate bucket, PSD SNR, band-edge visibility, size and
+class, plus pixel metrics and overlays; `--real` re-bases absolute-RF annotation edges to baseband and
+`--assume-continuous` extends labels over the whole recording.
 
 The design record for this lineage (why robust normalisation, what the ablations showed, the
 ingest guard) is in
@@ -135,12 +153,16 @@ dino_fine_tuning/
 ├── configs/      dataset.yaml (geometry, dB calibration, splits), train.yaml (optimizer, loss, schedule)
 ├── src/          rfdata (SigMF I/O, GPU spectrogram, GT rasterization) · build_dataset (Argus sweep)
 │                 build_dataset_rt / gen_491 (491.52 synthetic) · build_dataset_ota + ../label_ota.sh (OTA teacher labels)
+│                 rates (X410 rate set + per-rate app geometry) · real_stats (receiver / OTA statistics) · synth_mods
+│                 (modulators + rate-agnostic placer + receiver model) · gen_scenes (scenario scenes, any rate) ·
+│                 build_dataset_scenes (multi-rate dataset) · eval_scenes (any-rate SigMF eval) · check_scene_levels
 │                 combine_datasets · dataset · model · train · evaluate · eval_heldout · frontend (deployment front end)
 │                 finetuned_infer / finetuned_rt_infer (Python twins of the operator) · gen_finetuned_run / gen_compare_tables
 │                 (materialize masks for the shared eval harness) · paths (portable path resolution)
-├── scripts/      setup_env.sh · run_full.sh · run_notebooks.sh · resmon.sh
+├── scripts/      setup_env.sh · run_full.sh · run_m6.sh (scenario retrain pipeline) · run_notebooks.sh · resmon.sh
 ├── ab_norm_validate.py, ab_span_floor_sweep.py   ground-truth A/B harnesses for the front-end knobs
-├── data/         materialized datasets (gitignored)      checkpoints/   weights/   eval_out/   (gitignored)
+├── data/         materialized datasets (gitignored) · real_stats/ (committed statistics) · hard_test_cases/ (real test
+│                 recordings: metas committed, IQ local)      checkpoints/   weights/   eval_out/   (gitignored)
 └── reports/      report.md (results), pipeline.md (system description), metrics tables, figures
 ```
 

@@ -51,10 +51,17 @@ class FrontEndCfg:
     adaptive_floor_below_calib_db: float = 25.0
 
 
+def _cpp_round(x: float) -> float:
+    """C++ std::round/llround semantics (half away from zero); Python round() is half-to-even."""
+    return math.copysign(math.floor(abs(x) + 0.5), x)
+
+
 def auto_fft_size(rate_hz: float, ref_span_hz=500.0e6, ref_fft=20480, packet=1024) -> int:
+    """Wide-FFT size the operator (and the app's fft_runtime_config) derive from the delivered rate.
+    Uses C++ rounding: at 2.5 packets (49.152-83.33 MHz) the app picks 3072, Python's round() would say 2048."""
     span_ratio = rate_hz / ref_span_hz
-    snapped = 2.0 ** round(math.log2(span_ratio)) if span_ratio > 0 else 1.0
-    packets = max(1, int(round(ref_fft * snapped / packet)))
+    snapped = 2.0 ** _cpp_round(math.log2(span_ratio)) if span_ratio > 0 else 1.0
+    packets = max(1, int(_cpp_round(ref_fft * snapped / packet)))
     return max(packet, packets * packet)
 
 

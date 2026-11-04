@@ -251,6 +251,7 @@ See the header of each script for its inputs and policy knobs, and
 | `config_live_v3_single_channel.yaml` / `config_live_v3_two_channel.yaml` | coherent_power | **Live demo** start configs (`v5`, `v5dual`): snipper on, dashboard with DEMO CONTROLS. |
 | `config_live_v3_dino_ft_m5s.yaml` / `config_live_v3_dino_ft_m5s_two_channel.yaml` | cuda_dino_finetuned (M5-S) | Live demo DINO target (conductor switch) and the M5-S loopback runners. |
 | `config_live_v3_dino_ft_m5s_sf2048.yaml` | cuda_dino_finetuned (M5-S) | Same as the M5-S config with the short-FFT front-end (2048-point FFT, power-pooled rows): higher detection rate and less GPU per frame. Run it with `sudo ./bash_scripts/run_live_demo.sh config_live_v3_dino_ft_m5s_sf2048.yaml`, or point the conductor's `cuda_dino_finetuned` entry at it. |
+| `config_live_v3_dino_ft_m7s.yaml` | cuda_dino_finetuned (M7-S) | M5-S config pointed at the multi-rate / multi-scenario M7-S retrain (`dino_fine_tuning/README.md` §3); run with `sudo ./bash_scripts/run_live_demo.sh config_live_v3_dino_ft_m7s.yaml` for an OTA A/B against M5-S. |
 | `config_live_v3_dino.yaml` | cuda_dino | Live zero-shot DINO target of the conductor. |
 | `config_live_v3_dino_ft_sb.yaml` | cuda_dino_finetuned (M4) | Legacy conductor entry (hidden in the dropdown). |
 | `config_loopback_v3_{single_channel,dino,dino_ft,dino_ft_sb}.yaml` | all | 245.76 MSps composite loopback demo (`run_loopback_v3_demo.sh`); `dino_ft*` use the M3 export. |
@@ -265,7 +266,7 @@ See the header of each script for its inputs and policy knobs, and
 | `config_coherent_power_capture_chdr_single_channel.yaml` | coherent_power | Capture a frozen CHDR/IQ snapshot for offline replay. |
 
 Fine-tuned exports referenced by the configs (all gitignored, under `dino_fine_tuning/weights/`):
-`finetuned_dino_m5s_491_bf16.ts` (**required** for the demo), `finetuned_dino_m4_491_bf16.ts`
+`finetuned_dino_m5s_491_bf16.ts` (**required** for the demo), `finetuned_dino_m7s_scenes_v2_bf16.ts` (`_m7s`), `finetuned_dino_m4_491_bf16.ts`
 (`_sb`), `finetuned_dino_m3_491_bf16.ts` (`loopback_v3_dino_ft*`), `finetuned_dino_m2_dr_bf16.ts`
 (`dino_finetuned_viz_demo`). How they were trained and how to export a new one:
 [`dino_fine_tuning/README.md`](../../dino_fine_tuning/README.md).

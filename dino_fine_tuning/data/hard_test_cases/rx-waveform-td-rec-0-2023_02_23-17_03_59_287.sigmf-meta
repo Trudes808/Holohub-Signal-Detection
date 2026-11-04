@@ -1,0 +1,70 @@
+{
+    "global": {
+        "core:author": "Abdo Gaber",
+        "core:datatype": "cf32_le",
+        "core:description": "Waveform: LTE_FDD_DL_10MHz_CC-1_E-UTRA_E-TM2",
+        "core:hw": "USRP X310",
+        "core:license": "MIT License",
+        "core:num_channels": 1,
+        "core:recorder": "Using NI RF Data Recording API: https://github.com/genesys-neu/ni-rf-data-recording-api",
+        "core:sample_rate": 15360000.0,
+        "core:sha512": "fe54bb5538cabf995c46ec4a89f8f52f31df8793b8a8dc6f8ddcba36c1ac81c1b7470b210045921801d8862c92e5112b02243581c7f459020da0919948017cff",
+        "core:version": "1.0.0"
+    },
+    "captures": [
+        {
+            "capture_details": {
+                "acquisition_bandwidth": 10000000.0,
+                "gain": 20.0
+            },
+            "core:datetime": "2023-02-23T16:03:59.301932Z",
+            "core:frequency": 3600000000.3434067,
+            "core:sample_start": 0
+        }
+    ],
+    "annotations": [
+        {
+            "core:freq_lower_edge": 3592320000.3434067,
+            "core:freq_upper_edge": 3607680000.3434067,
+            "core:label": "LTE FDD Generation",
+            "core:sample_count": 307200,
+            "core:sample_start": 0,
+            "num_tx_signals": 1,
+            "system_components:channel": {
+                "attenuation": 33
+            },
+            "system_components:receiver": {
+                "bandwidth": "160000000.0",
+                "clock_reference": "internal",
+                "hw_subtype": "UBX-160",
+                "manufacturer": "NI",
+                "seid": "30CA171"
+            },
+            "system_components:transmitter": {
+                "Tx_0": {
+                    "signal:detail": {
+                        "bandwidth": 10000000.0,
+                        "frame_structure": "FDD",
+                        "link_direction": "Downlink",
+                        "pdsch:modulation": "QPSK",
+                        "sampling_rate": 15360000.0,
+                        "standard": "LTE FDD Generation",
+                        "subcarrier_spacing": 15000.0,
+                        "test_model": "3GPP LTE FDD Generation-EUTRA2"
+                    },
+                    "signal:emitter": {
+                        "bandwidth": "160000000.0",
+                        "clock_reference": "internal",
+                        "frequency": "3600000000.0",
+                        "gain_tx": "20",
+                        "hw": "USRP X310",
+                        "hw_subtype": "UBX-160",
+                        "manufacturer": "NI",
+                        "sample_rate": "15360000.0",
+                        "seid": "30F1628"
+                    }
+                }
+            }
+        }
+    ]
+}
