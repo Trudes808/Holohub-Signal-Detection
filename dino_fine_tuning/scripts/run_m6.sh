@@ -29,7 +29,7 @@ combine() {
 train() {
   [ -f "$FT/checkpoints/$NAME/DONE" ] && { echo "[train] done: $FT/checkpoints/$NAME"; return; }
   cd "$FT" && $PY src/train.py --config configs/train.yaml --dataset "$DATASET" --mode ft_lastN \
-      --backbone vits16 --weights-path "$VITS" --name "$NAME" --out "checkpoints/$NAME" --resume
+      --backbone vits16 --weights-path "$VITS" --name "$NAME" --out "checkpoints/$NAME" --resume ${TRAIN_EXTRA:-}
 }
 evaluate() {
   cd "$FT"

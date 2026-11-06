@@ -142,6 +142,7 @@ def main() -> int:
         mode=ckpt.get("mode", "ft_lastN"),
         unfreeze_last_n=int(train_cfg.get("unfreeze_last_n", 4)),
         backbone=backbone,
+        head=ckpt.get("head", "v1"),
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()

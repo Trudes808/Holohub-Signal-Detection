@@ -119,3 +119,5 @@ dino_fine_tuning/data/*
 dino_fine_tuning/data/real_stats/*.log
 !dino_fine_tuning/data/hard_test_cases/
 dino_fine_tuning/data/hard_test_cases/*.sigmf-data
+dino_fine_tuning/data/real_backgrounds/**/*.sigmf-data
+dino_fine_tuning/data/real_backgrounds/**/*.bin

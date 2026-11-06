@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--thr", type=float, default=0.6); ap.add_argument("--max-frames", type=int, default=12)
     ap.add_argument("--overlay-frames", type=int, default=2); ap.add_argument("--train-yaml", default="configs/train.yaml")
     ap.add_argument("--only", nargs="*", default=None, help="restrict to these stems")
+    ap.add_argument("--fill-guard", action="store_true", help="apply postfilter.fill_guard to every mask before saving")
     a = ap.parse_args()
     dev = "cuda"; cfg = fe.FrontEndCfg()
     models = {}
@@ -67,6 +68,9 @@ def main():
             o = fe.compute_front_end(fr, rate, cfg, fft_size=F)
             for n, m in models.items():
                 masks[n][k] = (m.prob(o.tiles) >= a.thr).to(torch.uint8).cpu().numpy().reshape(-1, cfg.nfft)[:rows]
+                if a.fill_guard:
+                    from postfilter import fill_guard as _fg
+                    masks[n][k], _ = _fg(masks[n][k], o.resized[0].clamp(0, 1).cpu().numpy())
             if k < a.overlay_frames:
                 imgs[k] = o.resized[0].clamp(0, 1).cpu().numpy()
         det = {"capture": meta_p.stem, "rate_hz": rate, "fft_size": F, "frame_samples": FS, "frames_total": int(nfr_all),

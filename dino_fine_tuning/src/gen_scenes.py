@@ -36,6 +36,11 @@ from scipy.io import loadmat
 import synth_mods as sm
 from synth_mods import Burst
 import rates as R
+import real_backgrounds as rb
+
+# v5 (2026-11-05): probability that a scene at <= 250 MSps is laid over a REAL terminated-input N320 recording
+# (data/real_backgrounds) instead of synthetic noise + a floor template. Override with REALBG_P=0 to disable.
+P_REALBG = float(os.environ.get("REALBG_P", "0.5"))
 
 HERE = Path(__file__).resolve().parents[1]
 LIB = Path(os.environ.get("ARGUS_WAVEFORM_LIB",
@@ -584,6 +589,8 @@ def scen_ism(rng, R_hz, T, tag, drone=False) -> list[Job]:
                 bursts.append(Burst("Microwave", "oven", 60, fcj, t + j * 1.04e-3, 1.04e-3, bw, snr, tag))
             t += 16.7e-3
         jobs.append(Job("hops", fac, bursts, ramp_s=50e-6))
+    if band == "2g4" and rng.random() < 0.15:
+        jobs += fhss_network_jobs(rng, R_hz, T, tag, 900)
     if drone:
         jobs += drone_jobs(rng, R_hz, T, tag, ap_centers)
     return jobs
@@ -623,8 +630,31 @@ def drone_jobs(rng, R_hz, T, tag, ap_centers) -> list[Job]:
     return jobs
 
 
+def fhss_network_jobs(rng, R_hz, T, tag, eid0) -> list[Job]:
+    """v6: a dense FHSS network (smart-meter / sensor mesh): 8-30 narrowband hoppers (25-200 kHz, GFSK) over a
+    shared span, each hopping every 1-50 ms with 20-90 % duty and its own level. Many simultaneous narrow bursts on
+    the same time rows -- the pattern that still made M10-S paint a whole tile on the 900 MHz ISM capture."""
+    jobs = []
+    n = int(rng.integers(8, 31)); span = min(0.95 * R_hz, logu(rng, 2e6, 60e6))
+    center = float(rng.uniform(-0.3, 0.3)) * R_hz
+    bw = logu(rng, 25e3, 200e3); n_ch = int(rng.integers(16, 100)); chans = center + np.linspace(-span / 2, span / 2, n_ch)
+    base = float(rng.uniform(4, 25))
+    for k in range(n):
+        s = int(rng.integers(0, 2**31)); rs = bw / 1.5
+        fac = (lambda s=s, rs=rs: sm.mod_gfsk(np.random.default_rng(s), rs, 100e-3, 0.5, 0.5, 2))
+        snr = float(np.clip(rng.normal(base, 6.0), -2, 35)); dwell = logu(rng, 1e-3, 50e-3); duty = float(rng.uniform(0.2, 0.9))
+        bursts, t = [], -float(rng.uniform(0, dwell / duty))
+        while t < T:
+            bursts.append(Burst("GFSK", "fhss_net", eid0 + k, float(chans[rng.integers(n_ch)]), t, dwell, bw, snr, tag))
+            t += dwell / duty
+        jobs.append(Job("hops", fac, bursts, ramp_s=5e-6, multipath=None))
+    return jobs
+
+
 def scen_hoppers(rng, R_hz, T, tag) -> list[Job]:
     jobs = []
+    if rng.random() < 0.35:
+        jobs += fhss_network_jobs(rng, R_hz, T, tag, 900)
     for k in range(int(rng.integers(1, 5))):
         kind = choose(rng, {"bt": .2 if R_hz >= 10e6 else .05, "ble": .15, "slow_tone": .15, "fast": .2, "wide": .1 if R_hz >= 20e6 else 0.0, "nbfh": .2})
         if kind == "nbfh":
@@ -851,10 +881,30 @@ def ue_jobs(rng, R_hz, T, fc, bw, tech, base_snr, tag, eid0, windows=None) -> li
     return jobs
 
 
+def wideband_burst_jobs(rng, R_hz, T, tag, eid0=950) -> list[Job]:
+    """v7: short EDGE-TO-EDGE bursts (a full-carrier PUSCH or PRACH seen through a narrow look, a wideband pulse):
+    1-8 bursts of 0.3-5 ms spanning 0.98 of the band, 3-20 dB, each labelled on its own rows only. Teaches
+    "a band-wide burst is painted on its rows, not over the whole tile" (the narrow 850 MHz uplink look)."""
+    jobs = []
+    bw = 0.98 * R_hz; base = float(rng.uniform(3, 20))
+    for k in range(int(rng.integers(1, 9))):
+        dur = logu(rng, 0.3e-3, 5e-3); t0 = float(rng.uniform(-dur / 2, T)); snr = float(np.clip(rng.normal(base, 4), 2, 30))
+        s = int(rng.integers(0, 2**31))
+        if rng.random() < 0.6:
+            nfft = 2048; nu = int(nfft * 0.9); scs = bw / nu
+            fac = (lambda s=s, nfft=nfft, nu=nu, scs=scs, dur=dur: sm.mod_ofdm(np.random.default_rng(s), nfft, nu, scs, 0.07, dur + 1e-3, 4)); lab = "LTE_UL"
+        else:
+            fac = (lambda s=s, bw=bw, dur=dur: sm.mod_noise_band(np.random.default_rng(s), bw, dur + 1e-3)); lab = "NoiseBand"
+        jobs.append(Job("single", fac, [Burst(lab, "wide_burst", eid0 + k, 0.0, t0, dur, bw, snr, tag)], ramp_s=20e-6, multipath=None))
+    return jobs
+
+
 def scen_cellular_uplink(rng, R_hz, T, tag) -> list[Job]:
     """An FDD uplink band: 1-4 carriers of sporadic UE traffic (no downlink), NB-IoT / LTE-M in the guard
     bands or in-band, a few land-mobile neighbours."""
     jobs = []
+    if rng.random() < (0.25 if R_hz <= 20e6 else 0.08):
+        jobs += wideband_burst_jobs(rng, R_hz, T, tag)
     n_car = int(rng.integers(1, 5)) if R_hz >= 20e6 else int(rng.integers(1, 3))
     bws = [float(choose(rng, {1.4e6: .05, 3e6: .05, 5e6: .25, 10e6: .3, 15e6: .15, 20e6: .2})) for _ in range(n_car)]
     guard = float(choose(rng, {0.0: .2, 0.1e6: .2, 0.5e6: .2, 1e6: .2, 2e6: .2}))
@@ -978,6 +1028,10 @@ def scen_lmr_band(rng, R_hz, T, tag) -> list[Job]:
     """A land-mobile / paging band (150 / 450 / 900 MHz): narrowband PTT, TDMA and hopping radios, pagers,
     narrowband data, 40 dB power spread, one wideband neighbour now and then."""
     jobs = []
+    if rng.random() < 0.3:
+        jobs += fhss_network_jobs(rng, R_hz, T, tag, 900)
+    if rng.random() < 0.08:
+        jobs += wideband_burst_jobs(rng, R_hz, T, tag)
     for k in range(int(rng.integers(3, 16))):
         kind = choose(rng, {"nbfh": .55, "pager": .15, "nbdata": .1, "ptt": .2})
         if kind == "nbfh":
@@ -1020,9 +1074,10 @@ def scen_broadcast_fm(rng, R_hz, T, tag) -> list[Job]:
 def scen_quiet(rng, R_hz, T, tag) -> list[Job]:
     """Noise-only half the time; otherwise a quiet band with 1-4 narrow persistent lines (CW spurs, narrow
     carriers, a lone pager) -- what a high-gain look at an empty band really shows."""
+    extra = wideband_burst_jobs(rng, R_hz, T, tag) if rng.random() < 0.10 else []
     if rng.random() < 0.5:
-        return []
-    jobs = []
+        return extra
+    jobs = list(extra)
     for k in range(int(rng.integers(1, 5))):
         kind = choose(rng, {"cw": .5, "nbfsk": .3, "pager": .2})
         if kind == "pager":
@@ -1122,17 +1177,102 @@ def make_scene(scenario: str, rate_hz: float, seed: int, n_frames: int | None = 
     t_sig = time.time() - t0
     # receiver: noise (unit power) -> response shaping -> DC spur -> level -> optional ADC clipping
     rx = sample_receiver(rng, scenario)
-    noise = (rng.standard_normal(T_samp, dtype=np.float32) + 1j * rng.standard_normal(T_samp, dtype=np.float32)).astype(np.complex64)
-    canvas += noise * np.float32(1 / math.sqrt(2)); del noise
-    if rx["profile_kind"] != "flat":
-        canvas = sm.apply_receiver(canvas, sm.receiver_response_taps(rx["profile"], 513))
-    if rx["dc_spur_db"] > 0:
-        f_dc = sm.add_dc_spur(canvas, rate_hz, F, rx["dc_spur_db"], rng)
-        # the spur is labelled as a signal (one model bin wide, whole scene) -- "flag everything, filter later"
-        b = Burst("DC_spur", "rx_dc", 9000, f_dc, 0.0, T, max(2.0 * rate_hz / F, rate_hz / R.NFFT_MODEL), rx["dc_spur_db"], scenario)
-        b.sample_start, b.sample_count, b.total_snr_db = 0, T_samp, rx["dc_spur_db"]
-        placed.append(b)
+    real_bg = None
+    if rate_hz <= 250.01e6 and P_REALBG > 0 and rng.random() < P_REALBG:
+        real_bg = rb.pick(rng, rate_hz, T_samp)
+    if real_bg is not None:
+        # REAL receiver noise (terminated-input N320 recording, unit power at the scene rate) under the synthetic
+        # emitters. The emitters still get the receiver's pass-band shaping; the background already has its own.
+        bg, e, lines = real_bg
+        if rx["profile_kind"] != "flat":
+            canvas = sm.apply_receiver(canvas, sm.receiver_response_taps(rx["profile"], 513))
+        canvas += bg; del bg
+        rx["profile_kind"] = "real_bg"; rx["dc_spur_db"] = 0.0
+        rx["real_bg"] = {"path": Path(e["path"]).name, "rate_hz": e["rate_hz"], "gain_db": e["gain_db"], "dc_excess_db": e["dc_excess_db"], "n_lines": len(lines)}
+        # flag-everything convention: the recording's DC line and persistent spur lines are labelled as signals
+        lab_w = max(2.0 * rate_hz / F, rate_hz / R.NFFT_MODEL)
+        if e["dc_excess_db"] > 3.0:
+            b = Burst("DC_spur", "rx_dc", 9000, 0.0, 0.0, T, lab_w, e["dc_excess_db"], scenario)
+            b.sample_start, b.sample_count, b.total_snr_db = 0, T_samp, e["dc_excess_db"]; placed.append(b)
+        for k, l in enumerate(lines):
+            b = Burst("RX_spur", "rx_spur", 9100 + k, l["f_hz"], 0.0, T, max(l["bw_hz"], lab_w), l["excess_db"], scenario)
+            b.sample_start, b.sample_count, b.total_snr_db = 0, T_samp, l["excess_db"]; placed.append(b)
+    else:
+        noise = (rng.standard_normal(T_samp, dtype=np.float32) + 1j * rng.standard_normal(T_samp, dtype=np.float32)).astype(np.complex64)
+        canvas += noise * np.float32(1 / math.sqrt(2)); del noise
+        if rx["profile_kind"] != "flat":
+            canvas = sm.apply_receiver(canvas, sm.receiver_response_taps(rx["profile"], 513))
+        if rx["dc_spur_db"] > 0:
+            f_dc = sm.add_dc_spur(canvas, rate_hz, F, rx["dc_spur_db"], rng)
+            # the spur is labelled as a signal (one model bin wide, whole scene) -- "flag everything, filter later"
+            b = Burst("DC_spur", "rx_dc", 9000, f_dc, 0.0, T, max(2.0 * rate_hz / F, rate_hz / R.NFFT_MODEL), rx["dc_spur_db"], scenario)
+            b.sample_start, b.sample_count, b.total_snr_db = 0, T_samp, rx["dc_spur_db"]
+            placed.append(b)
+    # v5 (2026-11-05): spur combs. A quiet band at high gain shows an irregular comb of faint persistent lines; on
+    # real N320 captures M7-S/M8-S painted such tiles wholesale (they resemble the resolved-subcarrier comb of an OFDM
+    # carrier at low sample rates, which IS labelled as one filled box). Irregular, stationary combs are therefore
+    # generated explicitly and labelled line by line ("flag everything"), so the model has both classes.
+    p_comb = 0.5 if scenario == "noise_only" else 0.06
+    if rng.random() < p_comb:
+        lab_w = max(2.0 * rate_hz / F, rate_hz / R.NFFT_MODEL)
+        wide_bin = rate_hz / F; lines = []
+        regular = rng.random() < 0.45
+        if regular:
+            # v6 (2026-11-06): REGULAR combs. The 900 MHz ISM N320 capture that every retrain still painted whole
+            # carries 30 persistent lines on an exact 1.00 MHz grid (~4 dB, up to 10 dB): clock / reference
+            # harmonics reaching the antenna. A regular grid of weak lines is the resolved-subcarrier signature the
+            # models fill, and the irregular combs below never showed it with line-by-line labels.
+            spacing = float(np.clip(logu(rng, 0.2e6, 2.5e6), max(4 * wide_bin, 0.96 * rate_hz / 60), 0.96 * rate_hz / 4))
+            off = float(rng.uniform(-0.5, 0.5)) * spacing
+            fs_ = np.arange(-0.48 * rate_hz, 0.48 * rate_hz, spacing) + off
+            fs_ = fs_[np.abs(fs_) < 0.48 * rate_hz]
+            keep = rng.random(len(fs_)) > 0.1                           # a few teeth missing
+            fs_ = fs_[keep]
+            extra = rng.uniform(-0.48, 0.48, int(rng.integers(0, 4))) * rate_hz   # plus a few unrelated spurs
+            fs_ = np.sort(np.r_[fs_, extra])
+            base = float(rng.uniform(3, 9)); ripple = float(rng.uniform(0, 4)); cyc = float(rng.uniform(0.5, 3)); ph = float(rng.uniform(0, 2 * np.pi))
+            n_ = max(len(fs_), 1)
+            lvls = np.clip(base + ripple * np.sin(2 * np.pi * cyc * np.arange(n_) / n_ + ph) + rng.normal(0, 1.5, n_), 2.0, 25.0)
+            drift_all = float(rng.uniform(-1e3, 1e3)) if rng.random() < 0.2 else 0.0
+        else:
+            n_lines = int(rng.integers(5, 61))
+            fs_ = np.sort(rng.uniform(-0.48, 0.48, n_lines) * rate_hz)
+            fs_ = fs_[np.r_[True, np.diff(fs_) > 3 * wide_bin]]       # keep lines >= 3 wide bins apart
+            base = float(rng.uniform(3, 12)); lvls = None; drift_all = 0.0
+        for k, f_ in enumerate(fs_):
+            lvl = float(lvls[k]) if lvls is not None else float(np.clip(rng.normal(base, 5.0), 2.0, 30.0))
+            drift = drift_all if regular else (float(rng.uniform(-2e3, 2e3)) if rng.random() < 0.3 else 0.0)
+            gate = None if regular else ((logu(rng, 10e-3, 0.5), logu(rng, 10e-3, 0.5)) if rng.random() < 0.25 else None)
+            lines.append((float(f_), lvl, drift, gate))
+            b = Burst("RX_spur", "spur_comb", 9200 + k, float(f_), 0.0, T, max(lab_w, abs(drift) + wide_bin), lvl, scenario)
+            b.sample_start, b.sample_count, b.total_snr_db = 0, T_samp, lvl; placed.append(b)
+        sm.add_cw_lines(canvas, rate_hz, F, lines, rng)
+        rx["spur_comb"] = len(lines); rx["spur_comb_regular"] = bool(regular)
     canvas *= np.float32(10 ** (rx["level_db"] / 20))
+    # v4 (2026-11-05): live-ingest artefacts. M7-S paints 24-54 % of a frame under 30 % zero-filled packet loss and
+    # 16-35 % under a 20 dB mid-frame gain step (test_1 experiments); none of this was in the training data.
+    ingest = {"zero_ranges": []}
+    u = rng.random()
+    if u < 0.10:                                           # random CHDR packet (1024-sample) zero-fill over a window
+        loss = logu(rng, 0.005, 0.40)
+        w0 = int(rng.integers(0, T_samp)); w1 = min(T_samp, w0 + int(logu(rng, 5e-3, 0.5) * rate_hz)) if rng.random() < 0.6 else T_samp
+        if rng.random() < 0.4: w0 = 0
+        n_pk = (w1 - w0) // 1024
+        drop = np.flatnonzero(rng.random(n_pk) < loss)
+        for k in drop:
+            canvas[w0 + k * 1024: w0 + (k + 1) * 1024] = 0
+        ingest["zero_packet_loss"] = float(loss); ingest["zero_window"] = [int(w0), int(w1)]
+    elif u < 0.15:                                         # contiguous outage (zeros) of 2-128 wide rows -> GT cleared there
+        n_rows = int(logu(rng, 2, 128)); r0 = int(rng.integers(0, max(1, T_samp // F - n_rows)))
+        s0, s1 = r0 * F, (r0 + n_rows) * F
+        canvas[s0:s1] = 0; ingest["zero_ranges"].append([int(s0), int(s1)])
+    # v7 (2026-11-06): the gain step is back. v6 (no gain step) made M11-S/M12-S paint whole tiles around band-wide
+    # burst rows (narrow 850 MHz uplink look) and the DC phase-noise pedestal of a quiet band -- the gain-step
+    # negatives were what taught M10-S "an elevated floor region without structure is background". Policy: that
+    # lesson is worth more than the (rare) band-filling TDD carrier at a narrow look it makes ambiguous.
+    if rng.random() < 0.05:                                # gain step mid-scene (AGC / manual gain change)
+        g_db = float(rng.choice([-1, 1])) * float(rng.uniform(6, 25)); k0 = int(rng.integers(int(0.1 * T_samp), int(0.9 * T_samp)))
+        canvas[k0:] *= np.float32(10 ** (g_db / 20)); ingest["gain_step_db"] = g_db; ingest["gain_step_sample"] = k0
     if rx["clip_over_db"] is not None and placed:
         peak = float(np.max(np.maximum(np.abs(canvas.real), np.abs(canvas.imag))))
         g = (10 ** (rx["clip_over_db"] / 20)) / max(peak, 1e-12)
@@ -1141,7 +1281,7 @@ def make_scene(scenario: str, rate_hz: float, seed: int, n_frames: int | None = 
     meta = {"scenario": scenario, "rate_hz": rate_hz, "n_frames": n_frames, "seed": seed, "fft_size": F,
             "frame_samples": R.ROWS_WIDE * F, "duration_s": T, "n_bursts": len(placed), "n_jobs": len(jobs),
             "receiver": {k: (v if k != "profile" else None) for k, v in rx.items()}, "gen_seconds": time.time() - t0,
-            "signal_seconds": t_sig}
+            "signal_seconds": t_sig, "ingest": ingest}
     if verbose:
         print(f"[scene] {scenario} @ {rate_hz/1e6:.2f} MSps: {len(jobs)} jobs -> {len(placed)} bursts, "
               f"{T*1e3:.1f} ms, gen {meta['gen_seconds']:.1f}s (signals {t_sig:.1f}s), rx {rx['profile_kind']} dc {rx['dc_spur_db']:.0f} clip {rx['clip_over_db']}")
@@ -1169,7 +1309,8 @@ def write_sigmf(scene: Scene, stem: Path, center_hz: float = 0.0) -> None:
     meta = {"global": {"core:datatype": "cf32_le", "core:sample_rate": float(scene.rate_hz), "core:version": "1.0.0",
                        "core:num_channels": 1, "core:description": f"synthetic scene {scene.scenario} seed {scene.seed} (gen_scenes.py)",
                        "wfgt:scenario": scene.scenario, "wfgt:seed": scene.seed, "wfgt:fft_size": scene.fft_size,
-                       "wfgt:frame_samples": scene.frame_samples, "wfgt:receiver": scene.meta.get("receiver")},
+                       "wfgt:frame_samples": scene.frame_samples, "wfgt:receiver": scene.meta.get("receiver"),
+                       "wfgt:ingest": scene.meta.get("ingest")},
             "captures": [{"core:sample_start": 0, "core:frequency": center_hz}],
             "annotations": annotations_of(scene)}
     meta_p.write_text(json.dumps(meta))

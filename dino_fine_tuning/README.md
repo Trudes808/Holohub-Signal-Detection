@@ -90,7 +90,8 @@ that deployment.
 | M3_491 | ViT-B/16 | synthetic dense+sparse composites at **491.52 MSps** through the exact deployment front end (`src/frontend.py`: flatten + robust p20 floor normalisation) | first model trained at the deployment rate; held-out detection 83–100 % across SNR |
 | M4_491_ota | ViT-B/16 | M3 data + real over-the-air captures labelled by the coherent detector (teacher) + antenna-off noise negatives | fixed the real-OTA domain gap |
 | **M5S_491_ota** | **ViT-S/16** | M4 data | **deployed**: ~10 ms per tile pair, so the live detector runs on every frame at 491.52 MSps |
-| M6S_multirate / **M7S_scenes_v2** | ViT-S/16 | multi-rate / multi-scenario synthetic scenes (`src/gen_scenes.py`: hoppers, adjacent cellular carriers and uplinks, ISM near-far collisions, 5 GHz, drones, land-mobile radios, broadcast FM, band-edge cut-offs, every X410 rate 5–500 MSps; realism calibrated on real captures) + the M4 OTA tiles | **M7-S = candidate successor of M5-S (2026-11-03; an M8-S trained on the v3 generator scores higher on synthetic sets but fills quiet high-gain frames on real N320 captures, so M7-S stays)**: real cellular/LMR/NR test recordings pixel recall 0.33 → 0.95, region det@0.5 24 → 80 %; synthetic held-out detection 65 → 87 %; legacy 491.52 held-out unchanged or better; OTA A/B pending (`config_live_v3_dino_ft_m7s.yaml`). Details in [`infocom_evals/.../dino_ft_multirate_scenes/`](../applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_experiments/dino_ft_multirate_scenes/README.md) |
+| M6S_multirate / **M7S_scenes_v2** | ViT-S/16 | multi-rate / multi-scenario synthetic scenes (`src/gen_scenes.py`: hoppers, adjacent cellular carriers and uplinks, ISM near-far collisions, 5 GHz, drones, land-mobile radios, broadcast FM, band-edge cut-offs, every X410 rate 5–500 MSps; realism calibrated on real captures) + the M4 OTA tiles | **M7-S = candidate successor of M5-S since 2026-11-03** (`config_live_v3_dino_ft_m7s.yaml`; M8-S / v3 scored higher on synthetic sets but filled quiet high-gain frames on real N320 captures): real cellular/LMR/NR test recordings pixel recall 0.33 → 0.95, region det@0.5 24 → 80 %; synthetic held-out detection 65 → 87 %; legacy 491.52 held-out unchanged or better; OTA A/B pending (`config_live_v3_dino_ft_m7s.yaml`). Details in [`infocom_evals/.../dino_ft_multirate_scenes/`](../applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_experiments/dino_ft_multirate_scenes/README.md) |
+| M8S_scenes_v3 / M9S_headv2 / **M10S_v5** / M11S_v6 | ViT-S/16 | generator v3 (fill keeps an edge, DC spur labelled) → v4/v5 (`SegHeadV2` full-resolution input stem + quiet-pixel BCE weight; real terminated-input N320 backgrounds, spur combs labelled line by line, live-ingest artefacts) → v6 (gain-step artefact dropped as label noise, dense FHSS networks, regular spur combs) | **M10-S (2026-11-05) is the first model without the quiet-band "comb fill"** (synthetic comb probe 0 % filled tiles vs 12–25 % for M7/M9; 900 MHz ISM capture 7 of 116 tiles vs 34) and has the best real-data numbers of the lineage (hard cases det@0.5 88 % vs 80 %, pixel P 0.98; Argus P 0.80), at the cost of some cellular recall at 5–10 MSps traced to the gain-step artefact. **M11-S (v6, 2026-11-06)** is the best model on every labelled set (v6 held-out IoU 0.841 vs 0.809 / 0.741 for M10-S / M7-S, hard cases IoU 0.931) and marks the 900 MHz comb line by line, but with the quiet-pixel weight lowered to 1.0 it fills tiles on one narrow 10.24 MSps uplink look and paints the DC pedestal of the quiet reference; **M12-S (v6 data, weight 2.0) is training** to separate the two effects. The winner replaces M7-S as the candidate (operating threshold 0.5, see the experiment record). |
 
 To retrain the deployed lineage (needs the waveform library for the synthetic composites,
 `ARGUS_WAVEFORM_LIB`, and OTA captures):
@@ -134,6 +135,38 @@ and the demo handoff
 
 ---
 
+## 3a. Front-end contract (read before running a model anywhere else)
+
+Every model from M3 on was trained behind the **deployment front end**, and only produces sensible masks
+behind it. Feeding it a plain 1024-point-per-row spectrogram with a fixed dB clip (the M1/M2 geometry)
+makes it paint whole tiles (verified 2026-11-05 on `OOD_captures/OTA/test_1`: 454 of 2812 native tiles at
+100 % occupancy vs 0 of 280 frames through the proper front end). Per frame at sample rate R:
+
+1. **Frame** = 512 rows × F samples, F = `rates.app_fft_size(R)` (the app's wide FFT: 20480 at 491.52/500
+   MSps, 10240 at 245.76, 5120 at 122.88, 3072 at 49–83, 1024 below ~22 MSps). Row time = F/R (41.7 µs at
+   245.76), not 1024/R.
+2. **Per row**: Hann window scaled to unit RMS, F-point FFT, fftshift, power in dB, minus 10·log10(F/1024).
+3. **Flatten**: per-frequency column mean, Gaussian-smoothed (σ = max(2, 0.005·F)), two passes with signal
+   capped at reference + 6 dB; add `clamp(reference − floor, 0, 12 dB)` per column.
+4. **Robust normalisation**: p20 / p95 of the flattened image; if p95 − p20 ≥ 8 dB and p20 is within 25 dB
+   of the calibrated vmin: `value = clamp((dB − (p20 − 0.12·34)) / 34, 0, 1)`, else the fixed clip
+   (`db_vmin` / `db_vmax` of the export's `.meta.json`).
+5. **Resize** frequency F → 1024 bilinearly (align_corners = false, no antialias).
+6. **Tile** the 512 rows into two 256 × 1024 tiles, float in [0, 1], shape [B, 1, 256, 1024]. The export
+   returns logits; mask = sigmoid ≥ threshold (0.6).
+
+Reference implementations: `src/frontend.py::compute_front_end` (+ `src/rates.py`; Python twin of the CUDA
+operator, corr 1.0) and the C++ operator with `real_time_downsample: true`, `flatten_noise_floor: true`,
+`adaptive_normalization: true`, `adaptive_robust_floor: true` (`config_live_v3_dino_ft_m7s.yaml`). To run a
+TorchScript export on another machine you need only `src/run_ts_on_sigmf.py`, `src/frontend.py`,
+`src/rates.py`, the `.ts` and torch:
+
+```bash
+python run_ts_on_sigmf.py --ts finetuned_dino_m7s_scenes_v2_bf16.ts --capture x.sigmf-meta --out out_dir --png 4
+```
+
+---
+
 ## 4. Weights
 
 `weights/` and `checkpoints/` are gitignored. Release artifacts to distribute alongside the code:
@@ -155,7 +188,8 @@ dino_fine_tuning/
 │                 build_dataset_rt / gen_491 (491.52 synthetic) · build_dataset_ota + ../label_ota.sh (OTA teacher labels)
 │                 rates (X410 rate set + per-rate app geometry) · real_stats (receiver / OTA statistics) · synth_mods
 │                 (modulators + rate-agnostic placer + receiver model) · gen_scenes (scenario scenes, any rate) ·
-│                 build_dataset_scenes (multi-rate dataset) · eval_scenes (any-rate SigMF eval) · check_scene_levels
+│                 build_dataset_scenes (multi-rate dataset) · eval_scenes (any-rate SigMF eval) · check_scene_levels ·
+│                 run_ts_on_sigmf (standalone .ts inference, correct front end) · scan_capture / run_ota_detections (per-frame scans)
 │                 combine_datasets · dataset · model · train · evaluate · eval_heldout · frontend (deployment front end)
 │                 finetuned_infer / finetuned_rt_infer (Python twins of the operator) · gen_finetuned_run / gen_compare_tables
 │                 (materialize masks for the shared eval harness) · paths (portable path resolution)

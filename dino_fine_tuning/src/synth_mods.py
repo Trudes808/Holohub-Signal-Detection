@@ -532,6 +532,27 @@ def add_dc_spur(canvas: np.ndarray, rate: float, fft_size: int, spur_db: float, 
     return float(f)
 
 
+def add_cw_lines(canvas: np.ndarray, rate: float, fft_size: int, lines: list, rng) -> None:
+    """Persistent narrow lines (receiver / local-oscillator spurs, idle carriers, smart-meter beacons): each
+    entry (f_hz, level_db, drift_hz, gate) adds a CW tone level_db above the per-bin noise floor (noise power 1),
+    optionally drifting linearly by drift_hz over the scene and gated on/off with the given (on_s, off_s) pattern.
+    Written in 4M-sample chunks; a scene at 245.76 MSps with 40 lines takes ~10 s."""
+    T = canvas.size; B = 1 << 22
+    for (f_hz, level_db, drift_hz, gate) in lines:
+        A = math.sqrt(10 ** (level_db / 10.0) / (0.667 * fft_size))
+        phi = float(rng.uniform(0, TWO_PI))
+        on_s, off_s = (gate if gate else (0.0, 0.0))
+        for i in range(0, T, B):
+            n = np.arange(i, i + min(B, T - i), dtype=np.float64)
+            f_inst = f_hz + drift_hz * (n / T)                      # linear drift across the scene
+            ph = np.mod(TWO_PI * np.cumsum(np.full(n.size, 0.0)) + TWO_PI * (f_hz * n + 0.5 * drift_hz * n * n / T) / rate + phi, TWO_PI)
+            tone = (A * np.exp(1j * ph)).astype(C64)
+            if on_s > 0 and off_s > 0:
+                t = n / rate; per = on_s + off_s
+                tone[(np.mod(t, per) >= on_s)] = 0
+            canvas[i:i + n.size] += tone
+
+
 def synthetic_floor_profile(rng) -> np.ndarray:
     """Random plausible receiver floor shape (dB over 1024 bins): tilt + edge roll-off + ripple."""
     x = np.linspace(-0.5, 0.5, 1024, endpoint=False)

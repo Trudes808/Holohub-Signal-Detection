@@ -33,7 +33,7 @@ def load_model(ckpt_path, train_yaml, device):
     ck = torch.load(ckpt_path, map_location=device)
     m = DinoSegmenter(backbone_weights(ck.get("weights_path"), cfg["weights_path"]), feat_layers=tuple(cfg["feat_layers"]),
                       mode=ck.get("mode", "ft_lastN"), unfreeze_last_n=cfg["unfreeze_last_n"],
-                      backbone=ck.get("backbone", "vitb16")).to(device)
+                      backbone=ck.get("backbone", "vitb16"), head=ck.get("head", "v1")).to(device)
     m.load_state_dict(ck["model"]); m.eval()
     return m
 

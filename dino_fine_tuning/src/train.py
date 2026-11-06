@@ -65,6 +65,8 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--backbone", default="vitb16", help="dinov3 backbone: vitb16 (M4) | vits16 (M5-S)")
     ap.add_argument("--weights-path", default=None, help="override cfg weights_path (e.g. the ViT-S .pth)")
+    ap.add_argument("--head", default="v1", choices=["v1", "v2"], help="v2 = SegHead + full-res input stem (model.SegHeadV2)")
+    ap.add_argument("--fp-quiet-w", type=float, default=None, help="extra BCE weight on background pixels at floor level (cfg fp_quiet_w)")
     args = ap.parse_args()
 
     from paths import resolve
@@ -75,6 +77,8 @@ def main():
     args.dataset = str(resolve(args.dataset))
     if args.epochs:
         cfg["epochs"] = args.epochs
+    if args.fp_quiet_w is not None:
+        cfg["fp_quiet_w"] = args.fp_quiet_w
     device = "cuda"
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(cfg["seed"]); np.random.seed(cfg["seed"])
@@ -90,11 +94,12 @@ def main():
 
     model = DinoSegmenter(args.weights_path or cfg["weights_path"], feat_layers=tuple(cfg["feat_layers"]),
                           mode=args.mode, unfreeze_last_n=cfg["unfreeze_last_n"],
-                          backbone=args.backbone).to(device)
+                          backbone=args.backbone, head=args.head).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
     log(f"trainable params: {n_train:.2f}M  (mode={args.mode}, backbone={args.backbone})")
-    loss_fn = DiceBCELoss(pos_weight=cfg["pos_weight"], dice_w=cfg["dice_w"],
-                          bce_w=cfg["bce_w"]).to(device)
+    loss_fn = DiceBCELoss(pos_weight=cfg["pos_weight"], dice_w=cfg["dice_w"], bce_w=cfg["bce_w"],
+                          fp_quiet_w=float(cfg.get("fp_quiet_w", 0.0)), fp_quiet_thr=float(cfg.get("fp_quiet_thr", 0.30))).to(device)
+    log(f"head={args.head} fp_quiet_w={cfg.get('fp_quiet_w', 0.0)}")
     opt = torch.optim.AdamW(model.param_groups(cfg["lr_head"], cfg["lr_backbone"]),
                             weight_decay=cfg["weight_decay"])
     steps = cfg["epochs"] * max(1, len(tl))
@@ -127,7 +132,7 @@ def main():
             mask = batch["mask"].to(device, non_blocking=True)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cfg["amp"]):
                 logits = model(img)
-                loss = loss_fn(logits, mask)
+                loss = loss_fn(logits, mask, img)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -145,7 +150,7 @@ def main():
                  "epoch": epoch, "best_iou": best_iou, "gstep": gstep,
                  "history": history, "cfg": cfg, "mode": args.mode,
                  "atten_max": args.atten_max, "name": args.name,
-                 "backbone": args.backbone, "weights_path": args.weights_path or cfg["weights_path"]}
+                 "backbone": args.backbone, "weights_path": args.weights_path or cfg["weights_path"], "head": args.head}
         torch.save(state, ckpt_last)
         if val["iou"] > best_iou:
             best_iou = val["iou"]; state["best_iou"] = best_iou

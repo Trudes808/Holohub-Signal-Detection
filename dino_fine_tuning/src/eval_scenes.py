@@ -115,7 +115,7 @@ def dur_bucket(rows):
 
 # --------------------------------------------------------------------------- eval
 def eval_scene(model: Model, meta_p: Path, cfg, thr: float, max_frames: int, real: bool, device, png: Path | None,
-               continuous: bool = False):
+               continuous: bool = False, fill_guard: bool = False):
     meta = json.loads(meta_p.read_text()); g = meta["global"]
     rate = float(g["core:sample_rate"]); dtype = g.get("core:datatype", "cf32_le")
     data_p = meta_p.with_suffix(".sigmf-data")
@@ -142,6 +142,9 @@ def eval_scene(model: Model, meta_p: Path, cfg, thr: float, max_frames: int, rea
         out = fe.compute_front_end(fr, rate, cfg, fft_size=F)
         prob = model.prob(out.tiles)                                  # [n_tiles,256,1024]
         mask = (prob >= thr).to(torch.uint8).cpu().numpy().reshape(-1, cfg.nfft)[:rows]
+        if fill_guard:
+            from postfilter import fill_guard as _fg
+            mask, _ = _fg(mask, out.resized[0].clamp(0, 1).cpu().numpy()[:rows])
         gt = fe.rasterize_gt(anns, fidx * FS_eff, F, rows, cfg.nfft, rate).numpy()
         m = mask.astype(bool); gtb = gt.astype(bool)
         tp += int((m & gtb).sum()); fp += int((m & ~gtb).sum()); fn += int((~m & gtb).sum())
@@ -209,6 +212,7 @@ def main():
     ap.add_argument("--png-per-scenario", type=int, default=2)
     ap.add_argument("--assume-continuous", action="store_true", help="real: extend every annotation over the whole recording")
     ap.add_argument("--max-scenes", type=int, default=None)
+    ap.add_argument("--fill-guard", action="store_true", help="apply postfilter.fill_guard to every mask")
     a = ap.parse_args()
     device = "cuda"
     cfg = fe.FrontEndCfg()
@@ -230,7 +234,7 @@ def main():
         if png_count[scen] < a.png_per_scenario:
             png = out / "overlays" / f"{scen}_{mp.stem}.png"; png_count[scen] += 1
         try:
-            srow, regs = eval_scene(model, mp, cfg, a.thr, a.max_frames, a.real, device, png, a.assume_continuous)
+            srow, regs = eval_scene(model, mp, cfg, a.thr, a.max_frames, a.real, device, png, a.assume_continuous, a.fill_guard)
         except Exception as e:
             print(f"  !! {mp.name}: {e}", flush=True); continue
         scene_rows.append(srow); regions += regs

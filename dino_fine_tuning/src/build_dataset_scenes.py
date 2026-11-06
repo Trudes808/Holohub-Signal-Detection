@@ -105,6 +105,10 @@ def process_scene(res, acc: Accum, cfg, device, gallery: dict | None):
         out = fe.compute_front_end(fr, rate, cfg, fft_size=F)
         resized = (out.resized[0].clamp(0, 1) * 255.0 + 0.5).to(torch.uint8).cpu().numpy()
         gt = fe.rasterize_gt(res["anns"], fidx * FS, F, ROWS, NFFT, rate).numpy()
+        for (s0, s1) in (res.get("meta", {}).get("ingest", {}) or {}).get("zero_ranges", []):   # outage rows carry no signal
+            r0 = max(0, -(-(s0 - fidx * FS) // F)); r1 = min(ROWS, (s1 - fidx * FS) // F)
+            if r1 > r0:
+                gt[r0:r1] = 0
         for ti in range(ROWS // TILE):
             r0 = ti * TILE
             info = {"frame_id": f"{stem}#f{fidx}t{ti}", "stem": stem, "fidx": fidx, "abs_start": fidx * FS,
