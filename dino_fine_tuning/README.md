@@ -29,7 +29,7 @@ Meta license form) go under its `weights/`:
 | Backbone | File | Used by |
 | --- | --- | --- |
 | ViT-B/16 | `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth` | M1–M4, zero-shot `cuda_dino` |
-| ViT-S/16 | `dinov3_vits16_pretrain_lvd1689m-08c60483.pth` | M5-S (deployed) |
+| ViT-S/16 | `dinov3_vits16_pretrain_lvd1689m-08c60483.pth` | M5-S, M6-S … M12-S (M7-S deployed) |
 
 `configs/train.yaml` points at the ViT-B file via `../../dinov3/weights/...`; edit `weights_path`
 or pass `--weights-path` to use another location.
@@ -75,7 +75,7 @@ its own `nfft`-point FFT to reproduce the trained per-pixel physics, so a model 
 245.76 MSps geometry is applied to a 491.52 MSps stream through the `real_time_downsample`
 front end; see §3 for the models trained directly at the deployment rate.
 The app also offers a short-FFT variant of that front end (`downsample_time_pool`, app README §7,
-`config_live_v3_dino_ft_m5s_sf2048.yaml`). M5-S was trained on the wide-FFT front end that
+`config_live_v3_dino_ft_m7s_sf2048.yaml`). M5-S and M7-S were trained on the wide-FFT front end that
 `src/frontend.py` replicates, so port the pooling into `src/frontend.py` before retraining a model for
 that deployment.
 
@@ -89,8 +89,8 @@ that deployment.
 | M2_dr | ViT-B/16 | M2 recipe with sample-rate domain randomisation (20.48–245.76 MSps, Hann) | rate-invariant model used by the 245.76 MSps replay demo (`config_dino_finetuned_viz_demo.yaml`) |
 | M3_491 | ViT-B/16 | synthetic dense+sparse composites at **491.52 MSps** through the exact deployment front end (`src/frontend.py`: flatten + robust p20 floor normalisation) | first model trained at the deployment rate; held-out detection 83–100 % across SNR |
 | M4_491_ota | ViT-B/16 | M3 data + real over-the-air captures labelled by the coherent detector (teacher) + antenna-off noise negatives | fixed the real-OTA domain gap |
-| **M5S_491_ota** | **ViT-S/16** | M4 data | **deployed**: ~10 ms per tile pair, so the live detector runs on every frame at 491.52 MSps |
-| M6S_multirate / **M7S_scenes_v2** | ViT-S/16 | multi-rate / multi-scenario synthetic scenes (`src/gen_scenes.py`: hoppers, adjacent cellular carriers and uplinks, ISM near-far collisions, 5 GHz, drones, land-mobile radios, broadcast FM, band-edge cut-offs, every X410 rate 5–500 MSps; realism calibrated on real captures) + the M4 OTA tiles | **M7-S = candidate successor of M5-S since 2026-11-03** (`config_live_v3_dino_ft_m7s.yaml`; M8-S / v3 scored higher on synthetic sets but filled quiet high-gain frames on real N320 captures): real cellular/LMR/NR test recordings pixel recall 0.33 → 0.95, region det@0.5 24 → 80 %; synthetic held-out detection 65 → 87 %; legacy 491.52 held-out unchanged or better; OTA A/B pending (`config_live_v3_dino_ft_m7s.yaml`). Details in [`infocom_evals/.../dino_ft_multirate_scenes/`](../applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_experiments/dino_ft_multirate_scenes/README.md) |
+| **M5S_491_ota** | **ViT-S/16** | M4 data | deployed in v1.0.0 (replaced by M7-S 2026-11-06): ~10 ms per tile pair, so the live detector runs on every frame at 491.52 MSps |
+| M6S_multirate / **M7S_scenes_v2** | ViT-S/16 | multi-rate / multi-scenario synthetic scenes (`src/gen_scenes.py`: hoppers, adjacent cellular carriers and uplinks, ISM near-far collisions, 5 GHz, drones, land-mobile radios, broadcast FM, band-edge cut-offs, every X410 rate 5–500 MSps; realism calibrated on real captures) + the M4 OTA tiles | **M7-S = deployed since 2026-11-06 (v1.5.0)**, same ~10 ms ViT-S cost as M5-S (`config_live_v3_dino_ft_m7s*.yaml`; M8-S / v3 scored higher on synthetic sets but filled quiet high-gain frames on real N320 captures): real cellular/LMR/NR test recordings pixel recall 0.33 → 0.95, region det@0.5 24 → 80 %; synthetic held-out detection 65 → 87 %; legacy 491.52 held-out unchanged or better. Details in [`infocom_evals/.../dino_ft_multirate_scenes/`](../applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_experiments/dino_ft_multirate_scenes/README.md) |
 | M8S_scenes_v3 / M9S_headv2 / **M10S_v5** / M11S_v6 | ViT-S/16 | generator v3 (fill keeps an edge, DC spur labelled) → v4/v5 (`SegHeadV2` full-resolution input stem + quiet-pixel BCE weight; real terminated-input N320 backgrounds, spur combs labelled line by line, live-ingest artefacts) → v6 (gain-step artefact dropped as label noise, dense FHSS networks, regular spur combs) | **M10-S (2026-11-05) is the first model without the quiet-band "comb fill"** (synthetic comb probe 0 % filled tiles vs 12–25 % for M7/M9; 900 MHz ISM capture 7 of 116 tiles vs 34) and has the best real-data numbers of the lineage (hard cases det@0.5 88 % vs 80 %, pixel P 0.98; Argus P 0.80), at the cost of some cellular recall at 5–10 MSps traced to the gain-step artefact. **M11-S (v6, 2026-11-06)** is the best model on every labelled set (v6 held-out IoU 0.841 vs 0.809 / 0.741 for M10-S / M7-S, hard cases IoU 0.931) and marks the 900 MHz comb line by line, but with the quiet-pixel weight lowered to 1.0 it fills tiles on one narrow 10.24 MSps uplink look and paints the DC pedestal of the quiet reference; **M12-S (v6 data, weight 2.0) is training** to separate the two effects. The winner replaces M7-S as the candidate (operating threshold 0.5, see the experiment record). |
 
 To retrain the deployed lineage (needs the waveform library for the synthetic composites,
@@ -173,7 +173,8 @@ python run_ts_on_sigmf.py --ts finetuned_dino_m7s_scenes_v2_bf16.ts --capture x.
 
 | File | Needed for |
 | --- | --- |
-| `weights/finetuned_dino_m5s_491_bf16.ts` + `.meta.json` | the live demo and every `*_m5s*` config |
+| `weights/finetuned_dino_m7s_scenes_v2_bf16.ts` + `.meta.json` | the live demo, offline eval, preprocessing: every current fine-tuned config (v1.5.0 release asset) |
+| `weights/finetuned_dino_m5s_491_bf16.ts` + `.meta.json` | `old_configs/*_m5s*` A/B only (v1.0.0 release asset) |
 | `weights/finetuned_dino_m4_491_bf16.ts`, `..._m3_491_...`, `..._m2_dr_...` | legacy configs only (see the app README §6) |
 | `checkpoints/<model>/best.pt` | retraining / re-export (each bundles backbone + head + the val threshold) |
 

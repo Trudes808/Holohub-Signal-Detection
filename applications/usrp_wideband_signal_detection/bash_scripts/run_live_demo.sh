@@ -71,10 +71,10 @@ case "${MODE}" in
     V3_DUAL=1
     ;;
   v3m5s)
-    # Single-channel v3 pipeline whose DINO detector is the fine-tuned ViT-S (M5-S): ~10 ms bs=2
-    # forward, single-pass, so emit_stride=1 runs per-frame. STARTS ON COHERENT POWER (like v3);
-    # the conductor's cuda_dino_finetuned target is the M5-S config, so selecting DINO in DEMO
-    # CONTROLS switches to M5-S (not M4). Detection overlay ON so DINO masks are visible for eval.
+    # Single-channel v3 pipeline whose DINO detector is the fine-tuned ViT-S (M7-S since 2026-11-06;
+    # preset name kept from M5-S): ~10 ms bs=2 forward, single-pass, so emit_stride=1 runs per-frame.
+    # STARTS ON COHERENT POWER (like v3); the conductor's cuda_dino_finetuned target is the M7-S config,
+    # so selecting DINO in DEMO CONTROLS switches to M7-S. Detection overlay ON so DINO masks are visible.
     # GAIN=10 (same as v3): the busy 2.4 GHz band saturates the front end at 15, dropping strong signals.
     CONFIG_NAME=config_live_v3_single_channel.yaml
     export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234} \
@@ -83,7 +83,7 @@ case "${MODE}" in
     ;;
   v3m5sdual)
     # v3m5s on BOTH channels: ch0 @ 2.4 GHz, ch1 @ 1 GHz, 491.52 MSps each. STARTS ON COHERENT POWER;
-    # selecting DINO switches to M5-S dual (emit_stride 8, single-pass, in budget next to 2x FFT/viz/snips).
+    # selecting DINO switches to M7-S dual (single-pass ViT-S, in budget next to 2x FFT/viz/snips).
     # GAIN=10 like v3m5s (busy 2.4 GHz saturates at 15); override GAIN=15 if the 1 GHz band reads low.
     CONFIG_NAME=config_live_v3_two_channel.yaml
     export CHANNELS=${CHANNELS:-"0 1"} FREQS=${FREQS:-"2400e6 1000e6"} \
@@ -92,11 +92,11 @@ case "${MODE}" in
     V3_DUAL=1
     ;;
   v5)
-    # v5 = M5-S DINO detector + detection overlay ON, with the release_v2 CLASSIFIER stack:
+    # v5 = M7-S DINO detector + detection overlay ON, with the release_v2 CLASSIFIER stack:
     # 6 classes (qpsk/bfm/he/nr5g/ble/noise), the snipper feeds occupied_bw + 10 MHz (additive
     # guard). The class-color overlay ("Color Mask by Class" + "Color source") is retired -- those
     # DEMO CONTROLS are hidden and the overlay uses its default color. Starts on Coherent Power;
-    # switch to DINO v3 M5-S in DEMO CONTROLS.
+    # switch to DINO v3 M7-S in DEMO CONTROLS.
     CONFIG_NAME=config_live_v3_single_channel.yaml
     export CHANNELS=${CHANNELS:-0} FREQS=${FREQS:-2400e6} DEST_PORTS=${DEST_PORTS:-1234} \
            GAIN=${GAIN:-10} USRP_OVERLAY=1 \
@@ -105,7 +105,7 @@ case "${MODE}" in
     AMC_V2=1
     ;;
   v5dual)
-    # v5 on BOTH channels (ch0 2.4 GHz + ch1 1 GHz, 491.52 MSps each). DINO dual = M5-S stride 4.
+    # v5 on BOTH channels (ch0 2.4 GHz + ch1 1 GHz, 491.52 MSps each). DINO dual = M7-S stride 4.
     CONFIG_NAME=config_live_v3_two_channel.yaml
     export CHANNELS=${CHANNELS:-"0 1"} FREQS=${FREQS:-"2400e6 1000e6"} \
            DEST_PORTS=${DEST_PORTS:-"1234 1235"} GAIN=${GAIN:-15} USRP_OVERLAY=1 \

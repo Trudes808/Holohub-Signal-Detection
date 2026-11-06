@@ -468,8 +468,8 @@ labelled-set numbers at M11-S level.
 `dino_fine_tuning/weights/finetuned_dino_m7s_scenes_v2_bf16.ts` (+ `.meta.json`, eager-vs-traced IoU 1.000,
 threshold 0.6, trained_rate_range 5–500 MSps; the M6-S export `finetuned_dino_m6s_multirate_bf16.ts` is kept
 for A/B). Same geometry contract and front-end as M5-S, so the only config change is `model_script_path`
-(done in `config_live_v3_dino_ft_m7s.yaml`). The conductor's live DINO
-target still points at M5-S until the OTA A/B.
+(done in `config_live_v3_dino_ft_m7s.yaml` and `config_live_v3_dino_ft_m7s_two_channel.yaml`). Since 2026-11-06
+the demo's DINO switch (conductor single + dual, loopback supervisor and runners) loads M7-S; M5-S is off the switch.
 
 ### Reproduce
 

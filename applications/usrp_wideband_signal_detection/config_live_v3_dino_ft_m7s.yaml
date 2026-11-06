@@ -1,4 +1,4 @@
-# M7-S multi-rate DINO-FT live config: identical to config_live_v3_dino_ft_m5s.yaml except the detector loads
+# M7-S multi-rate DINO-FT live config: identical to old_configs/config_live_v3_dino_ft_m5s.yaml except the detector loads
 # the M7-S export (ViT-S fine-tuned 2026-11-03 on the v2 multi-rate / multi-scenario synthetic scenes + real OTA
 # tiles: hoppers, adjacent cellular carriers + uplinks, ISM near-far collisions, 5 GHz, drones, land-mobile
 # radios, band-edge cut-offs, 5-500 MSps). Same front-end,

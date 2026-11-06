@@ -2773,7 +2773,7 @@ static const char* const kDemoSnrNames[] = {"clean", "30", "20", "15", "12", "9"
 // to restore, re-add {"cuda_dino", "CUDA-DINO"} / {"cuda_dino_finetuned_sb", "DINO-FT (SB ignore)"}
 // here and bump the Combo count below.
 static const char* const kDemoDetectorNames[] = {"coherent_power", "cuda_dino_finetuned"};
-static const char* const kDemoDetectorLabels[] = {"Coherent Power", "DINO v3 M5-S"};
+static const char* const kDemoDetectorLabels[] = {"Coherent Power", "DINO v3 M7-S"};
 static const char* const kDemoChannelModeNames[] = {"single", "dual"};
 static const char* const kDemoChannelModeLabels[] = {"Single", "Dual"};
 

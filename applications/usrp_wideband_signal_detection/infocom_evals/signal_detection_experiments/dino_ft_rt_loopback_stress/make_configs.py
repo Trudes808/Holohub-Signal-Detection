@@ -127,7 +127,7 @@ def coherent() -> None:
 
 def dino(leg: str, model: str, rt: bool, label: str, snipper: bool = True, viz: bool = True,
          extra: dict | None = None) -> None:
-    base = "config_live_v3_dino_ft_m5s.yaml"
+    base = "old_configs/config_live_v3_dino_ft_m5s.yaml"   # moved 2026-11-06 (M7-S replaced M5-S)
     t = (APP / base).read_text()
     # Pipeline-load ablations (same detector block -> same offline reference as the full-pipeline leg):
     # *_nosnip drops the snipper+compression+sink branch, *_nosnip_noviz also drops the dashboard.

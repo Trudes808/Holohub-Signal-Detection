@@ -18,7 +18,7 @@ unchanged in [`doc/holohub_upstream_README.md`](doc/holohub_upstream_README.md).
 | --- | --- |
 | **Install Holoscan and run the live demo** on a USRP X410 (dashboard, detector switch, signal classifier) | [`applications/usrp_wideband_signal_detection/README.md`](applications/usrp_wideband_signal_detection/README.md) §1 Install, §2 Live demo |
 | **Segment the regions of interest in an offline dataset** (a directory of SigMF captures → `<dir>_preprocessed` of per-signal SigMF cutouts) | [`applications/usrp_wideband_signal_detection/README.md`](applications/usrp_wideband_signal_detection/README.md) §3 Preprocess an offline dataset |
-| **Retrain the fine-tuned DINOv3 detector** (the M2 recipe on the Argus dataset, and how the deployed M5-S was trained and exported) | [`dino_fine_tuning/README.md`](dino_fine_tuning/README.md) |
+| **Retrain the fine-tuned DINOv3 detector** (the M2 recipe on the Argus dataset, and how the deployed M7-S and its M5-S predecessor were trained and exported) | [`dino_fine_tuning/README.md`](dino_fine_tuning/README.md) |
 
 Quick version of each:
 
@@ -54,7 +54,7 @@ python src/train.py --config configs/train.yaml --dataset data/dataset --mode ft
 - **Original bench:** x86_64 with an RTX 4000 Ada (CUDA 12.6, GPUDirect RDMA). Container image: `applications/usrp_freq_detection/Dockerfile`. Platform deltas: [`notes/RUNNING_ON_DGX_SPARK.md`](applications/usrp_wideband_signal_detection/notes/RUNNING_ON_DGX_SPARK.md) §1.
 
 Model weights are not in git. The app README §1 lists what to download and where it goes
-(DINOv3 backbone, the fine-tuned `M5-S` TorchScript export, optional classifier weights).
+(DINOv3 backbone, the fine-tuned `M7-S` TorchScript export, optional classifier weights).
 
 ## License
 

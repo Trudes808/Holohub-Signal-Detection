@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Persistent DUAL-channel M5-S DINO loopback demo over the Spark's own QSFP loopback cable
+# Persistent DUAL-channel M7-S DINO loopback demo over the Spark's own QSFP loopback cable  [M7-S since 2026-11-06; script name kept]
 # (CX7 sender enp1s0f1np1 -> CX7 data port 0000:01:00.0; NO radio). Replays the 491.52 MSps
 # composite on BOTH channels: ch0 (udp 1234) + ch1 (udp 1235, portmap copy) simultaneously on the
 # one wire; the DPDK receive-port flows split them. Unlike run_loopback_dual_dino_ft.sh (a 45 s
-# self-tearing test on the M3/M4 dual config), this launches the M5-S dual config and STAYS UP:
+# self-tearing test on the M3/M4 dual config), this launches the M7-S dual config and STAYS UP:
 # the app runs detached in the container and the two tcpreplay loops run detached on the host, so
 # the dashboard keeps scrolling until you stop it.
 #
@@ -11,7 +11,7 @@
 #   Stop:    ./bash_scripts/stop_loopback_m5s_dual.sh   (or stop_loopback_demo.sh)
 #
 # Env knobs:
-#   CONFIG_NAME  dual config to run     (default config_live_v3_dino_ft_m5s_two_channel.yaml)
+#   CONFIG_NAME  dual config to run     (default config_live_v3_dino_ft_m7s_two_channel.yaml)
 #   PCAP_CH0     ch0 pcap basename      (default x410_ota_2g4_gain10_20260908_46f.spark.pcap)
 #   PCAP_CH1     ch1 pcap basename      (default x410_ota_ch1_p1235_46f.spark.pcap)
 #   PPS          tcpreplay pkt rate/ch  (default 480000 = full 491.52 MSps)
@@ -28,7 +28,7 @@ CN="${CONTAINER_NAME:-usrp_x410_sig_det_sat3737}"
 
 SENDER_IFACE="${SENDER_IFACE:-enp1s0f1np1}"
 DEMO_DISPLAY="${DEMO_DISPLAY:-${DISPLAY:-:1}}"
-CONFIG_NAME="${CONFIG_NAME:-config_live_v3_dino_ft_m5s_two_channel.yaml}"
+CONFIG_NAME="${CONFIG_NAME:-config_live_v3_dino_ft_m7s_two_channel.yaml}"
 RATE_HZ="${RATE_HZ:-491520000}"
 CENTER_HZ="${CENTER_HZ:-2400000000}"
 PPS="${PPS:-480000}"
@@ -56,7 +56,7 @@ sudo docker exec "${CN}" bash -lc \
    for i in \$(seq 1 30); do pgrep -f '(^|/)usrp_wideband_signal_detection( |\$)' >/dev/null || break; sleep 1; done; \
    rm -f /dev/hugepages/nwlrbbmqbh* 2>/dev/null; rm -rf /var/run/dpdk/nwlrbbmqbh 2>/dev/null || true"
 
-echo "==> [3/5] launch M5-S dual app (${CONFIG_NAME}) detached on ${DEMO_DISPLAY} @ ${RATE_HZ} Hz"
+echo "==> [3/5] launch M7-S dual app (${CONFIG_NAME}) detached on ${DEMO_DISPLAY} @ ${RATE_HZ} Hz"
 # v5 dashboard env (mirror run_live_demo.sh v5dual): detection overlay ON, class-colored masks, the
 # release_v2 classifier taxonomy (so the panels read QPSK/802.11AX/BLE/5G_NR/BFM), additive snip guard.
 USRP_OVERLAY="${USRP_OVERLAY:-1}"
@@ -97,7 +97,7 @@ sudo setsid nohup tcpreplay --preload-pcap --loop 0 --pps "${PPS}" -i "${SENDER_
 sudo setsid nohup tcpreplay --preload-pcap --loop 0 --pps "${PPS}" -i "${SENDER_IFACE}" "${P1}" \
   > "${JOB}/tr_ch1.log" 2>&1 < /dev/null &
 sleep 1
-echo "==> dual M5-S loopback is UP (detached). tcpreplay procs:"
+echo "==> dual M7-S loopback is UP (detached). tcpreplay procs:"
 pgrep -a -x tcpreplay | sed 's/^/    /' || echo "    (none yet -- check ${JOB}/tr_ch*.log)"
 echo "    app log:   sudo docker exec ${CN} tail -f /workspace/spectrograms/demo_app.log"
 echo "    stop with: ${SCRIPT_DIR}/stop_loopback_m5s_dual.sh"

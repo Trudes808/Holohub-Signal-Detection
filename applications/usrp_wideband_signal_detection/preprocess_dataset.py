@@ -59,7 +59,7 @@ REPACK_SCRIPT = APP_DIR / "repack_offline_masks.py"
 DETECTOR_BASE_CONFIGS = {
     "coherent_power": APP_DIR / "config_signal_snipper_single_channel.yaml",
     "cuda_dino": APP_DIR / "config_cuda_dino_performance_single_channel.yaml",
-    "cuda_dino_finetuned": APP_DIR / "config_live_v3_dino_ft_m5s.yaml",
+    "cuda_dino_finetuned": APP_DIR / "config_live_v3_dino_ft_m7s.yaml",
 }
 
 # Defaults used only when the base config has no signal_snipper / sigmf_file_sink block

@@ -349,8 +349,8 @@ endforeach()
     config_signal_snipper_single_channel.yaml
     config_live_v3_single_channel.yaml
     config_live_v3_two_channel.yaml
-    config_live_v3_dino_ft_m5s.yaml
-    config_live_v3_dino_ft_m5s_two_channel.yaml
+    config_live_v3_dino_ft_m7s.yaml
+    config_live_v3_dino_ft_m7s_two_channel.yaml
   )
 
   set(USRP_WIDEBAND_CONFIG_OUTPUTS)

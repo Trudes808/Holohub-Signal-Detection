@@ -24,8 +24,8 @@ config_for() {
   case "$1/$2" in
     coherent_power/single)      echo "single config_live_v3_single_channel.yaml" ;;
     coherent_power/dual)        echo "dual config_live_v3_two_channel.yaml" ;;
-    cuda_dino_finetuned/single) echo "single config_live_v3_dino_ft_m5s.yaml" ;;
-    cuda_dino_finetuned/dual)   echo "dual config_live_v3_dino_ft_m5s_two_channel.yaml" ;;
+    cuda_dino_finetuned/single) echo "single config_live_v3_dino_ft_m7s.yaml" ;;
+    cuda_dino_finetuned/dual)   echo "dual config_live_v3_dino_ft_m7s_two_channel.yaml" ;;
     *) echo "" ;;
   esac
 }

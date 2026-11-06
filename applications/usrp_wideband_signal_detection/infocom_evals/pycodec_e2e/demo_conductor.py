@@ -47,10 +47,11 @@ CONFIG_BY_DETECTOR = {
 CONFIG_BY_DETECTOR_LIVE = {
     "coherent_power": "config_live_v3_single_channel.yaml",
     "cuda_dino": "config_live_v3_dino.yaml",
-    # DINO-FT switch target is the fine-tuned ViT-S (M5-S): ~10 ms bs=2 forward so the
+    # DINO-FT switch target is the fine-tuned ViT-S M7-S (multi-rate / multi-scenario retrain,
+    # 2026-11-03; replaced M5-S 2026-11-06): same ViT-S cost as M5-S (~10 ms bs=2 forward), so the
     # rate-adaptive downsample path sustains emit_stride=1 (per-frame) at 491.52 MSps.
-    # (M4 ViT-B is retired from the live switch; its config/weights remain for offline A/B.)
-    "cuda_dino_finetuned": "config_live_v3_dino_ft_m5s.yaml",
+    # (M5-S / M4 are retired from the live switch; their configs/weights remain for offline A/B.)
+    "cuda_dino_finetuned": "config_live_v3_dino_ft_m7s.yaml",
     # Legacy A/B variant (mask-edge trim). Superseded by circular edge inference
     # in the operator, kept selectable for comparison.
     "cuda_dino_finetuned_sb": "config_live_v3_dino_ft_sb.yaml",
@@ -67,10 +68,10 @@ CONFIG_BY_DETECTOR_LIVE = {
 # already removes the border artifact, so a separate trimmed variant adds nothing in dual mode.
 CONFIG_BY_DETECTOR_LIVE_DUAL = {
     "coherent_power": "config_live_v3_two_channel.yaml",
-    # M5-S dual: emit_stride=8 (half the M4 dual's 16, since ViT-S is ~2x faster) keeps
-    # both 491.52 MSps channels inside the compute budget.
-    "cuda_dino_finetuned": "config_live_v3_dino_ft_m5s_two_channel.yaml",
-    "cuda_dino_finetuned_sb": "config_live_v3_dino_ft_m5s_two_channel.yaml",
+    # M7-S dual (same ViT-S cost and stride as the M5-S dual it replaced) keeps both
+    # 491.52 MSps channels inside the compute budget.
+    "cuda_dino_finetuned": "config_live_v3_dino_ft_m7s_two_channel.yaml",
+    "cuda_dino_finetuned_sb": "config_live_v3_dino_ft_m7s_two_channel.yaml",
 }
 CONFIG_BY_DETECTOR_LOOPBACK = {
     "coherent_power": "config_loopback_v3_single_channel.yaml",

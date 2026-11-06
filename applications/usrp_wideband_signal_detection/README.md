@@ -20,7 +20,7 @@ Three detectors are selectable per config (`pipeline.detector_type`):
 | --- | --- | --- |
 | `coherent_power` | CUDA coherent-power detector with a live-learned (`dynamic`) or calibrated per-frequency noise floor. | Lowest latency, highest precision; default live detector. |
 | `cuda_dino` | Zero-shot DINOv3 ViT-B/16 features + coherence-gate fusion (TorchScript). | Reference / comparison detector. |
-| `cuda_dino_finetuned` | Fine-tuned DINOv3 segmenter, **M5-S (ViT-S)** deployed; per-frame at 491.52 MSps. | Best recall at low SNR; the "DINO" entry of the live demo. See [`dino_fine_tuning/`](../../dino_fine_tuning/README.md). |
+| `cuda_dino_finetuned` | Fine-tuned DINOv3 segmenter, **M7-S (ViT-S, multi-rate retrain)** deployed; per-frame at 491.52 MSps. | Best recall at low SNR; the "DINO" entry of the live demo. See [`dino_fine_tuning/`](../../dino_fine_tuning/README.md). |
 
 **Validated bench:** NVIDIA DGX Spark (GB10, aarch64, CUDA 13) + USRP X410 (`CG_400` FPGA image,
 491.52 MSps) + ConnectX-7. The original x86 bench (RTX 4000 Ada, CUDA 12.6, GPUDirect RDMA) still
@@ -43,7 +43,7 @@ All commands below run **from this directory**.
 | Input | Where it must be | Used by |
 | --- | --- | --- |
 | [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3) checkout + gated `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth` under its `weights/` | `<repo>/../dinov3` (sibling of this repo; override `HOST_DINOV3_ROOT`) | container build (`cuda_dino`, exported to TorchScript in-container) |
-| `finetuned_dino_m5s_491_bf16.ts` + `.meta.json` | `dino_fine_tuning/weights/` | every `cuda_dino_finetuned` config of the demo |
+| `finetuned_dino_m7s_scenes_v2_bf16.ts` + `.meta.json` | `dino_fine_tuning/weights/` | every `cuda_dino_finetuned` config of the demo, offline eval and `preprocess_dataset.py` (v1.5.0 release asset) |
 | `holoscan_waveform_generation` checkout with its `.venv-ml` (optional) | `~/Documents/holoscan_waveform_generation` (override `VENV_PY`, `PYCODEC_ROOT`) | the `v3`/`v5` classifier daemon and the loopback pcaps |
 
 Older fine-tuned exports (`m4_491`, `m3_491`, `m2_dr`) are only needed by the legacy configs listed in §6.
@@ -96,13 +96,13 @@ sudo ./bash_scripts/run_live_demo.sh v5dual     # dual channel: 2.4 GHz + 1.0 GH
 
 What you get: the HoloViz dashboard (PSD + max-hold, waterfall, detection overlay, throughput and
 GPU readouts) with a **DEMO CONTROLS** panel. The demo starts on **Coherent Power**; pick
-**DINO v3 M5-S** in the detector dropdown to switch (the conductor relaunches the app, ~15 s).
+**DINO v3 M7-S** in the detector dropdown to switch (the conductor relaunches the app, ~15 s).
 The `v5` presets also start the classify-only AMC daemon, which classifies the snipped signals
 (release_v2 classes `qpsk / bfm / he / nr5g / ble / noise`) and feeds the classifier panels.
 
 | Preset | Config | Detector switch | Classifier stack |
 | --- | --- | --- | --- |
-| `v5` / `v5dual` | `config_live_v3_single_channel.yaml` / `config_live_v3_two_channel.yaml` | Coherent Power ↔ DINO v3 M5-S | release_v2 (6 classes) |
+| `v5` / `v5dual` | `config_live_v3_single_channel.yaml` / `config_live_v3_two_channel.yaml` | Coherent Power ↔ DINO v3 M7-S | release_v2 (6 classes) |
 | `single` / `dual` | `config_coherent_power_perf_dynamic_single_channel.yaml` / `config_coherent_power_performance_emit_stride1_two_channel.yaml` | none (coherent only) | none, minimal footprint |
 | `v3` `v3dual` `v4` `v4dual` `v3m5s` `v3m5sdual` | the v3 configs | as `v5` | legacy v1 classifier (kept for reference) |
 | `<config.yaml>` | any top-level config | none | none |
@@ -129,7 +129,7 @@ derives its FFT geometry from the true rate.
 replays a captured CHDR stream into the DPDK port and the full pipeline runs unchanged:
 
 ```bash
-./bash_scripts/run_loopback_m5s_single.sh          # ch0 only, M5-S per frame
+./bash_scripts/run_loopback_m5s_single.sh          # ch0 only, M7-S per frame (script name kept from M5-S)
 ./bash_scripts/run_loopback_m5s_dual.sh            # ch0 + ch1 on one wire
 sudo env DEMO_DISPLAY=:1 ./bash_scripts/loopback_channel_supervisor.sh dual   # + live Single↔Dual / detector toggles
 ./bash_scripts/stop_loopback_m5s_dual.sh
@@ -151,7 +151,7 @@ Point a detector at a directory of SigMF captures and get a sibling directory of
 # 2. make sure the container is built (§1)
 # 3. run the selected detector over the directory
 sudo python3 preprocess_dataset.py /data/argus_captures --detector coherent_power
-sudo python3 preprocess_dataset.py /data/argus_captures --detector cuda_dino_finetuned   # DINO-FT M5-S
+sudo python3 preprocess_dataset.py /data/argus_captures --detector cuda_dino_finetuned   # DINO-FT M7-S
 sudo python3 preprocess_dataset.py /data/argus_captures --detector cuda_dino --mode time_only --out /data/argus_time_slices
 ```
 
@@ -249,9 +249,8 @@ See the header of each script for its inputs and policy knobs, and
 | Config | Detector | Role |
 | --- | --- | --- |
 | `config_live_v3_single_channel.yaml` / `config_live_v3_two_channel.yaml` | coherent_power | **Live demo** start configs (`v5`, `v5dual`): snipper on, dashboard with DEMO CONTROLS. |
-| `config_live_v3_dino_ft_m5s.yaml` / `config_live_v3_dino_ft_m5s_two_channel.yaml` | cuda_dino_finetuned (M5-S) | Live demo DINO target (conductor switch) and the M5-S loopback runners. |
-| `config_live_v3_dino_ft_m5s_sf2048.yaml` | cuda_dino_finetuned (M5-S) | Same as the M5-S config with the short-FFT front-end (2048-point FFT, power-pooled rows): higher detection rate and less GPU per frame. Run it with `sudo ./bash_scripts/run_live_demo.sh config_live_v3_dino_ft_m5s_sf2048.yaml`, or point the conductor's `cuda_dino_finetuned` entry at it. |
-| `config_live_v3_dino_ft_m7s.yaml` | cuda_dino_finetuned (M7-S) | M5-S config pointed at the multi-rate / multi-scenario M7-S retrain (`dino_fine_tuning/README.md` §3); run with `sudo ./bash_scripts/run_live_demo.sh config_live_v3_dino_ft_m7s.yaml` for an OTA A/B against M5-S. |
+| `config_live_v3_dino_ft_m7s.yaml` / `config_live_v3_dino_ft_m7s_two_channel.yaml` | cuda_dino_finetuned (M7-S) | **Live demo DINO target** (conductor switch + loopback supervisor/runners) and the `preprocess_dataset.py` default: the multi-rate / multi-scenario M7-S retrain (`dino_fine_tuning/README.md` §3), invalid-frame guard 0.98. The M5-S versions they replaced (2026-11-06) are in `old_configs/`. |
+| `config_live_v3_dino_ft_m7s_sf2048.yaml` | cuda_dino_finetuned (M7-S) | Same as the M7-S config with the short-FFT front-end (2048-point FFT, power-pooled rows). With M5-S this gave a higher detection rate and less GPU per frame; not yet re-measured with M7-S. Run it with `sudo ./bash_scripts/run_live_demo.sh config_live_v3_dino_ft_m7s_sf2048.yaml`, or point the conductor's `cuda_dino_finetuned` entry at it. |
 | `config_live_v3_dino.yaml` | cuda_dino | Live zero-shot DINO target of the conductor. |
 | `config_live_v3_dino_ft_sb.yaml` | cuda_dino_finetuned (M4) | Legacy conductor entry (hidden in the dropdown). |
 | `config_loopback_v3_{single_channel,dino,dino_ft,dino_ft_sb}.yaml` | all | 245.76 MSps composite loopback demo (`run_loopback_v3_demo.sh`); `dino_ft*` use the M3 export. |
@@ -259,14 +258,14 @@ See the header of each script for its inputs and policy knobs, and
 | `config_coherent_power_perf_perfreq_single_channel.yaml` | coherent_power | Plain live run, calibrated floor; offline-eval base config. |
 | `config_coherent_power_performance_emit_stride1_two_channel.yaml` | coherent_power | Plain dual-channel live run (`dual` preset). |
 | `config_cuda_dino_performance_single_channel.yaml` | cuda_dino | Plain live / offline-eval zero-shot DINO. |
-| `config_cuda_dino_finetuned_performance_single_channel.yaml` | cuda_dino_finetuned (M5-S) | Plain live / offline-eval fine-tuned DINO (no snipper). |
+| `config_cuda_dino_finetuned_performance_single_channel.yaml` | cuda_dino_finetuned (M7-S) | Plain live / offline-eval fine-tuned DINO (no snipper). |
 | `config_signal_snipper_single_channel.yaml` | coherent_power | Headless snipper (default base of `preprocess_dataset.py --detector coherent_power`). |
 | `config_mask_replay_snip_single_channel.yaml` | mask_replay | Snip from precomputed masks of any detector (`snip_eval`). |
 | `config_snipper_viz_demo.yaml` / `config_dino_finetuned_viz_demo.yaml` | coherent_power / cuda_dino_finetuned (M2_dr) | 245.76 MSps replay demo with decode (`run_loopback_demo.sh`). |
 | `config_coherent_power_capture_chdr_single_channel.yaml` | coherent_power | Capture a frozen CHDR/IQ snapshot for offline replay. |
 
 Fine-tuned exports referenced by the configs (all gitignored, under `dino_fine_tuning/weights/`):
-`finetuned_dino_m5s_491_bf16.ts` (**required** for the demo), `finetuned_dino_m7s_scenes_v2_bf16.ts` (`_m7s`), `finetuned_dino_m4_491_bf16.ts`
+`finetuned_dino_m7s_scenes_v2_bf16.ts` (**required**: the demo and every current fine-tuned config), `finetuned_dino_m5s_491_bf16.ts` (`old_configs/*_m5s*`, from the v1.0.0 release), `finetuned_dino_m4_491_bf16.ts`
 (`_sb`), `finetuned_dino_m3_491_bf16.ts` (`loopback_v3_dino_ft*`), `finetuned_dino_m2_dr_bf16.ts`
 (`dino_finetuned_viz_demo`). How they were trained and how to export a new one:
 [`dino_fine_tuning/README.md`](../../dino_fine_tuning/README.md).

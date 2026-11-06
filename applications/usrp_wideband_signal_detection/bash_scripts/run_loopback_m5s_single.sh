@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Persistent SINGLE-channel M5-S DINO loopback demo (ch0 only, udp 1234) over the Spark's QSFP
+# Persistent SINGLE-channel M7-S DINO loopback demo (ch0 only, udp 1234) over the Spark's QSFP  [M7-S since 2026-11-06; script name kept]
 # loopback cable. Sibling of run_loopback_m5s_dual.sh; used by loopback_channel_supervisor.sh when
-# the DEMO CONTROLS "Channels" toggle is set to Single. On single channel the M5-S detector runs
+# the DEMO CONTROLS "Channels" toggle is set to Single. On single channel the M7-S detector runs
 # emit_stride=1 (per-frame) so the ROI ribbon is smooth (no dual striding).
 #
 #   Launch:  ./bash_scripts/run_loopback_m5s_single.sh
 #   Stop:    ./bash_scripts/stop_loopback_m5s_dual.sh   (tears down app + all tcpreplay)
 #
-# Env knobs: CONFIG_NAME (default config_live_v3_dino_ft_m5s.yaml), PCAP_CH0, PPS (default 480000),
+# Env knobs: CONFIG_NAME (default config_live_v3_dino_ft_m7s.yaml), PCAP_CH0, PPS (default 480000),
 #            RATE_HZ (491520000), CENTER_HZ (2400000000), DEMO_DISPLAY.
 set -uo pipefail
 
@@ -17,7 +17,7 @@ CN="${CONTAINER_NAME:-usrp_x410_sig_det_sat3737}"
 
 SENDER_IFACE="${SENDER_IFACE:-enp1s0f1np1}"
 DEMO_DISPLAY="${DEMO_DISPLAY:-${DISPLAY:-:1}}"
-CONFIG_NAME="${CONFIG_NAME:-config_live_v3_dino_ft_m5s.yaml}"
+CONFIG_NAME="${CONFIG_NAME:-config_live_v3_dino_ft_m7s.yaml}"
 RATE_HZ="${RATE_HZ:-491520000}"
 CENTER_HZ="${CENTER_HZ:-2400000000}"
 PPS="${PPS:-480000}"
@@ -41,7 +41,7 @@ sudo docker exec "${CN}" bash -lc \
    for i in \$(seq 1 30); do pgrep -f '(^|/)usrp_wideband_signal_detection( |\$)' >/dev/null || break; sleep 1; done; \
    rm -f /dev/hugepages/nwlrbbmqbh* 2>/dev/null; rm -rf /var/run/dpdk/nwlrbbmqbh 2>/dev/null || true"
 
-echo "==> [3/5] launch M5-S single app (${CONFIG_NAME}) detached on ${DEMO_DISPLAY} @ ${RATE_HZ} Hz"
+echo "==> [3/5] launch M7-S single app (${CONFIG_NAME}) detached on ${DEMO_DISPLAY} @ ${RATE_HZ} Hz"
 USRP_OVERLAY="${USRP_OVERLAY:-1}"
 USRP_CLASS_COLORS="${USRP_CLASS_COLORS:-0}"   # class-color overlay retired; controls hidden (default off)
 USRP_CLASSIFIER_MODELS="${USRP_CLASSIFIER_MODELS:-resnet1d,cnn1d,tprime_lg}"
@@ -77,5 +77,5 @@ echo "==> [5/5] starting ONE detached tcpreplay loop (ch0 udp1234) @ ${PPS} pps"
 sudo setsid nohup tcpreplay --preload-pcap --loop 0 --pps "${PPS}" -i "${SENDER_IFACE}" "${P0}" \
   > "${JOB}/tr_ch0.log" 2>&1 < /dev/null &
 sleep 1
-echo "==> single M5-S loopback is UP (detached). tcpreplay procs:"
+echo "==> single M7-S loopback is UP (detached). tcpreplay procs:"
 pgrep -a -x tcpreplay | sed 's/^/    /' || echo "    (none yet -- check ${JOB}/tr_ch0.log)"

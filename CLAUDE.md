@@ -43,14 +43,14 @@ when adding files, and update references when moving anything:
 
 ## Experiment Entry Points
 
-- Live demo (current): `sudo ./bash_scripts/run_live_demo.sh v5` / `v5dual` (coherent start, DINO v3 M5-S via DEMO CONTROLS; configs `config_live_v3_*.yaml`, `config_live_v3_dino_ft_m5s*.yaml`).
-- Plain live runs: `config_coherent_power_perf_dynamic_single_channel.yaml` (dynamic floor), `config_coherent_power_perf_perfreq_single_channel.yaml` (calibrated), `config_cuda_dino_performance_single_channel.yaml`, `config_cuda_dino_finetuned_performance_single_channel.yaml` (M5-S).
+- Live demo (current): `sudo ./bash_scripts/run_live_demo.sh v5` / `v5dual` (coherent start, DINO v3 M7-S via DEMO CONTROLS; configs `config_live_v3_*.yaml`, `config_live_v3_dino_ft_m7s*.yaml`).
+- Plain live runs: `config_coherent_power_perf_dynamic_single_channel.yaml` (dynamic floor), `config_coherent_power_perf_perfreq_single_channel.yaml` (calibrated), `config_cuda_dino_performance_single_channel.yaml`, `config_cuda_dino_finetuned_performance_single_channel.yaml` (M7-S).
 - No-radio loopback: `bash_scripts/run_loopback_m5s_{single,dual}.sh`, `loopback_channel_supervisor.sh` (tcpreplay over the QSFP loopback; configs `config_loopback_v3_*.yaml` for the older 245.76 composite demo).
 - Offline dataset preprocessing (detector + snipper over a directory -> `<dir>_preprocessed`): `sudo python3 preprocess_dataset.py <dir> --detector {coherent_power|cuda_dino|cuda_dino_finetuned}`.
 - Signal snipper live (headless): `config_signal_snipper_single_channel.yaml`
 - Frozen-input capture: `config_coherent_power_capture_chdr_single_channel.yaml`
 - Offline eval (all detectors, same operators as live): `python3 run_cuda_dino_offline_file.py <file.sigmf-data> --detector {coherent_power|cuda_dino|cuda_dino_finetuned} --config <cfg>`; sweeps + scoring per `infocom_evals/signal_detection_experiments/run_signal_detection_README.md`.
-- Fine-tuning: `dino_fine_tuning/README.md` (M2 recipe = `build_dataset.py` + `train.py --mode ft_lastN`; deployed lineage M3 -> M4 -> M5-S).
+- Fine-tuning: `dino_fine_tuning/README.md` (M2 recipe = `build_dataset.py` + `train.py --mode ft_lastN`; deployed lineage M3 -> M4 -> M5-S -> M7-S multi-rate retrain).
 - Calibration: `sudo ./calibration/calibrate_coherent_power_config.sh` and `sudo ./calibration/calibrate_dino_coherence_config.sh`.
 
 ## Validation Rules
