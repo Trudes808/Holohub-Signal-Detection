@@ -125,6 +125,13 @@ The dashboard window opens immediately but stays blank until samples arrive; tha
 state, not a failure. The X410 negotiates **491.52 MSps** whatever `--rate` asks for; the pipeline
 derives its FFT geometry from the true rate.
 
+**USRP N320 instead of the X410** (preliminary testing, up to 245.76 MSps per channel on one
+10 GbE link). The N320 needs `ANTENNA=TX/RX` (its default RX2 port is empty) and `KEEP_HDR=1`, and the
+configs need its 16-byte CHDR header (the X410's is 64 bytes). DPDK runs on the second PCIe function
+of the cabled port (`0002:01:00.1`) so that UHD control keeps the kernel link. The working settings,
+the config changes, a run script and the results are in
+[`infocom_evals/signal_detection_experiments/n320_live_m7s_prelim/`](infocom_evals/signal_detection_experiments/n320_live_m7s_prelim/README.md).
+
 **No-radio loopback demo.** With a QSFP cable between the two ConnectX-7 ports, `tcpreplay`
 replays a captured CHDR stream into the DPDK port and the full pipeline runs unchanged:
 

@@ -78,6 +78,7 @@ class Config(argparse.Namespace):
     keep_hdr: bool
     spp: Optional[int]
     mtu: Optional[int]
+    antenna: Optional[str]
 
 
 def parse_args() -> Config:
@@ -150,6 +151,11 @@ def parse_args() -> Config:
         "--mtu", type=int,
         help="""Specifies the MTU size for all channels.
         If not specified, the USRP will use the default MTU size.""",
+    )
+    parser.add_argument(
+        "--antenna", type=str,
+        help="""RX antenna port for all channels (e.g. 'TX/RX' on an N320 whose antennas sit on
+        TX/RX). If not specified, the device default is kept (X410: as before).""",
     )
     return parser.parse_args()
 
@@ -230,6 +236,10 @@ def main():
     for chan in channels:
         usrp.set_rx_gain(args.gain, chan)
     print(f"Actual gain: {usrp.get_rx_gain(channels[0])} dB.")
+    if args.antenna:
+        for chan in channels:
+            usrp.set_rx_antenna(args.antenna, chan)
+        print(f"RX antenna: {', '.join(usrp.get_rx_antenna(c) for c in channels)}.")
     print("Generating RX streamer object...")
     rx_streamers = []
     for chx, chan in enumerate(channels):
@@ -246,7 +256,10 @@ def main():
         rx_streamers.append(usrp.get_rx_stream(stream_args))
         if args.spp:
             print(f"Configuring samples per packet for channel {chan} to {args.spp}...")
-            usrp.get_radio_control(chan).set_properties(f"spp={args.spp}", chan % 2)
+            # Port of this channel on its radio block: X410 radios carry 2 channels (chan % 2, as
+            # before); the N320 has one radio block per channel (port 0 for every channel).
+            radio = usrp.get_radio_control(chan)
+            radio.set_properties(f"spp={args.spp}", chan % radio.get_num_output_ports())
     print("Starting stream(s)...")
     start_time = (
         uhd.types.TimeSpec(usrp.get_time_now().get_real_secs() + INIT_DELAY)

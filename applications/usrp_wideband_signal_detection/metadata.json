@@ -8,12 +8,13 @@
             }
         ],
         "language": "C++",
-        "version": "1.5.0",
+        "version": "1.5.1",
         "changelog": {
             "0.1.0": "Initial C++ application scaffold with spectrogram + DINOv3 signal detector flow",
             "0.2.0": "Added selectable coherent-power detector scaffolding alongside the existing DINOv3 path",
             "1.0.0": "Release: coherent-power + zero-shot DINOv3 + fine-tuned DINOv3 (M5-S) detectors, signal snipper + SigMF sink, live dashboard, offline dataset preprocessing, DGX Spark (aarch64) support",
-            "1.5.0": "Fine-tuned DINOv3 M7-S (multi-rate / multi-scenario retrain, 5-500 MSps) replaces M5-S everywhere (demo switch, loopback, offline eval, preprocessing); real-time DINO-FT pipeline sustains 245.76 MSps; short-FFT front end; scenario generator + any-rate SigMF eval tools"
+            "1.5.0": "Fine-tuned DINOv3 M7-S (multi-rate / multi-scenario retrain, 5-500 MSps) replaces M5-S everywhere (demo switch, loopback, offline eval, preprocessing); real-time DINO-FT pipeline sustains 245.76 MSps; short-FFT front end; scenario generator + any-rate SigMF eval tools",
+            "1.5.1": "USRP N320 live support for preliminary testing (radio script --antenna / KEEP_HDR, N320 spp port fix); M7-S configs validated live on the N320 at 245.76 MSps single and 2 x 122.88 MSps dual"
         },
         "holoscan_sdk": {
             "minimum_required_version": "3.5.0",

@@ -1,0 +1,4 @@
+rx_out_of_buffer: 0
+rx_vport_unicast_packets: 14400000
+rx_vport_unicast_bytes: 59817600000
+rx_discards_phy: 0

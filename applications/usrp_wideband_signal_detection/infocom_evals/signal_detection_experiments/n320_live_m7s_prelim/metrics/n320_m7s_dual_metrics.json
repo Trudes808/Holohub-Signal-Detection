@@ -1,0 +1,121 @@
+{
+  "run": "n320_m7s_dual",
+  "leg": null,
+  "detector_type": null,
+  "rate_hz": 0.0,
+  "pps": null,
+  "loops": 1,
+  "pcap_packets": 0,
+  "fft_size": null,
+  "ffts_per_batch": null,
+  "samples_per_frame": null,
+  "frame_period_ms": null,
+  "expected_frames": null,
+  "sent_samples": null,
+  "app_log": {
+    "dpdk": {
+      "received_packets": 13694079,
+      "missed_packets": 705918,
+      "rx_out_of_buffers": 322763209,
+      "rx_phy_packets": 14400909,
+      "rx_q0_errors": 160491033,
+      "rx_q0_packets": 6849599
+    },
+    "chdr": {
+      "processed_packets": 6609920,
+      "active_receive_s": 55.237,
+      "avg_msps": 122.54,
+      "batches_queued": 2582,
+      "batches_emitted": 2582,
+      "partial_batch_drops": 0,
+      "panic_resets": 0,
+      "backlog_events": 1,
+      "ring_full_shed_packets": 230400,
+      "max_out_q_depth": 8,
+      "mean_release_dwell_ms": 9.83,
+      "max_release_dwell_ms": 545.185
+    },
+    "fell_behind_count": 2,
+    "dpdk_might_get_dropped_warnings": 14,
+    "derived_fft": {
+      "span_hz": "122880000"
+    },
+    "fft_ingress": {
+      "windows": 1,
+      "emitted_frames_last": 2578,
+      "mean_chdr_to_fft_ms_last": 65.236,
+      "mean_chdr_to_fft_ms_windows_mean": 65.236,
+      "max_chdr_to_fft_ms": 405.998
+    },
+    "dino_total_gpu_sampled": {
+      "samples": 42,
+      "last_frame": 2560,
+      "p50_ms": 14.004999999999999,
+      "max_ms": 34.28
+    },
+    "dino_inference_log": {
+      "path": "downsample",
+      "geometry": "FFT 5120 -> model 1024 (gain corr 6.99 dB), 512 rows -> 2 tiles",
+      "mean_ms_final": 14.69,
+      "frames_timed": 640
+    },
+    "sink": {
+      "files_written": 37,
+      "dropped": 0
+    },
+    "dino_guard_suppressed": 0,
+    "rx_worker": {
+      "active_windows": 59,
+      "rate_mpps_mean": 0.11608474576271187,
+      "rate_mpps_max": 0.12,
+      "ring_full_drops_last": 0
+    },
+    "rx_pool": {
+      "capacity": 327680,
+      "free_min": 63488,
+      "free_first": 142661,
+      "drain_buffers_per_s": 0.0,
+      "arrival_pps": 118064.87719298246,
+      "drain_frac_of_arrival": 0.0,
+      "exhausted": false
+    },
+    "chdr_summaries": {
+      "active_windows": 55,
+      "rate_mpps_mean": 0.12398181818181819,
+      "emitted_per_window_mean": 46.92727272727273,
+      "max_out_q_depth": 8
+    },
+    "errors": 17,
+    "cuda_errors": 0
+  },
+  "tcpreplay": {},
+  "manifest": {
+    "frames_dumped": 0
+  },
+  "gpu": {},
+  "headline": {
+    "packets_sent": 0,
+    "packets_received_dpdk": 13694079,
+    "packet_loss_frac": null,
+    "dpdk_missed_packets": 705918,
+    "chdr_partial_batch_drops": 0,
+    "chdr_backlog_events": 1,
+    "fell_behind": 2,
+    "frames_expected": null,
+    "frames_emitted": 2582,
+    "frames_emitted_frac": null,
+    "detector_ms_p50": 14.004999999999999,
+    "detector_ms_p95": null,
+    "detector_ms_max": null,
+    "frame_period_ms": null,
+    "fft_ingress_ms_mean": 65.236,
+    "fft_ingress_ms_max": 405.998,
+    "gpu_util_mean": null,
+    "gpu_util_max": null,
+    "achieved_pps": null,
+    "pool_drain_frac": 0.0,
+    "pool_exhausted": false,
+    "ring_full_shed_packets": 230400,
+    "sustained_realtime": true
+  }
+}

@@ -32,6 +32,8 @@ CTRL_ADDR=${CTRL_ADDR:-192.168.21.2}     # X410 control address (sfp1, kernel li
 ADAPTER=${ADAPTER:-sfp0}                 # X410 QSFP the data exits (the data link)
 SPP=${SPP:-1024}                         # samples per packet (must match chdr_converter)
 DURATION=${DURATION:-}                   # empty = stream until Ctrl-C
+ANTENNA=${ANTENNA:-}                     # RX antenna port, empty = device default (N320 antennas: ANTENNA=TX/RX)
+KEEP_HDR=${KEEP_HDR:-}                   # 1 = full_packet (keep CHDR headers); N320 needs it so the DPDK header split lines up
 
 cd "${SCRIPT_DIR}/../../usrp_freq_detection"
 
@@ -52,4 +54,6 @@ exec python3 rx_to_remote_udp.py \
   --dest-port ${DEST_PORTS} \
   --dest-mac-addr "${DEST_MAC}" \
   --spp "${SPP}" \
-  ${DURATION:+--duration "${DURATION}"}
+  ${DURATION:+--duration "${DURATION}"} \
+  ${ANTENNA:+--antenna "${ANTENNA}"} \
+  ${KEEP_HDR:+--keep-hdr}
