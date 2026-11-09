@@ -18,6 +18,7 @@ unchanged in [`doc/holohub_upstream_README.md`](doc/holohub_upstream_README.md).
 | --- | --- |
 | **Install Holoscan and run the live demo** on a USRP X410 (dashboard, detector switch, signal classifier) | [`applications/usrp_wideband_signal_detection/README.md`](applications/usrp_wideband_signal_detection/README.md) §1 Install, §2 Live demo |
 | **Segment the regions of interest in an offline dataset** (a directory of SigMF captures → `<dir>_preprocessed` of per-signal SigMF cutouts) | [`applications/usrp_wideband_signal_detection/README.md`](applications/usrp_wideband_signal_detection/README.md) §3 Preprocess an offline dataset |
+| **Pseudo-label (soft-label) IQ recordings** with the released fine-tuned DINO models: files or whole directory trees in any common IQ format (SigMF, raw `.bin/.dat`, `.npy`, `.mat`, HDF5, …) → `<stem>_softlabel.sigmf-meta` with one annotation per detection, in plain PyTorch with no container | [`applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/soft_label_pipeline/README.md`](applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/soft_label_pipeline/README.md) |
 | **Retrain the fine-tuned DINOv3 detector** (the M2 recipe on the Argus dataset, and how the deployed M7-S and its M5-S predecessor were trained and exported) | [`dino_fine_tuning/README.md`](dino_fine_tuning/README.md) |
 
 Quick version of each:
@@ -30,6 +31,11 @@ sudo ./bash_scripts/run_live_demo.sh v5        # or v5dual for two channels
 
 # 2. offline dataset -> regions of interest
 sudo python3 preprocess_dataset.py /data/my_captures --detector coherent_power   # -> /data/my_captures_preprocessed
+
+# 2b. any IQ recordings -> DINO pseudo-labels as SigMF annotations (no container, no sudo; GPU or CPU)
+cd infocom_evals/snip_eval/soft_label_pipeline
+python3 soft_label_pipeline.py --input /data/recordings --recursive --detector dino_finetuned_m12s --out-dir /data/labels
+cd ../../..
 
 # 3. fine-tune DINOv3 (M2 recipe)
 cd ../../dino_fine_tuning

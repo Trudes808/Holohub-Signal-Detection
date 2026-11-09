@@ -4,13 +4,15 @@
 Clusters each frame's mask into signal boxes using the SAME rule as the C++ signal_snipper
 (4-connected components >= min_box_pixels, then coalesce boxes within merge_gap_{rows,cols}),
 maps every box to (sample_start, sample_count, freq_lower/upper_edge) on the ORIGINAL capture
-timeline, and writes a SigMF-style `<stem>_snipped.sigmf-meta` whose `annotations[]` are labelled
+timeline, and writes a SigMF `<stem>_softlabel.sigmf-meta` whose `annotations[]` are labelled
 `detected_waveform`. Because the clustering matches the snipper, these annotations line up with the
 per-snippet recordings the snipper emits.
 
 Usage:
   python3 snip_annotations.py --run-dir <batch_root>/<detector>/<stem> \
-      --captures-dir /home/bqn82/captures --out-dir <out>/<detector>/<stem>_snipped
+      --captures-dir /home/bqn82/captures --out-dir <out>/<detector>
+  # fill an existing SigMF meta (the pipeline's <stem>_softlabel.sigmf-meta written by to_sigmf.py) in place:
+  python3 snip_annotations.py --run-dir <run> --source-meta X_softlabel.sigmf-meta --out-meta X_softlabel.sigmf-meta
 """
 from __future__ import annotations
 import argparse, csv, glob, json
@@ -62,24 +64,18 @@ def boxes_from_mask(m, min_box_pixels, gap_rows, gap_cols, max_boxes=1500):
     return [tuple(v) for v in groups.values()]
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--run-dir", required=True, type=Path, help="<batch_root>/<detector>/<stem>")
-    ap.add_argument("--captures-dir", type=Path, default=Path("/home/bqn82/captures"))  # lab-admin home has no captures/
-    ap.add_argument("--out-dir", type=Path, default=None)
-    ap.add_argument("--min-box-pixels", type=int, default=256)
-    ap.add_argument("--merge-gap-rows", type=int, default=16)
-    ap.add_argument("--merge-gap-cols", type=int, default=80)
-    a = ap.parse_args()
-
-    run = a.run_dir
+def annotate(run: Path, source_meta: Path, out: Path, min_box_pixels: int = 256, merge_gap_rows: int = 16,
+             merge_gap_cols: int = 80, quiet: bool = False) -> int:
+    """Detections of run (<batch_root>/<detector>/<key>) -> SigMF annotations in `out`. Returns their count."""
     stem = run.name
     detector = run.parent.name
     manifest = {int(r["frame_number"]): r for r in csv.DictReader(open(run / "frame_manifest.csv"))}
-    # fs/center from the source SigMF meta
-    src_meta = json.load(open(a.captures_dir / f"{stem}.sigmf-meta"))
+    # fs/center from the source SigMF meta (centre: global block if present, else the first capture segment)
+    src_meta = json.load(open(source_meta))
     g = src_meta.get("global", {})
-    fs = float(g.get("core:sample_rate")); center = float(g.get("core:frequency", 0.0))
+    caps = src_meta.get("captures") or [{"core:sample_start": 0}]
+    fs = float(g.get("core:sample_rate"))
+    center = float(g.get("core:frequency", caps[0].get("core:frequency", 0.0)) or 0.0)
 
     ann = []
     for mf in sorted((run / "mask_arrays").glob("mask_ch0_f*.*")):
@@ -90,7 +86,7 @@ def main() -> int:
         m = load_mask(mf); rows, cols = m.shape
         fsc = int(float(row["complex_samples_read"]))
         gstart = int(float(row["global_sample_start"]))
-        for r0, r1, c0, c1 in boxes_from_mask(m, a.min_box_pixels, a.merge_gap_rows, a.merge_gap_cols):
+        for r0, r1, c0, c1 in boxes_from_mask(m, min_box_pixels, merge_gap_rows, merge_gap_cols):
             local_start = int(np.floor((r0 / rows) * fsc))
             local_end = int(np.ceil(((r1 + 1) / rows) * fsc))
             ann.append({
@@ -102,15 +98,45 @@ def main() -> int:
                 "wfgt:detector": detector, "wfgt:frame_number": num,
             })
 
-    out_dir = a.out_dir or (run.parent.parent / f"{detector}_snipped" / f"{stem}_snipped")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{stem}_snipped.sigmf-meta"
-    meta = {"global": {"core:datatype": "cf32_le", "core:sample_rate": fs, "core:frequency": center,
-                       "core:description": f"{detector} detections on {stem} (annotations only)"},
-            "captures": [{"core:sample_start": 0}],
-            "annotations": sorted(ann, key=lambda x: x["core:sample_start"])}
+    ann = sorted(ann, key=lambda x: x["core:sample_start"])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists() and out.resolve() == Path(source_meta).resolve():      # fill the pipeline's SigMF meta in place
+        meta = src_meta
+        meta["annotations"] = ann
+        meta["global"].update({"argus:soft_label_detector": detector,
+                               "argus:soft_label_gates": {"min_box_pixels": min_box_pixels,
+                                                          "merge_gap_rows": merge_gap_rows,
+                                                          "merge_gap_cols": merge_gap_cols}})
+    else:
+        meta = {"global": {"core:datatype": g.get("core:datatype", "cf32_le"), "core:sample_rate": fs,
+                           "core:frequency": center,
+                           "core:description": f"{detector} detections on {stem} (annotations only)"},
+                "captures": [{"core:sample_start": 0}],
+                "annotations": ann}
     out.write_text(json.dumps(meta, indent=2))
-    print(f"{detector}/{stem}: {len(ann)} detections -> {out}")
+    if not quiet:
+        print(f"{detector}/{stem}: {len(ann)} detections -> {out}")
+    return len(ann)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run-dir", required=True, type=Path, help="<batch_root>/<detector>/<stem>")
+    ap.add_argument("--captures-dir", type=Path, default=Path("/home/bqn82/captures"))  # lab-admin home has no captures/
+    ap.add_argument("--out-dir", type=Path, default=None)
+    ap.add_argument("--source-meta", type=Path, default=None,
+                    help="SigMF meta of the recording (default: <captures-dir>/<stem>.sigmf-meta)")
+    ap.add_argument("--out-meta", type=Path, default=None,
+                    help="write here (default: <out-dir>/<stem>_softlabel.sigmf-meta); == --source-meta fills it in place")
+    ap.add_argument("--min-box-pixels", type=int, default=256)
+    ap.add_argument("--merge-gap-rows", type=int, default=16)
+    ap.add_argument("--merge-gap-cols", type=int, default=80)
+    a = ap.parse_args()
+    run = a.run_dir
+    src = a.source_meta or (a.captures_dir / f"{run.name}.sigmf-meta")
+    out = a.out_meta or ((a.out_dir or (run.parent.parent / f"{run.parent.name}_softlabel"))
+                         / f"{run.name}_softlabel.sigmf-meta")
+    annotate(run, src, out, a.min_box_pixels, a.merge_gap_rows, a.merge_gap_cols)
     return 0
 
 if __name__ == "__main__":

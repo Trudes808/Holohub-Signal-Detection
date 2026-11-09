@@ -43,7 +43,7 @@ All commands below run **from this directory**.
 | Input | Where it must be | Used by |
 | --- | --- | --- |
 | [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3) checkout + gated `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth` under its `weights/` | `<repo>/../dinov3` (sibling of this repo; override `HOST_DINOV3_ROOT`) | container build (`cuda_dino`, exported to TorchScript in-container) |
-| `finetuned_dino_m7s_scenes_v2_bf16.ts` + `.meta.json` | `dino_fine_tuning/weights/` | every `cuda_dino_finetuned` config of the demo, offline eval and `preprocess_dataset.py` (v1.5.1 release asset) |
+| `finetuned_dino_m7s_scenes_v2_bf16.ts` + `.meta.json` | `dino_fine_tuning/weights/` | every `cuda_dino_finetuned` config of the demo, offline eval and `preprocess_dataset.py` (v1.5.1 release asset). The soft-label pipeline (§3) downloads this and the M12-S / M13-S exports itself when they are missing. |
 | `finetuned_dino_m12s_v6q2_bf16.ts` / `finetuned_dino_m13s_v7_bf16.ts` + `.meta.json` (optional) | `dino_fine_tuning/weights/` | the `_m12s` / `_m13s` configs: the v1.6.0 detectors recommended for low-SNR recall (M12-S) or fewer false positives (M13-S); not yet validated live, so the demo switch stays on M7-S (v1.6.0 release assets) |
 | `holoscan_waveform_generation` checkout with its `.venv-ml` (optional) | `~/Documents/holoscan_waveform_generation` (override `VENV_PY`, `PYCODEC_ROOT`) | the `v3`/`v5` classifier daemon and the loopback pcaps |
 
@@ -206,6 +206,19 @@ produced by the same sink; the container trades a custom reader for far fewer fi
 detector-mask pixels), `oversample_percent`, `bandwidth_margin_hz`, and the detector's own
 sensitivity (`coherent_power_signal_detector.fast_score_threshold`,
 `finetuned_dino_detector.threshold`, …). Pass your edited copy with `--config`.
+
+**Soft labels instead of cutouts, without the container.** To annotate recordings rather than cut them
+(every detection becomes a SigMF annotation in `<stem>_softlabel.sigmf-meta`, in a folder you choose), with
+the released fine-tuned models (M12-S, M13-S, M7-S or any `.ts` export) in plain PyTorch, no container or
+`sudo`, on single files or whole directory trees in any common IQ format (SigMF, raw `.bin/.dat`,
+`.npy/.npz`, `.mat`, HDF5, numpy pickles, IQ WAV):
+
+```bash
+cd infocom_evals/snip_eval/soft_label_pipeline
+python3 soft_label_pipeline.py --input /data/recordings --recursive --detector dino_finetuned_m12s --out-dir /data/labels
+```
+
+Details: [`infocom_evals/snip_eval/soft_label_pipeline/README.md`](infocom_evals/snip_eval/soft_label_pipeline/README.md).
 
 Scoring detectors against annotated ground truth (masks vs SigMF annotations, per class / SNR /
 bandwidth) is a separate harness:

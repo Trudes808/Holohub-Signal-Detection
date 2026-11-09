@@ -165,6 +165,13 @@ TorchScript export on another machine you need only `src/run_ts_on_sigmf.py`, `s
 python run_ts_on_sigmf.py --ts finetuned_dino_m7s_scenes_v2_bf16.ts --capture x.sigmf-meta --out out_dir --png 4
 ```
 
+To turn an export's detections into SigMF annotations (pseudo-labels) on any IQ recording, single files or
+whole directory trees in any common format, use the soft-label pipeline's torchscript tier
+(`applications/usrp_wideband_signal_detection/infocom_evals/snip_eval/soft_label_pipeline/`,
+`--detector dino_finetuned_{m12s,m13s,m7s}` or `dino_finetuned_ts --ts-model <your>.ts`). It runs this same
+front end (masks identical to `run_ts_on_sigmf.py`) and adds what the C++ operator does after the model:
+the mask widened to F columns, the invalid-frame guard and the snipper's box clustering.
+
 ---
 
 ## 4. Weights
@@ -179,6 +186,9 @@ python run_ts_on_sigmf.py --ts finetuned_dino_m7s_scenes_v2_bf16.ts --capture x.
 | `weights/finetuned_dino_m5s_491_bf16.ts` + `.meta.json` | `old_configs/*_m5s*` A/B only (v1.0.0 release asset) |
 | `weights/finetuned_dino_m4_491_bf16.ts`, `..._m3_491_...`, `..._m2_dr_...` | legacy configs only (see the app README §6) |
 | `checkpoints/<model>/best.pt` | retraining / re-export (each bundles backbone + head + the val threshold) |
+
+The soft-label pipeline downloads the M7-S, M12-S and M13-S exports from their release into `weights/` on
+first use; on a CPU-only machine it also writes a `<stem>.cpu.ts` copy there (the exports were traced on a GPU).
 
 ---
 
