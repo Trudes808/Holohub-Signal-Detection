@@ -29,7 +29,7 @@ Meta license form) go under its `weights/`:
 | Backbone | File | Used by |
 | --- | --- | --- |
 | ViT-B/16 | `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth` | M1–M4, zero-shot `cuda_dino` |
-| ViT-S/16 | `dinov3_vits16_pretrain_lvd1689m-08c60483.pth` | M5-S, M6-S … M12-S (M7-S deployed) |
+| ViT-S/16 | `dinov3_vits16_pretrain_lvd1689m-08c60483.pth` | M5-S, M6-S … M13-S (M7-S deployed) |
 
 `configs/train.yaml` points at the ViT-B file via `../../dinov3/weights/...`; edit `weights_path`
 or pass `--weights-path` to use another location.
@@ -91,7 +91,7 @@ that deployment.
 | M4_491_ota | ViT-B/16 | M3 data + real over-the-air captures labelled by the coherent detector (teacher) + antenna-off noise negatives | fixed the real-OTA domain gap |
 | **M5S_491_ota** | **ViT-S/16** | M4 data | deployed in v1.0.0 (replaced by M7-S 2026-11-06): ~10 ms per tile pair, so the live detector runs on every frame at 491.52 MSps |
 | M6S_multirate / **M7S_scenes_v2** | ViT-S/16 | multi-rate / multi-scenario synthetic scenes (`src/gen_scenes.py`: hoppers, adjacent cellular carriers and uplinks, ISM near-far collisions, 5 GHz, drones, land-mobile radios, broadcast FM, band-edge cut-offs, every X410 rate 5–500 MSps; realism calibrated on real captures) + the M4 OTA tiles | **M7-S = deployed since 2026-11-06 (v1.5.0)**, same ~10 ms ViT-S cost as M5-S (`config_live_v3_dino_ft_m7s*.yaml`; M8-S / v3 scored higher on synthetic sets but filled quiet high-gain frames on real N320 captures): real cellular/LMR/NR test recordings pixel recall 0.33 → 0.95, region det@0.5 24 → 80 %; synthetic held-out detection 65 → 87 %; legacy 491.52 held-out unchanged or better. Details in [`infocom_evals/.../dino_ft_multirate_scenes/`](../applications/usrp_wideband_signal_detection/infocom_evals/signal_detection_experiments/dino_ft_multirate_scenes/README.md) |
-| M8S_scenes_v3 / M9S_headv2 / **M10S_v5** / M11S_v6 | ViT-S/16 | generator v3 (fill keeps an edge, DC spur labelled) → v4/v5 (`SegHeadV2` full-resolution input stem + quiet-pixel BCE weight; real terminated-input N320 backgrounds, spur combs labelled line by line, live-ingest artefacts) → v6 (gain-step artefact dropped as label noise, dense FHSS networks, regular spur combs) | **M10-S (2026-11-05) is the first model without the quiet-band "comb fill"** (synthetic comb probe 0 % filled tiles vs 12–25 % for M7/M9; 900 MHz ISM capture 7 of 116 tiles vs 34) and has the best real-data numbers of the lineage (hard cases det@0.5 88 % vs 80 %, pixel P 0.98; Argus P 0.80), at the cost of some cellular recall at 5–10 MSps traced to the gain-step artefact. **M11-S (v6, 2026-11-06)** is the best model on every labelled set (v6 held-out IoU 0.841 vs 0.809 / 0.741 for M10-S / M7-S, hard cases IoU 0.931) and marks the 900 MHz comb line by line, but with the quiet-pixel weight lowered to 1.0 it fills tiles on one narrow 10.24 MSps uplink look and paints the DC pedestal of the quiet reference; **M12-S (v6 data, weight 2.0) is training** to separate the two effects. The winner replaces M7-S as the candidate (operating threshold 0.5, see the experiment record). |
+| M8S_scenes_v3 / M9S_headv2 / M10S_v5 / M11S_v6 / **M12S_v6q2** / M13S_v7 | ViT-S/16 | generator v3 (fill keeps an edge, DC spur labelled) → v4/v5 (`SegHeadV2` full-resolution input stem + quiet-pixel BCE weight; real terminated-input N320 backgrounds, irregular spur combs labelled line by line, live-ingest artefacts) → v6 (gain-step artefact dropped, dense FHSS networks, regular 1 MHz-style spur combs) → v7 (gain step restored, short band-wide bursts) | **M12-S = recommended successor of M7-S for the live demo** (`config_live_v3_dino_ft_m12s.yaml`, not yet validated live): no quiet-band comb fills (synthetic probe 0 %, 900 MHz ISM capture 0 of 116 tiles vs 34 for M7-S), v6 held-out IoU 0.839 vs 0.741, hard cases IoU 0.920, Argus 0.425, weak HDTV channels found; residuals: tile fills on one narrow 10 MSps uplink look (12 of 78 tiles) and a painted DC pedestal on quiet bands (5.9 %), neither reachable at 491.52 MSps. **M13-S** (v7) is the low-false-positive alternative: fewer fills (7 of 78), pedestal 2.1 %, best real labelled numbers (hard IoU 0.941, Argus 0.433) but it drops weak flat carriers (HDTV 499–531 MHz 6 % vs 41 %). M10-S keeps the pedestal and uplink look clean but fills 7 of 116 tiles on the 900 MHz comb. Full story in the experiment record. |
 
 To retrain the deployed lineage (needs the waveform library for the synthetic composites,
 `ARGUS_WAVEFORM_LIB`, and OTA captures):
@@ -173,7 +173,9 @@ python run_ts_on_sigmf.py --ts finetuned_dino_m7s_scenes_v2_bf16.ts --capture x.
 
 | File | Needed for |
 | --- | --- |
-| `weights/finetuned_dino_m7s_scenes_v2_bf16.ts` + `.meta.json` | the live demo, offline eval, preprocessing: every current fine-tuned config (v1.5.0 release asset) |
+| `weights/finetuned_dino_m7s_scenes_v2_bf16.ts` + `.meta.json` | the live demo, offline eval, preprocessing: every current fine-tuned config (v1.5.1 release asset) |
+| `weights/finetuned_dino_m12s_v6q2_bf16.ts` + `.meta.json` | `config_live_v3_dino_ft_m12s.yaml`: recommended for low-SNR recall (v1.6.0 release asset) |
+| `weights/finetuned_dino_m13s_v7_bf16.ts` + `.meta.json` | `config_live_v3_dino_ft_m13s.yaml`: fewer false positives, less low-SNR recall (v1.6.0 release asset) |
 | `weights/finetuned_dino_m5s_491_bf16.ts` + `.meta.json` | `old_configs/*_m5s*` A/B only (v1.0.0 release asset) |
 | `weights/finetuned_dino_m4_491_bf16.ts`, `..._m3_491_...`, `..._m2_dr_...` | legacy configs only (see the app README §6) |
 | `checkpoints/<model>/best.pt` | retraining / re-export (each bundles backbone + head + the val threshold) |

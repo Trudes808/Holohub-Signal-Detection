@@ -463,13 +463,60 @@ labels stay consistent. **M13S_v7** = SegHeadV2 + `fp_quiet_w` 2.0 on `dataset_m
 test_1/2/3 and the three sensitive captures. Decision rule: zero fills on the probe and on ism900 / narrow uplink / quiet 1350,
 labelled-set numbers at M11-S level.
 
+### M13-S (v7: gain step restored + band-wide bursts, fp_quiet 2.0) — outcome (2026-11-06 ~10:30)
+
+`checkpoints/M13S_v7` (dataset_m13 = v7 + OTA tiles, 22.3 k tiles, 20 epochs, best val IoU 0.816 on the v7 validation set;
+`results/comparison_M13S_v7.md`; export `weights/finetuned_dino_m13s_v7_bf16.ts`).
+
+**Like-for-like on the v7 held-out** — M10-S / M11-S / M12-S / M13-S: pixel precision 0.926 / 0.939 / 0.941 / **0.945**, recall
+0.832 / **0.891** / 0.885 / 0.863, IoU 0.780 / **0.842** / 0.839 / 0.821; det@0.1 81.6 / **84.0** / 83.6 / 83.1 %, det@0.5 72.5 /
+**74.8** / 74.3 / 73.6 %. The new `wide_burst` emitters are found 100 % by every model; `fill` carriers 95 / 100 / 100 / 93 %.
+**Real sets**: hard cases P **0.988** R **0.953** IoU **0.941** (best of the lineage), det@0.1 87.9 % (the 7 kHz LMR lines are
+lost again), Argus LTE P **0.809** IoU **0.433** (best), legacy 491.52 @0.6 P 0.959 R 0.956 IoU 0.919, mixed real + synthetic UAV
+96.3 / 92.2 %, comb probe 0 % fills with the best line recall (62.5 %).
+
+**N320 OTA** (`results/ota_n320_detections.md`, six models; full scans `eval_out/scan_*_m13`): 900 MHz ISM 0 of 116 tiles
+(fixed, as M11/M12); narrow 850 MHz uplink **7 of 78 tiles** above 50 % (M12-S 12, M10-S 0; 9 at threshold 0.5, 5 at 0.7);
+quiet 1350 MHz pedestal **2.1 %** (M12-S 5.9, M10-S 0.6). **But the weak ATSC channels of the 499–531 MHz look are lost: 6 %
+occupancy (M10-S 44, M12-S 41, M7-S 14), threshold-independent (3.8 % at 0.5)**, and the downlink bands are covered less
+completely (cell850 DL 85.6 % vs 94–95 %, AWS 58.9 % vs 76.8 M10-S / 51.8 M12-S). Total tiles above 50 % over the 30 captures
+(mostly legitimate full downlink bands): M7-S 160, M10-S 147, M12-S 140, M13-S 137. test_1/2/3 unchanged (max 5.3 / 17.3 / 5.5 %,
+no tile above 50 %).
+
+Reading: the gain-step negatives did for M13-S what they did for M10-S — the floor fills and the pedestal mostly go away — and
+charged the same price, weak flat (Gaussian-like) carriers, this time including the two TV channels M10-S still caught. The
+band-wide-burst positives are learned perfectly in synthesis but only halve the real narrow-look fill. **After robust
+per-frame normalisation the three looks "weak 6 MHz carrier", "elevated floor region" and "tile of band-wide bursts" differ
+only in texture, and the lineage is now trading them against each other; the next real gain is the absolute-level second
+input channel (operator change), not another data variant.**
+
+### Final comparison and recommendation (2026-11-07)
+
+| | M7-S (deployed) | M10-S (v5) | M12-S (v6, q2) | M13-S (v7) |
+|---|---|---|---|---|
+| quiet-band comb fill: 900 MHz ISM tiles > 50 % (of 116) | 34 | 7 | **0** | **0** |
+| narrow 10 MSps uplink look, tiles > 50 % (of 78) | 13 | **0** | 12 | 7 |
+| quiet 1350 MHz pedestal occupancy | 0.5 % | **0.6 %** | 5.9 % | 2.1 % |
+| weak ATSC channels 499–531 MHz (occupancy) | 14 % | **44 %** | 41 % | 6 % |
+| synthetic held-out IoU (v6 / v7 set) | 0.741 / — | 0.809 / 0.780 | 0.839 / 0.839 | — / 0.821 |
+| hard cases pixel IoU / det@0.5 | 0.922 / 80 % | 0.921 / 88 % | 0.920 / 80 % | **0.941** / 80 % |
+| Argus LTE pixel IoU | 0.422 | 0.418 | 0.425 | **0.433** |
+| sub-0 dB det@0.5 (v6 held-out) | **37.9 %** | 32.0 % | 32.7 % | — |
+
+No model dominates. **M12-S is the recommended successor of M7-S for the live demo**: at 491.52 MSps nothing spans the band
+(its fill trigger) and the DC pedestal is two bins wide, so its two residuals cannot show, while its recall on weak and
+low-SNR signals is the best of the lineage and the comb fill M7-S shows on every quiet high-gain look is gone. **M13-S** is the
+choice for low-rate offline use where a painted tile costs more than a missed weak carrier. **M10-S** stays available for
+looks where the pedestal / narrow-uplink behaviour must be exactly M7-S-like without the comb fill. Operating threshold for
+M12-S: 0.6 (lowering it adds fills; the 0.5 finding for M10-S does not transfer).
+
 ### Deploy
 
-`dino_fine_tuning/weights/finetuned_dino_m7s_scenes_v2_bf16.ts` (+ `.meta.json`, eager-vs-traced IoU 1.000,
-threshold 0.6, trained_rate_range 5–500 MSps; the M6-S export `finetuned_dino_m6s_multirate_bf16.ts` is kept
-for A/B). Same geometry contract and front-end as M5-S, so the only config change is `model_script_path`
-(done in `config_live_v3_dino_ft_m7s.yaml` and `config_live_v3_dino_ft_m7s_two_channel.yaml`). Since 2026-11-06
-the demo's DINO switch (conductor single + dual, loopback supervisor and runners) loads M7-S; M5-S is off the switch.
+`config_live_v3_dino_ft_m12s.yaml` = the current M7-S live config (N320 support, invalid-frame guard 0.98) with
+`model_script_path` → `dino_fine_tuning/weights/finetuned_dino_m12s_v6q2_bf16.ts`, label "DINO v3 M12-S", threshold 0.6.
+Same geometry contract and front-end as M5-S / M7-S. **M7-S remains the deployed model** (conductor switch, loopback,
+preprocessing) until the live A/B: `sudo ./bash_scripts/run_live_demo.sh config_live_v3_dino_ft_m12s.yaml`. The M13-S export
+(`finetuned_dino_m13s_v7_bf16.ts`) and the M10-S export are kept for A/B; swap the path and the label.
 
 ### Reproduce
 

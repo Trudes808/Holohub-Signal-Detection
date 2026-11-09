@@ -43,7 +43,8 @@ All commands below run **from this directory**.
 | Input | Where it must be | Used by |
 | --- | --- | --- |
 | [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3) checkout + gated `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth` under its `weights/` | `<repo>/../dinov3` (sibling of this repo; override `HOST_DINOV3_ROOT`) | container build (`cuda_dino`, exported to TorchScript in-container) |
-| `finetuned_dino_m7s_scenes_v2_bf16.ts` + `.meta.json` | `dino_fine_tuning/weights/` | every `cuda_dino_finetuned` config of the demo, offline eval and `preprocess_dataset.py` (v1.5.0 release asset) |
+| `finetuned_dino_m7s_scenes_v2_bf16.ts` + `.meta.json` | `dino_fine_tuning/weights/` | every `cuda_dino_finetuned` config of the demo, offline eval and `preprocess_dataset.py` (v1.5.1 release asset) |
+| `finetuned_dino_m12s_v6q2_bf16.ts` / `finetuned_dino_m13s_v7_bf16.ts` + `.meta.json` (optional) | `dino_fine_tuning/weights/` | the `_m12s` / `_m13s` configs: the v1.6.0 detectors recommended for low-SNR recall (M12-S) or fewer false positives (M13-S); not yet validated live, so the demo switch stays on M7-S (v1.6.0 release assets) |
 | `holoscan_waveform_generation` checkout with its `.venv-ml` (optional) | `~/Documents/holoscan_waveform_generation` (override `VENV_PY`, `PYCODEC_ROOT`) | the `v3`/`v5` classifier daemon and the loopback pcaps |
 
 Older fine-tuned exports (`m4_491`, `m3_491`, `m2_dr`) are only needed by the legacy configs listed in §6.
@@ -258,6 +259,8 @@ See the header of each script for its inputs and policy knobs, and
 | `config_live_v3_single_channel.yaml` / `config_live_v3_two_channel.yaml` | coherent_power | **Live demo** start configs (`v5`, `v5dual`): snipper on, dashboard with DEMO CONTROLS. |
 | `config_live_v3_dino_ft_m7s.yaml` / `config_live_v3_dino_ft_m7s_two_channel.yaml` | cuda_dino_finetuned (M7-S) | **Live demo DINO target** (conductor switch + loopback supervisor/runners) and the `preprocess_dataset.py` default: the multi-rate / multi-scenario M7-S retrain (`dino_fine_tuning/README.md` §3), invalid-frame guard 0.98. The M5-S versions they replaced (2026-11-06) are in `old_configs/`. |
 | `config_live_v3_dino_ft_m7s_sf2048.yaml` | cuda_dino_finetuned (M7-S) | Same as the M7-S config with the short-FFT front-end (2048-point FFT, power-pooled rows). With M5-S this gave a higher detection rate and less GPU per frame; not yet re-measured with M7-S. Run it with `sudo ./bash_scripts/run_live_demo.sh config_live_v3_dino_ft_m7s_sf2048.yaml`, or point the conductor's `cuda_dino_finetuned` entry at it. |
+| `config_live_v3_dino_ft_m12s.yaml` | cuda_dino_finetuned (M12-S) | **Recommended fine-tuned detector for low-SNR recall** (v1.6.0, not yet validated live): the M7-S live config pointed at the v6 retrain (`dino_fine_tuning/README.md` §3) — no quiet-band comb fills, finds weak carriers M7-S misses; known residual: painted tiles on one narrow 10 MSps uplink look and a 2 MHz DC pedestal on quiet bands at low sample rates. `sudo ./bash_scripts/run_live_demo.sh config_live_v3_dino_ft_m12s.yaml`. |
+| `config_live_v3_dino_ft_m13s.yaml` | cuda_dino_finetuned (M13-S) | **Fewer false positives than M12-S** at the cost of some low-SNR recall (v1.6.0): v7 retrain with the gain-step negatives; about half the painted tiles of M12-S on the narrow uplink look and a cleaner quiet band, but weak flat carriers (e.g. distant ATSC channels) are dropped. Best real-data pixel IoU. `sudo ./bash_scripts/run_live_demo.sh config_live_v3_dino_ft_m13s.yaml`. |
 | `config_live_v3_dino.yaml` | cuda_dino | Live zero-shot DINO target of the conductor. |
 | `config_live_v3_dino_ft_sb.yaml` | cuda_dino_finetuned (M4) | Legacy conductor entry (hidden in the dropdown). |
 | `config_loopback_v3_{single_channel,dino,dino_ft,dino_ft_sb}.yaml` | all | 245.76 MSps composite loopback demo (`run_loopback_v3_demo.sh`); `dino_ft*` use the M3 export. |
@@ -272,7 +275,7 @@ See the header of each script for its inputs and policy knobs, and
 | `config_coherent_power_capture_chdr_single_channel.yaml` | coherent_power | Capture a frozen CHDR/IQ snapshot for offline replay. |
 
 Fine-tuned exports referenced by the configs (all gitignored, under `dino_fine_tuning/weights/`):
-`finetuned_dino_m7s_scenes_v2_bf16.ts` (**required**: the demo and every current fine-tuned config), `finetuned_dino_m5s_491_bf16.ts` (`old_configs/*_m5s*`, from the v1.0.0 release), `finetuned_dino_m4_491_bf16.ts`
+`finetuned_dino_m7s_scenes_v2_bf16.ts` (**required**: the demo and every current fine-tuned config), `finetuned_dino_m12s_v6q2_bf16.ts` (`_m12s`) and `finetuned_dino_m13s_v7_bf16.ts` (`_m13s`) (v1.6.0 release assets), `finetuned_dino_m5s_491_bf16.ts` (`old_configs/*_m5s*`, from the v1.0.0 release), `finetuned_dino_m4_491_bf16.ts`
 (`_sb`), `finetuned_dino_m3_491_bf16.ts` (`loopback_v3_dino_ft*`), `finetuned_dino_m2_dr_bf16.ts`
 (`dino_finetuned_viz_demo`). How they were trained and how to export a new one:
 [`dino_fine_tuning/README.md`](../../dino_fine_tuning/README.md).

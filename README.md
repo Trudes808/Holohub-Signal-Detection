@@ -54,7 +54,7 @@ python src/train.py --config configs/train.yaml --dataset data/dataset --mode ft
 - **Original bench:** x86_64 with an RTX 4000 Ada (CUDA 12.6, GPUDirect RDMA). Container image: `applications/usrp_freq_detection/Dockerfile`. Platform deltas: [`notes/RUNNING_ON_DGX_SPARK.md`](applications/usrp_wideband_signal_detection/notes/RUNNING_ON_DGX_SPARK.md) §1.
 
 Model weights are not in git. The app README §1 lists what to download and where it goes
-(DINOv3 backbone, the fine-tuned `M7-S` TorchScript export, optional classifier weights).
+(DINOv3 backbone, the fine-tuned `M7-S` TorchScript export, the optional `M12-S` / `M13-S` exports of v1.6.0, optional classifier weights).
 
 ## License
 
